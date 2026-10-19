@@ -192,3 +192,146 @@ QWEN_BASE_URL=https://<你的端点>/compatible-mode   cargo run --example strea
 ```
 
 即完整补跑 ≈ 1 次主跑 + 4 次 base_url 形态跑（用默认 dashscope base 时其中两两 URL 相同，见四组合表下的注；用自建端点时四个都该打）。失败的那几次同样要记录原文，别只留成功的。stdout/stderr 原样贴进四问表格，不转述、不修剪 `TOOLCALL` 行。
+
+## 风险 2：Tauri 二进制 IPC
+
+**一句话结论：raw body 在 Windows/WebView2 上可用，且是明显更快的那一条。** 512KB（以及 4MB）的 `Uint8Array` 作为 `invoke` 的**第二参数整体**传入时，Rust 侧命令收到的是 `tauri::ipc::InvokeBody::Raw`，实测中位往返 **7.5ms**；base64 字段形态在同一尺寸下 IPC 往返中位 **20.3ms**，再加分块编码 11.1ms 后为 **31.2ms**。**Task 18 采用 `InvokeBody::Raw`；Task 19 不需要为 IPC 传输本身加 loading 态。**
+
+本节全部延迟数字都是**实测**（CDP 程序化驱动，见下方「测量方法」）。协议形态判读单独放在「协议判读」一节并逐条给 file:line，两类证据不混用：**源码能证明走的是哪条通路，但证明不了延迟；延迟是测出来的，但解释不了为什么。**
+
+### 必答四问
+
+| # | 问题 | 结论 | 证据类型 |
+| --- | --- | --- | --- |
+| 1 | 两种传法哪种可用 | **raw body 可用**（`invoke("ipc_probe_raw", bytes)` → `Ok(524288)`，7/7 与 15/15 全中）；base64 字段同样可用，仅作对照 | 实测 |
+| 2 | 各自实测延迟（512KB，15 次） | raw：min 7.10 / **median 7.50** / max 10.10 ms。b64：IPC 往返 min 19.20 / **median 20.30** / max 21.20 ms；加分块编码后 min 29.90 / **median 31.20** / max 34.20 ms | 实测 |
+| 3 | Task 18 是否取 `InvokeBody::Raw` | **是**。命令签名 `normalize_image(req: tauri::ipc::Request<'_>)`，前端 `invoke("normalize_image", bytes)`（bytes 为 `Uint8Array` 或 `ArrayBuffer`，两者都实测可用）。**约束：raw body 与 JSON 字段互斥**——同一命令不能既收字节又收兄弟参数（实测负控制 + 源码），max-edge / mime 之类参数只能内置、或走第二条命令 | 实测 + 协议判读 |
+| 4 | Task 19 是否需要 loading 态 | **传输层不需要**：512KB 单张 7.5ms，4MB 也只要 56ms，空载往返基线 1.1ms，肉眼不可能感知。**但 Task 18 侧的图像解码/缩放/编码耗时未实测**，Task 19 若要 pending/进度反馈，理由只能是那条未实测的归一化与模型往返，不得拿 IPC 延迟当依据 | 实测（限传输层） |
+
+无待肉眼确认项：按 R13，Step 3 的「打开 DevTools 点按钮」已由 WebView2 远程调试端口程序化替代，`probe()` 的 `console.log` 由 CDP `Runtime.consoleAPICalled` 捕获原文（见下方原文）。
+
+### 测量方法
+
+```bash
+# 起 app（第一次链接约 40s，之后增量秒级）
+cd "D:/aido/qwen do 1" && WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222 npm run tauri dev
+# 确认页面 target
+curl -s http://localhost:9222/json   # → type=page url=http://localhost:1420/
+# 驱动（Node 24 内置 fetch + WebSocket，零依赖，脚本在 .superpowers/ 下不入树）
+node .superpowers/sdd/2026-10-19-plan-a-shell-chat-vision/tmp/cdp_probe.mjs console
+PROBE_REPS=15 node .../cdp_probe.mjs measure
+PROBE_BYTES=$((2*1024*1024)) PROBE_REPS=5 node .../cdp_probe.mjs size
+node .../cdp_probe.mjs negctrl
+```
+
+- 计时方式：`performance.now()` 直接包住 `await invoke(...)`，即「JS 侧发出 → JS 侧拿到结果」的端到端往返，含 WebView2 网络栈、自定义协议、serde 与命令执行。
+- base64 形态拆成两个数：**编码**（`chunkedB64`，8192 字节一段 `String.fromCharCode` + `btoa`）单独计时，**IPC 往返**单独计时；`b64WithChunkedEncode` 是同一轮里两者之和（512KB 那轮是直接量得的总和，2MB/4MB 那两轮是两段实测值相加）。
+- 载荷固定 `bytes[i] = i % 251`（512KB），非全零，避免任何压缩/去优化通路干扰；`greet` 空载往返作对照基线。
+- 运行环境原文：`navigator.userAgent = Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36 Edg/155.0.0.0`；`window.__TAURI_INTERNALS__.__TAURI_PATTERN__ = {"pattern":"brownfield"}`；`typeof window.ipc.postMessage === "function"` 为 `true`（存在，但本次没有走它）。
+
+### 实测原文：brief 的 `probe()` 逐字执行
+
+```
+[console.log] "raw:" 524288
+[console.log] "b64:" 8192
+```
+
+`raw:` 直接给出 `524288`（= 512×1024），即 `InvokeBody::Raw` 分支命中；该命令的另一分支会返回 `Err("got json body: …")`，所以这个数不是「碰巧算对」。控制台**没有**出现 `IPC custom protocol failed, Tauri will now use the postMessage interface instead` 这条 warn。
+
+### 实测原文：512KB × 15 次（`measure` 汇总，未修剪）
+
+```json
+{
+  "payloadBytes": 524288,
+  "reps": 15,
+  "summary": {
+    "raw":                  { "n": 15, "min": 7.099999997764826,  "median": 7.5,                "max": 10.100000001490116 },
+    "b64IpcOnly":           { "n": 15, "min": 19.199999999254942, "median": 20.300000000745058, "max": 21.199999999254942 },
+    "b64WithChunkedEncode": { "n": 15, "min": 29.899999998509884, "median": 31.199999999254942, "max": 34.19999999925494 },
+    "chunkedEncode":        { "n": 15, "min": 10.400000002235174, "median": 11.100000001490116, "max": 13 },
+    "greetBaseline":        { "n": 15, "min": 0.8999999985098839, "median": 1.0999999977648258,  "max": 2 }
+  },
+  "raw": { "results": [524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288] },
+  "b64": { "results": [524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288, 524288] },
+  "encode": { "b64Length": 699052,
+              "spread8kb": "ok, b64 len=10924",
+              "spread512kb": "ERROR: RangeError: Maximum call stack size exceeded" }
+}
+```
+
+复跑一致性：同机同一 session 内先跑了一轮 7 次（raw min 7.10 / median 7.90 / max 9.60；b64 往返 min 19.40 / median 20.30 / max 21.30），再跑 15 次，中位差 0.4ms。15 个原始 `performance.now()` 差值数组与全部中间文件见 task-3-report.md。
+
+### 实测原文：尺寸放大（5 次/档，同一 target）
+
+```
+PROBE_BYTES=2097152（2MB）
+  raw            min 28.600 / median 28.900 / max 29.900   → 5 次全部 Ok(2097152)
+  b64IpcOnly     min 74.600 / median 74.600  / max 87.900   → 5 次全部 Ok(2097152)
+  chunkedEncode  min 43.300 / median 46.100  / max 50.199   （b64 串长 2796204）
+  编码+IPC 相加 ≈ 120.7ms（两段各自实测后相加，非单次直接实测）
+PROBE_BYTES=4194304（4MB）
+  raw            min 54.699 / median 56.300  / max 58.899   → 5 次全部 Ok(4194304)
+  b64IpcOnly     min 143.50 / median 150.900 / max 162.899  → 5 次全部 Ok(4194304)
+  chunkedEncode  min 87.099 / median 88.100  / max 94.700   （b64 串长 5592408）
+  编码+IPC 相加 ≈ 239.0ms（同上，相加值）
+```
+
+线性度（由上表实测值折算）：raw ≈ 68 / 72 / 74 MB/s（512KB / 2MB / 4MB），b64 按原始字节折算 ≈ 25 / 28 / 26 MB/s → **raw 稳定快约 2.6–2.7 倍**（只比 IPC 往返），连编码一起算约 **4.2 倍**。
+
+### 实测原文：并发与形态边角（Task 19 的多图入口）
+
+```
+附加项（与 512KB / 2MB 档同轮测得）：
+  arrayBufferRes        = 524288                 // invoke("ipc_probe_raw", b.buffer) —— ArrayBuffer 形态同样走 raw
+  concurrent3Res        = "524288,524288,524288"  // Promise.all 三个 raw invoke
+  concurrent3Ms(512KB)  = 16.400 ms               // 单张 7.6ms → 3 张并发 16.4ms（≈2.2 倍单张）
+  concurrent3Ms(2MB)    = 66.500 ms               // 单张 28.9ms → 3 张并发 66.5ms（≈2.3 倍单张）
+```
+
+即「粘贴多张图」在这一层**并发安全且近似线性**，不需要为多图串行化。
+
+### 实测原文：负控制（证明 Raw/Json 判据不是空转）+ 8KB 注意项
+
+```json
+{
+  "json_object_to_raw_cmd": "got json body: {\"bytesB64\":\"AAAA\"}",
+  "empty_typed_array": "Ok(0)",
+  "typed_array_4_bytes": "Ok(4)",
+  "digit_array_field_in_object": "Err(got json body: {\"a\":[1,2,3,4]})",
+  "json_number_array_512kb": [
+    { "buildMs": 7.2, "ipcMs": 254.8 },
+    { "buildMs": 6.9, "ipcMs": 260.6 }
+  ]
+}
+```
+
+（`json_number_array_512kb` 的 `result` 字段原文是被截断的 `Err(got json body: {"a":[0,1,2,3,4,5,6,7,8,9,10,11,…)`，即 512KB 的数字数组被 Rust 当成 `InvokeBody::Json` 收了回去；截断由探针做，不影响 `ipcMs` 计时。）
+
+三条要点：
+
+1. **`String.fromCharCode(...bytes)` 在 512KB 上的真实报错原文是 `RangeError: Maximum call stack size exceeded`**（同一份数据切成 8192 字节展开则 `ok, b64 len=10924`）。brief 的 8KB 警告在本机 WebView2 上成立且可复现（7 次与 15 次两轮都命中）。→ Task 19 若在任何地方需要 base64（见下方 Android/回退两条），**必须**用 `File.slice` 分段 + 逐段 `btoa`，禁止一次性展开。
+2. **JSON 数字数组是最差的形态**：512KB 走 `{a: Array.from(bytes)}` 实测往返 **254.8 / 260.6ms**，是同尺寸 raw 的**约 34 倍**（`Array.from` 本身只花 7ms，代价在序列化 + serde）。`InvokeArgs` 类型里 `number[]` 是合法项（`core.d.ts:268`），所以这是个「类型通过、性能归零」的坑，Task 18/19 不要碰。
+3. 空 `Uint8Array` → `Ok(0)`：raw 路径对 0 字节载荷也成立，Task 18 不必为「空输入」特殊绕路。
+
+### 协议判读（读源码所得，非实测；只用于解释实测为什么成立）
+
+以下路径均在本机已安装的源里，Git Bash 正斜杠：
+
+- `D:/aido/qwen do 1/node_modules/@tauri-apps/api/core.js:340-341` —— `invoke(cmd, args, options)` 只是转发到 `window.__TAURI_INTERNALS__.invoke`，JS API 层不做任何序列化决策。
+- `tauri-2.12.4/scripts/core.js:81-101` —— `__TAURI_INTERNALS__.invoke` 把 payload 原样交给 `__TAURI_INTERNALS__.ipc({cmd, callback, error, payload, options})`。
+- `tauri-2.12.4/scripts/ipc-protocol.js:20` —— `canUseCustomProtocol = osName !== 'android'`；`:22-41` —— 桌面走 `fetch(convertFileSrc(cmd,'ipc'), {method:'POST', body:data, headers})`，并设 `Content-Type` / `Tauri-Callback` / `Tauri-Error` / `Tauri-Invoke-Key` 四个头。
+- `tauri-2.12.4/scripts/process-ipc-message-fn.js:8-16` —— **判据是「整个 payload 是不是一个字节载体」**：`message instanceof ArrayBuffer || ArrayBuffer.isView(message) || Array.isArray(message)` → `{contentType:'application/octet-stream', data: message}`；否则 `JSON.stringify`，且 `:26-29` 把 `Uint8Array`/`ArrayBuffer` 转成数字数组（这正是上面 254ms 那条路）。
+- `tauri-2.12.4/src/ipc/protocol.rs:434`（`parse_invoke_request`）→ `:452-457`（缺 `Content-Type` 时默认 `APPLICATION_OCTET_STREAM`）→ **`:521-522` `content_type == APPLICATION_OCTET_STREAM` 时 `body.into()`，即 `InvokeBody::Raw`**；`:523-531` JSON → `InvokeBody::Json`；`:533` 其他 content type 直接报 `content type … is not implemented`。
+- `tauri-2.12.4/src/ipc/mod.rs:165-172` —— `impl CommandArg for Request<'_>` 把整个 `InvokeBody` 交给命令，所以命令参数**只能有一个** `req: tauri::ipc::Request<'_>`；`tauri-2.12.4/src/ipc/command.rs:104-116` —— 任何带 key 的参数在 Raw body 上报错 `command … expected a value for key … but the IPC call used a bytes payload`。这解释了四问表第 3 条的「互斥」约束。
+- `tauri-2.12.4/src/ipc/mod.rs:52-64` —— `InvokeBody` 只有 `Json(JsonValue)` / `Raw(Vec<u8>)` 两态；`:55-56` 的文档明确 **Android 拿不到 Raw**，官方建议那种平台改传 base64 `String`（本项目 Windows-only，但这条是 Task 18 唯一需要预留的降级理由）。
+- `tauri-2.12.4/src/ipc/protocol.rs:185`（`handle_ipc_message`）与 `:236-245`（其 `struct Message { payload: serde_json::Value, … }`）—— **`window.ipc.postMessage` 回退通路只能携带 JSON**，字节会退化成数字数组（实测约 255ms/512KB）且不再进 `Raw` 分支。回退由 `ipc-protocol.js:55-68` 在 fetch 失败时触发并打 warn。→ Task 13 装配 IPC 层后，若 `normalize_image` 收到的是 `InvokeBody::Json`，第一嫌疑是自定义协议被 CSP/WebView2 策略挡了，而不是前端调用写错。
+- `D:/aido/qwen do 1/node_modules/@tauri-apps/api/core.d.ts:268` —— `type InvokeArgs = Record<string, unknown> | number[] | ArrayBuffer | Uint8Array`；`:306` 是 `invoke` 签名。**`Uint8Array`/`ArrayBuffer` 本来就在公开类型里，前端不需要 `as any`**（带探针的代码 `npx tsc --noEmit` 零报错，实测）；但 `File`/`Blob` **不在**里面，Task 19 三个入口都得先 `await file.arrayBuffer()` 再传。
+- 上述 `tauri-2.12.4/...` 的绝对前缀是 `$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`。
+
+**未实测项**：Rust→JS 方向返回 `InvokeResponseBody::Raw`（`tauri-2.12.4/src/ipc/mod.rs:74-81`）的形态与延迟——本节只测了 JS→Rust。Task 20（历史图片降级回显）若要往界面送字节，需另测，不得引用本节的毫秒数。
+
+### 本任务的副作用（非 IPC 结论，但影响后续任务）
+
+- `cargo add base64 image` 解析到 **`base64 0.23.1`**、**`image 0.25.10`**（写入 `src-tauri/Cargo.toml`，两者均保留给 Task 18）。brief 的 `use base64::Engine; base64::engine::general_purpose::STANDARD.decode(…)` 在 0.23.1 上**未改动即可编译**（0.23.1 仍有 `pub mod engine` 与 `pub use engine::Engine`，见 `$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base64-0.23.1/src/lib.rs:298-299`）。
+- `image` 的**默认 feature** 把 `rav1e 0.8.1` / `ravif` / `av1-grain` / `exr` / `tiff` / `gif` 整条编解码树拉了进来（依赖构建单元约 520 个，冷链接 36.68s）。本探针一行没用 `image`，因此**没有与它的 API 搏斗过**，不能据此评价其 API 好坏；但对 <15MB 的发布体积验收是实打实的风险 → **建议 Task 18 落地时按需收敛为 `default-features = false` + 只开所需的 jpeg/png/webp**（具体开哪些由 Task 18 按真实解码需求决定，此处只记录体积风险，不替它拍板）。
+- Step 4 已把临时命令与前端探针彻底移除：`grep -rn "ipc_probe" src-tauri/src src/` 无命中，`src-tauri/src/lib.rs` 与 `src/App.tsx` 与 HEAD 逐字节相同；`cargo test` / `npm test` / `npm run build` 全绿。生产代码里**不存在**可被误当成 IPC 模式的探针样本，本项目第一个正式 IPC 层由 Task 13 建立。
