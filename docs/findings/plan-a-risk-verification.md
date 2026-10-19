@@ -195,7 +195,7 @@ QWEN_BASE_URL=https://<你的端点>/compatible-mode   cargo run --example strea
 
 ## 风险 2：Tauri 二进制 IPC
 
-**一句话结论：raw body 在 Windows/WebView2 上可用，且是明显更快的那一条。** 512KB（以及 4MB）的 `Uint8Array` 作为 `invoke` 的**第二参数整体**传入时，Rust 侧命令收到的是 `tauri::ipc::InvokeBody::Raw`，实测中位往返 **7.5ms**；base64 字段形态在同一尺寸下 IPC 往返中位 **20.3ms**，再加分块编码 11.1ms 后为 **31.2ms**。**Task 18 采用 `InvokeBody::Raw`；Task 19 不需要为 IPC 传输本身加 loading 态。**
+**一句话结论：raw body 在 Windows/WebView2 上可用，且是明显更快的那一条。** 512KB（以及 4MB）的 `Uint8Array` 作为 `invoke` 的**第二参数整体**传入时，Rust 侧命令收到的是 `tauri::ipc::InvokeBody::Raw`，实测中位往返 **7.5ms**；base64 字段形态在同一尺寸下 IPC 往返中位 **20.3ms**，连同分块编码（中位 11.1ms）端到端实测 **31.2ms**（中位数不可相加，31.2 是逐轮直接量得的总和）。**Task 18 采用 `InvokeBody::Raw`；Task 19 不需要为 IPC 传输本身加 loading 态。**
 
 本节全部延迟数字都是**实测**（CDP 程序化驱动，见下方「测量方法」）。协议形态判读单独放在「协议判读」一节并逐条给 file:line，两类证据不混用：**源码能证明走的是哪条通路，但证明不了延迟；延迟是测出来的，但解释不了为什么。**
 
@@ -213,7 +213,7 @@ QWEN_BASE_URL=https://<你的端点>/compatible-mode   cargo run --example strea
 ### 测量方法
 
 ```bash
-# 起 app（第一次链接约 40s，之后增量秒级）
+# 起 app（本次新增依赖后 cargo 报 "Finished dev profile in 36.68s"，之后增量秒级）
 cd "D:/aido/qwen do 1" && WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222 npm run tauri dev
 # 确认页面 target
 curl -s http://localhost:9222/json   # → type=page url=http://localhost:1420/
@@ -236,9 +236,9 @@ node .../cdp_probe.mjs negctrl
 [console.log] "b64:" 8192
 ```
 
-`raw:` 直接给出 `524288`（= 512×1024），即 `InvokeBody::Raw` 分支命中；该命令的另一分支会返回 `Err("got json body: …")`，所以这个数不是「碰巧算对」。控制台**没有**出现 `IPC custom protocol failed, Tauri will now use the postMessage interface instead` 这条 warn。
+`raw:` 直接给出 `524288`（= 512×1024），即 `InvokeBody::Raw` 分支命中；该命令的另一分支会返回 `Err("got json body: …")`，所以这个数不是「碰巧算对」——同一个命令在收到对象时明确回了 `got json body: {"bytesB64":"AAAA"}`（见下方负控制），两条分支都被实测打通了。CDP 订阅的是 `Runtime.consoleAPICalled`，除上面三行外没有捕获到任何 Tauri 侧 warn；更硬的判据是逻辑性的：若自定义协议失败并回退到 `window.ipc.postMessage`，字节只能以 JSON 数字数组进 `InvokeBody::Json`（`ipc-protocol.js:55-68` + `protocol.rs:236-245`，源码判读），本命令必然回 `Err` —— 实测 15/15 全 `Ok`，**故本次没有发生回退**。
 
-### 实测原文：512KB × 15 次（`measure` 汇总，未修剪）
+### 实测原文：512KB × 15 次（`measure` 输出的 summary 与逐次返回值；15 个原始毫秒数组与 `transport` 字段见 task-3-report.md，本块未列全）
 
 ```json
 {
@@ -259,7 +259,7 @@ node .../cdp_probe.mjs negctrl
 }
 ```
 
-复跑一致性：同机同一 session 内先跑了一轮 7 次（raw min 7.10 / median 7.90 / max 9.60；b64 往返 min 19.40 / median 20.30 / max 21.30），再跑 15 次，中位差 0.4ms。15 个原始 `performance.now()` 差值数组与全部中间文件见 task-3-report.md。
+复跑一致性：同机同一 session 内先跑了一轮 7 次（raw min 7.10 / median 7.90 / max 9.60；b64 往返 min 19.40 / median 20.30 / max 21.30），再跑 15 次，中位差 0.4ms。15 个原始 `performance.now()` 差值数组与全部中间文件见 task-3-report.md。**补跑须知**：驱动脚本 `cdp_probe.mjs` 留在 `.superpowers/sdd/2026-10-19-plan-a-shell-chat-vision/tmp/`（被 `.superpowers/sdd/.gitignore` 忽略，不入 git 树），但临时命令与前端计时 wrapper 已按 Step 4 从 `lib.rs` / `App.tsx` 删除且从未提交，重跑前要先照 brief Step 1/2 加回去（源码全文也抄在 task-3-report.md 里）。
 
 ### 实测原文：尺寸放大（5 次/档，同一 target）
 
@@ -276,7 +276,7 @@ PROBE_BYTES=4194304（4MB）
   编码+IPC 相加 ≈ 239.0ms（同上，相加值）
 ```
 
-线性度（由上表实测值折算）：raw ≈ 68 / 72 / 74 MB/s（512KB / 2MB / 4MB），b64 按原始字节折算 ≈ 25 / 28 / 26 MB/s → **raw 稳定快约 2.6–2.7 倍**（只比 IPC 往返），连编码一起算约 **4.2 倍**。
+线性度（由上表实测中位值折算，算法 = 载荷字节 ÷ 中位毫秒，1 MB = 10⁶ 字节）：raw ≈ **70 / 73 / 74 MB/s**（512KB→524288/0.0075=69.9；2MB→2097152/0.0289=72.6；4MB→4194304/0.0563=74.5），b64 按**原始字节**折算 ≈ **26 / 28 / 28 MB/s**（524288/0.0203=25.8；2097152/0.0746=28.1；4194304/0.1509=27.8），按线上实际走的 **b64 串字节**折算 ≈ 34 / 37 / 37 MB/s（699052/0.0203、2796204/0.0746、5592408/0.1509）→ **raw 稳定快约 2.6–2.7 倍**（只比 IPC 往返），连编码一起算约 **4.2 倍**（31.2/7.5=4.16；120.7/28.9=4.18；239.0/56.3=4.25）。
 
 ### 实测原文：并发与形态边角（Task 19 的多图入口）
 
@@ -288,7 +288,7 @@ PROBE_BYTES=4194304（4MB）
   concurrent3Ms(2MB)    = 66.500 ms               // 单张 28.9ms → 3 张并发 66.5ms（≈2.3 倍单张）
 ```
 
-即「粘贴多张图」在这一层**并发安全且近似线性**，不需要为多图串行化。
+即「粘贴多张图」在这一层是**并发安全**的（三张各自拿到正确长度、无错乱）；墙钟为单张的 2.2–2.3 倍——既不是理想并发的 1 倍，也不是完全串行的 3 倍，说明传输层有部分排队。绝对量仍在几十毫秒级，Task 19 不必为多图做串行化。
 
 ### 实测原文：负控制（证明 Raw/Json 判据不是空转）+ 8KB 注意项
 
@@ -328,10 +328,10 @@ PROBE_BYTES=4194304（4MB）
 - `D:/aido/qwen do 1/node_modules/@tauri-apps/api/core.d.ts:268` —— `type InvokeArgs = Record<string, unknown> | number[] | ArrayBuffer | Uint8Array`；`:306` 是 `invoke` 签名。**`Uint8Array`/`ArrayBuffer` 本来就在公开类型里，前端不需要 `as any`**（带探针的代码 `npx tsc --noEmit` 零报错，实测）；但 `File`/`Blob` **不在**里面，Task 19 三个入口都得先 `await file.arrayBuffer()` 再传。
 - 上述 `tauri-2.12.4/...` 的绝对前缀是 `$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/`。
 
-**未实测项**：Rust→JS 方向返回 `InvokeResponseBody::Raw`（`tauri-2.12.4/src/ipc/mod.rs:74-81`）的形态与延迟——本节只测了 JS→Rust。Task 20（历史图片降级回显）若要往界面送字节，需另测，不得引用本节的毫秒数。
+**未实测项**：Rust→JS 方向返回 `InvokeResponseBody::Raw`（`tauri-2.12.4/src/ipc/mod.rs:99-104` 的 `enum InvokeResponseBody { Json(String), Raw(Vec<u8>) }`）的形态与延迟——本节只测了 JS→Rust。Task 20（历史图片降级回显）若要往界面送字节，需另测，不得引用本节的毫秒数。
 
 ### 本任务的副作用（非 IPC 结论，但影响后续任务）
 
 - `cargo add base64 image` 解析到 **`base64 0.23.1`**、**`image 0.25.10`**（写入 `src-tauri/Cargo.toml`，两者均保留给 Task 18）。brief 的 `use base64::Engine; base64::engine::general_purpose::STANDARD.decode(…)` 在 0.23.1 上**未改动即可编译**（0.23.1 仍有 `pub mod engine` 与 `pub use engine::Engine`，见 `$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base64-0.23.1/src/lib.rs:298-299`）。
-- `image` 的**默认 feature** 把 `rav1e 0.8.1` / `ravif` / `av1-grain` / `exr` / `tiff` / `gif` 整条编解码树拉了进来（依赖构建单元约 520 个，冷链接 36.68s）。本探针一行没用 `image`，因此**没有与它的 API 搏斗过**，不能据此评价其 API 好坏；但对 <15MB 的发布体积验收是实打实的风险 → **建议 Task 18 落地时按需收敛为 `default-features = false` + 只开所需的 jpeg/png/webp**（具体开哪些由 Task 18 按真实解码需求决定，此处只记录体积风险，不替它拍板）。
+- `image` 的**默认 feature** 把 `rav1e 0.8.1` / `ravif` / `av1-grain` / `exr` / `tiff` / `gif` 整条编解码树拉了进来（本次 `cargo build` 走到 520 个构建单元，cargo 报 "Finished dev profile in 36.68s"——tauri 本身已热，新编的正是 image/rav1e 那条树）。本探针一行没用 `image`，因此**没有与它的 API 搏斗过**，不能据此评价其 API 好坏；但对 <15MB 的发布体积验收是实打实的风险 → **建议 Task 18 落地时按需收敛为 `default-features = false` + 只开所需的 jpeg/png/webp**（具体开哪些由 Task 18 按真实解码需求决定，此处只记录体积风险，不替它拍板）。
 - Step 4 已把临时命令与前端探针彻底移除：`grep -rn "ipc_probe" src-tauri/src src/` 无命中，`src-tauri/src/lib.rs` 与 `src/App.tsx` 与 HEAD 逐字节相同；`cargo test` / `npm test` / `npm run build` 全绿。生产代码里**不存在**可被误当成 IPC 模式的探针样本，本项目第一个正式 IPC 层由 Task 13 建立。
