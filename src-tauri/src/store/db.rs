@@ -16,9 +16,9 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 /// schema 版本（R74）。`blocks_json` 存的就是 Task 5 的线上格式（`tag = "type"` 那一套），
-/// 所以这个库的格式和协议格式是同一条演进线：T12 往同一个文件加 settings 表、
-/// Plan B/C 加列时都要靠它认库。**schema 变了就 +1，旧库不自动迁移** —— 这里只标记，
-/// 不搬数据；谁要迁移，读到的就是这一行的值。
+/// 所以这个库的格式和协议格式是同一条演进线：Plan B/C 加表加列时要靠它认库
+/// （T12 的 settings 是同目录下的**另一个文件**，不占这里的版本号）。
+/// **schema 变了就 +1，旧库不自动迁移** —— 这里只标记，不搬数据；谁要迁移，读到的就是这一行的值。
 const SCHEMA_VERSION: i64 = 1;
 
 /// 会话标题上限（字符）。这是**标题**规则（40），不是工具输出预览（200，见
@@ -27,9 +27,10 @@ const TITLE_CHARS: usize = 40;
 
 /// 建表语句。`ON DELETE CASCADE` 是 `delete_session` 只发一条 DELETE 的前提（R73）。
 /// 那句 `PRAGMA foreign_keys = ON` 在本仓库当前**是重复的**：`libsqlite3-sys` 的 bundled
-/// 构建已经 `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`（build.rs:153），实测把 pragma 那一行整行删掉，
-/// 25 条测试仍全绿（变异 M10）；显式设它买的是「换系统 SQLite / 上游默认变了也仍然成立」。
-/// 它不是空话：把它改成 OFF 的变异（M10b）一次红了 3 条测试。
+/// 构建已经 `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`（`build.rs:153`），实测把 pragma 那一行整行删掉
+/// 后相关测试仍全绿 —— 说明 CASCADE 的真机制是编译期那个宏。显式设它买的是「换系统
+/// SQLite、或上游默认变了以后仍然成立」。它也不是空话：实测把它改成 `OFF` 会一次红掉
+/// 三条级联测试，而 `foreign_keys()` 那条断言（R73）就是盯这一点的哨兵。
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS sessions(
     id TEXT PRIMARY KEY,
@@ -69,8 +70,12 @@ impl Db {
     /// app data 目录归 `ipc.rs` 决定（Plan A 约束）。
     pub fn open(path: &Path) -> Result<Db, rusqlite::Error> {
         let conn = Connection::open(path)?;
-        // WAL 在这里买的是**崩溃耐久** + 将来第二个连接（T12 的 settings 同库）能读，
-        // 不是并发写优化：所有写都在同一把 Mutex 后面（R78）。
+        // WAL 买的是**跨连接**的「读不被写挡住」，不是本进程内的并发优化：Plan A 只有这一个
+        // 连接，所有写都排在下面那把 Mutex 后面（R78），开不开 WAL 对本进程没有区别。
+        // 留它的理由是 spec 风险表 #9 点名的并发写 —— 同一个库文件被第二个进程打开时
+        // （跑 `cargo test` 时 app 恰好也在写同一路径），默认的 DELETE 日志模式下读者直接
+        // `SQLITE_BUSY`，WAL 下读者照样能读。**双连接并发本任务未实测**，真撞上再补。
+        // （T12 的 settings 是**独立文件**存储、不落这个库，所以这里不存在日常的第二条连接。）
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA_SQL)?;
         // 只给**未标记**的库（0 = 这个钩子之前的库，其 schema 与本版本一致）盖章。
@@ -89,6 +94,8 @@ impl Db {
     /// 这个取舍成立的前提是本模块的写全部是**单语句 autocommit**：没有跨锁持有的事务，
     /// 也没有 panic 时留在连接上的未回滚事务。将来谁把两条语句包成一个事务，
     /// 这里必须改成显式回滚，吞掉 poison 就不再安全了。
+    /// 这层 `Mutex` 不可重入：`Db` 的方法都是「先取锁再碰连接」，将来谁在持锁期间
+    /// 再调一个 `Db` 方法，就是自己等自己 —— 表现是界面卡死而不是报错，所以别试。
     fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -327,7 +334,11 @@ fn truncate_chars(t: &str, max: usize) -> String {
 /// 放行与否仍在 Rust 的权限门里判（Plan A 约束：UI 不参与决策）。
 pub fn events_from_messages(msgs: &[Message], risk_of: &dyn Fn(&str) -> Risk) -> Vec<AgentEvent> {
     let mut out = Vec::new();
-    let mut turn = 0u32;
+    // 轮号必须复用**直播路径的规则**，不是「从 0 往后连号」：`session.rs:119` 是
+    // `for turn in 1..=max_turns`，一次 `run()`（= 一次发送）里第一条助手行是 `turn: 1`，
+    // 每多一个工具轮加 1，下一次发送又从 1 起。所以这里遇到真人发言就重置。
+    // 重放若连号，前端拿到的「第 N 轮」与直播错位 —— 正是 spec:421 要消灭的那两套真相。
+    let mut turn = 1u32;
     for m in msgs {
         match m.role {
             // System 行整行跳过（R69）：系统提示词与 Plan C 的压缩摘要都是给模型读的，
@@ -335,6 +346,16 @@ pub fn events_from_messages(msgs: &[Message], risk_of: &dyn Fn(&str) -> Risk) ->
             Role::System => {}
             Role::User => {
                 if is_tool_row(m) {
+                    // T10 从不用「Text + ToolResult 混在一行」的形状（结果一律 `Message::tool`
+                    // 单块构造），所以这一臂只发结果事件、把同行的 Text 丢掉。
+                    // 上面那条规则由这道 debug 断言守着：将来谁真的写出混合行，测试与 dev
+                    // 构建会在这里响，而不是让用户的话静默从重放里消失。
+                    debug_assert!(
+                        m.blocks
+                            .iter()
+                            .all(|b| matches!(b, ContentBlock::ToolResult { .. })),
+                        "工具结果行混进了非 ToolResult 块：这一臂会把它的文本丢掉"
+                    );
                     for b in &m.blocks {
                         if let ContentBlock::ToolResult {
                             call_id,
@@ -361,14 +382,16 @@ pub fn events_from_messages(msgs: &[Message], risk_of: &dyn Fn(&str) -> Risk) ->
                     // blocks 原样带上：重开会话要能看到当时的图片缩略图。
                     // （User 行里的 ToolCall 块在 Plan A 不可达 —— 调用只出自助手行；
                     // 它只会原样留在 blocks 里，显示与否由前端决定。）
+                    turn = 1; // 一次发送的轮号从这里重新开始（见函数开头那条规则）
                     out.push(AgentEvent::UserMessage {
                         blocks: m.blocks.clone(),
                     });
                 }
             }
             Role::Assistant => {
-                // 轮号从 0 递增，与直播路径同一个起点（`session.rs:127` 的 `for turn in 0..`），
-                // 否则前端 reducer 的「本轮」索引会错位。
+                // 轮号沿用函数开头那条规则：从 1 起、每次真人发言重置，和 `session.rs:119`
+                // 的 `for turn in 1..=max_turns` 同一个形状（不是从 0 连号）。
+                // 前端 reducer 用 turn 定位「本轮」，错位一次就会把两段助手文本并到同一轮。
                 out.push(AgentEvent::TurnStart { turn });
                 turn += 1;
                 for b in &m.blocks {
@@ -813,6 +836,26 @@ mod tests {
         );
     }
 
+    /// 上面那条「工具行只发结果事件」的规则得有哨兵：行里混进 Text 块时这一臂会把用户的话
+    /// 静默丢掉。`debug_assert!` 在 dev/测试构建里响一声（release 把它编译掉了 = 维持静默丢弃，
+    /// 这是刻意的取舍 —— 见映射函数上那段注释），这条 `should_panic` 就是那声响的证明。
+    #[test]
+    #[should_panic(expected = "工具结果行混进了非 ToolResult 块")]
+    fn a_mixed_tool_row_trips_the_debug_assert_instead_of_losing_text() {
+        let mixed = Message {
+            role: Role::User,
+            blocks: vec![
+                text_block("别把我的话吞了"),
+                ContentBlock::ToolResult {
+                    call_id: "c1".into(),
+                    is_error: false,
+                    output: ToolOutput::text("ok"),
+                },
+            ],
+        };
+        events_from_messages(&[mixed], &read_of);
+    }
+
     /// R69：System 行跳过。系统提示词与 Plan C 的压缩摘要都不该变成聊天气泡。
     #[test]
     fn system_rows_never_become_chat_bubbles() {
@@ -827,13 +870,22 @@ mod tests {
         );
     }
 
-    /// 直播路径第一轮发 `TurnStart{turn: 0}`（`session.rs:127` 的 `for turn in 0..`），
-    /// 重放必须给同样的号，否则前端 reducer 的「本轮」索引错位。
+    /// 轮号复用直播路径的规则：`session.rs:119` 的 `for turn in 1..=max_turns` ——
+    /// 一次发送里第一条助手行是 `turn: 1`，每多一个工具轮加 1，下一次发送又从 1 起。
+    /// 重放若自己往后连号，前端 reducer 的「本轮」索引就会和直播错位。
     #[test]
-    fn assistant_turns_are_numbered_from_zero_in_append_order() {
+    fn assistant_turn_numbers_restart_at_one_on_every_user_line() {
         let msgs = vec![
+            // 第一次发送：一个工具轮 + 一句收尾文本 = 直播里的 turn 1、turn 2
             user_text("一"),
+            assistant(vec![ContentBlock::ToolCall {
+                id: "c1".into(),
+                name: "echo".into(),
+                input: json!({}),
+            }]),
+            Message::tool("c1", ToolOutput::text("ok"), false),
             assistant(vec![text_block("答一")]),
+            // 第二次发送：号码从头再来
             user_text("二"),
             assistant(vec![text_block("答二")]),
         ];
@@ -844,7 +896,26 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(turns, [0, 1], "每个助手行开一轮，turn 从 0 递增");
+        assert_eq!(
+            turns,
+            [1, 2, 1],
+            "轮号要从 1 起、随助手行递增、遇真人发言重置"
+        );
+    }
+
+    /// 上一条靠真人发言把初值盖掉了，所以计数器起点没人验。历史不以真人发言开头
+    /// （第一行就是助手 —— Plan A 现在不产这种形状，但重放层不该为它特判）时，
+    /// 第一条助手行仍然要是 `turn: 1`，不能露出 off-by-one。
+    #[test]
+    fn the_first_assistant_row_is_turn_one_even_without_a_leading_user_line() {
+        let turns: Vec<u32> = events_from_messages(&[assistant(vec![text_block("答")])], &read_of)
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::TurnStart { turn } => Some(*turn),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(turns, [1], "初值必须是 1，和直播的第一轮同一个号");
     }
 
     /// R70：风险徽章是安全语义，硬编码 `Risk::Read` 会让 Plan B 的 `write_file`
@@ -867,8 +938,14 @@ mod tests {
     }
 
     /// R77：预览文本只许有一份实现（`ToolOutput::preview()`）。直播那条
-    /// `session.rs:1610` 断言的是「200 字符 + 省略号」，重放这边必须逐字相同，
-    /// 否则 spec:421 消灭掉的「两套渲染路径」在库里复活。
+    /// `session.rs:1582 a_long_tool_output_reaches_the_ui_as_a_bounded_preview` 断言的是
+    /// 「200 字符 + 省略号」，重放这边必须逐字相同，否则 spec:421 消灭掉的
+    /// 「两套渲染路径」在库里复活。
+    ///
+    /// 下面那条 zip 证明的是「重放发出的 preview == 同一个 ToolOutput 自己算的 preview」，
+    /// 也就是**中间没人再切一遍**；它**不**证明直播路径也调的是这个函数 ——
+    /// 那一半靠 `session.rs:250` 只此一处调 `output.preview()`，两处截断形状若分叉，
+    /// 红的是 1582 那条，不是这条。
     #[test]
     fn replayed_preview_is_the_same_string_the_live_path_emits() {
         let long = "字".repeat(250);
