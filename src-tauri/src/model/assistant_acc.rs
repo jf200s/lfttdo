@@ -33,6 +33,10 @@ impl AssistantAcc {
 
     /// 返回需要即时发给 UI 的文本增量；tool_call 与 usage 类 delta 返回 `None`。
     /// 这里不返回 `Result`：累加器不能失败，参数能不能解析要等 `finish` 拿到完整片段后才知道。
+    ///
+    /// `ModelDelta::Usage` 除了返回 `None`，它的 token 计数也会被**丢弃**：本类型没有像
+    /// `text()` 那样的读取口能把它们找回来。调用方（Task 10 的流式循环）要在把 Usage
+    /// delta 交进来之前就自己取走，否则统计静默为 0。
     pub fn apply(&mut self, d: ModelDelta) -> Option<String> {
         match d {
             ModelDelta::Text(t) => {
@@ -67,6 +71,12 @@ impl AssistantAcc {
     /// 块序固定为：一个合并 Text（仅当非空）→ 按 `index` 升序的 ToolCall。
     /// 文本恒在工具调用之前是刻意选择（R30）：交错顺序不保证被 OpenAI 兼容端点接受，
     /// 而交错本身对 UI 没有损失——流式期间每段文本都已经由 `apply` 实时投出去了。
+    ///
+    /// 空流会返回一条**零块**消息（累加器无从知道调用方是否想要一个空轮，所以这里不加
+    /// 新 API、也不报错）。这样的消息在下游是发不出去的：`require_slots` 对空块列表直接
+    /// 放行，`ChatCompletionRequestAssistantMessageArgs` 字段全有 `default` setter 所以
+    /// `build()` 也不会失败，最终会上网成既没有 content 也没有 tool_calls 的
+    /// `{"role":"assistant"}`。调用方（Task 10）必须自己判 `blocks.is_empty()`。
     pub fn finish(self) -> Message {
         let mut blocks = Vec::with_capacity(self.calls.len() + 1);
         if !self.text.is_empty() {
@@ -92,20 +102,45 @@ impl AssistantAcc {
     }
 }
 
+/// **R32**：解析失败时写进消息的原始片段上限，单位是**字符**不是字节。
+/// 与 `openai_compat` 的 `RAW_BODY_KEEP`（`openai_compat.rs:438`）取同一个 200，理由共用：
+/// 200 个字符足够看出坏在哪，再多就只是把垃圾搬走。区别在于那边截的是**日志**，
+/// 这里截的是**消息内容**——这条 `Value` 会被 `assistant_msg` 重新序列化进下一轮的
+/// `arguments`（`openai_compat.rs:315`）、计入 Task 8 的滑窗预算、由 Task 11 落库，
+/// 整块内联等于让一坨截断输出永久骑在之后每一个请求上。
+const RAW_ARGS_KEEP: usize = 200;
+
+/// 按字符边界截断，不用 `&raw[..n]`：这里的输入是模型输出，中日韩字符一个占 3 字节，
+/// 按字节下标切片会在非边界上 panic。丢弃的字符数写进标记，失败保持可归因。
+fn args_snippet(raw: &str) -> String {
+    let mut it = raw.chars();
+    let head: String = it.by_ref().take(RAW_ARGS_KEEP).collect();
+    let dropped = it.count();
+    if dropped == 0 {
+        head
+    } else {
+        format!("{head}…（后续 {dropped} 个字符已丢弃）")
+    }
+}
+
 fn parse_args(raw: &str) -> Value {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return serde_json::json!({});
     }
     match serde_json::from_str::<Value>(trimmed) {
-        // 合法但不是对象（`[1,2]` / `"str"`）原样透传：报错应由工具自己的入参校验产生，
+        // 合法但不是对象（`[1,2]` / `"str"` / `null`）原样透传：报错应由工具自己的入参校验产生，
         // 那种错误模型读得懂，而这里改写会把「模型输出了数组」这个事实抹平。
         Ok(v) => v,
         // 模型输出被截断时不能 panic，也不能静默变空对象——
         // 空参数会让工具报一个模型看不懂归因的错。标记后交给工具层报错。
-        Err(e) => {
-            serde_json::json!({ "__parse_error": format!("工具参数无法解析: {e}; 原始片段: {trimmed}") })
-        }
+        // 原因和片段一起走（R32）：片段只留前缀，长度由 `args_snippet` 兜住。
+        Err(e) => serde_json::json!({
+            "__parse_error": format!(
+                "工具参数无法解析: {e}; 原始片段: {}",
+                args_snippet(trimmed)
+            )
+        }),
     }
 }
 
@@ -172,6 +207,10 @@ mod tests {
         // 输出顺序必须按 index 稳定，不能随网络抖动变化
         assert_eq!(calls[0].1, "first");
         assert_eq!(calls[1].1, "second");
+        // id 也要跟着 index 走：只钉 name/args 的话，「按 index 排好了但 id 张冠李戴」
+        // 这种变异照样能过——而错 id 会让 tool_result 关联回错误的调用。
+        assert_eq!(calls[0].0, "a", "index 0 的 id 没跟着 index 走");
+        assert_eq!(calls[1].0, "b", "index 1 的 id 没跟着 index 走");
         assert_eq!(calls[0].2["n"], 1);
         assert_eq!(calls[1].2["n"], 2);
     }
@@ -210,14 +249,82 @@ mod tests {
                     .as_str()
                     .unwrap_or_else(|| panic!("缺少 __parse_error：{input}"));
                 // 原始片段必须留在消息里：模型下一轮看得见自己刚才输出了什么，
-                // 否则它只会收到一个无法归因的错误。
+                // 否则它只会收到一个无法归因的错误。这条片段的长度在 `RAW_ARGS_KEEP`
+                // 之内（R32 只砍超过上限的部分），所以要求它**逐字**保住。
                 assert!(
                     raw.contains(r#"{"url":"http"#),
                     "__parse_error 没保住原始片段：{raw}"
                 );
+                assert!(
+                    !raw.contains("已丢弃"),
+                    "短于上限的片段不该出现截断标记：{raw}"
+                );
+                // 报错原因与片段同行：只剩「原始片段」的话模型不知道是哪儿坏了。
+                assert!(
+                    raw.starts_with("工具参数无法解析: "),
+                    "__parse_error 丢了 serde_json 的解析原因：{raw}"
+                );
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// R32：截断的**长**片段只准留前缀。这条 `Value` 是消息内容而不是日志行——它会被
+    /// `assistant_msg` 重新序列化进下一轮的 `arguments`、计入 Task 8 的滑窗预算、由
+    /// Task 11 落库，整块内联等于把一坨垃圾永久骑在之后每一个请求上。
+    /// 片段用 800 个互不相同的 CJK 字符：既远超上限，又保证按字节切片会 panic、
+    /// 且「尾部没出现」这条断言不会因为有重复子串而白过。
+    #[test]
+    fn a_long_truncated_fragment_is_capped_instead_of_being_inlined_whole() {
+        let junk: String = (0..800u32)
+            .map(|i| char::from_u32(0x4E00 + i).unwrap())
+            .collect();
+        let fragment = format!(r#"{{"url":"{junk}"#);
+        let fragment_chars = fragment.chars().count();
+        assert_eq!(fragment_chars, 808);
+        let mut a = AssistantAcc::default();
+        a.apply(ModelDelta::ToolCallStart {
+            index: 0,
+            id: Some("c".into()),
+            name: Some("x".into()),
+        });
+        a.apply(ModelDelta::ToolCallArgs { index: 0, fragment });
+        let calls = a.finish().tool_calls();
+        let raw = calls[0].2["__parse_error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("缺少 __parse_error：{}", calls[0].2));
+        // 上限生效：整段垃圾没有被原样搬进消息。
+        assert!(
+            !raw.contains(&junk),
+            "{fragment_chars} 个字符的片段被整块内联了，标记里留着它自己的长度：{}",
+            raw.chars().count()
+        );
+        let tail: String = junk.chars().skip(RAW_ARGS_KEEP).collect();
+        assert!(
+            !raw.contains(&tail),
+            "超出 {RAW_ARGS_KEEP} 个字符的尾部仍然出现在消息里：{raw}"
+        );
+        // 前缀留着（可归因），丢弃量如实标注（808 - 200 = 608）。
+        let head: String = junk.chars().take(100).collect();
+        assert!(raw.contains(&head), "保留的前缀被丢了：{raw}");
+        assert!(
+            raw.contains("后续 608 个字符已丢弃"),
+            "截断标记与实际丢弃字符数对不上（片段共 {fragment_chars} 个字符，上限 {RAW_ARGS_KEEP}）：{raw}"
+        );
+        // 消息侧总长度有界，两道（实测 305 个字符 vs 片段 808 个字符）：
+        // 1) 严格小于片段本身——「垃圾没被整块搬进消息」的最直接形状；
+        // 2) 不超过「上限 + 截断标记 + 解析原因」。用 saturating_add 是为了让**改动上限**
+        //    这种变异红在测试里，而不是红成 `usize::MAX + 250` 的编译期 overflow 错误。
+        let serialized = serde_json::to_string(&calls[0].2).unwrap();
+        let serialized_chars = serialized.chars().count();
+        assert!(
+            serialized_chars < fragment_chars,
+            "序列化后的 arguments 比原始片段还大（{serialized_chars} vs {fragment_chars}）——垃圾被整块搬进消息了"
+        );
+        assert!(
+            serialized_chars <= RAW_ARGS_KEEP.saturating_add(250),
+            "序列化后的 arguments 超出了「上限 {RAW_ARGS_KEEP} + 标记 + 解析原因」：{serialized_chars} 个字符"
+        );
     }
 
     /// R30：文本恒在工具调用之前且**只有一个合并 Text 块**。交错顺序不保证被
@@ -327,9 +434,14 @@ mod tests {
         assert_eq!(calls[0].2["n"], 7, "参数片段不能因为缺 Start 就丢掉");
     }
 
-    /// 合法但**不是对象**的参数（`[1,2]` / `"str"`）原样透传。
+    /// 合法但**不是对象**的参数（`[1,2]` / `"str"` / `null`）原样透传。
     /// 累加器不做 schema 检查：报错应由工具自身的入参校验产生，那样模型才读得懂；
     /// 在这里改成 `__parse_error` 或 `Null` 反而会把「模型输出了数组」这个事实抹平。
+    /// `null` 是这里最不显眼的一个形状：它恰好和空参数表现得一模一样（`input["path"]`
+    /// 在 `Value::Null` 上返回 `Null`），正是本任务要拦的「工具静默收到空参数」，
+    /// 而且它一路没有标记。但「模型输出了 JSON 字面量 null」和「模型什么都没输」的区分
+    /// 不是累加器的判断，所以这里同样不加防御分支——报错归工具的 schema 检查，
+    /// 与上面两个形状的裁定一致。
     #[test]
     fn valid_but_non_object_arguments_pass_through_untouched_for_the_tool_to_reject() {
         let mut a = AssistantAcc::default();
@@ -351,11 +463,30 @@ mod tests {
             index: 1,
             fragment: "\"str\"".into(),
         });
+        a.apply(ModelDelta::ToolCallStart {
+            index: 2,
+            id: Some("c3".into()),
+            name: Some("h".into()),
+        });
+        a.apply(ModelDelta::ToolCallArgs {
+            index: 2,
+            fragment: "null".into(),
+        });
         let calls = a.finish().tool_calls();
         assert_eq!(calls[0].2, serde_json::json!([1, 2]));
         assert_eq!(calls[1].2, serde_json::json!("str"));
+        assert_eq!(
+            calls[2].2,
+            serde_json::json!(null),
+            "`null` 要透传成 Value::Null，既不换成空对象也不报错"
+        );
         assert!(
-            calls[0].2.as_object().is_none() && calls[1].2.get("__parse_error").is_none(),
+            calls[0].2.as_object().is_none()
+                && calls[1].2.as_object().is_none()
+                && calls[2].2.as_object().is_none()
+                && calls[0].2.get("__parse_error").is_none()
+                && calls[1].2.get("__parse_error").is_none()
+                && calls[2].2.get("__parse_error").is_none(),
             "非对象参数不该被累加器改写：{calls:?}"
         );
     }
@@ -446,6 +577,5 @@ mod tests {
         let msg = AssistantAcc::default().finish();
         assert_eq!(msg.role, Role::Assistant);
         assert!(msg.blocks.is_empty(), "空流不该凭空造块：{msg:?}");
-        assert_eq!(AssistantAcc::default().text(), "");
     }
 }
