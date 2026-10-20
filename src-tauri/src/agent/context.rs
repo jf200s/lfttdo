@@ -73,6 +73,7 @@ impl ContextBuilder {
 
     /// 组装本次请求的消息。预算 = 配置上限 - 输出预留，先受滑窗上限约束，
     /// 再从最近往前缩到预算内；缩到只剩 1 条仍超预算时**照样返回**（spec :365 保证不报错）。
+    /// 切口永不会落在 assistant 的 `ToolCall` 与它的 tool 结果之间（见循环里的 advance）。
     pub fn build(&self, history: &[Message]) -> Built {
         let system = Message::system_note(SYSTEM_PROMPT);
         // 保留历史里已有的 system 备注（Plan C 的摘要消息走这一路），
@@ -95,7 +96,22 @@ impl ContextBuilder {
 
         // 从最近往前扩，累到预算或窗口上限为止
         loop {
-            let start = conversational.len() - keep;
+            let mut start = conversational.len() - keep;
+            // 切口不许落在「带 ToolCall 的 assistant 消息」与「它的 tool 结果」之间：
+            // Task 6 的 `to_api` 把 ToolResult 映射成 `role:"tool"` + `tool_call_id`
+            // （openai_compat.rs 的 `tool_msg`），而 OpenAI 兼容端点要求它前面必须有一条
+            // 带同一 `tool_call_id` 的 assistant 消息，否则回 400 —— 正是 spec :364 点名的
+            // 「聊到第 N 轮突然 400，极难排查」。Task 10 的循环确实会成对 push
+            // assistant(ToolCall) 与 Message::tool(..)，所以这条在 Plan A 里可达。
+            // 终止性：advance 只让 `start` **单调前进**并被 `start < conversational.len()`
+            // 夹住，最多 len 步；外层每轮 `keep -= 1` 让下一轮的起始 start 更大，
+            // 故被跳过的 ToolResult 不会被重新包含，`start` 也不可能越过 len（无越界、
+            // 无下溢：`keep` 由 `len - start` 反推，start ≤ len）。
+            while start < conversational.len() && has_tool_result(conversational[start]) {
+                start += 1;
+            }
+            // keep 由最终的 start 反推：被 advance 跳过的孤儿工具结果同样要计入 dropped。
+            keep = conversational.len() - start;
             let tail: Vec<Message> = conversational[start..]
                 .iter()
                 .map(|m| (*m).clone())
@@ -103,6 +119,7 @@ impl ContextBuilder {
             let mut cand = vec![system.clone()];
             cand.extend_from_slice(&notes);
             cand.extend(tail);
+            // est 与 messages.len() 都必须来自 advance 之后的 cand。
             let est = (estimate_tokens(&cand) as f64 * self.calibration) as usize;
             // `keep <= 1` 而非 `keep == 1`：keep 可以是 0（空历史、window_messages: 0、
             // 或 budget_tokens: 0），此时 `keep -= 1` 会 usize 下溢并在 debug 直接 panic。
@@ -162,6 +179,14 @@ fn is_cjk(ch: char) -> bool {
         | 0x3000..=0x303F | 0xFF00..=0xFFEF)
 }
 
+/// 该消息是否携带 `ToolResult` 块（Task 5 的 `Message::tool(..)` 就是这一形态）。
+/// 只有 `build` 的切口需要它：丢弃位置归本片所有，Task 6 的协议映射不反过来依赖这里。
+fn has_tool_result(m: &Message) -> bool {
+    m.blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+}
+
 pub fn text_of(m: &Message) -> String {
     m.blocks
         .iter()
@@ -179,13 +204,49 @@ pub fn text_of(m: &Message) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::types::{ContentBlock, ImageMime, Message, Role};
+    use crate::agent::types::{ContentBlock, ImageMime, Message, Role, ToolOutput};
+    use serde_json::json;
 
     fn u(text: &str) -> Message {
         Message {
             role: Role::User,
             blocks: vec![ContentBlock::Text { text: text.into() }],
         }
+    }
+
+    /// Task 10 循环真实产出的成对消息：assistant 带 `ToolCall`，紧跟一条 `Message::tool(..)`
+    /// 结果（用的是 `agent::types` 的真实变体，不是 mock）。
+    fn tool_pair(id: &str) -> Vec<Message> {
+        vec![
+            Message {
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::ToolCall {
+                    id: id.into(),
+                    name: "fs.read".into(),
+                    input: json!({"path": "a.txt"}),
+                }],
+            },
+            Message::tool(id, ToolOutput::text("文件内容"), false),
+        ]
+    }
+
+    /// 保留段（`messages[1..]` = 备注 + tail）里「找不到对应 ToolCall 的 ToolResult」，
+    /// 返回它的 call_id。非 None 就意味着这条请求上线必被端点判 400。
+    fn dangling_tool_result(messages: &[Message]) -> Option<String> {
+        let mut calls: Vec<String> = Vec::new();
+        for m in messages.iter().skip(1) {
+            for b in &m.blocks {
+                if let ContentBlock::ToolCall { id, .. } = b {
+                    calls.push(id.clone());
+                }
+                if let ContentBlock::ToolResult { call_id, .. } = b
+                    && !calls.iter().any(|seen| seen == call_id)
+                {
+                    return Some(call_id.clone());
+                }
+            }
+        }
+        None
     }
 
     // ---- 估算口径 ----
@@ -279,6 +340,93 @@ mod tests {
         assert!(built.dropped > 0);
         let last = built.messages.last().unwrap();
         assert!(text_of(last).contains("轮 199"));
+    }
+
+    #[test]
+    fn a_window_cut_never_starts_with_a_dangling_tool_result() {
+        // I-1：窗口只容得下最后一条，而最后一条是 tool 结果。
+        // 直接切会让请求的第一条业务消息就是 `role:"tool"`（它的 assistant 轮已被切掉），
+        // OpenAI 兼容端点回 400 —— spec :364 点名的「聊到第 N 轮突然 400，极难排查」。
+        let mut hist = vec![u("先读一下 a.txt")];
+        hist.extend(tool_pair("c1"));
+        let cfg = ContextConfig {
+            reserve_output: 0,
+            budget_tokens: 100_000,
+            window_messages: 1,
+        };
+        let built = ContextBuilder::new(cfg).build(&hist);
+        assert_eq!(dangling_tool_result(&built.messages), None);
+        // advance 把这条孤儿结果也跳掉了：3 条全丢，只剩 system。
+        assert_eq!(built.messages.len(), 1);
+        assert_eq!(
+            built.dropped, 3,
+            "被 advance 跳过的工具结果也要计入 dropped"
+        );
+    }
+
+    #[test]
+    fn a_window_cut_that_skips_a_dangling_result_still_keeps_the_next_pair() {
+        // advance 只许丢掉「孤儿结果」，不许把成对的两条一起丢：
+        // window=3 时 start 落在第 1 对的结果上，前进一格后第 2 对必须完整保留。
+        let mut hist = tool_pair("c1");
+        hist.extend(tool_pair("c2"));
+        let cfg = ContextConfig {
+            reserve_output: 0,
+            budget_tokens: 100_000,
+            window_messages: 3,
+        };
+        let built = ContextBuilder::new(cfg).build(&hist);
+        assert_eq!(dangling_tool_result(&built.messages), None);
+        assert_eq!(built.messages.len(), 3, "system + 第二对（调用 + 结果）");
+        assert_eq!(built.messages[1].role, Role::Assistant);
+        assert_eq!(built.messages[1].tool_calls().len(), 1);
+        assert_eq!(
+            built.dropped, 2,
+            "1 条窗口外的 + 1 条被 advance 跳过的孤儿结果"
+        );
+    }
+
+    #[test]
+    fn a_budget_cut_lands_outside_a_tool_pair_too() {
+        // 同一条不变式在「预算而不是窗口」逼着切口前进时也必须成立。
+        // 预算 40 连 system 一条都装不下（SYSTEM_PROMPT 的粗估就有 ~100），
+        // 所以循环一路缩到最后一条 = tool 结果，advance 把它也跳掉。
+        let mut hist = vec![u("先读一下 a.txt")];
+        hist.extend(tool_pair("c1"));
+        let cfg = ContextConfig {
+            reserve_output: 0,
+            budget_tokens: 40,
+            window_messages: 40,
+        };
+        let built = ContextBuilder::new(cfg).build(&hist);
+        assert_eq!(dangling_tool_result(&built.messages), None);
+        assert_eq!(built.messages.len(), 1);
+        assert_eq!(built.dropped, 3);
+    }
+
+    #[test]
+    fn a_history_of_only_orphan_tool_results_terminates_at_the_end() {
+        // advance 的终止性边界：整段历史都是 tool 结果（没有任何 assistant 调用配对），
+        // start 必须被 `start < conversational.len()` 夹住停在 len，
+        // keep 由此归 0 而不是下溢，且每种窗口配置都不报错、不留孤儿。
+        let hist: Vec<Message> = (0..5)
+            .map(|i| Message::tool(&format!("c{i}"), ToolOutput::text("孤儿结果"), true))
+            .collect();
+        for window in [0usize, 1, 3, 5, 40] {
+            let cfg = ContextConfig {
+                reserve_output: 0,
+                budget_tokens: 100_000,
+                window_messages: window,
+            };
+            let built = ContextBuilder::new(cfg).build(&hist);
+            assert_eq!(
+                dangling_tool_result(&built.messages),
+                None,
+                "window {window}"
+            );
+            assert_eq!(built.messages.len(), 1, "window {window}");
+            assert_eq!(built.dropped, 5, "window {window}");
+        }
     }
 
     #[test]
