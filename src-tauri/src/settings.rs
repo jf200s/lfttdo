@@ -21,10 +21,13 @@
 // 测试值（R80）。这里只走注入的 `Arc<CredentialStore>` + `build(..)`，
 // 生产实现持真实的 Windows store，测试持 `keyring_core::mock::Store` —— 全仓
 // `cargo test` 期间不创建也不修改任何真实凭据（R81 ③，cmdkey 前后各查一次为证）。
-// 唯一的例外是 `real_windows_store_round_trip_probe`：`#[ignore]` + 环境变量双闸门，只有人工
-// 两步跑它才动真实库。留这个例外是因为 brief Step 4 要求「亲眼看到 key 落进凭据管理器」，
-// 而「写路径真的写得进去」这件事在自动化测试里测不到（那条接缝的存在本就是为了绕开真实库）。
-// 2026-10-20 已实测一次：写入 → 另一个进程读回 → 删除，`cmdkey /list` 前后逐字节相同。
+// **R81 到这里是没有例外的**：本模块不含任何碰真实库的测试。看一眼真实凭据管理器的那件事
+// 写在 `examples/keyring_probe.rs`（人工 `cargo run --example`），形态照搬 `mcp_probe.rs`。
+// 它原来确实是个 `#[ignore]` 测试，再审实测指出 `#[ignore]` 挡不住 `cargo test -- --ignored`
+// 和 `--include-ignored` —— 两种跑法都会真的执行它，那时唯一在挡的是环境变量匹配。
+// 会写进用户真实库、且写成功后留在进程之外的东西不该靠一道门挡着，于是搬出测试二进制。
+// brief Step 4 要的证据由它提供，2026-10-20 实测跑通：写入 → 另一个进程读回 → 删除，
+// `cmdkey /list` 前后逐字节相同。
 
 use crate::agent::context::ContextConfig;
 use crate::model::openai_compat::{ModelConfig, normalize_base_url};
@@ -438,6 +441,9 @@ impl SettingsStore {
         // 损坏回落刚刚把原件 `rename` 走了，紧接着的第二次 `load()` 命中的是 `NotFound`，
         // 那是同一次事故的延续而不是新事故；在那里清空会让 T13 只要多读一次就永远看不到提示。
         // `Err(Io)` 那一支同样不清：读都读不到，没有资格宣布问题已经过去了。
+        // 三条分支各有测试钉住（`a_healthy_load_expires_the_pending_corrupt_notice` /
+        // `a_missing_file_keeps_the_notice_alive` / `an_unreadable_file_keeps_the_notice_alive_too`）：
+        // 后两条是再审补的 —— 那两句当时只是文档，变异在全绿下存活。
         self.lock().corrupt_backup = None;
         Ok(settings)
     }
@@ -887,6 +893,29 @@ mod tests {
         assert!(
             store.take_corrupt_backup().is_some(),
             "`NotFound` 一支不许清通知"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_keeps_the_notice_alive_too() {
+        // 通知生命周期第三条腿。`SettingsStore::load` 的文档明写「`Err(Io)` 那一支同样不清」，
+        // 但这句话此前只是文档 —— 变异（在 Io 支也清一次通知）能在 44 条全绿下存活。
+        // 库里已经立着一次回落的证据时，一次读不动不该把证据抹掉：文件坏过、现在又读不到，
+        // 是两个各自要报的问题，不是后一个把前一个抵消了。
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        std::fs::write(store.path(), "{ not json").unwrap();
+        store.load().unwrap();
+        // 回落已把原件 rename 走，于是这个位置现在是空的 —— 换成一个目录，
+        // 下一次读就会走 `Err(Io)`（`read_to_string` 读目录给 PermissionDenied / os error 5）。
+        std::fs::create_dir(store.path()).unwrap();
+        assert!(
+            matches!(store.load(), Err(SettingsError::Io(_))),
+            "前提：这里必须真的走到 `Io` 那支，否则本条什么都没测"
+        );
+        assert!(
+            store.take_corrupt_backup().is_some(),
+            "`Io` 错误没有资格宣布问题已经过去，通知得留着"
         );
     }
 
@@ -1372,71 +1401,6 @@ mod tests {
             dbg.contains("api_key.qwen-do"),
             "实测条目名取自 crate 的 `{{prefix}}{{user}}{{divider}}{{service}}{{suffix}}`，实得：{dbg}"
         );
-    }
-
-    /// brief Step 4 的机器可执行版本：证明 `CredWriteW` 经本模块接缝真的落盘。
-    /// 上一条测试只 `build()`，证明的是**条目名**；「写进去了、重启还在、删了就没了」这一半
-    /// 此前没有任何证据（review 与 re-review 都把它记成 MISSING）。2026-10-20 本条跑通，
-    /// 证据见文件头注释。
-    ///
-    /// 默认 `#[ignore]`，并且还要 `QWEN_DO_REAL_KEYRING` 显式给 `arm`/`check` 才动手 ——
-    /// 双重闸门是因为它会写**用户真实的**凭据管理器，R81 严禁 `cargo test` 碰到它；
-    /// 忘了 `--ignored` 的手滑、或将来有人把这条接进 CI，都不该改写到用户的库。
-    ///
-    /// 人工核验的跑法（两条命令 = 两个进程，正好把「跨进程存活」测出来）：
-    /// ```text
-    /// QWEN_DO_REAL_KEYRING=arm   cargo test --lib real_windows_store_round_trip_probe -- --ignored --nocapture
-    /// QWEN_DO_REAL_KEYRING=check cargo test --lib real_windows_store_round_trip_probe -- --ignored --nocapture
-    /// ```
-    /// 中间用 `cmdkey //list | iconv -f GBK -t UTF-8` 应当查到 `api_key.qwen-do`，
-    /// `check` 跑完应当查不到。库里已有条目时 `arm` 直接失败：本探针绝不覆盖别人的 key。
-    #[cfg(windows)]
-    #[test]
-    #[ignore = "写真实 Windows 凭据管理器；只在 brief Step 4 人工核验时按本条文档两步跑（R81）"]
-    fn real_windows_store_round_trip_probe() {
-        const CANARY: &str = "sk-QWEN-DO-SELFTEST-CANARY-DELETE-ME";
-        let phase = std::env::var("QWEN_DO_REAL_KEYRING").unwrap_or_default();
-        let store = KeyringSecretStore::new().expect("真实 Windows store 构造失败");
-        match phase.as_str() {
-            "arm" => {
-                let existing = store.get().expect("arm 前置检查：读真实条目失败");
-                assert!(
-                    existing.is_none(),
-                    "真实库里 `api_key.qwen-do` 已有条目，探针拒绝覆盖。要跑这一步请先在 Windows \
-                     凭据管理器里确认那条是本探针留下的残留（值以 {CANARY} 开头）再删除。"
-                );
-                store
-                    .set(CANARY)
-                    .expect("arm：CredWriteW 经本模块接缝写入失败");
-                assert_eq!(
-                    store.get().expect("arm：写后读回失败").as_deref(),
-                    Some(CANARY),
-                    "arm：同进程内写进去就该读得回来"
-                );
-            }
-            "check" => {
-                let got = store.get().expect("check：跨进程读回失败");
-                assert_eq!(
-                    got.as_deref(),
-                    Some(CANARY),
-                    "check：这是另一个进程，读回来才叫「落到了 Windows 库里」而不是内存缓存。\
-                     读不到说明 arm 那次写入没持久化。"
-                );
-                store.delete().expect("check：删除失败");
-                assert_eq!(
-                    store.get().expect("check：删后读失败"),
-                    None,
-                    "check：删完必须读不到（NoEntry → Ok(None)）"
-                );
-                store
-                    .delete()
-                    .expect("check：再删一次仍要幂等成功，UI 的「清除」不许依赖先探测");
-            }
-            other => panic!(
-                "本条测试是人工探针，需要 QWEN_DO_REAL_KEYRING=arm 或 =check（实得 {other:?}）。\
-                 没有环境变量就动手写真实凭据管理器，正是 R81 要防的事故。"
-            ),
-        }
     }
 
     // ---- review M-1：`{:?}` 不许把秘密字节打出来 ----
