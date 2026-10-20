@@ -484,7 +484,9 @@ mod tests {
     }
 
     /// 一问就失败的模型。`ModelError::Api` = 已连通的 429（provider.rs 的分类表）。
+    /// `head` 是报错之前先吐出来的分片：留空就是「第一个 delta 之前就断了」。
     struct FailingModel {
+        head: Vec<ModelDelta>,
         recorder: Recorder,
     }
 
@@ -496,9 +498,10 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn Stream<Item = Result<ModelDelta, ModelError>> + Send + 'a>>
         {
             self.recorder.push(req);
-            Box::pin(futures::stream::iter(vec![Err(ModelError::Api(
-                "429 rate limited".into(),
-            ))]))
+            let head = self.head.clone();
+            Box::pin(futures::stream::iter(head.into_iter().map(Ok).chain(
+                std::iter::once(Err(ModelError::Api("429 rate limited".into()))),
+            )))
         }
     }
 
@@ -633,8 +636,16 @@ mod tests {
         }
 
         fn failing() -> Rig {
+            Rig::failing_after(Vec::new())
+        }
+
+        /// 先吐 `head` 再报错的模型。「流里已经攒下一个完整 tool_call，然后断了」这条
+        /// 组合只能由它造出来 —— 报错出口和取消出口共用 `commit_partial`，而 R56 的
+        /// 裁定只写在「取消」上，没测过就等于另一半路径没走过。
+        fn failing_after(head: Vec<ModelDelta>) -> Rig {
             let recorder = Recorder::default();
             let model = Arc::new(FailingModel {
+                head,
                 recorder: recorder.clone(),
             });
             Rig::assembled(model, ContextConfig::default(), recorder, vec![])
@@ -1193,6 +1204,50 @@ mod tests {
             "错误在第一个 delta 之前就到了：没有任何内容已经流给 UI，所以不提交空轮"
         );
         assert_eq!(rig.reqs().len(), 1);
+    }
+
+    /// R56 的另外半张脸：取消出口被 `interrupting_mid_stream_...` 钉住了，报错出口用的是
+    /// 同一个 `commit_partial`，但「流里已经攒下一个完整 tool_call，然后断了」这条组合此前
+    /// 只有代码路径、没有断言。它造的形态正是下一轮会 400 的那个：history 结尾停在
+    /// `assistant(ToolCall)`。而本轮终止之后，这条 history 是要由 Task 11 落库、由 Task 13
+    /// 带着它开下一轮会话的 —— 所以「报错时的 history」和「取消时的 history」一样得配对。
+    #[tokio::test]
+    async fn a_model_error_after_an_accumulated_tool_call_backfills_it_too() {
+        let mut rig = Rig::failing_after(tool_round(0, &[("echo", r#"{"text":"x"}"#)]));
+        assert_eq!(rig.run("hi").await, StopReason::Error);
+
+        let hist = rig.session.history();
+        assert_eq!(
+            hist.len(),
+            3,
+            "user + assistant(带调用) + 补出来的结果，一条都不能少：{hist:?}"
+        );
+        assert_eq!(
+            tool_results_of(hist),
+            vec![("r0c0".to_string(), true, MODEL_FAILURE_NOTE.to_string())],
+            "补的结果必须归因到「流中断」，而不是「工具坏了」——后者会诱使模型重试同一个调用"
+        );
+        assert_eq!(
+            hist.last().map(|m| &m.role),
+            Some(&Role::User),
+            "结尾必须是工具结果，不能停在带 tool_call 的 assistant 上"
+        );
+        // 工具一次都没执行：调用只到了累加器，还没走到注册表。
+        assert_eq!(
+            rig.sink.kinds(),
+            ["turn_start", "error", "done"],
+            "报错轮里不许出现 tool_call / tool_result / permission_request：{kinds:?}",
+            kinds = rig.sink.kinds()
+        );
+        assert_eq!(rig.reqs().len(), 1, "报错就收尾，不许再问一遍");
+
+        // 这段 history 会被落库并用于下一个会话轮次，所以它必须自己能上线。
+        let next = ChatRequest {
+            messages: hist.to_vec(),
+            tools: Vec::new(),
+            temperature: None,
+        };
+        assert_paired("报错之后待续聊的历史", &next);
     }
 
     // ---- 触顶 ----
