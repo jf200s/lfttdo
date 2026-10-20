@@ -65,15 +65,22 @@ impl ContextBuilder {
     /// 因为 `est = 粗估 × calibration`（spec :362）。端点实际比粗估省 token → factor < 1；
     /// 反过来接成 `粗估 ÷ 真实` 不会报错，只会让估算一直朝危险的方向偏。
     /// 接线方（切片 5 的 usage 校准）负责传入 `input_tokens ÷ est_input_tokens`。
-    /// 夹在 `0.2..=3.0`：一次坏 usage（比如 0 或 NaN 之外的极值）不许把估算清零、
-    /// 否则预算形同虚设并把请求顶到 400。
+    /// 夹在 `0.2..=3.0`：一次坏 usage（比如 0）不许把估算清零，否则预算形同虚设并把请求顶到 400。
+    /// **非有限输入（NaN、±inf）直接忽略并保留上一个系数**：`f64::clamp` 对 NaN 返回 NaN，
+    /// 而 `(粗估 as f64 * NaN) as usize` 饱和成 0 —— 于是每条估算都变成 0、预算再也不生效，
+    /// 正是上面禁止的那个后果，而且是静默的。`est_input_tokens == 0` 时接线的除法还会产出 inf。
     pub fn set_calibration(&mut self, factor: f64) {
+        if !factor.is_finite() {
+            return;
+        }
         self.calibration = factor.clamp(0.2, 3.0);
     }
 
     /// 组装本次请求的消息。预算 = 配置上限 - 输出预留，先受滑窗上限约束，
     /// 再从最近往前缩到预算内；缩到只剩 1 条仍超预算时**照样返回**（spec :365 保证不报错）。
     /// 切口永不会落在 assistant 的 `ToolCall` 与它的 tool 结果之间（见循环里的 advance）。
+    /// 已知取舍：历史里的 system 备注一律排在保留 tail **之前**，与它们在历史中的位置无关
+    /// （今天的摘要备注就该在最前）；切片 5 若引入需要按时序穿插的系统备注，要改这里。
     pub fn build(&self, history: &[Message]) -> Built {
         let system = Message::system_note(SYSTEM_PROMPT);
         // 保留历史里已有的 system 备注（Plan C 的摘要消息走这一路），
@@ -274,14 +281,22 @@ mod tests {
     #[test]
     fn a_sentence_with_punctuation_costs_more_than_the_same_words_without_it() {
         // 摘掉 is_cjk 的标点区间 → 差额从 3 掉到 1，本测试立刻变红。
+        // 差额按这句话**自己的**标点个数算，而不是写死 3：改句子不会让它因为
+        // 一个看不出来的原因变红（每个中文标点正好是 1 字符 = 1 token，
+        // 且去掉标点不改变非 CJK 字符数，所以 `other.div_ceil(4)` 那段不贡献差额）。
         let punctuated = "今天天气不错，我们出门走走、去看看展览。";
         let bare: String = punctuated
             .chars()
             .filter(|c| !matches!(c, '，' | '、' | '。'))
             .collect();
+        let marks = punctuated
+            .chars()
+            .filter(|c| matches!(c, '，' | '、' | '。'))
+            .count();
+        assert!(marks > 0, "夹具里必须真的有标点，否则这个等式什么都不断言");
         assert_eq!(
             estimate_tokens(&[u(punctuated)]),
-            estimate_tokens(&[u(&bare)]) + 3
+            estimate_tokens(&[u(&bare)]) + marks
         );
     }
 
@@ -308,6 +323,91 @@ mod tests {
         assert!(s >= 700, "单图至少按 ~800 token 计");
     }
 
+    #[test]
+    fn the_three_image_weights_are_pinned_to_numbers() {
+        // `>= 700` 那种「够高就行」的断言挡不住把 PNG 从 900 改成 701、
+        // 或把工具图片与 JPEG 悄悄改成同一个值：这里把三个权重钉成数字。
+        let cost = |b: ContentBlock| {
+            estimate_tokens(&[Message {
+                role: Role::User,
+                blocks: vec![b],
+            }]) - MSG_TOKEN_OVERHEAD
+        };
+        assert_eq!(
+            cost(ContentBlock::Image {
+                data: "AAAA".into(),
+                mime: ImageMime::Png,
+            }),
+            PNG_TOKENS
+        );
+        assert_eq!(
+            cost(ContentBlock::Image {
+                data: "AAAA".into(),
+                mime: ImageMime::Jpeg,
+            }),
+            JPEG_TOKENS
+        );
+        assert_eq!(
+            cost(ContentBlock::Image {
+                data: "/9j/AAAA".into(),
+                mime: ImageMime::Jpeg,
+            }),
+            cost(ContentBlock::Image {
+                data: "A".repeat(100_000),
+                mime: ImageMime::Jpeg,
+            }),
+            "非 PNG 也一样不按长度计价"
+        );
+        assert_eq!(
+            cost(ContentBlock::ToolResult {
+                call_id: "c1".into(),
+                is_error: false,
+                output: ToolOutput::Image {
+                    data: "iVBOR".into(),
+                    mime: ImageMime::Png,
+                },
+            }),
+            TOOL_IMAGE_TOKENS
+        );
+        assert_eq!(PNG_TOKENS, 900);
+        assert_eq!(JPEG_TOKENS, 800);
+        assert_eq!(TOOL_IMAGE_TOKENS, 900);
+        assert_ne!(
+            JPEG_TOKENS, PNG_TOKENS,
+            "两种 mime 必须给不同的价，否则分支是白写的"
+        );
+    }
+
+    #[test]
+    fn a_tool_call_and_a_tool_result_are_not_priced_at_zero() {
+        // 结构上「什么都不收」是最容易被静默引入的一条退化
+        // （`ContentBlock::ToolCall { .. } => 0`）：带工具的历史会被估成几乎免费，
+        // 于是滑窗再也不丢东西，请求长度一路撞到 400。
+        let call = Message {
+            role: Role::Assistant,
+            blocks: vec![ContentBlock::ToolCall {
+                id: "c1".into(),
+                name: "fs.read".into(),
+                input: json!({"path": "a.txt"}),
+            }],
+        };
+        let result = Message::tool("c1", ToolOutput::text("文件内容在这里"), false);
+        assert!(
+            estimate_tokens(std::slice::from_ref(&call)) > MSG_TOKEN_OVERHEAD,
+            "ToolCall 的 name + input 必须收钱"
+        );
+        assert!(
+            estimate_tokens(std::slice::from_ref(&result)) > MSG_TOKEN_OVERHEAD,
+            "ToolResult 的 output 文本必须收钱"
+        );
+        // 收的钱就是那条算式的值，不是「大于 0」这种弱断言：
+        // name `"fs.read"` = 7 字符 → div_ceil(4) = 2；input 序列化成
+        // `{"path":"a.txt"}` = 16 个非 CJK 字符 → 16 ÷ 4 = 4；合计 6，再加每条消息的 4。
+        assert_eq!(estimate_tokens(&[call]), MSG_TOKEN_OVERHEAD + 2 + 4);
+        // output 文本 `"文件内容在这里"` = 7 个 CJK 字 → 7，再加每条消息的 4。
+        assert_eq!(estimate_tokens(&[result]), MSG_TOKEN_OVERHEAD + 7);
+    }
+
     // ---- 滑窗与预算 ----
 
     #[test]
@@ -327,6 +427,13 @@ mod tests {
             1 + ContextConfig::default().window_messages
         );
         assert!(built.dropped > 0);
+        // 只断言「丢了一些」和尾巴内容钉不住切口位置：这里补上起点。
+        // 200 条 + 窗口 40 → 起点必须是「轮 160」。
+        assert!(
+            built.messages[1].text_of().contains("轮 160"),
+            "窗口 40 时切口必须落在轮 160，实际是 {:?}",
+            built.messages[1].text_of()
+        );
         let last = built.messages.last().unwrap();
         assert!(last.text_of().contains("轮 199"));
     }
@@ -431,7 +538,13 @@ mod tests {
             .collect();
         let built = ContextBuilder::new(cfg).build(&hist);
         let total = estimate_tokens(&built.messages[1..]);
-        assert!(total <= 20_000, "超预算 {total}");
+        // 这条测试的存在意义就是「绑住它的是预算而不是窗口」，所以断言必须钉在
+        // 真实预算 = budget_tokens - reserve_output 上；写 20_000 的话，
+        // 忘记减 reserve_output 的退化（预算 20_000 → 留 4 条 = 16_020）照样通过。
+        assert!(
+            total <= 20_000 - 4_096,
+            "超预算 {total}（预算 = 20_000 - 4_096 = 15_904）"
+        );
         assert!(built.messages.len() < 40);
     }
 
@@ -549,21 +662,55 @@ mod tests {
             window_messages: 40,
         };
         let hist: Vec<Message> = (0..4).map(|_| u(&"测".repeat(300))).collect();
-        let raw = estimate_tokens(&hist);
 
         let mut tiny = ContextBuilder::new(cfg.clone());
         tiny.set_calibration(0.05);
         let mut floor = ContextBuilder::new(cfg);
         floor.set_calibration(0.2);
 
+        // 与下限 0.2 的构建结果逐字节相同 == 0.05 已被抬到 0.2，无需再断言一条
+        // `>= raw * 0.1`（那只是把同一个结论换个方向再说一遍，Minor 9 裁定删除）。
         assert_eq!(
             tiny.build(&hist).est_input_tokens,
             floor.build(&hist).est_input_tokens
         );
-        assert!(
-            tiny.build(&hist).est_input_tokens >= (raw as f64 * 0.1) as u32,
-            "0.05 必须被抬到下限 0.2"
-        );
+    }
+
+    #[test]
+    fn a_non_finite_calibration_keeps_the_previous_factor() {
+        // Minor 7：NaN 会穿过 clamp（`f64::clamp` 对 NaN 返回 NaN），
+        // 而 `(x as f64 * NaN) as usize` 饱和成 0 —— 每条估算变 0、预算彻底失效，
+        // 正是 set_calibration 文档承诺禁止的那个后果。inf 同理（除法可得 inf）。
+        let cfg = ContextConfig {
+            reserve_output: 0,
+            budget_tokens: 1000,
+            window_messages: 40,
+        };
+        let hist: Vec<Message> = (0..4).map(|_| u(&"测".repeat(300))).collect();
+        let bad = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+
+        // 默认系数 1.0 之下：坏输入必须让 build() 的表现逐字节不变。
+        for factor in bad {
+            let mut b = ContextBuilder::new(cfg.clone());
+            b.set_calibration(factor);
+            let poisoned = b.build(&hist);
+            let untouched = ContextBuilder::new(cfg.clone()).build(&hist);
+            assert_eq!(
+                poisoned.est_input_tokens, untouched.est_input_tokens,
+                "{factor} 不许把估算清零"
+            );
+            assert_eq!(poisoned.messages.len(), untouched.messages.len());
+        }
+
+        // 已校准到 0.2 之后再喂 NaN：保留的还是 0.2 的表现。
+        let mut b = ContextBuilder::new(cfg);
+        b.set_calibration(0.2);
+        let kept = b.build(&hist);
+        b.set_calibration(f64::NAN);
+        let after_nan = b.build(&hist);
+        assert_eq!(after_nan.est_input_tokens, kept.est_input_tokens);
+        assert_eq!(after_nan.messages.len(), kept.messages.len());
+        assert_eq!(kept.messages.len(), 5, "0.2 下四条全留（夹具前提）");
     }
 
     #[test]
