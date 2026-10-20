@@ -408,3 +408,186 @@ PROBE_BYTES=524288（附加轮：ArrayBuffer 形态与三张并发就在这一�
 - `cargo add base64 image` 解析到 **`base64 0.23.1`**、**`image 0.25.10`**（写入 `src-tauri/Cargo.toml`，两者均保留给 Task 18）。brief 的 `use base64::Engine; base64::engine::general_purpose::STANDARD.decode(…)` 在 0.23.1 上**未改动即可编译**（0.23.1 仍有 `pub mod engine` 与 `pub use engine::Engine`，见 `$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base64-0.23.1/src/lib.rs:298-299`）。
 - `image` 的**默认 feature** 把 `rav1e 0.8.1` / `ravif` / `av1-grain` / `exr` / `tiff` / `gif` 整条编解码树拉了进来（本次 `cargo build` 走到 520 个构建单元，cargo 报 "Finished dev profile in 36.68s"——tauri 本身已热，新编的正是 image/rav1e 那条树）。本探针一行没用 `image`，因此**没有与它的 API 搏斗过**，不能据此评价其 API 好坏；但对 <15MB 的发布体积验收是实打实的风险 → **建议 Task 18 落地时按需收敛为 `default-features = false` + 只开所需的 jpeg/png/webp**（具体开哪些由 Task 18 按真实解码需求决定，此处只记录体积风险，不替它拍板）。
 - Step 4 已把临时命令与前端探针彻底移除：`grep -rn "ipc_probe" src-tauri/src src/` 无命中，`src-tauri/src/lib.rs` 与 `src/App.tsx` 与 HEAD 逐字节相同；`cargo test` / `npm test` / `npm run build` 全绿。生产代码里**不存在**可被误当成 IPC 模式的探针样本，本项目第一个正式 IPC 层由 Task 13 建立。
+
+## 风险 3：rmcp 客户端与 Windows spawn
+
+探针：`src-tauri/examples/mcp_probe.rs`（`cargo build --example mcp_probe` 通过、零 warning；`cargo run --example mcp_probe` 实测可完成真实握手）。它是纯 `examples/` 探针，未 `mod` 进 `src/`，不含 `use tauri`，对 `qwen-do` 应用二进制不可达。
+
+**一句话结论：rmcp 3.5.1 能在 Windows 上作为 MCP client 拉起并跑通 `npx` stdio 服务器（实测 `tools=16`），但只有 B（`cmd /C npx`）和 C（spawn 绝对路径 `npx.cmd`）两种策略可用——直接 `Command::new("npx")` 会以 `NotFound` 失败。子进程不泄漏，但泄漏判定依赖于「服务器主动响应 stdin EOF」这一前提，因此 Plan B 必须自带进程树 kill。**
+
+### 关于本轮运行环境的诚实说明（复跑者必读）
+
+本机 `static.crates.io`（cargo 下载 `.crate` 的域名）与 `github.com` 均**连不上**（`curl` 报 `Failed to connect ... port 443`，非限速、是 TCP 层失败）；但 `index.crates.io`、`registry.npmjs.org`、`rsproxy.cn`、`docs.rs` 都通。`cargo add` 只做索引解析所以能成功，`cargo fetch`/`cargo build` 因要下载 `.crate` 而失败。本轮为读源码与编译，临时把 crates-io 换源到 rsproxy 镜像，**用的是每次调用带 `--config` 覆盖、不落任何文件、不进仓库**：
+
+```bash
+# 每次 cargo 都带这两行覆盖；不创建 .cargo/config.toml，不改任何被跟踪文件
+cargo <cmd> \
+  --config 'source.crates-io.replace-with="rsproxy-sparse"' \
+  --config 'source.rsproxy-sparse.registry="sparse+https://rsproxy.cn/index/"'
+```
+
+副作用：经镜像下载的 crate 解到 `$HOME/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/`（镜像源的哈希目录名），**不是** `index.crates.io-1949cf8c6b5b557f`。下文所有 file:line 的绝对前缀即此目录（字节内容与 crates.io 官方一致，校验和相同）。npm 侧无需换源：`npx -y @modelcontextprotocol/server-everything` 正常下载并启动（见握手原文）。
+
+### 必答四问
+
+| # | 问题 | 结论（均实测） |
+| --- | --- | --- |
+| 1 | rmcp 实际 feature 名 | brief 的 `client,transport-io,jsonrpce-types` 里 **`jsonrpce-types` 是无效名**（cargo 直接拒绝）；客户端跑 npx stdio 的**正确三件套 = `client` + `transport-io` + `transport-child-process`**（缺 `transport-child-process` 就没有 `TokioChildProcess`）。详见下「Q1」。 |
+| 2 | client 与 stdio 的真实 import 路径与构造代码 | client 侧 stdio 传输是 **`rmcp::transport::TokioChildProcess`**（不是 `io::stdio`——那是 server 侧）；用 `().serve(TokioChildProcess::new(cmd)?)` 完成 initialize，`client.peer().list_tools(..)` 取工具。逐条 file:line + 可编译代码见下「Q2」。 |
+| 3 | spawn 方式 A\|B\|C 哪个可用 | **A（`Command::new("npx")`）不可用**：`NotFound … program not found`。**B（`cmd /C npx`）与 C（spawn 绝对 `npx.cmd`）都可用**，且各自都真跑通了一次握手（`tools=16`）。原始输出见下「Q3」。 |
+| 4 | 子进程清理结论 | 4 次运行退出后 `tasklist \| grep node.exe` 均 **0 残留**；但**清理成立的原因是 rmcp 关闭了子进程 stdin、server-everything 收到 EOF 自行退出**，而 rmcp 自己的 `kill()` **只杀直接子进程**（且 B/C 的真服务器是**孙进程**）。→ **Plan B 的 `McpBridge::shutdown()` 必须显式 kill 整棵进程树（`taskkill /T /F /PID`，或给子进程套 Windows JobObject）**。证据与推理见下「Q4」。 |
+
+### Q1：真实 feature 名
+
+`cargo add rmcp --features client,transport-io,jsonrpce-types --dry-run` 的**原文拒绝**：
+
+```
+error: unrecognized feature for crate rmcp: jsonrpce-types
+disabled features:
+    __reqwest, auth, auth-client-credentials-jwt, auth-enterprise-managed
+    client-side-sse, elicitation, local, request-state, reqwest, reqwest-native-tls
+    reqwest-tls-no-provider, server-side-http, tower, transport-child-process
+    transport-streamable-http-client, transport-streamable-http-client-reqwest
+    transport-streamable-http-client-unix-socket, transport-streamable-http-server
+    transport-streamable-http-server-session, transport-worker, which-command
+enabled features:
+    base64, client, macros, schemars, server, transport-async-rw, transport-io uuid
+```
+
+即三个猜测名里 **2 个有效（`client`、`transport-io`）、1 个无效（`jsonrpce-types`）**。`client` 与 `transport-io` 都不是默认 feature（默认只有 `base64, macros, server`，见 `rmcp-3.5.1/Cargo.toml:88-92`），必须显式开。
+
+**关键补充（brief 没写、但不加就编不出客户端）**：`transport-io` 只提供 server 侧的 `stdio()`；**client 侧 spawn 子进程要的是 `transport-child-process`**（`Cargo.toml:141-145` = `["transport-async-rw", "tokio/process", "dep:process-wrap"]`，其门控的 `pub use child_process::TokioChildProcess` 见 `src/transport.rs:84-89`）。本项目最终锁定：
+
+```toml
+rmcp = { version = "3.5.1", features = ["client", "transport-io", "transport-child-process"] }
+```
+
+`transport-io` 保留着（`io::stdio` 供 Plan B 里可能的“把本进程当 server”路径），但握手实测只用到 `transport-child-process`。可选：`which-command`（`Cargo.toml:178-181`）会把 rmcp 自带的 `which_command()` 打开（见 Q2），Plan B 若想要它就一并加。新增锁定包（共 7 条 `[[package]]`）：`rmcp 3.5.1`、`rmcp-macros 3.5.1`、`process-wrap 10.0.1`、`pastey 0.2.3`、`schemars_derive 1.2.3`、`serde_derive_internals 0.30.0`、`nix 0.31.3`（后两者经 process-wrap/rmcp-macros 传入）。
+
+### Q2：client + stdio 的真实 import 路径与构造代码（逐条 file:line）
+
+传输选型判据（crate 自带文档表格，`src/transport.rs:7-10`）：
+
+| 传输 | client 侧 | server 侧 |
+| --- | --- | --- |
+| std IO | **`child_process::TokioChildProcess`** | `io::stdio` |
+
+- 再导出：`pub use child_process::{ConfigureCommandExt, TokioChildProcess}` `src/transport.rs:84-89`；`pub use io::stdio` `src/transport.rs:91-94`；`io::stdio()` 实际返回 `(tokio::io::Stdin, tokio::io::Stdout)`（`src/transport/io.rs:4`，即 server 把**自己**的 stdin/stdout 当传输）。
+- `TokioChildProcess::new(command: impl Into<CommandWrap>) -> std::io::Result<Self>`：`src/transport/child_process.rs:61`（默认 stdin/stdout = `Stdio::piped()`，stderr = `inherit`，见 `:123-131`）。**它收的是 `tokio::process::Command`**（`tokio::process::Command: Into<CommandWrap>`；crate 自身测试 `:257` 就是 `TokioChildProcess::new(Command::new("sleep").configure(..))`）。
+- 优雅关闭：`TokioChildProcess::graceful_shutdown()` `src/transport/child_process.rs:81-107`，`Transport::close` 直接委托它 `:183`；`MAX_WAIT_ON_DROP_SECS = 3` `:10`；`Drop` 兜底 `inner.kill()` `:45-57`。
+- crate 自带的 Windows 助手（**它自己就承认 `.cmd` 解析坑**，与本轮风险点撞了个正着）：`which_command(name) -> io::Result<tokio::process::Command>` `src/transport/child_process.rs:217-224`（走 `which::which`，尊重 PATHEXT），其文档注释 `:198-204` 明写 “especially useful on Windows where `.cmd`/`.exe` shim scripts (e.g. `npx.cmd`) are not reliably found by `tokio::process::Command` without a fully-qualified path”，doctest 例子 `:206-216` 用的正是 `which_command("npx").arg("-y").arg("@modelcontextprotocol/server-everything")`。受 `which-command` feature 门控。
+- 客户端 service API（来自 `rmcp-3.5.1/src`）：
+  - `rmcp::ServiceExt`（提供 `.serve`）：re-export `src/lib.rs:23-24`，trait 与 `fn serve` 定义 `src/service.rs:330-357`；客户端侧 blanket impl `impl<S: Service<RoleClient>> ServiceExt<RoleClient> for S` `src/service/client.rs:677`。
+  - `()` 是合法 client handler：`impl ClientHandler for () {}` `src/handler/client.rs:296`（`ClientHandler` → `Service<RoleClient>` 的 blanket impl `src/handler/client.rs:14`）。
+  - `rmcp::serve_client` / `RoleClient`：`src/lib.rs:19-22`。
+  - `RunningService::peer() -> &Peer<RoleClient>`：`src/service.rs:1076`。
+  - `Peer<RoleClient>::list_tools(params: Option<PaginatedRequestParams>) -> Result<ListToolsResult, ServiceError>`：`src/service/client.rs:1701-1704`。
+  - `ListToolsResult { tools: Vec<Tool> }`：`src/model.rs:4232`（宏 `paginated_result!`）；`Tool { pub name: Cow<'static, str>, .. }`：`src/model/tool.rs:17-19`。
+  - 关停：`RunningService::cancel(self)` `src/service.rs:1168-1172` → `close()` `:1123`；worker 收尾处**显式 `transport.close().await`** `src/service.rs:1805`（`:1106-1110` 文档亦言 close 会“wait for the background task … which includes calling `transport.close()`”）。
+
+实测跑通的**最小 Plan B 形态**（就是探针 Phase 2 用的，C 策略版；B 把 command 换成 `Command::new("cmd").args(["/C","npx",..])` 即可）：
+
+```rust
+use rmcp::{ServiceExt, transport::TokioChildProcess};
+use tokio::process::Command;
+
+// C：绝对路径 npx.cmd（等价于开了 which-command 后的 which_command("npx")?）
+let cmd = Command::new(r"C:\Program Files\nodejs\npx.cmd");
+let transport = TokioChildProcess::new(cmd.arg("-y")
+    .arg("@modelcontextprotocol/server-everything").arg("stdio"))?; // 真正 spawn
+let client = ().serve(transport).await?;                             // 完成 initialize 握手
+let result = client.peer().list_tools(Default::default()).await?;     // result.tools: Vec<Tool>
+for t in result.tools.iter().take(3) { println!("{}", t.name); }
+client.cancel().await?;                                              // 关 transport(=关子进程 stdin) + 直接子进程兜底 kill
+```
+
+### Q3：spawn 方式 A|B|C —— 每种各测各的，原始输出
+
+探针用 `tokio::process::Command`（**不是** `std::process::Command`）来跑 A/B/C，因为 rmcp 的 `TokioChildProcess::new` 收的就是 tokio 那种 Command；这样量到的不对称对 Plan B 直接可用。三者互不改写，A 的失败如实保留。Phase 1（纯可行性）原文（run4，UTF-8 行）：
+
+```
+A direct npx       -> ERR kind=NotFound os=None program not found
+B cmd /C npx       -> ok pid=Some(11344)
+C `where npx`      -> ["C:\\Program Files\\nodejs\\npx", "C:\\Program Files\\nodejs\\npx.cmd"]
+C resolved         -> Some("C:\\Program Files\\nodejs\\npx.cmd")
+C spawn(abs path)  -> ok pid=Some(9372)
+```
+
+- **A**：`NotFound / program not found`（`raw_os_error()` 这里为 `None`，因为 tokio/std 在“程序名找不到”时不回填 `CreateProcess` 的 OS 码）。这正是 Windows 的不对称：`npx` 在 shell 里能跑，但 `CreateProcess` 只补 `.exe`、不解析 `npx.cmd`，所以 `Command::new("npx")` 找不到——`where npx` 给出的恰恰是 `npx`/`npx.cmd`，`npx.exe` 根本不存在。
+- **C 的解析**：优先取 `where npx` 里带 `.cmd` 的那条（`C:\Program Files\nodejs\npx.cmd`），spawn 绝对路径成功。**给绝对路径且带 `.cmd` 时能起来**（A 失败纯粹因为没扩展名/没绝对路径，不是因为 `.cmd` 本身不可 exec）。
+- B/C 均 `ok pid=Some(..)`。
+
+Phase 2 真实握手——B 与 C 各自都独立跑通一次（用 `MCP_PROBE_ORDER` 把 C 提前，避免被 B 短路）。B 轮（run2）原文：
+
+```
+handshake A-direct-npx: spawn ERR kind=NotFound os=None program not found
+handshake B-cmd-C: child spawned pid=Some(12928)
+Starting default (STDIO) server...
+handshake B-cmd-C: tools=16 first3=["echo", "get-annotated-message", "get-env"]
+handshake B-cmd-C: cancelled via rmcp, quit=Cancelled
+HANDSHAKE_WINNER=Some("B-cmd-C") WINNER_CHILD_PID=Some(12928)
+```
+
+C 轮（run4，`MCP_PROBE_ORDER=C-resolved,B-cmd-C`）原文：
+
+```
+handshake C-resolved: child spawned pid=Some(14612)
+Starting default (STDIO) server...
+handshake C-resolved: tools=16 first3=["echo", "get-annotated-message", "get-env"]
+handshake C-resolved: cancelled via rmcp, quit=Cancelled
+HANDSHAKE_WINNER=Some("C-resolved") WINNER_CHILD_PID=Some(14612)
+```
+
+**判据达成：`tools=16`（N>0），且 initialize 确实发生**（`Starting default (STDIO) server...` 是 server-everything 自己的 stderr，说明握手过、进了服务态）。A 在 Phase 2 依旧 `NotFound`（rmcp 内部同样无法 spawn 裸 `npx`）。
+
+- **对 Plan B 的选型**：**优先 C**（绝对路径 `npx.cmd`，直接子进程链最短、语义最干净），或开启 rmcp 的 `which-command` 用官方 `which_command("npx")`（同 C 思路）。**B（`cmd /C`）能用但多套一层 `cmd.exe`**，见 Q3 安全条与 Q4 树深。**A 一律不可用**，Plan B 里不要写 `Command::new("npx")`。
+- **`-y` 是必须的**：不带它 `npx` 会在 stdin 上弹“要装吗?”的交互确认，而 stdio 传输里那个 stdin 归 MCP 服务器用，探针/桥接会直接卡死。
+
+> **安全（强制，无论哪种策略胜出都写死）**：既然 **A 不可用、只有 B/C 可用**，而 B 的形态是 `cmd /C npx <用户提供的参数…>`——**Plan B 绝不能把用户提供的 MCP 配置字符串（命令、参数、URL、env）不加校验地拼进 `cmd /C`**。`cmd /C` 会把整条命令行交给 `cmd.exe` 二次解析，`&`、`|`、`>`、`^`、引号错配等都会变成命令注入面。落地要求：①优先用 C（`Command::new(绝对 npx.cmd)` + `.arg()` 逐个传参，不经 `cmd.exe`）；②若必须用 B，参数只能是白名单化的 argv 片段、显式转义，且服务器可执行文件名/路径不接受自由文本。这条是 `cmd /C` 路线固有代价，Plan B 必须显式处理，不能默认“字符串拼上去没事儿”。
+
+### Q4：子进程清理 —— 无泄漏，但机制是「关 stdin 让服务器自杀」，不是「杀了树」
+
+基线（跑探针**前**）：本机 `node.exe`/`npx` 进程数 = 0：
+
+```
+tasklist //FI "IMAGENAME eq node.exe"   → 无匹配（0 个 node.exe）
+tasklist | grep -iE "node|npx"          → 无命中（grep EXIT=1）
+```
+
+探针退出**后**（每次运行都查，run1–run4 四次结果一致；run2 与 run4 原文）：
+
+```
+$ tasklist //FO CSV //NH | grep -iE "node.exe|npx"
+（无输出）
+GREP_EXIT=1   # 1 = grep 无命中 = 没有 node.exe / npx 残留
+$ tasklist //FO CSV //NH | grep -icE "node.exe"
+0
+```
+
+区分“我起的 vs 用户别的 app 起的”：基线就是 0，所以探针跑完后任何 node.exe 都只可能是探针的子进程；探针又自报了 `WINNER_CHILD_PID`（B 12928 / C 14612）。四轮里赢家 pid 与全部 Phase 1 spawn 的 pid 在 `tasklist` 中都已消失，无孤儿 node。Phase 1 起的进程由探针自己 `taskkill /T /F` 清（见下证据），Phase 2 赢家**只用 rmcp 的 `cancel()`、探针没替它 taskkill**——所以“无泄漏”是对 rmcp 原生清理的实测，不是探针代劳。
+
+**但“无泄漏”不等于“rmcp 会杀树”。两条硬证据说明清理靠的是关 stdin：**
+
+1. **B/C 的真服务器是孙进程，rmcp 的 kill 够不到。** Phase 1 对 B 直接子进程做 `taskkill /T /F /PID`，它一次性要杀 **3 层**（GBK 控制台中文乱码，逐条还原为“成功: 已终止 PID X（属于 PID Y 子进程）的进程”；PID 关系保留原样）：
+
+```
+[phase1 cleanup] taskkill /T /F /PID 3252
+  已终止 PID 12012 (属于 PID 5264 子进程)   # 孙：node 跑 server-everything
+  已终止 PID  5264 (属于 PID 3252 子进程)   # 子：node 跑 npx-cli.js
+  已终止 PID  3252 (属于 PID 17524 子进程)   # 直接子：cmd.exe（B）/ npx.cmd host（C 同形，见 run4 的 9372→…）
+```
+
+   即 `cmd /C npx …` 展开成 `cmd.exe → node(npx-cli) → node(server)`。rmcp 的 `graceful_shutdown`/`Drop` 只 `inner.kill()` **直接子进程**（`child_process.rs:88`、`:51`），够不到孙。而实测赢家（直接子 = cmd.exe/npx.cmd host）**退出后 node 也没留**——唯一能解释的是：node 服务器是被 **stdin EOF** 逼退的，不是被 kill 的（kill 根本杀不到它）。
+
+2. **rmcp 的 kill 不套 JobObject，只杀单进程。** `graceful_shutdown` 第一步是 `self.transport.close().await?`（`child_process.rs:83`）= 关掉 `AsyncRwTransport` 持有的子进程 stdin 写端 → 服务器读 stdin 见 EOF；`server-everything` 遵 EOF 自行退出，于是 `child.wait()` 正常返回，`MAX_WAIT_ON_DROP_SECS=3` 的 kill 兜底都没触发。process-wrap **有** Windows `JobObject`（会级联杀树）且是其默认 feature（`process-wrap-10.0.1/src/lib.rs:464`），但 **rmcp 全仓从不 `.wrap(JobObject)`**（`grep -rniE "JobObject|\.wrap\(" rmcp-3.5.1/src` 空），`Into<CommandWrap>` 走的是不加任何 wrapper 的裸转换，故 `kill()`（`process-wrap-10.0.1/src/tokio/core.rs:146`）= 对直接子进程的单 PID `TerminateProcess`。
+
+**给 Plan B 的清理结论（必须落地）：**
+- `McpBridge::shutdown()` **不能只依赖 rmcp 的 `cancel()`**。`cancel()` 只在“服务器自觉响应 stdin EOF”时才干净；一旦用户接的第三方 MCP server 不理会 stdin 关闭，rmcp 的 kill 只会干掉 `cmd.exe`/`npx.cmd` 宿主，**node 服务器作为孙进程会成孤儿泄漏**。
+- 兜底二选一：① 显式 `taskkill /T /F /PID <直接子进程 pid>`（探针 Phase 1 用的就是它，能连树端掉）；② 起子进程时给它套 Windows **JobObject**（process-wrap 的 `JobObject` wrapper，随父进程终止级联清理），比事后 taskkill 更稳。
+- 拿到 pid：`TokioChildProcess::id() -> Option<u32>`（`child_process.rs:71-74`）在 `serve()` **消费 transport 之前**取；或 `into_inner()`（`:109-112`）取回 `ChildWrapper` 自行管理。
+
+### 对本任务的副作用（非 rmcp 结论，但影响后续）
+
+- `src-tauri/Cargo.toml` +rmcp 一条（见 Q1）；`Cargo.lock` +7 包。均为探针/ Plan B 所需，未动任何既有依赖版本。
+- 探针依赖本机 `C:\Program Files\nodejs\`（node v24.19.0 / npm 11.17.0）与可达的 npm registry；`server-everything` 首次经 `npx -y` 下载，之后走 npm 本地缓存，握手在毫秒级完成（run2 起 `Starting default (STDIO) server...` 几乎瞬时）。无任何 API key。
+- 运行环境换源细节见本节开头「诚实说明」；Plan B 正常联网（能连 `static.crates.io`）时**不需要** rsproxy 换源，那只是本轮该机器网络受限的临时手段。
