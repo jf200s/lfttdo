@@ -514,6 +514,35 @@ mod tests {
         assert_eq!(sink.request_ids().len(), 1);
     }
 
+    /// `with_rules` 是 Interfaces 承诺的注入口（Task 13 可能拿一张预填的表进来），
+    /// 它必须共享同一张表而不是拷一份 —— 这条就钉这件事。
+    #[tokio::test]
+    async fn with_rules_shares_one_table_across_gate_clones() {
+        let rules = Arc::new(RuleTable::default());
+        let sink = Arc::new(VecSink::default());
+        let gate = PermissionGate::new()
+            .with_sink(sink.clone())
+            .with_rules(rules.clone());
+        let cancel = CancellationToken::new();
+        let c = call("write_file", Risk::Write);
+        let key = gate.rule_key(&c);
+        // 从表这一侧写入，gate 那一侧必须立刻看得见（同一个 Arc）
+        rules.remember_session(&key);
+        let d = tokio::time::timeout(Duration::from_secs(2), gate.check(&c, &cancel))
+            .await
+            .expect("注入的规则表没被读到：gate 又去问人了");
+        assert_eq!(d, Decision::allow(Scope::Session));
+        assert_eq!(
+            gate.rules().lookup(&key),
+            Some(Decision::allow(Scope::Session))
+        );
+        assert!(
+            sink.events().is_empty(),
+            "命中注入的规则表不该弹窗，实际 {:?}",
+            sink.events()
+        );
+    }
+
     // ---- R45：会话规则按作用域令牌存，不按裸工具名 ----
     #[tokio::test]
     async fn session_allow_is_scoped_by_root_not_bare_tool_name() {
