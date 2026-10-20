@@ -28,6 +28,9 @@ tokio = { version = "1.53.3", features = ["full"] }
 base64 = "0.23.1"
 image = "0.25.10"
 rmcp = { version = "3.5.1", features = ["client", "transport-io", "transport-child-process"] }
+async-stream = "0.3.6"
+async-trait = "0.1.92"
+thiserror = "2.0.21"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
