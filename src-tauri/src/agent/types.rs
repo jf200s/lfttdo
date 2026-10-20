@@ -98,11 +98,14 @@ impl Message {
             })
             .collect()
     }
-    /// 只拼接 `Text` 块，其余块返回空串——这是**约定**而不是能力：唯一的调用方
-    /// `model::openai_compat::to_api` 在 system/assistant 两臂先用 `require_slots`
-    /// 保证传进来的消息只有文本，所以这里不可能出现「一条 system 因为只有一个 Image
-    /// 而序列化成 `"content": ""`」的静默降级（folded item 1）。
-    /// 绕过 `to_api` 直接调本方法拼请求时，请连同守卫一起调。
+    /// 只拼接 `Text` 块，其余块返回空串——这是**约定**而不是能力：生产调用方有两处，
+    /// 一处靠守卫、一处不靠。`model::openai_compat::to_api` 在 system/assistant 两臂先用
+    /// `require_slots` 限定块类型（system 只允许 Text；assistant 允许 Text/ToolCall，
+    /// ToolCall 另有 `tool_calls` 字段承接，所以这里丢掉的不是任何唯一信息），
+    /// 因此不会出现「一条 system 因为只有一个 Image 而序列化成 `"content": ""`」的静默降级
+    /// （folded item 1）。`agent::context::build` 的 notes 去重是第二个调用方，它**没有**
+    /// 守卫，只拿这个字符串和 `SYSTEM_PROMPT` 比相等，所以空串在这里是无害的比较值。
+    /// 绕过 `to_api` 直接调本方法拼请求时，请连同 `require_slots` 一起调。
     /// （R40：这段约定原先只写在 `openai_compat.rs` 私有 `text_of` 头上，而
     /// `context.rs` 里有一份逐字相同的副本没这句话；实现现在只有这一处，
     /// 它描述的是一个 `Message`，所以住在这里。）

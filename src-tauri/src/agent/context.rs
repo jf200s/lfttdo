@@ -41,7 +41,8 @@ impl Default for ContextConfig {
 pub struct Built {
     /// 进请求的消息：`[system] + 历史 system 备注 + 保留的最近消息`
     pub messages: Vec<Message>,
-    /// 被滑窗整条丢弃的非 system 消息数。Plan A 无消费者（`ContextCompacted` 属切片 5），
+    /// 没有进入 `messages` 的非 system 消息数：滑窗切掉的**加上** I-1 前进指针跳过的孤立
+    /// `ToolResult`（两者合成一个数，不重复计）。Plan A 无消费者（`ContextCompacted` 属切片 5），
     /// 但按 spec :365 如实返回，Task 10 不得为它造事件。
     pub dropped: usize,
     /// 已乘校准系数的粗估输入 token
