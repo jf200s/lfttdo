@@ -2796,9 +2796,25 @@ Expected: PASS（6 个）
 
 - [ ] **Step 4: 手工验证 keyring 真的落在 Windows 凭据管理器**
 
-Run: `cargo test settings -- --nocapture` 后打开「控制面板 → 凭据管理器 → Windows 凭据」，应看到 `qwen-do` 条目。
+> **本步原来的写法跑不通，2026-10-20 更正。** 原文让跑 `cargo test settings -- --nocapture`
+> 然后去控制面板找 `qwen-do` 条目 —— 但实现期裁定 R80/R81 之后，测试一律注入
+> `keyring_core::mock::Store`，**没有任何测试会写真实库**（照原文跑必然什么都看不到，
+> 而它会看起来像「测试坏了」）；真实条目名是 `api_key.qwen-do`（user 在前，R88 更正过）；
+> 原文末句 `cargo add keyring --features windows-native` 会把 R80 明令禁用的 facade 引回来。
 
-若报 `NoDefaultKeyring`，说明 keyring 后端未选；`cargo add keyring --features windows-native`（与默认特性冲突时以实际为准，把结论写进 findings 文档）。
+实际跑法在 `src-tauri/examples/keyring_probe.rs`（测试运行器摸不到它，形态同 `mcp_probe.rs`）：
+
+```bash
+cmdkey //list 2>&1 | iconv -f GBK -t UTF-8 | grep -i qwen     # 前置：应当为空
+cargo run --example keyring_probe -- arm                      # 写入 canary
+cmdkey //list 2>&1 | iconv -f GBK -t UTF-8 | grep -i qwen     # 应当出现 api_key.qwen-do
+cargo run --example keyring_probe -- check                    # 另一个进程读回 → 删除 → 幂等
+cargo run --example keyring_probe -- status                   # 收尾自检：应当报「干净」
+```
+
+`arm` 与 `check` 必须是两条命令（跨进程才是证据）。若中途收工，`cleanup` 只会删掉本探针写的那条
+canary，别的条目一律不碰；`arm` 在库里已有任何条目时直接拒绝动手。非 Windows 上本探针只打印一句
+「无意义」就走（R81 那支 store 每次调用都 `UnsupportedPlatform`）。
 
 - [ ] **Step 5: 提交**
 
