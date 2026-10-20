@@ -2,6 +2,19 @@
 //! chunk → `ModelDelta` 翻译四件事都在这个文件里（Task 6 的文件清单如此）。
 //!
 //! 这里不出现 `tauri`：模型层必须能脱离 Tauri、脱离网络单测（Plan A 约束）。
+//!
+//! 两条与「用户看到什么」直接相关的规则都在这里落地，改动前先读它们：
+//!
+//! - **URL 形态**：`normalize_base_url`（R27）负责把用户从各家控制台粘贴的那一行
+//!   收敛成 async-openai 能用的 base。控制台的惯例是给完整端点
+//!   （dashscope：`https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`），
+//!   而客户端自己还要再拼一次 `/chat/completions`（`chat.rs:90`），所以端点段必须被摘掉。
+//! - **错误方向**：`classify_openai_error`（R28）是上游错误进入 `ModelError` 的唯一入口。
+//!   日志上必须一眼分得开这两件事：
+//!   `模型返回错误: 401 Unauthorized invalid_api_key: Incorrect API key provided`
+//!   （已连通，是 key/配额/模型名的问题，去查设置）
+//!   vs `无法连接模型端点 https://…: http error: dns error`（没连通，去查网络/代理）。
+//!   分错的代价是把「你的 key 不对」送去查网络。
 use super::provider::{ChatRequest, ModelDelta, ModelError, ModelProvider, ToolDef};
 use crate::agent::types::{ContentBlock, ImageMime, Message, Role, ToolOutput};
 use async_openai::{
@@ -22,13 +35,54 @@ use async_openai::{
 };
 use futures::StreamExt;
 
-/// 幂等地整理成 `<origin><path>/v1`，无尾斜杠。规则按顺序：
+/// 端点段后缀：它们属于**请求路径**，不属于 base_url。async-openai 自己在
+/// `chat.rs:55`（非流式）与 `chat.rs:90`（流式）后面拼 `/chat/completions`，
+/// 所以 base 里留着它就会被拼成 `…/chat/completions/v1/chat/completions` → 404。
+const CHAT_COMPLETIONS_SUFFIX: &str = "/chat/completions";
+const COMPLETIONS_SUFFIX: &str = "/completions";
+const VERSION_SUFFIX: &str = "/v1";
+/// 上面几条的字面拼接（`concat!` 只接受字面量，所以必须重抄一遍；
+/// `endpoint_suffixes_are_spelled_as_expected` 这条测试负责钉住拼写一致）。
+const COMPLETIONS_V1_SUFFIX: &str = "/completions/v1";
+const V1_V1_SUFFIX: &str = "/v1/v1";
+
+/// 若 `s` 以 ASCII 大小写不敏感的 `suffix` 结尾，返回**去掉它之后**的字节长度。
+///
+/// 为什么按字节比对而不是 `s.to_lowercase().ends_with(..)`：`str::to_lowercase`
+/// 对少数码位会改变字节长度（U+212A KELVIN SIGN → 1 字节的 'k'），那样
+/// `truncate(len - suffix.len())` 就不保证落在字符边界上。这里命中即意味着尾段
+/// 每个字节都折叠成 ASCII 后缀对应字节（≥0x80 的字节永远折叠不出 ASCII），
+/// 所以 cut 点必然是边界——大小写判定能力不变（`/V1`、`/CHAT/Completions` 照样命中）。
+fn strip_len(s: &str, suffix: &str) -> Option<usize> {
+    let sb = s.as_bytes();
+    if sb.len() >= suffix.len()
+        && sb[sb.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+    {
+        Some(sb.len() - suffix.len())
+    } else {
+        None
+    }
+}
+
+/// 幂等地整理成 `<origin><path>/v1`，无尾斜杠，且**不含端点段**。规则按顺序：
 /// 1. trim；纯空白输入原样返回空串（`OpenAiCompat::new` 会先用 `NotConfigured` 拦下它）。
 /// 2. 截掉第一个 `?` 或 `#` 之后的内容——查询串/fragment 不属于 base_url 的形态，
 ///    留着会拼出 `…?x=1/v1` 这种非法 URL。
-/// 3. 去掉全部尾斜杠。
-/// 4. 反复折叠尾部的 `/v1/v1`（复制粘贴常见），直到尾段是且仅是 `v1`；否则补一个 `/v1`。
-/// 大小写只用于**判定**（`v1`/`V1` 都算已经带版本段），不改写用户的路径大小写——
+/// 3. 循环（每步都严格变短，必然终止）：
+///    a. 去全部尾斜杠；
+///    b. 尾部是「端点段 + 版本段」的颠倒粘贴（`…/chat/completions/v1`、`…/completions/v1`）
+///       → 只摘尾部 `/v1`，剩下的端点段交给 d 处理；
+///    c. 尾部恰为 `/v1/v1`（复制粘贴常见，可多层，循环收敛）→ 摘掉一个 `/v1`；
+///    d. 尾部是端点段 → 摘掉它。**`/chat/completions` 必须先于 `/completions` 判定**，
+///       否则 `…/v1/chat/completions` 会被削成 `…/v1/chat` 再加 `/v1`（R27 的主形态）。
+/// 4. 尾段不是 `/v1` 就补一个。
+///
+/// R27 的动机：用户粘贴的是各家控制台显示的那一行。dashscope 控制台给的就是
+/// `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`，按旧规则会得到
+/// `…/v1/chat/completions/v1`，再被 `client.rs:674`（`post_stream("/chat/completions", …)`，
+/// 见 `chat.rs:90`）拼成双端点 404 —— 而 404 在用户那儿长得和「模型报错」甚至「连不上」一样。
+///
+/// 大小写只用于**判定**（`v1`/`V1`、`Chat/Completions` 都算），不改写用户的路径大小写——
 /// URL 路径段区分大小写，改写会让一个本来能用的 base 变成 404。
 pub fn normalize_base_url(raw: &str) -> String {
     let mut s = raw.trim().to_string();
@@ -38,20 +92,33 @@ pub fn normalize_base_url(raw: &str) -> String {
     if let Some(cut) = s.find(['?', '#']) {
         s.truncate(cut);
     }
-    while s.ends_with('/') {
-        s.pop();
-    }
     loop {
-        let lower = s.to_lowercase();
-        if lower.ends_with("/v1/v1") {
-            // 能进这个分支说明尾部三个字节就是 ASCII 的 "/v1"，truncate 必落在字符边界上。
-            s.truncate(s.len() - 3);
+        while s.ends_with('/') {
+            s.pop();
+        }
+        // b. 端点段在前、版本段在后是同一个粘贴事故的两种写法之一
+        if strip_len(&s, COMPLETIONS_V1_SUFFIX).is_some() {
+            s.truncate(s.len() - VERSION_SUFFIX.len());
             continue;
         }
-        if !lower.ends_with("/v1") {
-            s.push_str("/v1");
+        // c. `/v1/v1`（折叠一轮后再走 d/b 的判定）
+        if strip_len(&s, V1_V1_SUFFIX).is_some() {
+            s.truncate(s.len() - VERSION_SUFFIX.len());
+            continue;
+        }
+        // d. 端点段本身，长后缀先判
+        if let Some(n) = strip_len(&s, CHAT_COMPLETIONS_SUFFIX) {
+            s.truncate(n);
+            continue;
+        }
+        if let Some(n) = strip_len(&s, COMPLETIONS_SUFFIX) {
+            s.truncate(n);
+            continue;
         }
         break;
+    }
+    if strip_len(&s, VERSION_SUFFIX).is_none() {
+        s.push_str(VERSION_SUFFIX);
     }
     s
 }
@@ -118,16 +185,26 @@ impl OpenAiCompat {
     /// Task 5 的 `Message::tool(..)` 用 `Role::User` 承载 `ToolResult`，而协议的
     /// `role: "tool"` 必须独立成条，所以这里把 ToolResult 块拆出去先出 tool 消息，
     /// 同一 Message 里的 text/image 再合成一条 user 消息。
+    ///
+    /// **块-角色守卫（folded item 1）**：每个角色能承载的块由协议决定，见下面三处
+    /// `require_slots`。不在集合内的块**拒绝**（`ModelError::Decode`），不静默丢：
+    /// 静默丢会让一条内容被削空的消息上线，上层拿不到任何信号，而端点回的 400
+    /// 与真实原因（我们的消息树不合法）隔了一层——正是 R28 要消灭的那类误导。
+    /// 唯一保留的丢弃是 user 轮的 `ToolCall`（见该臂注释）：它与同轮 ToolResult
+    /// 所指同一次调用，丢弃不丢任何端点需要的信息。
     fn to_api(messages: &[Message]) -> Result<Vec<ChatCompletionRequestMessage>, ModelError> {
         let mut out = Vec::with_capacity(messages.len());
         for m in messages {
             match m.role {
                 Role::System => {
+                    // system 的 content 只能是字符串（`chat_.rs` 的
+                    // `ChatCompletionRequestSystemMessageContent`）：任何非 Text 块都没位置。
+                    require_slots(m, &["Text"])?;
                     out.push(ChatCompletionRequestMessage::System(
                         ChatCompletionRequestSystemMessageArgs::default()
                             .content(text_of(m))
                             .build()
-                            .map_err(decode_err)?,
+                            .map_err(request_build_err)?,
                     ));
                 }
                 Role::User => {
@@ -138,14 +215,14 @@ impl OpenAiCompat {
                                 ChatCompletionRequestMessageContentPartTextArgs::default()
                                     .text(text)
                                     .build()
-                                    .map_err(decode_err)?
+                                    .map_err(request_build_err)?
                                     .into(),
                             ),
                             ContentBlock::Image { data, mime } => parts.push(
                                 ChatCompletionRequestMessageContentPartImageArgs::default()
                                     .image_url(format!("data:{};base64,{}", mime_url(mime), data))
                                     .build()
-                                    .map_err(decode_err)?
+                                    .map_err(request_build_err)?
                                     .into(),
                             ),
                             ContentBlock::ToolResult {
@@ -157,6 +234,9 @@ impl OpenAiCompat {
                             }
                             // 用户轮携带 ToolCall 不是协议形态（那是 assistant 的），
                             // 类型层允许、协议层没有对应位置：显式丢弃，不静默塞进 content。
+                            // 这里**不**走 `require_slots`（与 assistant/system 两臂不同）是有意的：
+                            // Task 5/7 会把「调用 + 结果」成对塞进一轮，ToolCall 的信息在同轮
+                            // ToolResult 里已经在场（同一个 call_id），丢掉它不丢端点需要的东西。
                             ContentBlock::ToolCall { .. } => {}
                         }
                     }
@@ -165,11 +245,14 @@ impl OpenAiCompat {
                             ChatCompletionRequestUserMessageArgs::default()
                                 .content(parts)
                                 .build()
-                                .map_err(decode_err)?,
+                                .map_err(request_build_err)?,
                         ));
                     }
                 }
                 Role::Assistant => {
+                    // assistant 的 content 只允许 text/refusal（`chat_.rs:292-295`，**没有** image
+                    // 位），ToolCall 走 `tool_calls` 字段；ToolResult 必须属于 user 轮。
+                    require_slots(m, &["Text", "ToolCall"])?;
                     out.push(ChatCompletionRequestMessage::Assistant(assistant_msg(m)?))
                 }
             }
@@ -204,7 +287,7 @@ impl OpenAiCompat {
         if !req.tools.is_empty() {
             b.tools(req.tools.iter().map(to_api_tool).collect::<Vec<_>>());
         }
-        b.build().map_err(decode_err)
+        b.build().map_err(request_build_err)
     }
 }
 
@@ -229,8 +312,11 @@ fn assistant_msg(m: &Message) -> Result<ChatCompletionRequestAssistantMessage, M
     let text = text_of(m);
     let mut tool_calls: Vec<ChatCompletionMessageToolCalls> = Vec::new();
     for (id, name, input) in m.tool_calls() {
-        let arguments =
-            serde_json::to_string(&input).map_err(|e| ModelError::Decode(e.to_string()))?;
+        let arguments = serde_json::to_string(&input).map_err(|e| {
+            ModelError::Decode(format!(
+                "请求构造失败（未发出网络请求）: tool_call 的 arguments 无法序列化为 JSON 字符串: {e}"
+            ))
+        })?;
         tool_calls.push(
             ChatCompletionMessageToolCall {
                 id,
@@ -246,7 +332,7 @@ fn assistant_msg(m: &Message) -> Result<ChatCompletionRequestAssistantMessage, M
     if !tool_calls.is_empty() {
         b.tool_calls(tool_calls);
     }
-    b.build().map_err(decode_err)
+    b.build().map_err(request_build_err)
 }
 
 /// `ToolResult` → 协议 `role: "tool"` 消息。
@@ -277,7 +363,7 @@ fn tool_msg(
             .content(content)
             .tool_call_id(call_id)
             .build()
-            .map_err(decode_err)?,
+            .map_err(request_build_err)?,
     ))
 }
 
@@ -288,6 +374,47 @@ fn mime_url(m: &ImageMime) -> &'static str {
     }
 }
 
+fn role_label(r: &Role) -> &'static str {
+    match r {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
+}
+
+/// 块的类型名，只用于错误文本（消息要能自报「哪一类块放不下」）。
+fn block_label(b: &ContentBlock) -> &'static str {
+    match b {
+        ContentBlock::Text { .. } => "Text",
+        ContentBlock::Image { .. } => "Image",
+        ContentBlock::ToolCall { .. } => "ToolCall",
+        ContentBlock::ToolResult { .. } => "ToolResult",
+    }
+}
+
+/// 块-角色守卫：`allowed` 之外出现任何块就返回 `ModelError::Decode`。
+/// 选「拒绝」而不是 `debug_assert!`/静默丢弃的理由：`debug_assert!` 在 release 构建里
+/// 不存在，而用户拿到的就是 release 构建；静默丢弃会把「系统提示整条消失」这种
+/// 事变成模型的一次无声降级回答，只有真端点跑起来才看得见。
+fn require_slots(m: &Message, allowed: &[&str]) -> Result<(), ModelError> {
+    for b in &m.blocks {
+        let label = block_label(b);
+        if !allowed.contains(&label) {
+            return Err(ModelError::Decode(format!(
+                "{} 轮的 {label} 块在 OpenAI 协议里没有位置（该轮只接受 {}）",
+                role_label(&m.role),
+                allowed.join("/")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 只拼接 `Text` 块，其余块返回空串——这是**约定**而不是能力：调用方（`to_api` 的
+/// system/assistant 两臂）已经用 `require_slots` 保证传进来的消息只有文本，
+/// 所以这里不可能再出现「一条 system 因为只有一个 Image 而序列化成 `"content": ""`」
+/// 的静默降级（folded item 1）。Task 10 若绕过 `to_api` 直接调 `text_of`，
+/// 请连同守卫一起调。
 fn text_of(m: &Message) -> String {
     m.blocks
         .iter()
@@ -299,17 +426,64 @@ fn text_of(m: &Message) -> String {
         .join("")
 }
 
-fn decode_err(e: OpenAIError) -> ModelError {
-    ModelError::Decode(e.to_string())
+/// 请求**还没出门**就失败的分支（derive_builder 的 `build()`、arguments 序列化、
+/// 客户端侧参数校验）统一走这里。措辞刻意是「请求构造失败」而不是「响应无法解析」：
+/// 这些情况下根本还没有响应可谈（folded item 2）。
+fn request_build_err(e: OpenAIError) -> ModelError {
+    ModelError::Decode(format!("请求构造失败（未发出网络请求）: {e}"))
 }
 
-/// 流里回来的错误分两类：端点自己报错，和响应解不出来。
-/// 后者必须进 `Decode`，否则 Task 10 会把「分片缺 index」这类解析问题显示成
-/// 「模型返回错误」，排查方向被带偏（findings 风险 1 判据 2）。
-fn stream_err(e: &OpenAIError) -> ModelError {
-    match e {
-        OpenAIError::JSONDeserialize(inner, _) => ModelError::Decode(inner.to_string()),
-        other => ModelError::Api(other.to_string()),
+/// 响应正文进错误信息时必须截断：一个 404 的 HTML 页能有几十 KB，而 Task 10 会把
+/// 这条错误整行显示给用户。200 字符足够看出「回来的不是 JSON，是网关/登录页」。
+const RAW_BODY_KEEP: usize = 200;
+
+fn body_snippet(raw: &str) -> String {
+    let mut it = raw.chars();
+    let head: String = it.by_ref().take(RAW_BODY_KEEP).collect();
+    if it.next().is_some() {
+        format!("{head}…（正文已截断）")
+    } else {
+        head
+    }
+}
+
+/// **R28：两个调用点共用的唯一分类入口。**
+///
+/// 上游 `OpenAIError`（`async-openai-0.42.2/src/error.rs:11-41`，`_api` feature 开着，
+/// 我们只有 `chat-completion,realtime`，没有 `middleware`，所以 `Boxed`（`error.rs:34-36`）
+/// 在我们的编译产物里不存在；`qwen-do` 是 Cargo.lock 里唯一依赖 async-openai 的包，
+/// 没有别处能把 feature 打开）在两个调用点上实际能出现的变体：
+///
+/// | 变体 | 从哪来 | 归入 |
+/// |---|---|---|
+/// | `ApiError(ApiErrorResponse)` `error.rs:18` | `client.rs:629-631` → `read_error_response`（5xx：`:740-749`；4xx 带 JSON body：`:754-757`） | `Api` |
+/// | `Reqwest(reqwest::Error)` `error.rs:14` | `client.rs:628` 发出请求本身（DNS/TLS/拒连）、`client.rs:672-677` 构造请求（base 不是合法 URL）、`client.rs:725/733` 读 body | `Transport` |
+/// | `StreamError(Box<StreamError>)` `error.rs:32` | 只可能在中途：`client.rs:848-851`（非 wasm 的 SSE 读环，`EventStream(String)` 在 `error.rs:78`）；`create_stream` 的返回类型里没有它（`client.rs:642-643` 只把 `stream(response).await` 包成流） | `Transport` |
+/// | `JSONDeserialize(serde_json::Error, String)` `error.rs:21` | `client.rs:769-770` 的 event_mapper（chunk 不是合法 JSON）、以及 `client.rs:758`（4xx 但 body 不是 `{ "error": … }` 形态，例如 HTML 404 页） | `Decode` |
+/// | `InvalidArgument(String)` `error.rs:40` | `chat.rs:82`（stream=false，我们恒 true，不可达）、`client.rs:399`（请求体序列化失败） | `Decode`（请求侧） |
+/// | `FileSaveError` / `FileReadError` `error.rs:25/29` | 文件类 API 专用，两个调用点都到不了 | `Decode`（本地侧） |
+///
+/// 匹配**写满七个变体、没有 `_` 兜底**：将来若某个 feature 加了新变体（如 `Boxed`），
+/// 编译器会在这里报错逼我们重新判，而不是让它顺着兜底被误分类。
+///
+/// 方向性要求（这条 finding 的全部意义）：**已经连通的端点回了错误，绝不能报成
+/// 「无法连接」**；反过来连接/SSE 断流也不能报成「模型返回错误」。401 与 DNS 失败
+/// 在日志里必须长得不一样，见 `provider.rs` 的 `ModelError` 文档表。
+fn classify_openai_error(err: OpenAIError, url: String) -> ModelError {
+    match err {
+        OpenAIError::ApiError(body) => ModelError::Api(body.to_string()),
+        e @ OpenAIError::Reqwest(_) => ModelError::Transport { url, source: e },
+        e @ OpenAIError::StreamError(_) => ModelError::Transport { url, source: e },
+        OpenAIError::JSONDeserialize(inner, raw) => ModelError::Decode(format!(
+            "响应体无法解析: {inner}｜响应正文: {}",
+            body_snippet(&raw)
+        )),
+        OpenAIError::InvalidArgument(msg) => {
+            ModelError::Decode(format!("请求构造失败（未发出网络请求）: {msg}"))
+        }
+        OpenAIError::FileSaveError(msg) | OpenAIError::FileReadError(msg) => {
+            ModelError::Decode(format!("本地文件读写失败（未发出网络请求）: {msg}"))
+        }
     }
 }
 
@@ -328,10 +502,15 @@ impl ModelProvider for OpenAiCompat {
         let client = self.client.clone();
         Box::pin(async_stream::stream! {
             match client.chat().create_stream(request).await {
-                Err(e) => yield Err(ModelError::Transport { url, source: e }),
+                // R28：这里**不能**无条件 `Transport`。`create_stream` 对任何非 2xx 都返回
+                // `ApiError`（`client.rs:629-631` → `error.rs:18`），把 401/429/模型不存在
+                // 说成「无法连接模型端点」就是本条 finding 要消灭的误导。
+                Err(e) => yield Err(classify_openai_error(e, url.clone())),
                 Ok(mut s) => while let Some(item) = s.next().await {
                     match item {
-                        Err(e) => yield Err(stream_err(&e)),
+                        // 同一个分类函数、同一个方向：SSE 中途断流 → Transport，
+                        // 端点错误 → Api，chunk 解不出来 → Decode。
+                        Err(e) => yield Err(classify_openai_error(e, url.clone())),
                         Ok(chunk) => for d in chunk_to_deltas(&chunk) { yield Ok(d); }
                     }
                 },
@@ -360,7 +539,7 @@ fn chunk_to_deltas(c: &CreateChatCompletionStreamResponse) -> Vec<ModelDelta> {
             for f in tcs {
                 // R21：0.42.2 的 `index` 是非可选 `u32`，且没有 `#[serde(default)]`
                 // （chat_.rs:1301-1311）。分片不带 index 时**整个 chunk** 反序列化失败，
-                // 走的是 `stream_err` → `Decode`，这里的 `f.index` 不可能"缺省成 0"。
+                // 走的是 `classify_openai_error` → `Decode`，这里的 `f.index` 不可能"缺省成 0"。
                 let index = f.index;
                 let name = f.function.as_ref().and_then(|x| x.name.clone());
                 let args = f.function.as_ref().and_then(|x| x.arguments.clone());
@@ -382,17 +561,28 @@ fn chunk_to_deltas(c: &CreateChatCompletionStreamResponse) -> Vec<ModelDelta> {
 
 #[cfg(test)]
 mod tests {
+    // `use super::*` 已经带进 ChatRequest / ModelError / ModelProvider / ToolDef /
+    // OpenAIError / CreateChatCompletionStreamResponse / futures::StreamExt /
+    // Message / ContentBlock / Role / ToolOutput / normalize_base_url /
+    // classify_openai_error / require_slots / text_of；这里只补 `super` 没有引到的名字。
     use super::*;
-    use crate::model::provider::{ChatRequest, ModelError, ModelProvider, ToolDef};
-    use async_openai::types::chat::CreateChatCompletionStreamResponse;
-    use futures::StreamExt;
+    use async_openai::error::{ApiError, ApiErrorResponse, StreamError};
+    // `json!` 是宏，父模块没有 `use serde_json::json`，所以必须自己引。
     use serde_json::json;
+
+    /// R25 的夹具 key：**刻意不带任何真实密钥的前缀形态**（形如密钥的字面量会触发密钥扫描器，
+    /// 而这个仓库里没有任何真 key，也就不该有任何看起来像 key 的东西），
+    /// 同时保持足够长且含唯一片段（`4f9d2c7be1a8`），让「渲染结果里搜不到它」
+    /// 不是一句空话——一个 3 字符的 fixture 会被任何掩码后的字符串偶然包含。
+    const FAKE_API_KEY: &str = "not-a-real-key-fixture-4f9d2c7be1a8";
+    /// `FAKE_API_KEY` 的一个尾部片段：用来证明掩码不是「只把开头藏起来」。
+    const FAKE_API_KEY_TAIL: &str = "4f9d2c7be1a8";
 
     fn cfg() -> ModelConfig {
         ModelConfig {
             base_url: "https://x.com".into(),
             model: "qwen-test".into(),
-            api_key: "sk-secret-123".into(),
+            api_key: FAKE_API_KEY.into(),
             max_output_tokens: 512,
         }
     }
@@ -435,12 +625,123 @@ mod tests {
     }
 
     /// R23：原测试名 `does_not_add_v1_when_path_already_ends_with_endpoint` 与它自己的
-    /// 断言相反（这里 `/v1` 确实会被补上）。改名以描述它真正证明的行为。
+    /// 断言相反（`/api/openai` 这种任意路径尾部确实会被补 `/v1`）。改名以描述它真正证明的行为。
+    ///
+    /// 注意本测试**不是**报告 §R23 旧文本里写的「`…/v1/chat/completions` → `…/v1/chat/completions/v1`」：
+    /// 那个输入从来就没有对应的测试（幻影条目，已在修复报告里更正），而且自 R27 起该输入的结果
+    /// 已经反转为 `…/v1` —— 见 `strips_a_pasted_full_endpoint_from_the_console`。
     #[test]
     fn appends_v1_to_an_arbitrary_path() {
         assert_eq!(
             normalize_base_url("https://x.com/api/openai"),
             "https://x.com/api/openai/v1"
+        );
+    }
+
+    /// R27 的主形态：各家控制台粘贴出来的是**完整端点**，而 async-openai 会自己再拼一次
+    /// `/chat/completions`（`chat.rs:90`），所以尾部端点段必须摘掉，留下版本段。
+    /// 不摘的话 `…/v1/chat/completions` 会先被补成 `…/v1/chat/completions/v1`，
+    /// 最终请求 URL 是 `…/v1/chat/completions/v1/chat/completions` → 404。
+    #[test]
+    fn strips_a_pasted_full_endpoint_from_the_console() {
+        assert_eq!(
+            normalize_base_url(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+            ),
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        );
+        // 控制台/文档里常带尾斜杠，先去斜杠再摘端点段
+        assert_eq!(
+            normalize_base_url("https://x.test/v1/chat/completions/"),
+            "https://x.test/v1"
+        );
+        // 双斜杠这种粘贴事故也要收敛
+        assert_eq!(
+            normalize_base_url("https://x.test/v1//chat/completions"),
+            "https://x.test/v1"
+        );
+    }
+
+    /// R27 要求钉死的第二个分支：文本补全（非 tool）端点后缀 `/completions` 同样不是
+    /// base 的一部分。本适配器只会说 chat 协议，所以规则是**照摘**：摘完补 `/v1`，
+    /// 请求打到 `…/v1/chat/completions`（同一个 base 上唯一我们能用的端点）。
+    #[test]
+    fn strips_a_pasted_text_completions_suffix() {
+        assert_eq!(
+            normalize_base_url("https://x.test/v1/completions"),
+            "https://x.test/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://x.test/completions"),
+            "https://x.test/v1"
+        );
+    }
+
+    /// R27 要求钉死的第三个分支：端点段与版本段的顺序颠倒（`…/chat/completions/v1`）。
+    /// 规则：与顺序无关，一律收敛成「一个版本段」——先摘尾部的 `/v1` 再摘端点段。
+    /// 不这么定的话它会以 `…/chat/completions/v1` 原样上线（尾段是 `/v1`，旧规则不补），
+    /// 然后被拼成 `…/chat/completions/v1/chat/completions`，正是 I-1 要消灭的那类 404。
+    #[test]
+    fn normalizes_an_endpoint_pasted_before_the_version_segment() {
+        assert_eq!(
+            normalize_base_url("https://x.test/api/chat/completions/v1"),
+            "https://x.test/api/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://x.test/v1/chat/completions/v1"),
+            "https://x.test/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://x.test/v1/completions/v1"),
+            "https://x.test/v1"
+        );
+    }
+
+    /// `/chat/completions` 必须先于它的短后缀 `/completions` 判定：顺序写反会把
+    /// `…/v1/chat/completions` 削成 `…/v1/chat`，再加 `/v1` 得到一个谁都不认识的 URL。
+    #[test]
+    fn strips_chat_completions_before_the_shorter_completions_alias() {
+        let out = normalize_base_url("https://x.test/v1/chat/completions");
+        assert_eq!(out, "https://x.test/v1");
+        assert!(!out.contains("/chat"), "短后缀抢判会得到 {out}");
+    }
+
+    /// 端点段判定同样只用大小写做判定、不改写其余路径（与 `/V1` 同一条约定）。
+    #[test]
+    fn matches_the_endpoint_suffix_case_insensitively() {
+        assert_eq!(
+            normalize_base_url("https://x.test/v1/CHAT/Completions"),
+            "https://x.test/v1"
+        );
+        assert_eq!(
+            normalize_base_url("https://x.test/Compatible-Mode/V1/Chat/Completions"),
+            "https://x.test/Compatible-Mode/V1"
+        );
+    }
+
+    /// 端点段之后还有别的段时**不算**尾部端点段：`…/chat/completions/prefill` 这种
+    /// 路径我们不动它（除它需要 `/v1` 之外没有别的规则可套），
+    /// 免得「摘后缀」变成任意子串删除。
+    #[test]
+    fn only_strips_an_endpoint_segment_at_the_very_end() {
+        assert_eq!(
+            normalize_base_url("https://x.test/chat/completions/prefill"),
+            "https://x.test/chat/completions/prefill/v1"
+        );
+    }
+
+    /// `strip_len` 用的那几个字面拼接常量和它们拆开的形式必须一致，
+    /// 否则 `…/completions/v1` 这条规则会静默地不再命中。
+    #[test]
+    fn endpoint_suffixes_are_spelled_as_expected() {
+        assert_eq!(
+            format!("{COMPLETIONS_SUFFIX}{VERSION_SUFFIX}"),
+            COMPLETIONS_V1_SUFFIX
+        );
+        assert_eq!(format!("{VERSION_SUFFIX}{VERSION_SUFFIX}"), V1_V1_SUFFIX);
+        assert_eq!(
+            normalize_base_url(&format!("https://x.test/api{CHAT_COMPLETIONS_SUFFIX}")),
+            "https://x.test/api/v1"
         );
     }
 
@@ -493,7 +794,8 @@ mod tests {
     }
 
     /// 契约里的「幂等」= f(f(x)) == f(x)，对全部样本钉住（含 `/v1/v1/v1` 这种极端形态：
-    /// 单次折叠做不到，所以实现里用的是循环）。
+    /// 单次折叠做不到，所以实现里用的是循环）。R27 之后新增的端点段形态必须同样收敛，
+    /// 所以它们的**一次结果**也要在这张表里再走一遍。
     #[test]
     fn is_idempotent_for_every_fixture_input() {
         let fixtures = [
@@ -510,6 +812,17 @@ mod tests {
             "https://x.com/V1",
             "https://x.com/v1?api-version=2",
             "http://localhost:11434/v1",
+            // ---- R27 新增 ----
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions/",
+            "https://x.com/completions",
+            "https://x.com/v1/completions",
+            "https://x.com/v1/chat/completions/v1",
+            "https://x.com/api/chat/completions/v1",
+            "https://x.com/v1/CHAT/Completions",
+            "https://x.com/chat/completions/prefill",
+            "https://x.com/v1//chat/completions",
+            "https://x.com/v1/chat/completions?stream=true",
         ];
         for raw in fixtures {
             let once = normalize_base_url(raw);
@@ -521,18 +834,35 @@ mod tests {
         }
     }
 
+    /// 端点段形态必须**收敛到带版本段的标准 base**——这条不是幂等（f(x) != x），
+    /// 而是「一次就到位」：`f(f(x)) == f(x)` 由上面那条保证，这条保证的是
+    /// 「粘贴完整端点的人和一个规规矩矩填 `…/v1` 的人最终请求同一个 URL」。
+    #[test]
+    fn a_pasted_endpoint_lands_on_the_same_base_as_a_well_formed_one() {
+        assert_eq!(
+            normalize_base_url(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+            ),
+            normalize_base_url("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        );
+        assert_eq!(
+            normalize_base_url("https://x.test/v1/completions"),
+            normalize_base_url("https://x.test/v1"),
+        );
+    }
+
     // ---- R25：Debug 不得带出 api_key ----
 
     #[test]
     fn model_config_debug_masks_the_api_key() {
         let rendered = format!("{:?}", cfg());
         assert!(
-            !rendered.contains("sk-secret-123"),
+            !rendered.contains(FAKE_API_KEY),
             "Debug 里绝不能出现完整 api_key：{rendered}"
         );
         assert!(
-            !rendered.contains("secret-123"),
-            "Debug 里不能出现 api_key 的任何连续片段：{rendered}"
+            !rendered.contains(FAKE_API_KEY_TAIL),
+            "Debug 里不能出现 api_key 的任何连续片段（掩码不是只遮开头）：{rendered}"
         );
         assert!(
             rendered.contains("<已配置·masked>"),
@@ -548,7 +878,7 @@ mod tests {
                     ..cfg()
                 }
             )
-            .contains("sk-secret"),
+            .contains(FAKE_API_KEY_TAIL),
         );
         assert!(
             format!(
@@ -753,6 +1083,135 @@ mod tests {
         );
     }
 
+    // ---- folded item 1：块-角色守卫（没有协议位的块 = 拒绝，不静默丢）----
+
+    /// assistant 轮里的 `ToolResult`：Task 5 的契约是 tool 结果属于 user 轮
+    /// （`Message::tool` 用的就是 `Role::User`），assistant 轮的 content 只允许
+    /// text/refusal（`chat_.rs:292-295`）。旧代码把它交给 `text_of` 一句话不说地丢掉，
+    /// 结果是一条「有 tool_calls、没有对应回应」的消息上线，端点回 400，
+    /// 用户看到的错误离真实原因隔了一层。现在在这里就拒绝，且错误文本指名角色与块。
+    #[test]
+    fn an_assistant_tool_result_is_rejected_where_it_used_to_be_dropped() {
+        let m = Message {
+            role: Role::Assistant,
+            blocks: vec![
+                ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: "fs.read".into(),
+                    input: json!({}),
+                },
+                ContentBlock::ToolResult {
+                    call_id: "c1".into(),
+                    is_error: false,
+                    output: ToolOutput::text("不该出现在 assistant 轮"),
+                },
+            ],
+        };
+        let err = OpenAiCompat::to_api(&[m]).expect_err("assistant 轮的 ToolResult 必须被拒绝");
+        match &err {
+            ModelError::Decode(text) => {
+                assert!(text.contains("assistant"), "{text}");
+                assert!(text.contains("ToolResult"), "{text}");
+            }
+            other => panic!("期望 Decode 拒绝，实际 {other:?}"),
+        }
+        // 拒绝发生在组装阶段：没有任何半截消息被发出去。
+        assert!(!format!("{err}").contains("不该出现在 assistant 轮"));
+    }
+
+    /// `text_of` 只收 Text，所以一条「只有一个 Image」的 System 消息过去会序列化成
+    /// `"content": ""`：系统提示整条消失，模型照常回答，谁都不知道。现在同样拒绝。
+    #[test]
+    fn a_system_message_with_no_text_slot_is_rejected_not_emptied() {
+        let only_image = Message {
+            role: Role::System,
+            blocks: vec![ContentBlock::Image {
+                data: "iVBOR".into(),
+                mime: ImageMime::Png,
+            }],
+        };
+        let err = OpenAiCompat::to_api(&[only_image]).expect_err("空 system 不是合法输入");
+        assert!(
+            matches!(&err, ModelError::Decode(text) if text.contains("system") && text.contains("Image"))
+        );
+        // 混合形态也一样：文本在场不代表 Image 有了位置。
+        let mixed = Message {
+            role: Role::System,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "你是助手".into(),
+                },
+                ContentBlock::Image {
+                    data: "iVBOR".into(),
+                    mime: ImageMime::Png,
+                },
+            ],
+        };
+        assert!(matches!(
+            OpenAiCompat::to_api(&[mixed]),
+            Err(ModelError::Decode(_))
+        ));
+        // 纯文本 system 照常通过，且多块无分隔拼接（协议 content 是单串）。
+        let ok = Message {
+            role: Role::System,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "你是".into(),
+                },
+                ContentBlock::Text {
+                    text: "助手".into(),
+                },
+            ],
+        };
+        assert_eq!(text_of(&ok), "你是助手");
+        let v = serde_json::to_value(OpenAiCompat::to_api(&[ok]).unwrap()).unwrap();
+        assert_eq!(v[0]["content"], json!("你是助手"));
+    }
+
+    /// 规则的另一半（也是唯一被保留的丢弃）：user 轮的 `ToolCall` 丢掉，
+    /// 同轮其它块照常发送。它是同轮 ToolResult 的冗余信息，丢掉不丢端点需要的东西
+    /// —— 与上面两条守卫的区别就在这里，改动前先读 `to_api` 的注释。
+    #[test]
+    fn a_user_turn_tool_call_is_still_dropped_and_the_rest_still_serializes() {
+        let m = Message {
+            role: Role::User,
+            blocks: vec![
+                ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: "fs.read".into(),
+                    input: json!({}),
+                },
+                ContentBlock::Text {
+                    text: "继续".into(),
+                },
+            ],
+        };
+        let v = serde_json::to_value(OpenAiCompat::to_api(&[m]).unwrap()).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v[0]["role"], json!("user"));
+        assert_eq!(v[0]["content"][0]["text"], json!("继续"));
+    }
+
+    /// 守卫的可达性检查：Task 5 的类型层确实允许 assistant 轮带 ToolResult
+    /// （`blocks: Vec<ContentBlock>` 无约束），所以这条不是纸面威胁。
+    #[test]
+    fn the_type_layer_does_really_allow_an_unmappable_assistant_block() {
+        let m = Message {
+            role: Role::Assistant,
+            blocks: vec![ContentBlock::ToolResult {
+                call_id: "c1".into(),
+                is_error: false,
+                output: ToolOutput::text("x"),
+            }],
+        };
+        // 序列化没问题（那是 Task 5 的 wire 形态），是**映射到协议**这一步放不下。
+        assert!(serde_json::to_value(&m).is_ok());
+        assert!(matches!(
+            OpenAiCompat::to_api(&[m]),
+            Err(ModelError::Decode(_))
+        ));
+    }
+
     // ---- chunk → ModelDelta（R21 的 index 形态在这里被钉住）----
 
     fn chunk(json_text: &str) -> CreateChatCompletionStreamResponse {
@@ -848,6 +1307,12 @@ mod tests {
     /// `stream()` 不 panic、也不返回空流：连接层面的失败必须作为一个 `Transport` item
     /// 发出来，并带上已解析的 URL（Task 10 靠这条把错误投给前端）。
     /// 这里用无法解析的 base_url 走这条路 —— reqwest 在发出请求前就拒了，所以不需要网络。
+    ///
+    /// 这条同时是 **`Reqwest` 变体的真实覆盖**：`reqwest::Error` 在 0.13.5 里没有任何
+    /// 公开构造函数、也没有 `impl From<…> for Error`（`reqwest-0.13.5/src/error.rs` 里
+    /// 只有 `pub fn is_*`/`status()` 这类访问器），所以它**无法用字面量造出来**。
+    /// 让它经过 `create_stream` → `client.rs:672-677` 的构造失败产生一个真正的
+    /// `OpenAIError::Reqwest`，是这里唯一诚实的取法。
     #[tokio::test]
     async fn stream_yields_transport_error_with_the_resolved_url() {
         let p = OpenAiCompat::new(ModelConfig {
@@ -860,13 +1325,235 @@ mod tests {
         match &items[0] {
             Err(ModelError::Transport { url, source }) => {
                 assert_eq!(url, "not a url/v1", "错误里要能看到我们真正请求的 URL");
+                let line = format!("{url} {source}");
                 assert!(
-                    !format!("{url} {source}").contains("sk-secret-123"),
+                    !line.contains(FAKE_API_KEY) && !line.contains(FAKE_API_KEY_TAIL),
                     "错误信息不得带出 api_key"
+                );
+                // R28：这条必须走 Transport 的 Display 文案（连接层面失败）。
+                let rendered = format!("{}", items[0].as_ref().unwrap_err());
+                assert!(
+                    rendered.starts_with("无法连接模型端点 not a url/v1: "),
+                    "真实 reqwest 失败必须报成连接问题，实际：{rendered}"
                 );
             }
             other => panic!("期望 Transport 错误，实际 {other:?}"),
         }
+    }
+
+    // ---- R28：classify_openai_error 的方向性（两个调用点共用这一个入口）----
+
+    /// 造一个 `ApiError`。`status_code` 的类型是 `reqwest::StatusCode`，而我们的
+    /// Cargo.toml 里没有、也不允许加 `reqwest` 依赖 —— 这里靠**结构体字段的类型推断**
+    /// 走 `TryFrom<u16>`（`http-1.5.0/src/status.rs:291`，`Error = InvalidStatusCode`
+    /// 且有 `Debug`，`:533`，所以 `expect` 可用），全程不必点名那个类型。
+    fn api_error(status: u16, kind: &str, message: &str) -> OpenAIError {
+        OpenAIError::ApiError(ApiErrorResponse {
+            status_code: status.try_into().expect("状态码必须落在 100..=999"),
+            api_error: ApiError {
+                message: message.into(),
+                r#type: Some(kind.into()),
+                param: None,
+                code: None,
+                misalignment: None,
+            },
+        })
+    }
+
+    fn classify(err: OpenAIError) -> ModelError {
+        classify_openai_error(err, "https://x.test/v1".into())
+    }
+
+    /// I-2 的主案发现场：401（key 不对/过期）是首次运行最常见的失败，
+    /// 简报片段把它报成「无法连接模型端点」——用户会去查网络，而问题在设置里。
+    #[test]
+    fn an_http_error_from_the_endpoint_is_api_not_transport() {
+        for (status, kind) in [
+            (401u16, "invalid_api_key"),
+            (429, "rate_limit_exceeded"),
+            (404, "model_not_found"),
+            (500, "internal_server_error"),
+        ] {
+            let m = classify(api_error(status, kind, "Incorrect API key provided"));
+            match &m {
+                ModelError::Api(text) => {
+                    assert!(text.contains(&status.to_string()), "{text} 必须带上状态码");
+                    assert!(text.contains(kind), "{text} 必须带上 error.type");
+                    assert!(
+                        text.contains("Incorrect API key provided"),
+                        "{text} 必须原样带上 error.message"
+                    );
+                }
+                other => panic!("{status}/{kind} 应归为 Api，实际 {other:?}"),
+            }
+            let line = format!("{m}");
+            assert!(line.starts_with("模型返回错误: "), "{line}");
+            assert!(
+                !line.contains("无法连接"),
+                "{status} 绝不能报成连不上：{line}"
+            );
+        }
+    }
+
+    /// 反向也要成立：SSE 中途断流是连接问题，不能报成「模型返回错误」
+    /// （旧代码的 `stream_err` 正是这样反着分的，`StreamError` 落进了 `Api`）。
+    /// `StreamError` 只在流中途出现（`client.rs:848-851`）；`create_stream` 的返回里
+    /// 不会有它（`client.rs:642-643` 只是把响应包成流）。
+    ///
+    /// **构造能力如实记录**：`OpenAIError::StreamError(Box<StreamError>)` 里
+    /// `StreamError::EventStream(String)`（`error.rs:77-78`）能用字面量造，
+    /// 而兄弟变体 `StreamError::UnknownEvent(eventsource_stream::Event)`（`error.rs:74-75`）
+    /// **造不出来**——载荷类型来自 `eventsource-stream`，我们没有也不该加这个依赖，
+    /// 类型名都点不到。两者走同一条 `Transport` 分支（都由 `client.rs:848` 那一个
+    /// `StreamError(...)` 构造点进入本函数），所以这一臂的覆盖对两个内层变体一致。
+    #[test]
+    fn a_dropped_stream_is_transport_not_api() {
+        let m = classify(OpenAIError::StreamError(Box::new(
+            StreamError::EventStream("connection closed by peer".into()),
+        )));
+        match &m {
+            ModelError::Transport { url, source } => {
+                assert_eq!(url, "https://x.test/v1");
+                assert!(
+                    format!("{source}").contains("stream failed"),
+                    "上游文案要原样保留：{source}"
+                );
+                assert!(
+                    format!("{source}").contains("connection closed by peer"),
+                    "断流原因不能被吃掉"
+                );
+            }
+            other => panic!("StreamError 是连接问题，不该归到 {other:?}"),
+        }
+        let line = format!("{m}");
+        assert!(line.starts_with("无法连接模型端点 https://x.test/v1: stream failed: "));
+        assert!(!line.contains("模型返回错误"), "断流别报成端点报错：{line}");
+    }
+
+    /// chunk 不是合法 JSON（或 4xx 回来一个 HTML 页，`client.rs:758`）→ `Decode`，
+    /// 且**必须保留一段正文**（否则「回来的根本不是 JSON」和「端点报了 404」分不开），
+    /// 同时**必须截断**（Task 10 会把这行整个显示给用户，一个网关 404 页有几十 KB）。
+    #[test]
+    fn an_unparseable_response_is_decode_with_a_bounded_body_snippet() {
+        let html = format!(
+            "<html><body>404 Not Found from the gateway</body>{}</>",
+            "x".repeat(5000)
+        );
+        let inner =
+            serde_json::from_str::<serde_json::Value>(&html).expect_err("HTML 必然不是合法 JSON");
+        let m = classify(OpenAIError::JSONDeserialize(inner, html));
+        match &m {
+            ModelError::Decode(text) => {
+                assert!(text.contains("响应体无法解析"), "{text}");
+                assert!(
+                    text.contains("404 Not Found from the gateway"),
+                    "正文要能看出这不是 JSON"
+                );
+                assert!(text.contains("正文已截断"), "长正文必须被截断");
+                assert!(
+                    text.chars().count() < RAW_BODY_KEEP + 200,
+                    "错误文本长度必须受控（实际 {} 字符）",
+                    text.chars().count()
+                );
+            }
+            other => panic!("解不出 JSON 属于 Decode，实际 {other:?}"),
+        }
+        assert!(!format!("{m}").contains("无法连接"));
+        assert!(!format!("{m}").contains("模型返回错误"));
+    }
+
+    /// 客户端侧的参数/序列化问题（`chat.rs:82`、`client.rs:399`）：请求根本没出门。
+    /// 既不能说「连不上」（网络没问题），也不能说「模型返回错误」（模型没收到东西）。
+    #[test]
+    fn client_side_failures_never_blame_the_endpoint_or_the_network() {
+        let m = classify(OpenAIError::InvalidArgument(
+            "When stream is false, use Chat::create".into(),
+        ));
+        let line = format!("{m}");
+        assert!(matches!(m, ModelError::Decode(_)), "{line}");
+        assert!(line.contains("请求构造失败（未发出网络请求）"), "{line}");
+        assert!(!line.contains("无法连接模型端点"), "{line}");
+        assert!(!line.contains("模型返回错误"), "{line}");
+    }
+
+    /// 文件类变体在两个调用点都到不了（只有 files API 用得上），但它们在
+    /// `_api` 开着 + 非 wasm 时是**真实存在的变体**（`error.rs:22-29`），
+    /// 我们的 match 写满七条、不留 `_`，所以这里一并钉住归属。
+    #[test]
+    fn local_file_variants_are_decode_and_stay_local() {
+        for m in [
+            classify(OpenAIError::FileSaveError("disk full".into())),
+            classify(OpenAIError::FileReadError("no such file".into())),
+        ] {
+            let line = format!("{m}");
+            assert!(matches!(m, ModelError::Decode(_)), "{line}");
+            assert!(
+                line.contains("本地文件读写失败（未发出网络请求）"),
+                "{line}"
+            );
+            assert!(!line.contains("无法连接模型端点"), "{line}");
+        }
+    }
+
+    /// 这条 finding 的全部意义落在两行日志的差别上：**401 和 DNS 失败必须长得不一样**。
+    #[test]
+    fn a_bad_key_and_a_dead_network_read_differently() {
+        let bad_key = format!(
+            "{}",
+            classify(api_error(
+                401,
+                "invalid_api_key",
+                "Incorrect API key provided"
+            ))
+        );
+        let dead_network = format!(
+            "{}",
+            classify(OpenAIError::StreamError(Box::new(
+                StreamError::EventStream("dns failure".into())
+            )))
+        );
+        assert!(bad_key.starts_with("模型返回错误: 401"), "{bad_key}");
+        assert!(
+            dead_network.starts_with("无法连接模型端点 "),
+            "{dead_network}"
+        );
+        assert_ne!(bad_key, dead_network);
+    }
+
+    /// folded item 2：`build()`/arguments 序列化这类**请求侧**失败过去被 `decode_err`
+    /// 一律写成「响应无法解析」——那时还没有响应。措辞改由 `request_build_err` 负责。
+    #[test]
+    fn request_side_build_failures_do_not_claim_a_response_was_parsed() {
+        let m = request_build_err(OpenAIError::InvalidArgument("field required".into()));
+        let line = format!("{m}");
+        assert!(matches!(m, ModelError::Decode(_)), "{line}");
+        assert!(line.contains("请求构造失败（未发出网络请求）"), "{line}");
+        assert!(!line.contains("响应"), "请求侧失败不该提响应：{line}");
+    }
+
+    /// R28 的结构守卫：单测能抓住「分类函数判错」，抓不住「某个调用点绕过它」。
+    /// 简报片段里 `Err(e) => yield Err(ModelError::Transport { url, source: e })`
+    /// 那行就是病灶，这里禁止它在实现部分复活。
+    #[test]
+    fn both_stream_error_sites_go_through_the_classifier() {
+        let src = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/model/openai_compat.rs"
+        ));
+        let impl_part = src.split("#[cfg(test)]").next().expect("本文件有测试模块");
+        assert_eq!(
+            impl_part.matches("Err(classify_openai_error").count(),
+            2,
+            "create_stream 的返回错误与流中途错误必须共用同一个分类入口"
+        );
+        assert!(
+            !impl_part.contains("Err(ModelError::Transport"),
+            "不许把 create_stream 的错误无条件归为 Transport（那是 401 报成连不上）"
+        );
+        assert!(
+            !impl_part.contains("fn stream_err"),
+            "旧的反向分类函数（StreamError → Api）不许留下"
+        );
     }
 
     // ---- Step 5：真端点回归（需要 key，不进通过数，ledger R5）----
