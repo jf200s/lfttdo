@@ -414,11 +414,15 @@ mod tests {
         let root = tmp_dir("drive"); // temp 在 C:
         let here = std::env::current_dir().unwrap(); // cargo 跑在 D: 的工作区里
         let (root_c, here_c) = (root.canonicalize().unwrap(), here.canonicalize().unwrap());
-        assert_ne!(
-            drive_of(&root_c),
-            drive_of(&here_c),
-            "夹具前提：本测试要求临时目录与 cwd 在不同盘符（本机 C: 与 D:）"
-        );
+        // 夹具前提：本测试要求临时目录与 cwd 在不同盘符（实测本机 C: 与 D:，见下方 SKIP
+        // 分支）。单盘符机器上前提不成立 —— 那是**环境**不满足而不是实现有 bug，
+        // 所以跳过而不是判红（reviewer Important：跨机器不该产生假失败）。
+        // 内置 harness 没有 skip 语义，所以这里 println；要用 `-- --show-output` 看。
+        if drive_of(&root_c) == drive_of(&here_c) {
+            println!("SKIP cross_drive: root 与 cwd 同盘符，跨盘符前提不成立");
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
         let cand = here.join("qwen-do-other-drive.txt");
         let err = ctx_with_roots(vec![root.clone()])
             .resolve_within_roots(cand.to_str().unwrap())
@@ -450,8 +454,10 @@ mod tests {
     #[tokio::test]
     async fn no_roots_denies_everything() {
         let ctx = ctx_with_roots(vec![]);
-        let abs = tmp_dir("noroot").join("x.txt");
+        let dir = tmp_dir("noroot");
+        let abs = dir.join("x.txt");
         let err = ctx.resolve_within_roots(abs.to_str().unwrap()).unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
         assert!(matches!(err, ToolError::BadInput(_)), "{err:?}");
     }
 

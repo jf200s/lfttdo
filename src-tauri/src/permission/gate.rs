@@ -166,6 +166,9 @@ impl PermissionGate {
             // 兜底：Plan A 的 gate 是长生命周期 `state.gate`，这支不可达（所以只能由
             // `drop_pending_for_test` 证明，见测试）；未来按会话建 gate 时它是「UI 关了 /
             // 前端崩了 / 会话对象被 drop」的那条保险带。
+            // 与上一支的不对称是有意的：R43 要求 cancel 分支 emit，是因为那时弹窗**还挂在
+            // 屏幕上**需要被收掉；这支的应答通道已经先没了，再发一条 PermissionResolved 等于
+            // 替前端宣布一个它从未做过的决定。若哪天这支变得可达，连同 emit 一起补。
             Waited::WindowGone => {
                 self.pending.lock().unwrap().remove(&id);
                 Decision::deny("确认窗口已关闭")
