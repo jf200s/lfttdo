@@ -24,9 +24,6 @@ use tokio_util::sync::CancellationToken;
 const INTERRUPTED_NOTE: &str = "本轮被打断，工具未执行";
 const MODEL_FAILURE_NOTE: &str = "本轮在模型流中断处失败，工具未执行";
 
-/// 事件流里工具输出的预览上限（字符）。
-const PREVIEW_CHARS: usize = 200;
-
 /// 循环的护栏。`max_turns` 是防模型自我循环的保险丝（spec 4.6）：日常对话 1 轮收尾，
 /// 带工具的多为 2–5 轮，25 是上限而不是目标；触顶时发 `Done{MaxTurns}` 让 UI 明确提示，
 /// 而不是静默停止。
@@ -250,7 +247,7 @@ impl AgentSession {
                         (ToolOutput::text(format!("{who}：{reason}")), true)
                     }
                 };
-                let preview = preview_of(&output);
+                let preview = output.preview();
                 self.deps.sink.emit(AgentEvent::ToolResult {
                     call_id: id.clone(),
                     is_error,
@@ -303,31 +300,6 @@ impl AgentSession {
             tools: self.deps.registry.defs(),
             temperature: None,
         }
-    }
-}
-
-/// 只把前 `PREVIEW_CHARS` 个字符放进事件流：完整工具输出留在 history（那才是下一轮
-/// 模型的输入），否则一次大页面抓取会同时压垮 IPC 与前端渲染。
-/// 按**字符**切而不是按字节下标：这里的输入可能是中日韩文本，一个字符 3 字节，
-/// `&text[..200]` 会在非边界上 panic。
-fn preview_of(o: &ToolOutput) -> String {
-    match o {
-        ToolOutput::Text { text } => {
-            let mut s: String = text.chars().take(PREVIEW_CHARS).collect();
-            if text.chars().count() > PREVIEW_CHARS {
-                s.push('…');
-            }
-            s
-        }
-        // 图片不进事件流：前端要的是一张已经落盘的图的引用，而那是切片 2 的事，
-        // 这里先给一行可归因的占位描述，不把 base64 搬过 IPC 边界。
-        ToolOutput::Image { mime, .. } => format!(
-            "[图片 {}]",
-            match mime {
-                ImageMime::Png => "png",
-                ImageMime::Jpeg => "jpeg",
-            }
-        ),
     }
 }
 

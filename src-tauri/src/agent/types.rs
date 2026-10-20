@@ -41,7 +41,41 @@ impl ToolOutput {
     pub fn text(s: impl Into<String>) -> Self {
         Self::Text { text: s.into() }
     }
+
+    /// 工具输出面向**事件流**的预览。全仓库只此一份实现（R77）：
+    /// 直播路径 `agent/session.rs` 在工具执行后调它，重放路径 `store/db.rs` 把库里的
+    /// `ToolResult` 块换成事件时调同一个函数。spec:421 花那么大力气就是为了不出现两套
+    /// 渲染路径，而预览文本是最容易各写一遍、重开就变味的地方 —— Task 11 的草稿那份
+    /// 没有省略号、图片写成 Debug 的 `Png`，正是活例子。
+    ///
+    /// 只交出前 [`PREVIEW_CHARS`] 个字符：完整输出留在 history（那才是下一轮模型的输入），
+    /// 否则一次大页面抓取会同时压垮 IPC 与前端渲染。按**字符**切而不是字节下标：
+    /// 中日韩一个字符 3 字节，`&text[..200]` 会在非边界 panic。
+    pub fn preview(&self) -> String {
+        match self {
+            ToolOutput::Text { text } => {
+                let mut s: String = text.chars().take(PREVIEW_CHARS).collect();
+                if text.chars().count() > PREVIEW_CHARS {
+                    s.push('…');
+                }
+                s
+            }
+            // 图片不进事件流：前端要的是一张已经落盘的图的引用，而那是切片 2 的事，
+            // 这里先给一行可归因的占位描述，不把 base64 搬过 IPC 边界。
+            // mime 用小写线上名（与 `ImageMime` 的 serde 表示一致），不是 Debug 的 `Png`。
+            ToolOutput::Image { mime, .. } => format!(
+                "[图片 {}]",
+                match mime {
+                    ImageMime::Png => "png",
+                    ImageMime::Jpeg => "jpeg",
+                }
+            ),
+        }
+    }
 }
+
+/// 事件流里工具输出的预览上限（字符）。见 [`ToolOutput::preview`]。
+const PREVIEW_CHARS: usize = 200;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "lowercase")]

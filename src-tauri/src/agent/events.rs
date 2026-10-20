@@ -23,6 +23,13 @@ pub enum AgentEvent {
     TextDelta {
         text: String,
     },
+    /// 用户说的话（R68，Task 11 新增）。**只有重放路径会发这一支**：live 时这句话由前端
+    /// 乐观插入（plan:4335），事件流里从来没有它。少了这一支，重开会话后用户的话只能
+    /// 塞进 `text_delta` ⇒ 落进助手气泡，而 spec:421 要的正是一条能重建「这句话是谁说的」
+    /// 的重放流。交接 T14：TS 联合类型与 reducer 都要有 `user_message` 分支。
+    UserMessage {
+        blocks: Vec<ContentBlock>,
+    },
     /// 不变量：`risk` 必须等于 `call.risk`，两者来自注册表的一次查表 —— 请用 `AgentEvent::tool_call` 构造。
     ToolCall {
         call: ToolCallView,
@@ -251,7 +258,7 @@ mod tests {
         );
     }
 
-    /// 钉住全部 10 个事件的 `t` 标签：本任务的交付物就是线上格式，不能只测两个变体。
+    /// 钉住全部 11 个事件的 `t` 标签：本任务的交付物就是线上格式，不能只测两个变体。
     #[test]
     fn every_agent_event_variant_serializes_its_t_tag() {
         let call = ToolCallView {
@@ -265,6 +272,7 @@ mod tests {
             AgentEvent::TextDelta {
                 text: String::new(),
             },
+            AgentEvent::UserMessage { blocks: vec![] },
             AgentEvent::tool_call(call.clone()),
             AgentEvent::permission_request("p1".into(), call.clone()),
             AgentEvent::PermissionResolved {
@@ -297,6 +305,7 @@ mod tests {
         let tags = [
             "turn_start",
             "text_delta",
+            "user_message",
             "tool_call",
             "permission_request",
             "permission_resolved",
@@ -308,8 +317,8 @@ mod tests {
         ];
         assert_eq!(
             (events.len(), tags.len()),
-            (10, 10),
-            "AgentEvent 有 10 个变体，标签表必须一一对应；新增事件要同步补进这张表"
+            (11, 11),
+            "AgentEvent 有 11 个变体，标签表必须一一对应；新增事件要同步补进这张表"
         );
         for (e, tag) in events.iter().zip(tags) {
             let v = serde_json::to_value(e).unwrap();

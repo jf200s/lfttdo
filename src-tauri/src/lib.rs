@@ -2,6 +2,7 @@
 pub mod agent;
 pub mod model;
 pub mod permission;
+pub mod store;
 pub mod tools;
 
 #[tauri::command]
