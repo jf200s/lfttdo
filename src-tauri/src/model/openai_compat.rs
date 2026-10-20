@@ -202,7 +202,7 @@ impl OpenAiCompat {
                     require_slots(m, &["Text"])?;
                     out.push(ChatCompletionRequestMessage::System(
                         ChatCompletionRequestSystemMessageArgs::default()
-                            .content(text_of(m))
+                            .content(m.text_of())
                             .build()
                             .map_err(request_build_err)?,
                     ));
@@ -309,7 +309,7 @@ fn to_api_tool(t: &ToolDef) -> ChatCompletionTools {
 /// 协议要 `arguments` 是**字符串**，所以这里对 `Value` 做 `serde_json::to_string`。
 /// 只有 tool_calls、没有文本时不设 content（协议规定 content 在 tool_calls 存在时可省）。
 fn assistant_msg(m: &Message) -> Result<ChatCompletionRequestAssistantMessage, ModelError> {
-    let text = text_of(m);
+    let text = m.text_of();
     let mut tool_calls: Vec<ChatCompletionMessageToolCalls> = Vec::new();
     for (id, name, input) in m.tool_calls() {
         let arguments = serde_json::to_string(&input).map_err(|e| {
@@ -408,22 +408,6 @@ fn require_slots(m: &Message, allowed: &[&str]) -> Result<(), ModelError> {
         }
     }
     Ok(())
-}
-
-/// 只拼接 `Text` 块，其余块返回空串——这是**约定**而不是能力：调用方（`to_api` 的
-/// system/assistant 两臂）已经用 `require_slots` 保证传进来的消息只有文本，
-/// 所以这里不可能再出现「一条 system 因为只有一个 Image 而序列化成 `"content": ""`」
-/// 的静默降级（folded item 1）。Task 10 若绕过 `to_api` 直接调 `text_of`，
-/// 请连同守卫一起调。
-fn text_of(m: &Message) -> String {
-    m.blocks
-        .iter()
-        .map(|b| match b {
-            ContentBlock::Text { text } => text.clone(),
-            _ => String::new(),
-        })
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 /// 请求**还没出门**就失败的分支（derive_builder 的 `build()`、arguments 序列化、
@@ -564,7 +548,8 @@ mod tests {
     // `use super::*` 已经带进 ChatRequest / ModelError / ModelProvider / ToolDef /
     // OpenAIError / CreateChatCompletionStreamResponse / futures::StreamExt /
     // Message / ContentBlock / Role / ToolOutput / normalize_base_url /
-    // classify_openai_error / require_slots / text_of；这里只补 `super` 没有引到的名字。
+    // classify_openai_error / require_slots；这里只补 `super` 没有引到的名字。
+    // （取文本不在此列：`text_of` 自 R40 起是 `agent::types::Message` 的方法，写作 `m.text_of()`。）
     use super::*;
     use async_openai::error::{ApiError, ApiErrorResponse, StreamError};
     // `json!` 是宏，父模块没有 `use serde_json::json`，所以必须自己引。
@@ -1163,7 +1148,7 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(text_of(&ok), "你是助手");
+        assert_eq!(ok.text_of(), "你是助手");
         let v = serde_json::to_value(OpenAiCompat::to_api(&[ok]).unwrap()).unwrap();
         assert_eq!(v[0]["content"], json!("你是助手"));
     }

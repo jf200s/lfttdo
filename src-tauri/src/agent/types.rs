@@ -98,6 +98,24 @@ impl Message {
             })
             .collect()
     }
+    /// 只拼接 `Text` 块，其余块返回空串——这是**约定**而不是能力：唯一的调用方
+    /// `model::openai_compat::to_api` 在 system/assistant 两臂先用 `require_slots`
+    /// 保证传进来的消息只有文本，所以这里不可能出现「一条 system 因为只有一个 Image
+    /// 而序列化成 `"content": ""`」的静默降级（folded item 1）。
+    /// 绕过 `to_api` 直接调本方法拼请求时，请连同守卫一起调。
+    /// （R40：这段约定原先只写在 `openai_compat.rs` 私有 `text_of` 头上，而
+    /// `context.rs` 里有一份逐字相同的副本没这句话；实现现在只有这一处，
+    /// 它描述的是一个 `Message`，所以住在这里。）
+    pub fn text_of(&self) -> String {
+        self.blocks
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Text { text } => text.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
 }
 
 /// 从 ContentBlock::ToolCall 派生的视图。risk 由 registry 补全，不来自消息本身。
@@ -175,5 +193,44 @@ mod tests {
                 json!({"path": "a.txt"})
             )]
         );
+    }
+
+    /// R40：`text_of` 是**唯一**的取文本实现（`context.rs` 与 `openai_compat.rs` 各自
+    /// 的副本已删除）。这里钉住它约定好的两点：只收 `Text`（其余块贡献空串，
+    /// `require_slots` 靠这一点），以及多块之间**无分隔**拼接（协议 content 是单串）。
+    #[test]
+    fn text_of_joins_only_the_text_blocks_without_a_separator() {
+        let m = Message {
+            role: Role::Assistant,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "你是".into(),
+                },
+                ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: "fs.read".into(),
+                    input: json!({}),
+                },
+                ContentBlock::Image {
+                    data: "iVBOR".into(),
+                    mime: ImageMime::Png,
+                },
+                ContentBlock::ToolResult {
+                    call_id: "c1".into(),
+                    is_error: false,
+                    output: ToolOutput::text("不该出现"),
+                },
+                ContentBlock::Text {
+                    text: "助手".into(),
+                },
+            ],
+        };
+        assert_eq!(m.text_of(), "你是助手");
+        // 非文本消息返回空串（调用方的守卫负责拒绝，而不是在这里发明兜底）。
+        assert_eq!(
+            Message::tool("c1", ToolOutput::text("只有结果"), false).text_of(),
+            ""
+        );
+        assert_eq!(Message::system_note("").text_of(), "");
     }
 }

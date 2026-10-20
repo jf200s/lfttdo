@@ -81,7 +81,7 @@ impl ContextBuilder {
         let notes: Vec<Message> = history
             .iter()
             .filter(|m| m.role == Role::System)
-            .filter(|m| text_of(m) != SYSTEM_PROMPT)
+            .filter(|m| m.text_of() != SYSTEM_PROMPT)
             .cloned()
             .collect();
 
@@ -185,17 +185,6 @@ fn has_tool_result(m: &Message) -> bool {
     m.blocks
         .iter()
         .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-}
-
-pub fn text_of(m: &Message) -> String {
-    m.blocks
-        .iter()
-        .map(|b| match b {
-            ContentBlock::Text { text } => text.clone(),
-            _ => String::new(),
-        })
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 // 覆盖 spec :503 交给本片的「预算计算」与「丢弃兜底不报错」两条；
@@ -326,7 +315,7 @@ mod tests {
         let hist: Vec<Message> = (0..200).map(|i| u(&format!("轮 {i}"))).collect();
         let built = ContextBuilder::new(ContextConfig::default()).build(&hist);
         assert_eq!(built.messages[0].role, Role::System);
-        assert_eq!(text_of(&built.messages[0]), SYSTEM_PROMPT);
+        assert_eq!(built.messages[0].text_of(), SYSTEM_PROMPT);
     }
 
     #[test]
@@ -339,7 +328,7 @@ mod tests {
         );
         assert!(built.dropped > 0);
         let last = built.messages.last().unwrap();
-        assert!(text_of(last).contains("轮 199"));
+        assert!(last.text_of().contains("轮 199"));
     }
 
     #[test]
@@ -497,7 +486,7 @@ mod tests {
             built.messages.len(),
             2 + ContextConfig::default().window_messages
         );
-        assert_eq!(text_of(&built.messages[1]), "早期对话摘要：前三轮聊了天气");
+        assert_eq!(built.messages[1].text_of(), "早期对话摘要：前三轮聊了天气");
         assert_eq!(
             built.dropped,
             200 - ContextConfig::default().window_messages
@@ -512,7 +501,7 @@ mod tests {
             built
                 .messages
                 .iter()
-                .filter(|m| text_of(m) == SYSTEM_PROMPT)
+                .filter(|m| m.text_of() == SYSTEM_PROMPT)
                 .count(),
             1
         );
