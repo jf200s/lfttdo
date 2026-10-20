@@ -413,29 +413,40 @@ PROBE_BYTES=524288（附加轮：ArrayBuffer 形态与三张并发就在这一�
 
 探针：`src-tauri/examples/mcp_probe.rs`（`cargo build --example mcp_probe` 通过、零 warning；`cargo run --example mcp_probe` 实测可完成真实握手）。它是纯 `examples/` 探针，未 `mod` 进 `src/`，不含 `use tauri`，对 `qwen-do` 应用二进制不可达。
 
-**一句话结论：rmcp 3.5.1 能在 Windows 上作为 MCP client 拉起并跑通 `npx` stdio 服务器（实测 `tools=16`），但只有 B（`cmd /C npx`）和 C（spawn 绝对路径 `npx.cmd`）两种策略可用——直接 `Command::new("npx")` 会以 `NotFound` 失败。子进程不泄漏，但泄漏判定依赖于「服务器主动响应 stdin EOF」这一前提，因此 Plan B 必须自带进程树 kill。**
+**一句话结论：rmcp 3.5.1 能在 Windows 上作为 MCP client 拉起并跑通 `npx` stdio 服务器（实测 `tools=16`），但只有 B（`cmd /C npx`）和 C（spawn 绝对路径 `npx.cmd`）两种策略可用——直接 `Command::new("npx")` 会以 `NotFound` 失败；注意 B 与 C 的直接子进程都是 `cmd.exe` 宿主，C 并不免掉 `cmd.exe`（见下「Q3」选型条）。子进程不泄漏，但泄漏判定依赖于「服务器主动响应 stdin EOF」这一前提，因此 Plan B 必须自带进程树清理——首选 Windows JobObject，事后 `taskkill /T /F` 是次选且实测不保证杀干净（见下「Q4」）。**
 
-### 关于本轮运行环境的诚实说明（复跑者必读）
+### 关于本轮取依赖方式的诚实说明（复跑者必读）
 
-本机 `static.crates.io`（cargo 下载 `.crate` 的域名）与 `github.com` 均**连不上**（`curl` 报 `Failed to connect ... port 443`，非限速、是 TCP 层失败）；但 `index.crates.io`、`registry.npmjs.org`、`rsproxy.cn`、`docs.rs` 都通。`cargo add` 只做索引解析所以能成功，`cargo fetch`/`cargo build` 因要下载 `.crate` 而失败。本轮为读源码与编译，临时把 crates-io 换源到 rsproxy 镜像，**用的是每次调用带 `--config` 覆盖、不落任何文件、不进仓库**：
+**先说结论：换源不是这台机器的必需，后续任务可以直接用 crates.io 默认源。** 本轮实现时为编译与读源码，临时把 crates-io 换源到 rsproxy 镜像，**用的是每次调用带 `--config` 覆盖、不落任何文件、不进仓库**（仓库里没有 `.cargo/config.toml`，也没有任何镜像配置被跟踪）。这段历史只影响两件事：下文 file:line 的**目录前缀**，以及别把它误读成“本机连不上 crates.io”。
+
+下面这段**只是**复现“镜像路径前缀”时才需要，正常复跑不必带：
 
 ```bash
-# 每次 cargo 都带这两行覆盖；不创建 .cargo/config.toml，不改任何被跟踪文件
+# 可选：仅当你要复现 rsproxy 解包目录前缀时才用；不创建 .cargo/config.toml，不改任何被跟踪文件
 cargo <cmd> \
   --config 'source.crates-io.replace-with="rsproxy-sparse"' \
   --config 'source.rsproxy-sparse.registry="sparse+https://rsproxy.cn/index/"'
 ```
 
-副作用：经镜像下载的 crate 解到 `$HOME/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/`（镜像源的哈希目录名），**不是** `index.crates.io-1949cf8c6b5b557f`。下文所有 file:line 的绝对前缀即此目录（字节内容与 crates.io 官方一致，校验和相同）。npm 侧无需换源：`npx -y @modelcontextprotocol/server-everything` 正常下载并启动（见握手原文）。
+**撤回原表述**：本节此前断言本机 `static.crates.io` 与 `github.com` 在 TCP 层“连不上”（并据此解释“`cargo add` 只解析索引所以能过、`cargo fetch/build` 因下载 `.crate` 而必须换源”）。该断言站不住，理由三条：①实现者报告只留下摘要式取证（记为 `HTTP=000（超时）`），**没有 `curl` 原文**，而 `HTTP=000` 是“请求未完成”的笼统码，区分不了 DNS、代理、瞬时超时与真封锁；②报告与本节此前同时又记录 `index.crates.io` 可达（Tasks 1–3 的源码就解在它的命名空间下，见下段），这与“crates.io 域名被封锁”自相矛盾；③本轮之后，复核方（controller）在同一台机器、不做任何换源的前提下实测：
+
+```
+$ curl -sS -o /dev/null -w '%{http_code} %{time_total}s\n' https://static.crates.io/crates/rmcp/rmcp-3.5.1.crate
+200 0.34s
+```
+
+即默认源当前可达，`cargo fetch/build` 不需要镜像。当时的失败要么是**瞬时网络状况**，要么是**换源配置自身的副作用**，现有材料不足以区分两者，因此此处**不臆断原因**，只撤回“本机会封锁这两个域名”这一说法——后续任务请直接用 crates.io。
+
+唯一的持久副作用是路径前缀：经镜像下载的 crate 解到 `$HOME/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/`（镜像源的哈希目录名），`rmcp-3.5.1` 当前就解在这个命名空间下（同一 `src/` 目录里还并存 Tasks 1–3 用过的 `index.crates.io-1949cf8c6b5b557f`）。**下文所有 file:line 的绝对前缀即 rsproxy 那个目录**；若改用默认源重下，字节内容与校验和一致，但同样的 file:line 前缀会变成 `index.crates.io-1949cf8c6b5b557f`。npm 侧无需换源：`npx -y @modelcontextprotocol/server-everything` 正常下载并启动（见握手原文）。
 
 ### 必答四问
 
 | # | 问题 | 结论（均实测） |
 | --- | --- | --- |
-| 1 | rmcp 实际 feature 名 | brief 的 `client,transport-io,jsonrpce-types` 里 **`jsonrpce-types` 是无效名**（cargo 直接拒绝）；客户端跑 npx stdio 的**正确三件套 = `client` + `transport-io` + `transport-child-process`**（缺 `transport-child-process` 就没有 `TokioChildProcess`）。详见下「Q1」。 |
+| 1 | rmcp 实际 feature 名 | brief 的 `client,transport-io,jsonrpce-types` 里 **`jsonrpce-types` 是无效名**（cargo 直接拒绝）；客户端 spawn 子进程跑 npx stdio 的**必需对 = `client` + `transport-child-process`**（缺 `transport-child-process` 就没有 `TokioChildProcess`）。`transport-io` 是 **server 侧** stdio，客户端不需要它，本项目只是**故意保留**（Plan B 可能的进程内 server 路径）。详见下「Q1」。 |
 | 2 | client 与 stdio 的真实 import 路径与构造代码 | client 侧 stdio 传输是 **`rmcp::transport::TokioChildProcess`**（不是 `io::stdio`——那是 server 侧）；用 `().serve(TokioChildProcess::new(cmd)?)` 完成 initialize，`client.peer().list_tools(..)` 取工具。逐条 file:line + 可编译代码见下「Q2」。 |
-| 3 | spawn 方式 A\|B\|C 哪个可用 | **A（`Command::new("npx")`）不可用**：`NotFound … program not found`。**B（`cmd /C npx`）与 C（spawn 绝对 `npx.cmd`）都可用**，且各自都真跑通了一次握手（`tools=16`）。原始输出见下「Q3」。 |
-| 4 | 子进程清理结论 | 4 次运行退出后 `tasklist \| grep node.exe` 均 **0 残留**；但**清理成立的原因是 rmcp 关闭了子进程 stdin、server-everything 收到 EOF 自行退出**，而 rmcp 自己的 `kill()` **只杀直接子进程**（且 B/C 的真服务器是**孙进程**）。→ **Plan B 的 `McpBridge::shutdown()` 必须显式 kill 整棵进程树（`taskkill /T /F /PID`，或给子进程套 Windows JobObject）**。证据与推理见下「Q4」。 |
+| 3 | spawn 方式 A\|B\|C 哪个可用 | **A（`Command::new("npx")`）不可用**：`NotFound … program not found`。**B（`cmd /C npx`）与 C（spawn 绝对 `npx.cmd`）都可用**，且各自都真跑通了一次握手（`tools=16`）。**但 B 与 C 的直接子进程都是 `cmd.exe` 宿主**（Windows `CreateProcess` 会为 `.cmd` 自动起 `cmd.exe` 解释），C 并不免掉 `cmd.exe` 解析，见下「Q4」树深。原始输出见下「Q3」。 |
+| 4 | 子进程清理结论 | 4 次运行退出后 `tasklist \| grep node.exe` 均 **0 残留**；但**清理成立的原因是 rmcp 关闭了子进程 stdin、server-everything 收到 EOF 自行退出**，而 rmcp 自己的 `kill()` **只杀直接子进程**（且 B/C 的真服务器是**孙进程**）。→ **Plan B 的 `McpBridge::shutdown()` 必须自己收整棵树：首选起子进程时套 Windows JobObject（随父级联终止；此路径本轮未实测，属源码判读）；事后 `taskkill /T /F /PID` 是次选、与首选不等价且不保证成功**（run4 对 B 的 3 个 PID 只成功 1 个）。证据与推理见下「Q4」。 |
 
 ### Q1：真实 feature 名
 
@@ -454,15 +465,15 @@ enabled features:
     base64, client, macros, schemars, server, transport-async-rw, transport-io uuid
 ```
 
-即三个猜测名里 **2 个有效（`client`、`transport-io`）、1 个无效（`jsonrpce-types`）**。`client` 与 `transport-io` 都不是默认 feature（默认只有 `base64, macros, server`，见 `rmcp-3.5.1/Cargo.toml:88-92`），必须显式开。
+即三个猜测名里 **2 个是合法 feature 名（`client`、`transport-io`）、1 个无效（`jsonrpce-types`）**。`client` 与 `transport-io` 都不是默认 feature（默认只有 `base64, macros, server`，见 `rmcp-3.5.1/Cargo.toml:88-92`），要开得显式；但**“合法且需显式开”不等于“客户端必需”**——客户端真正依赖的只有下段的 `client` + `transport-child-process` 这一对，`transport-io` 不在其中。
 
-**关键补充（brief 没写、但不加就编不出客户端）**：`transport-io` 只提供 server 侧的 `stdio()`；**client 侧 spawn 子进程要的是 `transport-child-process`**（`Cargo.toml:141-145` = `["transport-async-rw", "tokio/process", "dep:process-wrap"]`，其门控的 `pub use child_process::TokioChildProcess` 见 `src/transport.rs:84-89`）。本项目最终锁定：
+**关键补充（brief 没写、但不加就编不出客户端）**：**客户端 spawn 子进程所需的 feature 对只有两个——`client` + `transport-child-process`**。`transport-io` 提供的是 **server 侧**的 `stdio()`（把服务进程**自己**的 stdin/stdout 当传输），客户端握手用不到它；`transport-child-process` 才是 client 侧那半（`Cargo.toml:141-145` = `["transport-async-rw", "tokio/process", "dep:process-wrap"]`，其门控的 `pub use child_process::TokioChildProcess` 见 `src/transport.rs:84-89`）。本项目最终锁定（`transport-io` 是被刻意保留的第三项，不是必需的，见下）：
 
 ```toml
 rmcp = { version = "3.5.1", features = ["client", "transport-io", "transport-child-process"] }
 ```
 
-`transport-io` 保留着（`io::stdio` 供 Plan B 里可能的“把本进程当 server”路径），但握手实测只用到 `transport-child-process`。可选：`which-command`（`Cargo.toml:178-181`）会把 rmcp 自带的 `which_command()` 打开（见 Q2），Plan B 若想要它就一并加。新增锁定包（共 7 条 `[[package]]`）：`rmcp 3.5.1`、`rmcp-macros 3.5.1`、`process-wrap 10.0.1`、`pastey 0.2.3`、`schemars_derive 1.2.3`、`serde_derive_internals 0.30.0`、`nix 0.31.3`（后两者经 process-wrap/rmcp-macros 传入）。
+`transport-io` 是**刻意保留项而非必需项**：B、C 两轮握手的实际调用链里没有出现 `io::stdio`（全链路只走 `TokioChildProcess`），按上面的 feature 门控判据它属于 server 侧；留着只是给 Plan B 一条可能的“把本进程当 server”路径。注意本轮**没有实测过删掉 `transport-io` 后的编译结果**（`src-tauri/Cargo.toml` 三个都开着），所以 Plan B 若要删它，需要自己重编验证一次。可选：`which-command`（`Cargo.toml:178-181`）会把 rmcp 自带的 `which_command()` 打开（见 Q2），Plan B 若想要它就一并加。新增锁定包（共 7 条 `[[package]]`）：`rmcp 3.5.1`、`rmcp-macros 3.5.1`、`process-wrap 10.0.1`、`pastey 0.2.3`、`schemars_derive 1.2.3`、`serde_derive_internals 0.30.0`、`nix 0.31.3`（后两者经 process-wrap/rmcp-macros 传入）。
 
 ### Q2：client + stdio 的真实 import 路径与构造代码（逐条 file:line）
 
@@ -503,7 +514,7 @@ client.cancel().await?;                                              // 关 tran
 
 ### Q3：spawn 方式 A|B|C —— 每种各测各的，原始输出
 
-探针用 `tokio::process::Command`（**不是** `std::process::Command`）来跑 A/B/C，因为 rmcp 的 `TokioChildProcess::new` 收的就是 tokio 那种 Command；这样量到的不对称对 Plan B 直接可用。三者互不改写，A 的失败如实保留。Phase 1（纯可行性）原文（run4，UTF-8 行）：
+探针用 `tokio::process::Command`（**不是** `std::process::Command`）来跑 A/B/C，因为 rmcp 的 `TokioChildProcess::new` 收的就是 tokio 那种 Command；这样量到的不对称对 Plan B 直接可用。三者互不改写，A 的失败如实保留。Phase 1（纯可行性）原文（run4，UTF-8 行；此处只截可行性行，run4 每条 `taskkill` 的清理结果**含一次部分失败**，逐字见下「Q4」）：
 
 ```
 A direct npx       -> ERR kind=NotFound os=None program not found
@@ -514,7 +525,7 @@ C spawn(abs path)  -> ok pid=Some(9372)
 ```
 
 - **A**：`NotFound / program not found`（`raw_os_error()` 这里为 `None`，因为 tokio/std 在“程序名找不到”时不回填 `CreateProcess` 的 OS 码）。这正是 Windows 的不对称：`npx` 在 shell 里能跑，但 `CreateProcess` 只补 `.exe`、不解析 `npx.cmd`，所以 `Command::new("npx")` 找不到——`where npx` 给出的恰恰是 `npx`/`npx.cmd`，`npx.exe` 根本不存在。
-- **C 的解析**：优先取 `where npx` 里带 `.cmd` 的那条（`C:\Program Files\nodejs\npx.cmd`），spawn 绝对路径成功。**给绝对路径且带 `.cmd` 时能起来**（A 失败纯粹因为没扩展名/没绝对路径，不是因为 `.cmd` 本身不可 exec）。
+- **C 的解析**：优先取 `where npx` 里带 `.cmd` 的那条（`C:\Program Files\nodejs\npx.cmd`），spawn 绝对路径成功。**给绝对路径且带 `.cmd` 时能起来**（A 失败纯粹因为没扩展名/没绝对路径，不是因为 `.cmd` 本身不可 exec）。注意“能起来”≠“不经 `cmd.exe`”：被 spawn 的是 `.cmd`，Windows 仍会起一个 `cmd.exe` 宿主来解释它，见下「Q4」树深。
 - B/C 均 `ok pid=Some(..)`。
 
 Phase 2 真实握手——B 与 C 各自都独立跑通一次（用 `MCP_PROBE_ORDER` 把 C 提前，避免被 B 短路）。B 轮（run2）原文：
@@ -540,10 +551,10 @@ HANDSHAKE_WINNER=Some("C-resolved") WINNER_CHILD_PID=Some(14612)
 
 **判据达成：`tools=16`（N>0），且 initialize 确实发生**（`Starting default (STDIO) server...` 是 server-everything 自己的 stderr，说明握手过、进了服务态）。A 在 Phase 2 依旧 `NotFound`（rmcp 内部同样无法 spawn 裸 `npx`）。
 
-- **对 Plan B 的选型**：**优先 C**（绝对路径 `npx.cmd`，直接子进程链最短、语义最干净），或开启 rmcp 的 `which-command` 用官方 `which_command("npx")`（同 C 思路）。**B（`cmd /C`）能用但多套一层 `cmd.exe`**，见 Q3 安全条与 Q4 树深。**A 一律不可用**，Plan B 里不要写 `Command::new("npx")`。
+- **对 Plan B 的选型**：**仍然优先 C**（绝对路径 `npx.cmd`，或开 rmcp 的 `which-command` 用官方 `which_command("npx")`——它尊重 PATHEXT，该目录里 `.com/.exe/.bat` 都不存在，解析出的应当同样是 `npx.cmd`，即与 C 同形；本轮没启用该 feature，这一句是源码判读而非实测），但**选型理由必须写对：不是“C 不经 `cmd.exe`”、也不是“C 的链最短”**。见下「Q4」的 PID 树原文：C 的直接子进程（run4 的 `9372`）与 B 的直接子进程（`11344`）**同为 3 层树、同为 `cmd.exe` 宿主**——Windows `CreateProcess` 遇到 `.cmd` 会另起一个 `cmd.exe` 来解释它，**C 的参数照样过 `cmd.exe` 解析**。C 相对 B 的真实优势只有一个：argv 由 `.arg()` 逐段传下去，**整条命令行不是我们手搓拼接的**，少一层我们自己引入的引号/转义错误；这是“少一个我们造的坑”，**不是免疫**。要**真正**绕开 `cmd.exe`，只有换成不解释命令行的宿主：spawn 一个真实 `.exe`。本轮 `npx` 自己没有 `.exe` 形态（`where npx` 只给出无扩展名的 `C:\Program Files\nodejs\npx` 与 `npx.cmd`，本轮解析并 spawn 的是后者；前者未单独取证，故不能断言它能被 `CreateProcess` 起来）。理论上 cmd.exe-free 的形态是直接 spawn `node.exe` 并把脚本路径作为 `.arg()` 传进去，**本轮未实测**。另一条路不是“绕开”而是“承认 `cmd.exe` 在场并把整棵树管起来”——给子进程套 JobObject（见下「Q4」清理结论），它改变的是终止语义，**不改变注入面**，所以校验仍然照做。**B 依旧可用**（也跑通 `tools=16`），只是在“参数来自用户配置”这条路径上比 C 多一层我们自己的字符串拼接风险，故 C 优先。**A 一律不可用**，Plan B 里不要写 `Command::new("npx")`。
 - **`-y` 是必须的**：不带它 `npx` 会在 stdin 上弹“要装吗?”的交互确认，而 stdio 传输里那个 stdin 归 MCP 服务器用，探针/桥接会直接卡死。
 
-> **安全（强制，无论哪种策略胜出都写死）**：既然 **A 不可用、只有 B/C 可用**，而 B 的形态是 `cmd /C npx <用户提供的参数…>`——**Plan B 绝不能把用户提供的 MCP 配置字符串（命令、参数、URL、env）不加校验地拼进 `cmd /C`**。`cmd /C` 会把整条命令行交给 `cmd.exe` 二次解析，`&`、`|`、`>`、`^`、引号错配等都会变成命令注入面。落地要求：①优先用 C（`Command::new(绝对 npx.cmd)` + `.arg()` 逐个传参，不经 `cmd.exe`）；②若必须用 B，参数只能是白名单化的 argv 片段、显式转义，且服务器可执行文件名/路径不接受自由文本。这条是 `cmd /C` 路线固有代价，Plan B 必须显式处理，不能默认“字符串拼上去没事儿”。
+> **安全（强制，无论哪种策略胜出都写死）**：**A 不可用、只有 B/C 可用，而 B 与 C 的直接子进程都是 `cmd.exe`**（B 是我们显式 `cmd /C`；C 是 `CreateProcess` 为 `.cmd` 自动起的 `cmd.exe`，见下「Q4」树深原文）。所以 `cmd.exe` 的二次解析面**同时存在于 B 和 C**，`&`、`|`、`>`、`^`、引号错配等都是命令注入面。两条红线：**①绝不可把用户提供的字符串拼进 `cmd /C` 而不校验**——用户提供的 MCP 配置里的命令、参数、URL、env 一律算不可信输入；**②C 不是豁免**：`.arg()` 逐段传参只是让我们不必自己造引号层，参数进入 `cmd.exe` 后仍会被二次解析，因此**B 和 C 都必须对用户配置来的 argv 做白名单化 + 显式校验/转义**，服务器可执行文件名与路径不接受自由文本。要彻底关掉这个面，只能换成不解释命令行的宿主（见上条选型：真实 `.exe`；**JobObject 只解决终止语义、不解决注入面**，套了它校验一样要做）。Plan B 既不能默认“字符串拼上去没事儿”，也不能默认“用了 C 就安全”。
 
 ### Q4：子进程清理 —— 无泄漏，但机制是「关 stdin 让服务器自杀」，不是「杀了树」
 
@@ -564,30 +575,53 @@ $ tasklist //FO CSV //NH | grep -icE "node.exe"
 0
 ```
 
-区分“我起的 vs 用户别的 app 起的”：基线就是 0，所以探针跑完后任何 node.exe 都只可能是探针的子进程；探针又自报了 `WINNER_CHILD_PID`（B 12928 / C 14612）。四轮里赢家 pid 与全部 Phase 1 spawn 的 pid 在 `tasklist` 中都已消失，无孤儿 node。Phase 1 起的进程由探针自己 `taskkill /T /F` 清（见下证据），Phase 2 赢家**只用 rmcp 的 `cancel()`、探针没替它 taskkill**——所以“无泄漏”是对 rmcp 原生清理的实测，不是探针代劳。
+区分“我起的 vs 用户别的 app 起的”：基线就是 0，所以探针跑完后任何 node.exe 都只可能是探针的子进程；探针又自报了 `WINNER_CHILD_PID`（B 12928 / C 14612）。四轮里赢家 pid 与全部 Phase 1 spawn 的 pid 在 `tasklist` 中都已消失。Phase 1 起的进程由探针自己 `taskkill /T /F` 清理（**其中 run4 的 B 那次是部分失败的**，见下证据 1），Phase 2 赢家**只用 rmcp 的 `cancel()`、探针没替它 taskkill**——所以“无泄漏”那部分是对 rmcp 原生清理的实测，不是探针代劳。
 
-**但“无泄漏”不等于“rmcp 会杀树”。两条硬证据说明清理靠的是关 stdin：**
+**但这次采样不能反过来证明每次 kill 都成功**。run4 对 B 的直接子进程 `11344` 只成功终止了根本身，两个后代 `14324`/`25772` 报“此任务不支持”；而 `tasklist` 快照是在**整个探针进程退出之后**（其间还跑了数秒的 Phase 2）采的，因此它既说明不了这两个 PID 当时是不是 node（`taskkill` 转写只给 PID、不给镜像名；按树形推断它们应为 node，但那是推断，本轮没有对这两个 PID 单独取证），也说明不了它们何时消失。所以“无泄漏”必须按字面读：**探针退出后的那次快照里没有 node.exe / npx**，而不是“每一次清理都成功”。这一条与下方证据 1 合起来，正是 Plan B 不能把“事后 taskkill”当可靠兜底的原因。
 
-1. **B/C 的真服务器是孙进程，rmcp 的 kill 够不到。** Phase 1 对 B 直接子进程做 `taskkill /T /F /PID`，它一次性要杀 **3 层**（GBK 控制台中文乱码，逐条还原为“成功: 已终止 PID X（属于 PID Y 子进程）的进程”；PID 关系保留原样）：
+**但“无泄漏”不等于“rmcp 会杀树”。两条硬证据说明清理靠的是关 stdin；证据 1 里还夹着一条独立结论——连事后的 `taskkill` 本身都不保证杀干净。**
+
+1. **B/C 的真服务器是孙进程，rmcp 的 kill 够不到；而 `taskkill /T /F` 对同一形态的树并不总成功。** Phase 1 对 B 的直接子进程做 `taskkill /T /F /PID`，它一次性要杀 **3 层**（GBK 控制台中文乱码，逐条还原为“成功: 已终止 PID X（属于 PID Y 子进程）的进程”；PID 关系保留原样）。run1 那次三层全成功：
 
 ```
 [phase1 cleanup] taskkill /T /F /PID 3252
-  已终止 PID 12012 (属于 PID 5264 子进程)   # 孙：node 跑 server-everything
-  已终止 PID  5264 (属于 PID 3252 子进程)   # 子：node 跑 npx-cli.js
-  已终止 PID  3252 (属于 PID 17524 子进程)   # 直接子：cmd.exe（B）/ npx.cmd host（C 同形，见 run4 的 9372→…）
+  成功: 已终止 PID 12012 (属于 PID 5264 子进程)的进程。   # 孙：node 跑 server-everything
+  成功: 已终止 PID  5264 (属于 PID 3252 子进程)的进程。   # 子：node 跑 npx-cli.js
+  成功: 已终止 PID  3252 (属于 PID 17524 子进程)的进程。  # 直接子：cmd.exe（B 显式；C 亦同形，见下方 run4 的 9372）
 ```
 
-   即 `cmd /C npx …` 展开成 `cmd.exe → node(npx-cli) → node(server)`。rmcp 的 `graceful_shutdown`/`Drop` 只 `inner.kill()` **直接子进程**（`child_process.rs:88`、`:51`），够不到孙。而实测赢家（直接子 = cmd.exe/npx.cmd host）**退出后 node 也没留**——唯一能解释的是：node 服务器是被 **stdin EOF** 逼退的，不是被 kill 的（kill 根本杀不到它）。
+   同一轮 run4 里，**同一命令对 B 的树只成功 1 个 PID、另外 2 个明确失败**（原文，含失败行；这份转写此前只在 gitignored 日志里，现随本结论一并入库）：
+
+```
+[phase1 cleanup] taskkill /T /F /PID 11344
+  成功: 已终止 PID 11344 (属于 PID 6772 子进程)的进程。          # 直接子（cmd.exe 宿主）被端掉
+  错误: 无法终止 PID 25772 (属于 PID 14324 子进程)的进程。
+  原因: 此任务不支持。
+  错误: 无法终止 PID 14324 (属于 PID 11344 子进程)的进程。
+  原因: 此任务不支持。
+```
+
+   同轮紧接着对 **C** 的绝对路径 `npx.cmd` 起的 `9372` 做同一命令，三层全成功——这份原文就是“C 与 B 同形”的直接证据：**C 的直接子进程 `9372` 和 B 的 `11344` 一样是 3 层树的根、一样是 `cmd.exe` 宿主**（`CreateProcess` 会为 `.cmd` 起 `cmd.exe` 解释），不存在“C 的链更短”：
+
+```
+[phase1 cleanup] taskkill /T /F /PID 9372
+  成功: 已终止 PID 21248 (属于 PID 21608 子进程)的进程。   # 孙
+  成功: 已终止 PID 21608 (属于 PID 9372 子进程)的进程。    # 子
+  成功: 已终止 PID  9372 (属于 PID 6772 子进程)的进程。    # 直接子：cmd.exe（为 npx.cmd 而起）
+```
+
+   **由此得出的两条**：① `cmd /C npx …` 与“绝对 `npx.cmd`”都展开成 `cmd.exe → node(npx-cli) → node(server)`，真服务器是孙进程，而 rmcp 的 `graceful_shutdown`/`Drop` 只 `inner.kill()` **直接子进程**（`child_process.rs:88`、`:51`），够不到孙。实测赢家（直接子 = `cmd.exe` 宿主）**退出后 node 也没留**——唯一能解释的是：node 服务器是被 **stdin EOF** 逼退的，不是被 kill 的（kill 根本杀不到它）。② **`taskkill /T /F /PID` 不能当作可靠兜底**：本轮 4 次运行共 8 次 phase1 清理里，可见 1 次（run4 的 B）只杀掉根、2 个后代返回“此任务不支持”，且 taskkill 仍照常打印成功行；其余次全成功的原文只留在 gitignored 日志中，本节把与结论直接相关的三次落进文档即为证。→ 用它就必须**逐条核对输出里的“成功/无法终止”计数（并检查退出码）、对失败重试**，否则等于默认清理成功。
 
 2. **rmcp 的 kill 不套 JobObject，只杀单进程。** `graceful_shutdown` 第一步是 `self.transport.close().await?`（`child_process.rs:83`）= 关掉 `AsyncRwTransport` 持有的子进程 stdin 写端 → 服务器读 stdin 见 EOF；`server-everything` 遵 EOF 自行退出，于是 `child.wait()` 正常返回，`MAX_WAIT_ON_DROP_SECS=3` 的 kill 兜底都没触发。process-wrap **有** Windows `JobObject`（会级联杀树）且是其默认 feature（`process-wrap-10.0.1/src/lib.rs:464`），但 **rmcp 全仓从不 `.wrap(JobObject)`**（`grep -rniE "JobObject|\.wrap\(" rmcp-3.5.1/src` 空），`Into<CommandWrap>` 走的是不加任何 wrapper 的裸转换，故 `kill()`（`process-wrap-10.0.1/src/tokio/core.rs:146`）= 对直接子进程的单 PID `TerminateProcess`。
 
 **给 Plan B 的清理结论（必须落地）：**
-- `McpBridge::shutdown()` **不能只依赖 rmcp 的 `cancel()`**。`cancel()` 只在“服务器自觉响应 stdin EOF”时才干净；一旦用户接的第三方 MCP server 不理会 stdin 关闭，rmcp 的 kill 只会干掉 `cmd.exe`/`npx.cmd` 宿主，**node 服务器作为孙进程会成孤儿泄漏**。
-- 兜底二选一：① 显式 `taskkill /T /F /PID <直接子进程 pid>`（探针 Phase 1 用的就是它，能连树端掉）；② 起子进程时给它套 Windows **JobObject**（process-wrap 的 `JobObject` wrapper，随父进程终止级联清理），比事后 taskkill 更稳。
+- `McpBridge::shutdown()` **不能只依赖 rmcp 的 `cancel()`**。`cancel()` 只在“服务器自觉响应 stdin EOF”时才干净；一旦用户接的第三方 MCP server 不理会 stdin 关闭，rmcp 的 kill 只会干掉 `cmd.exe` 宿主（B 与 C 都是 `cmd.exe`，见上「Q3」选型条），**node 服务器作为孙进程会成孤儿泄漏**。
+- **首选：起子进程时给它套 Windows JobObject**（process-wrap 的 `JobObject` wrapper，随父进程终止由内核级联清理；rmcp 自己从不 `.wrap(..)`，所以**需要 Plan B 在把 Command 交给 `Into<CommandWrap>` 之前自己包一层**）。诚实标注：**这条本轮没实测**（既无成功证据也无失败证据，纯源码判读，见上证据 2）；推荐它的理由是级联终止由内核保证，不依赖事后枚举 PID——而这正是 `taskkill` 的失败模式（下条）。
+- **次选（与首选不等价，不是“二选一都算兜底”）：事后 `taskkill /T /F /PID <直接子进程 pid>`**——实测**不保证端掉整棵树**（run4 的 B：3 个 PID 只成功 1 个，两个报“此任务不支持”）。若采用，必须解析 taskkill 输出/退出码并对失败重试或回落到 JobObject；**不得把“taskkill 返回了”当成“树已清”**。
 - 拿到 pid：`TokioChildProcess::id() -> Option<u32>`（`child_process.rs:71-74`）在 `serve()` **消费 transport 之前**取；或 `into_inner()`（`:109-112`）取回 `ChildWrapper` 自行管理。
 
 ### 对本任务的副作用（非 rmcp 结论，但影响后续）
 
 - `src-tauri/Cargo.toml` +rmcp 一条（见 Q1）；`Cargo.lock` +7 包。均为探针/ Plan B 所需，未动任何既有依赖版本。
 - 探针依赖本机 `C:\Program Files\nodejs\`（node v24.19.0 / npm 11.17.0）与可达的 npm registry；`server-everything` 首次经 `npx -y` 下载，之后走 npm 本地缓存，握手在毫秒级完成（run2 起 `Starting default (STDIO) server...` 几乎瞬时）。无任何 API key。
-- 运行环境换源细节见本节开头「诚实说明」；Plan B 正常联网（能连 `static.crates.io`）时**不需要** rsproxy 换源，那只是本轮该机器网络受限的临时手段。
+- 换源细节见本节开头「取依赖方式的诚实说明」：那是**本轮的一次性手段**，默认源（`static.crates.io`）当前实测可达（HTTP 200 / 0.34s），**Plan B 与 CI 都不需要 rsproxy 换源**；它唯一留下的影响是本节 file:line 引用的解包目录前缀。
