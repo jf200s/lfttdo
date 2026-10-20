@@ -21,6 +21,10 @@
 // 测试值（R80）。这里只走注入的 `Arc<CredentialStore>` + `build(..)`，
 // 生产实现持真实的 Windows store，测试持 `keyring_core::mock::Store` —— 全仓
 // `cargo test` 期间不创建也不修改任何真实凭据（R81 ③，cmdkey 前后各查一次为证）。
+// 唯一的例外是 `real_windows_store_round_trip_probe`：`#[ignore]` + 环境变量双闸门，只有人工
+// 两步跑它才动真实库。留这个例外是因为 brief Step 4 要求「亲眼看到 key 落进凭据管理器」，
+// 而「写路径真的写得进去」这件事在自动化测试里测不到（那条接缝的存在本就是为了绕开真实库）。
+// 2026-10-20 已实测一次：写入 → 另一个进程读回 → 删除，`cmdkey /list` 前后逐字节相同。
 
 use crate::agent::context::ContextConfig;
 use crate::model::openai_compat::{ModelConfig, normalize_base_url};
@@ -59,9 +63,13 @@ const BUDGET_HEADROOM: u32 = 1024;
 /// `reserve_output` 的上限（R97）：留出 `BUDGET_HEADROOM` 的空间，好让 normalize 的后置条件
 /// `budget_tokens > reserve_output` **无条件**成立。不夹这一道，`reserve_output = u32::MAX`
 /// 时 `saturating_add` 只能把预算也顶到 `u32::MAX`，两者相等，`context.rs:102` 的
-/// `saturating_sub` 照样把预算塌成 0 —— 那就是 :41-43 说这段钳位要防的事，
+/// `saturating_sub` 照样把预算塌成 0 —— 那就是 `BUDGET_HEADROOM` 的注释说这段钳位要防的事，
 /// 等于钳位函数在自己最难的那条边界上没兑现承诺。
 const MAX_RESERVE_OUTPUT: u32 = u32::MAX - BUDGET_HEADROOM;
+
+/// R97 的后置条件要同时喂两处：`clamp` 在 min > max 时会 panic，而 `reserve_output + headroom`
+/// 也只有在夹过之后才不溢出。两条都只靠两个 `const` 之间的算术，没人检查 —— 所以这里编译期就查。
+const _: () = assert!(MAX_RESERVE_OUTPUT >= 1);
 
 /// 设置与凭据的失败面（R82）。仓库约定是每模块一个枚举，不用 `Result<_, String>`：
 /// T13 要能区分「没有条目」（显示「未配置」）与「读不到」（显示原因），
@@ -75,8 +83,9 @@ pub enum SettingsError {
     #[error("设置文件读写失败: {0}")]
     Io(#[from] std::io::Error),
     /// 只出现在 `save` 的序列化失败上。`load` 解不开文件时**不**返回这一支，
-    /// 它备份原件后回落默认值（R84 与 :322 的说明才是权威）。解得开但不认识的字段走
-    /// `serde(default)`，同样不到这里（R91）。
+    /// 它备份原件后回落默认值（R84 与 `SettingsStore::load` 的文档才是权威 —— 本文件不写行号
+    /// 引用：1400 行的文件里行号一碰就烂，review N-4 实测这条已经错过一次）。
+    /// 解得开但不认识的字段走 `serde(default)`，同样不到这里（R91）。
     #[error("设置文件内容无法解析: {0}")]
     Json(#[from] serde_json::Error),
     /// 承载 `keyring_core::Error`（装箱后保留 `source()`，Display 原样带出上游文本，
@@ -113,6 +122,11 @@ impl std::fmt::Debug for SettingsError {
 /// 故 service/user 由实现内部固定，不暴露给调用方去拼。
 pub trait SecretStore: Send + Sync {
     /// 写入/覆盖条目。空串由 `SettingsStore` 先转成 `delete`，这里收到的必为非空。
+    ///
+    /// **这条接缝只服务「API key」这一种秘密**（N-5）：`SettingsStore` 在写入前 `trim`，
+    /// 读回来也 `trim`。Windows 的 generic credential 完全可以合法地存一段首尾带空白的秘密
+    /// （LM/NT 形态的 blob、以空格结尾的口令），那种秘密不许走这条接缝 —— 它会被每次保存
+    /// 悄悄改写。API key 不带空白，所以这里的取舍是安全的，但它是个**取舍**，不是免费午餐。
     fn set(&self, key: &str) -> Result<(), SettingsError>;
 
     /// 读出条目。`Ok(None)` 是「真没配过」，`Err` 是「读不到」—— 两者绝不能合并。
@@ -346,6 +360,11 @@ pub struct SettingsStore {
     /// ② 记下最近一次损坏回落留下的备份名，让 T13 有机会告诉用户「你的设置文件坏了、已备份为 X」，
     ///   而不是静默地看到一份默认值（R83 反对的正是这种静默）。
     /// 中毒不致命：这里没有跨调用的不变量，拿不到就 `into_inner`（同 `db.rs:100` 的处置）。
+    ///
+    /// **一个目录只许存在一个 `SettingsStore`**（N-3）：这把锁是**实例内**的，两个各自 `new` 在
+    /// 同一个目录上的实例会同时去写同一个固定名的 temp —— 审阅者实测 6 线程 × 8 次、两个实例，
+    /// 48 次 save 里 20~30 次报 `Io(os error 2)`，三次运行都能复现。
+    /// T13 必须用 `app.manage()` 装一个实例再到处共享，绝不许在每条命令里现构一个。
     state: Mutex<Shared>,
 }
 
@@ -415,12 +434,21 @@ impl SettingsStore {
             }
         };
         settings.normalize();
+        // N-2：**只有真的读通一份好文件才作废通知**。反过来说不能在这一支之外清它 ——
+        // 损坏回落刚刚把原件 `rename` 走了，紧接着的第二次 `load()` 命中的是 `NotFound`，
+        // 那是同一次事故的延续而不是新事故；在那里清空会让 T13 只要多读一次就永远看不到提示。
+        // `Err(Io)` 那一支同样不清：读都读不到，没有资格宣布问题已经过去了。
+        self.lock().corrupt_backup = None;
         Ok(settings)
     }
 
-    /// 取走「刚才那次 `load()` 把损坏文件备份成了什么」，取一次就清（R93）。
+    /// 取走「最近一次成功的 `load()` 是否发生了损坏回落」留下的备份路径，取一次就清（R93）。
     /// `T13` 需要在设置页第一屏告诉用户这件事；没有这个入口，损坏回落对外和「本来就没配置」
     /// 长得一模一样 —— 用户会以为设置被谁改了，而证据只躺在一条当前没有 subscriber 的 `warn!` 里。
+    ///
+    /// 生命周期（N-2）：这份通知描述的是**最近一次读盘的结果**。下一次 `load()` 如果读通了一份
+    /// 好文件，通知自动作废（文件已经修好了，继续报就是骗人）；如果那次是 `NotFound` 或 `Io` 错误，
+    /// 通知留着 —— 前者通常就是「坏文件刚被 rename 走」的同一现场。
     pub fn take_corrupt_backup(&self) -> Option<PathBuf> {
         self.lock().corrupt_backup.take()
     }
@@ -462,8 +490,13 @@ impl SettingsStore {
     }
 
     /// 明文 key。只给 T13 组装 `ModelConfig` 用，别存进任何结构体字段或日志（spec :473）。
+    ///
+    /// 读侧也 `trim`（N-5 的另一半）：`set_api_key` 写进去的已经是干净的，但库里那条可能是
+    /// **别的程序**、或 `ed0fc2e` 之前那次构建写的（那时还没有 trim）。那种条目会带着尾部
+    /// `\r\n` 一路走到 HTTP 头，换来一个 401，而设置页上掩码看着完全正常。
+    /// 读写两侧不对称才是问题，所以这一支也夹。
     pub fn api_key(&self) -> Result<Option<String>, SettingsError> {
-        self.secrets.get()
+        Ok(self.secrets.get()?.map(|k| k.trim().to_string()))
     }
 
     /// R83 覆盖 brief 的 `-> String`：`Ok(None)` 才是「未配置」，`Err` 是「读不到」，
@@ -812,14 +845,48 @@ mod tests {
             None,
             "同一次回落只许提示一次，否则每次重进设置页都会重复报错"
         );
-        // 坏→修好，不许把旧证据留着继续骗人：下一次正常 load 不该再报同一个备份。
-        std::fs::write(store.path(), "{ not json again").unwrap();
-        std::fs::remove_file(store.path()).unwrap();
+    }
+
+    #[test]
+    fn a_healthy_load_expires_the_pending_corrupt_notice() {
+        // N-2 的现场：通知**立着没人取**，然后用户把文件修好了。
+        // 这时候再把它报出去，就是指着一个月前的备份说「你的设置坏了」。
+        // （修复轮第一版把这段写成「再写坏、再删掉、再 load」，测的其实是 NotFound 分支，
+        //   和它自己注释承诺的「坏→修好」不是一件事 —— review N-2 实测戳穿的正是那个。）
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        std::fs::write(store.path(), "{ not json").unwrap();
         assert_eq!(store.load().unwrap(), Settings::default());
+        std::fs::write(store.path(), r#"{"model":"qwen-max"}"#).unwrap();
+        assert_eq!(
+            store.load().unwrap().model,
+            "qwen-max",
+            "前提：这次读通了好文件"
+        );
         assert_eq!(
             store.take_corrupt_backup(),
             None,
-            "文件不在了就没有新的回落"
+            "读通好文件必须作废那份还没取走的通知"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_keeps_the_notice_alive() {
+        // 损坏回落刚刚把原件 `rename` 走，于是紧接着的第二次 `load()` 命中的是 `NotFound`。
+        // 那是**同一次事故的延续**，不是新事故：在这里也清空的话，T13 只要 startup 时多读一次
+        // 就永远看不到提示（`load` 与渲染之间隔一次刷新是常规形态）。
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        std::fs::write(store.path(), "{ not json").unwrap();
+        store.load().unwrap();
+        assert!(
+            !store.path().exists(),
+            "前提：原件已被 rename 走，下一次读必然 NotFound"
+        );
+        assert_eq!(store.load().unwrap(), Settings::default());
+        assert!(
+            store.take_corrupt_backup().is_some(),
+            "`NotFound` 一支不许清通知"
         );
     }
 
@@ -1307,6 +1374,71 @@ mod tests {
         );
     }
 
+    /// brief Step 4 的机器可执行版本：证明 `CredWriteW` 经本模块接缝真的落盘。
+    /// 上一条测试只 `build()`，证明的是**条目名**；「写进去了、重启还在、删了就没了」这一半
+    /// 此前没有任何证据（review 与 re-review 都把它记成 MISSING）。2026-10-20 本条跑通，
+    /// 证据见文件头注释。
+    ///
+    /// 默认 `#[ignore]`，并且还要 `QWEN_DO_REAL_KEYRING` 显式给 `arm`/`check` 才动手 ——
+    /// 双重闸门是因为它会写**用户真实的**凭据管理器，R81 严禁 `cargo test` 碰到它；
+    /// 忘了 `--ignored` 的手滑、或将来有人把这条接进 CI，都不该改写到用户的库。
+    ///
+    /// 人工核验的跑法（两条命令 = 两个进程，正好把「跨进程存活」测出来）：
+    /// ```text
+    /// QWEN_DO_REAL_KEYRING=arm   cargo test --lib real_windows_store_round_trip_probe -- --ignored --nocapture
+    /// QWEN_DO_REAL_KEYRING=check cargo test --lib real_windows_store_round_trip_probe -- --ignored --nocapture
+    /// ```
+    /// 中间用 `cmdkey //list | iconv -f GBK -t UTF-8` 应当查到 `api_key.qwen-do`，
+    /// `check` 跑完应当查不到。库里已有条目时 `arm` 直接失败：本探针绝不覆盖别人的 key。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "写真实 Windows 凭据管理器；只在 brief Step 4 人工核验时按本条文档两步跑（R81）"]
+    fn real_windows_store_round_trip_probe() {
+        const CANARY: &str = "sk-QWEN-DO-SELFTEST-CANARY-DELETE-ME";
+        let phase = std::env::var("QWEN_DO_REAL_KEYRING").unwrap_or_default();
+        let store = KeyringSecretStore::new().expect("真实 Windows store 构造失败");
+        match phase.as_str() {
+            "arm" => {
+                let existing = store.get().expect("arm 前置检查：读真实条目失败");
+                assert!(
+                    existing.is_none(),
+                    "真实库里 `api_key.qwen-do` 已有条目，探针拒绝覆盖。要跑这一步请先在 Windows \
+                     凭据管理器里确认那条是本探针留下的残留（值以 {CANARY} 开头）再删除。"
+                );
+                store
+                    .set(CANARY)
+                    .expect("arm：CredWriteW 经本模块接缝写入失败");
+                assert_eq!(
+                    store.get().expect("arm：写后读回失败").as_deref(),
+                    Some(CANARY),
+                    "arm：同进程内写进去就该读得回来"
+                );
+            }
+            "check" => {
+                let got = store.get().expect("check：跨进程读回失败");
+                assert_eq!(
+                    got.as_deref(),
+                    Some(CANARY),
+                    "check：这是另一个进程，读回来才叫「落到了 Windows 库里」而不是内存缓存。\
+                     读不到说明 arm 那次写入没持久化。"
+                );
+                store.delete().expect("check：删除失败");
+                assert_eq!(
+                    store.get().expect("check：删后读失败"),
+                    None,
+                    "check：删完必须读不到（NoEntry → Ok(None)）"
+                );
+                store
+                    .delete()
+                    .expect("check：再删一次仍要幂等成功，UI 的「清除」不许依赖先探测");
+            }
+            other => panic!(
+                "本条测试是人工探针，需要 QWEN_DO_REAL_KEYRING=arm 或 =check（实得 {other:?}）。\
+                 没有环境变量就动手写真实凭据管理器，正是 R81 要防的事故。"
+            ),
+        }
+    }
+
     // ---- review M-1：`{:?}` 不许把秘密字节打出来 ----
 
     #[cfg(windows)]
@@ -1323,18 +1455,41 @@ mod tests {
 
         // 我们的 Debug 必须只走 Display。Display 侧本来就安全：那两个变体只会说
         // "Password data is not valid UTF-8"，一个字节都不带。
-        for err in [
-            credential_error(keyring_core::Error::BadEncoding(secret.clone())),
-            SettingsError::Credential(Box::new(std::io::Error::other(
+        // 每一对是「装箱后的错误」和「它的 Display 文本」。断言用的是**内层** Display：
+        // Debug 里透出的是上游那句原因，不带 `SettingsError` 自己的「凭据管理器操作失败: 」
+        // 前缀（前缀属于 Display，属于另一套实现），拿 `err.to_string()` 去比会假红。
+        for (err, reason) in [
+            (
+                credential_error(keyring_core::Error::BadEncoding(secret.clone())),
+                "Password data is not valid UTF-8",
+            ),
+            (
+                SettingsError::Credential(Box::new(std::io::Error::other(
+                    "凭据管理器读不到（测试注入）",
+                ))),
                 "凭据管理器读不到（测试注入）",
-            ))),
+            ),
         ] {
             let dbg = format!("{err:?}");
             assert!(
                 !dbg.contains("115") && !dbg.contains("sk-CANARY"),
                 "`{err:?}` 把秘密带出来了：{dbg}"
             );
+            // N-1：只查「不带出字节」是半个守卫 —— 变异 `Self::Credential(_) =>
+            // f.write_str("Credential")` 能在 41/41 全绿下存活，因为「安全但什么都不说」
+            // 同样满足前半句。后半句必须单独钉：原因文本要真的透出来。
+            assert!(
+                dbg.contains(reason),
+                "Debug 应当透出上游 Display 的那句原因，实测：{dbg}"
+            );
         }
+        // `TooLong` 自带平台上限数字（R82 要的就是它能透到调用方）：走 Display 之后仍在。
+        let too_long = credential_error(keyring_core::Error::TooLong(
+            "password encoded as UTF-16".to_string(),
+            2560,
+        ));
+        let dbg = format!("{too_long:?}");
+        assert!(dbg.contains("2560"), "上限数字必须留在 Debug 里：{dbg}");
         // 手写 Debug 的另一面：`UnsupportedPlatform` / `Io` / `Json` 三支仍然打得出来，
         // 别把「不泄露」做成「什么都打不出」。
         let p = format!("{:?}", SettingsError::UnsupportedPlatform);
@@ -1379,12 +1534,50 @@ mod tests {
         assert_eq!(
             store.api_key().unwrap().as_deref(),
             Some(""),
-            "明文侧照实返回（库里就是有一条），不在 api_key() 里撒谎"
+            "明文侧只夹空白，不把条目变成 None（库里确实有一条）"
         );
         assert_eq!(
             store.api_key_masked().unwrap(),
             None,
             "掩码侧空白必须收敛成 None，否则 UI 无从区分"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_entry_written_by_another_program_reads_back_trimmed() {
+        // N-5 的另一半。`set_api_key` 写进去的必然干净，但库里那条可能是**别的程序**、或
+        // R95 之前那次构建写的，带着尾部 `\r\n`。那种值一路走到 HTTP 头就是一个 401，
+        // 而设置页上的掩码看着完全正常 —— 读侧不夹，这个 bug 在本机没有任何线索。
+        let d = tempfile::tempdir().unwrap();
+        let (store, m) = mock_backed(d.path());
+        let put = |v: &str| {
+            m.build(KEYRING_SERVICE, KEYRING_USER, None)
+                .unwrap()
+                .set_password(v)
+                .expect("绕过 SettingsStore，直接往 mock 里塞条目")
+        };
+        put("sk-abcdefghijklmnop\r\n");
+        assert_eq!(
+            store.api_key().unwrap().as_deref(),
+            Some("sk-abcdefghijklmnop"),
+            "尾部的 \\r\\n 要在读侧就消失"
+        );
+        assert_eq!(
+            store.api_key_masked().unwrap().as_deref(),
+            Some("sk-a…mnop"),
+            "掩码不许带着 ␍␊ 的尾巴（那会让用户以为 key 是对的、只是显示问题）"
+        );
+        put("\r\n");
+        assert_eq!(
+            store.api_key().unwrap().as_deref(),
+            Some(""),
+            "纯空白条目夹完就是空串"
+        );
+        assert_eq!(
+            store.api_key_masked().unwrap(),
+            None,
+            "纯空白条目走「未配置」，与上一条同源"
         );
     }
 
