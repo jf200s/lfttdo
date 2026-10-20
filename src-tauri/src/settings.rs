@@ -9,6 +9,12 @@
 // `serialized_field_names_are_exactly_the_eight_settings_fields` 那条测试钉的正是这件事，
 // 它同时也是 R89 的防线：加字段必须先给出它的消费者，否则 Plan A 里多一个没人读的键。
 //
+// 「不写日志」那一条还有第二道闸，而且不在结构体上：`SettingsError` 的 `Debug` 是**手写**的
+// （R94，见 `impl fmt::Debug`）。`keyring_core::Error` 自己 derive 了 `Debug`，而它的
+// `BadEncoding(Vec<u8>)` / `BadDataFormat(Vec<u8>, _)` 两个变体装的就是那串秘密字节 ——
+// 一句 `.expect(..)` 或 `tracing::error!(?e)` 就能把 key 打成十进制转储，而 spec :543 计划的
+// 「全文搜索 key 字符串」查不到那种转储。Display 侧本来就安全，所以每一支都借 Display 落地。
+//
 // 凭据侧的接缝（`SecretStore`，3 方法）之所以存在，是因为 `keyring` facade 不可用：
 // 它的 `v1::Entry` 第一次被调用就把**进程级默认 store** 定死（crate 源码里的
 // `LazyLock`），于是任何测试都会往用户真实的凭据管理器里写条目、把用户真 key 覆盖成
@@ -21,7 +27,7 @@ use crate::model::openai_compat::{ModelConfig, normalize_base_url};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 /// 凭据条目的 service 段。**Windows 凭据管理器里显示的不是这个名字**：
@@ -35,6 +41,13 @@ const KEYRING_USER: &str = "api_key";
 
 const SETTINGS_FILE: &str = "settings.json";
 /// 原子写的中转文件（R85）：与目标同目录，`rename` 才可能同卷原子。
+///
+/// 名字**固定**是刻意的，不要改成 `…tmp-<pid>-<n>` 那种唯一名去解决并发：
+/// `save_routes_through_a_temp_file_before_replacing` 防的是「原子写退化回 `std::fs::write`」，
+/// 它的做法是把这个名字抢先占成目录，让 `File::create` 必然失败 —— 只有真走了 temp 这条路
+/// `save` 才会报错，直接覆盖目标文件的写法会照样「成功」。名字一唯一，这条测试就再也指不到
+/// 要拦的东西（review M-3 提出的唯一名方案会顺手废掉 R85 唯一的哨兵）。
+/// 并发写因此改用锁：见 `SettingsStore::state` 与 `save()` 开头那一行。
 const TEMP_FILE: &str = "settings.json.tmp";
 
 /// `budget_tokens` 不足以容纳 `reserve_output` 时补的余量（R86）。
@@ -43,15 +56,27 @@ const TEMP_FILE: &str = "settings.json.tmp";
 /// 而不是一条报错。宁可悄悄多给 1024，也不要一个不报错却失忆的会话。
 const BUDGET_HEADROOM: u32 = 1024;
 
+/// `reserve_output` 的上限（R97）：留出 `BUDGET_HEADROOM` 的空间，好让 normalize 的后置条件
+/// `budget_tokens > reserve_output` **无条件**成立。不夹这一道，`reserve_output = u32::MAX`
+/// 时 `saturating_add` 只能把预算也顶到 `u32::MAX`，两者相等，`context.rs:102` 的
+/// `saturating_sub` 照样把预算塌成 0 —— 那就是 :41-43 说这段钳位要防的事，
+/// 等于钳位函数在自己最难的那条边界上没兑现承诺。
+const MAX_RESERVE_OUTPUT: u32 = u32::MAX - BUDGET_HEADROOM;
+
 /// 设置与凭据的失败面（R82）。仓库约定是每模块一个枚举，不用 `Result<_, String>`：
 /// T13 要能区分「没有条目」（显示「未配置」）与「读不到」（显示原因），
 /// 后者被降级成前者会让用户重设 key、覆盖掉其实还在库里的那一条（R83/R71 同病）。
-#[derive(Error, Debug)]
+///
+/// **`Debug` 是手写的，不是 derive 的**（R94）—— 见 `impl fmt::Debug` 上面的注释。
+#[derive(Error)]
 pub enum SettingsError {
-    /// 配置目录不可写、文件被占用等。
+    /// 配置目录不可写、文件被占用、或 `settings.json` 根本不是文件（review M-2 实测：
+    /// 目录会走到这里，`read_to_string` 给 `PermissionDenied` / os error 5）。
     #[error("设置文件读写失败: {0}")]
     Io(#[from] std::io::Error),
-    /// 只在「文件解不开」时出现。解得开但不认识的字段走 `serde(default)`，不到这里（R91）。
+    /// 只出现在 `save` 的序列化失败上。`load` 解不开文件时**不**返回这一支，
+    /// 它备份原件后回落默认值（R84 与 :322 的说明才是权威）。解得开但不认识的字段走
+    /// `serde(default)`，同样不到这里（R91）。
     #[error("设置文件内容无法解析: {0}")]
     Json(#[from] serde_json::Error),
     /// 承载 `keyring_core::Error`（装箱后保留 `source()`，Display 原样带出上游文本，
@@ -62,6 +87,26 @@ pub enum SettingsError {
     /// 刻意**不**回落成内存存储：那会让用户以为 key 存住了，重启后才发现没有（R81）。
     #[error("当前平台没有凭据管理器")]
     UnsupportedPlatform,
+}
+
+/// R94：`thiserror` 的 `Debug` 与 `Display` 是两套实现，derive 出来的 `Debug` 会一路
+/// 走进 `keyring_core::Error` 自己 derive 的 `Debug`，而它的 `BadEncoding(Vec<u8>)` /
+/// `BadDataFormat(Vec<u8>, _)` 两个变体**装的就是那串秘密字节**（crate error.rs:44/50 实测）。
+/// 于是 `store.api_key().expect(..)`、panic hook、`tracing::error!(?e)` 都会把 key 逐字节
+/// 打成十进制转储 —— spec :473 说的「不写日志」在这种形态下守不住，而且 spec :543 计划的
+/// 「全文搜索 key 字符串」根本查不到十进制转储。Display 侧本来就安全（那两个变体的 Display
+/// 只说 "Password data is not valid UTF-8"），所以这里每一支都借 Display 落地。
+/// `serialized_field_names_are_exactly_the_eight_settings_fields` 同族的
+/// `credential_debug_never_prints_the_secret_bytes` 钉住它。
+impl std::fmt::Debug for SettingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "Io({e})"),
+            Self::Json(e) => write!(f, "Json({e})"),
+            Self::Credential(e) => write!(f, "Credential(<凭据错误·只透出 Display>{e})"),
+            Self::UnsupportedPlatform => f.write_str("UnsupportedPlatform"),
+        }
+    }
 }
 
 /// 凭据存取的本模块接缝（R81）。三件事，全是「这一条 key」的语义，
@@ -210,19 +255,20 @@ impl Settings {
         if self.window_messages < 1 {
             self.window_messages = 1;
         }
-        if self.reserve_output < 1 {
-            self.reserve_output = 1;
-        }
+        // R97：下限 1、上限 `u32::MAX - BUDGET_HEADROOM`（`clamp` 要求 max >= min，
+        // 这里 max = 42 亿 − 1024，恒成立）。夹上限是为了让下面那句加法不会饱和成
+        // 「budget == reserve」，而不是为了好看。
+        self.reserve_output = self.reserve_output.clamp(1, MAX_RESERVE_OUTPUT);
         if self.budget_tokens <= self.reserve_output {
-            // `saturating_add`：reserve 顶到 u32::MAX 时预算不可能再比它大，
-            // 取上限保证不溢出 panic；那种配置本来就发不出请求，属于 T13 的校验题，不归这里报错。
-            self.budget_tokens = self.reserve_output.saturating_add(BUDGET_HEADROOM);
+            self.budget_tokens = self.reserve_output + BUDGET_HEADROOM;
         }
         // font_size 本任务不钳（R86）：Plan A 里它 0 个消费者，边界等 T15/T16 定了再补。
     }
 
     /// 归一后的副本。派生方法用它，省掉「调用者忘了先 normalize」这条静默错误路径。
-    fn normalized(&self) -> Settings {
+    /// `pub`（review minor）：T13 的设置面板要把「表单当前的值」显示出来，那需要一个归一后的
+    /// 视图而不能就地把表单状态改掉 —— 没有它就只能走一次磁盘往返。
+    pub fn normalized(&self) -> Settings {
         let mut c = self.clone();
         c.normalize();
         c
@@ -266,8 +312,12 @@ pub fn mask_key(key: &str) -> String {
     format!("{head}…{tail}")
 }
 
-/// 备份名后缀用毫秒而不是秒：一分钟内连续坏两次是可能的（用户反复手改文件、
-/// 或两个进程抢同一份配置），秒级粒度会让第二份证据盖掉第一份。
+/// 备份名后缀用毫秒而不是秒：用户在**一分钟内连续改坏两次**（反复手改文件、改完没存盘又改）
+/// 是常规形态，秒级粒度会让第二份证据盖掉第一份。
+///
+/// 注意这里**只有**「同名覆盖」这一条路要防：`preserve_corrupt_file` 用 `rename` 而不是 copy，
+/// 所以真有两个进程同时撞上坏文件时，输的那一次 `rename` 会因为源已经不在了而失败（走 `warn`
+/// 分支），并不会互相覆盖 —— 早期注释把它算成需要毫秒的理由，是**错的**（review 实测更正）。
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -275,10 +325,28 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+/// `SettingsStore` 里需要跨调用共享、又必须串行访问的那一点状态（R92/R93）。
+#[derive(Default)]
+struct Shared {
+    /// 最近一次 `load()` 因「解不开」回落默认值时保留下来的备份路径。
+    /// 只有一份：第二次损坏会盖掉第一次的**指针**（文件本身还在磁盘上，名字带毫秒不撞）。
+    corrupt_backup: Option<PathBuf>,
+}
+
 /// `Settings` 的落盘位置 + 凭据接缝。目录由调用方给（Plan A：核心层不碰 Tauri path API）。
 pub struct SettingsStore {
     dir: PathBuf,
     secrets: Arc<dyn SecretStore>,
+    /// 一把锁两个用途（R93 补的字段，review M-3/M-4）：
+    /// ① 把 `save()` 整个串行化。temp 名是**固定**的（`TEMP_FILE` 的注释解释为什么不改成唯一名），
+    ///   而 T13 计划用 `spawn_blocking` 调本方法 —— 两个线程在同一路径上会互相踩：A `create`→写→
+    ///   `rename` 之后，B 的句柄已经指向被改名的 `settings.json`，B 再 `rename` 时报 `NotFound`，
+    ///   UI 于是收到一个平白无故的失败。共享的 state 对象挡不住这件事：`Send + Sync` 类型的
+    ///   `&self` 方法本来就可以被两个 blocking 线程同时调。
+    /// ② 记下最近一次损坏回落留下的备份名，让 T13 有机会告诉用户「你的设置文件坏了、已备份为 X」，
+    ///   而不是静默地看到一份默认值（R83 反对的正是这种静默）。
+    /// 中毒不致命：这里没有跨调用的不变量，拿不到就 `into_inner`（同 `db.rs:100` 的处置）。
+    state: Mutex<Shared>,
 }
 
 /// Tauri 的 `manage()` 只收 `Send + Sync`，而 T13 会在 `spawn_blocking` 里用它（同 db.rs）。
@@ -296,6 +364,7 @@ impl SettingsStore {
         Self {
             dir: dir.to_path_buf(),
             secrets: default_secret_store(),
+            state: Mutex::new(Shared::default()),
         }
     }
 
@@ -304,20 +373,29 @@ impl SettingsStore {
         Self {
             dir: dir.to_path_buf(),
             secrets,
+            state: Mutex::new(Shared::default()),
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn path(&self) -> PathBuf {
         self.dir.join(SETTINGS_FILE)
     }
 
-    /// 读设置。三条分支各有各的道理：
+    /// 读设置。四条分支各有各的道理：
     /// 1. 文件不存在 = 还没设置过，给默认值（这不是错误，`NotFound` 一支把「目录都没建」
-    ///    也算进来，首次启动就是这个形态）。
-    /// 2. 解不开 = 损坏。回落默认值让应用起得来（spec 要它起得来），但**先把原件留成
+    ///    也算进来，首次启动就是这个形态）。`first_run_reads_defaults_without_a_file` 钉它。
+    /// 2. 读都读不到（权限、`settings.json` 是个目录、被别的进程独占）= **报 `Io`，不回落**。
+    ///    回落默认值等于「一遇到读不动就替用户把设置清掉」，正是 R84 反对的静默，只是下沉了一层。
+    ///    `an_unreadable_settings_file_reports_io_instead_of_defaults` 钉它。
+    /// 3. 解不开 = 损坏。回落默认值让应用起得来（spec 要它起得来），但**先把原件留成
     ///    `settings.json.corrupt-<ms>`**（R84）—— 否则紧接着那次 `save()` 会把用户全部
     ///    设置静默抹掉，连查都没得查。备份本身失败也只是 `warn`，不 panic。
-    /// 3. 解得开 = 归一后再返回（R86），于是钳位规则在读写两侧各只有一处定义。
+    ///    备份名会存进 `Shared::corrupt_backup`，由 `take_corrupt_backup()` 交给 T13（R93）。
+    /// 4. 解得开 = 归一后再返回（R86），于是钳位规则在读写两侧各只有一处定义。
     ///
     /// `Json` 变体因此**不会**从 `load` 返回（损坏走回落），它只出现在 `save` 的序列化失败上。
     pub fn load(&self) -> Result<Settings, SettingsError> {
@@ -330,7 +408,9 @@ impl SettingsStore {
         let mut settings: Settings = match serde_json::from_str(&raw) {
             Ok(s) => s,
             Err(e) => {
-                preserve_corrupt_file(&path, &e.to_string());
+                if let Some(backup) = preserve_corrupt_file(&path, &e.to_string()) {
+                    self.lock().corrupt_backup = Some(backup);
+                }
                 return Ok(Settings::default());
             }
         };
@@ -338,11 +418,22 @@ impl SettingsStore {
         Ok(settings)
     }
 
+    /// 取走「刚才那次 `load()` 把损坏文件备份成了什么」，取一次就清（R93）。
+    /// `T13` 需要在设置页第一屏告诉用户这件事；没有这个入口，损坏回落对外和「本来就没配置」
+    /// 长得一模一样 —— 用户会以为设置被谁改了，而证据只躺在一条当前没有 subscriber 的 `warn!` 里。
+    pub fn take_corrupt_backup(&self) -> Option<PathBuf> {
+        self.lock().corrupt_backup.take()
+    }
+
     /// 写设置（R85 的原子写）：同目录 temp → `write_all` → `sync_all` → `rename`。
     /// `std::fs::write` 是「截断 + 写」，进程在写的中途被杀（或断电）就留下一份半文件，
     /// 下一次 `load()` 只能按损坏处理 —— R84 让损坏可查，防不住它，所以这里防。
     /// Windows 上 `std::fs::rename` 带 `REPLACE_EXISTING`，同卷（temp 就在目标目录里）是原子的。
+    ///
+    /// 整个方法在锁里（R92，review M-3）：temp 名字固定，两个线程同时写就会互相踩。
+    /// T13 用 `spawn_blocking`，所以「同时写」是设计形态而不是罕见形态。
     pub fn save(&self, settings: &Settings) -> Result<(), SettingsError> {
+        let _serial = self.lock();
         std::fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_string_pretty(&settings.normalized())?;
         let temp = self.dir.join(TEMP_FILE);
@@ -357,7 +448,13 @@ impl SettingsStore {
 
     /// 空串按「清除」处理：UI 的保存按钮把空输入原样送过来是常规路径，
     /// 而往凭据管理器里存一条空 key 只会让掩码显示「未配置」、库里却真有个条目（比没有更糟）。
+    ///
+    /// 先 `trim`（R95，review minor）：从聊天窗口/邮件里粘 key 常带尾部 `\r\n`，
+    /// 原样存进去换来的是 API 侧一个 401，而设置页上一切看起来都「已配置」—— 没有任何线索
+    /// 指向真正的原因。`normalize_base_url` 已经在钳位时 trim 了，key 这边不 trim 是不一致。
+    /// 纯空白 trim 完就是空串，于是自然走清除那一支，与「空串按清除处理」原本的意图一致。
     pub fn set_api_key(&self, key: &str) -> Result<(), SettingsError> {
+        let key = key.trim();
         if key.is_empty() {
             return self.clear_api_key();
         }
@@ -372,8 +469,17 @@ impl SettingsStore {
     /// R83 覆盖 brief 的 `-> String`：`Ok(None)` 才是「未配置」，`Err` 是「读不到」，
     /// 两者在界面上必须长得不一样（brief 的 `.ok().flatten()` 会把后者显示成「未配置」，
     /// 用户于是重设 key、覆盖掉其实还在库里的那一条）。
+    ///
+    /// 库里躺着一条空白条目时也给 `Ok(None)`（R95 的另一半）：`mask_key("")` 返回的是
+    /// 「未配置」这三个字，于是 `Ok(Some("未配置"))` 和 `Ok(None)` 在界面上又会长得一样，
+    /// 把 R83 好不容易分开的两件事重新合起来。空白条目不是本模块写进去的（`set_api_key`
+    /// 已经把它转成清除），但别的程序可以。
     pub fn api_key_masked(&self) -> Result<Option<String>, SettingsError> {
-        Ok(self.api_key()?.as_deref().map(mask_key))
+        Ok(self
+            .api_key()?
+            .filter(|k| !k.trim().is_empty())
+            .as_deref()
+            .map(mask_key))
     }
 
     pub fn clear_api_key(&self) -> Result<(), SettingsError> {
@@ -382,19 +488,29 @@ impl SettingsStore {
 }
 
 /// R84 的取证动作。只 `warn`，永不 `Err`：备份失败也不能让应用起不来。
-/// （`tracing` 在本仓当前没有 subscriber，src 里 0 处使用 —— 这几条 `warn!` 目前只在
-/// 测试里可见，subscriber 与「日志落 app data 文件」归 T13，见 R87。）
-fn preserve_corrupt_file(path: &Path, reason: &str) {
+/// 成功时把备份路径交回调用方（R93），失败时给 `None`。
+/// （`tracing` 在本仓没有 subscriber，而本模块是 src 里第一个也是唯一一个使用者
+/// —— 这几条 `warn!` 目前只在测试里可见，subscriber 与「日志落 app data 文件」归 T13，见 R87。）
+fn preserve_corrupt_file(path: &Path, reason: &str) -> Option<PathBuf> {
     let backup = format!("{}.corrupt-{}", path.display(), now_ms());
     // rename 而不是 copy：证据挪走、原路径腾干净，下一次 `save()` 才不会把坏文件当成
     // 「已修复的旧配置」盖掉；而且同目录 rename 是原子的，不会留下两份坏文件并存。
     match std::fs::rename(path, &backup) {
-        Ok(()) => tracing::warn!(
-            "settings.json 无法解析（{reason}），原件已保留为 {backup}，本次回落默认值"
-        ),
-        Err(e) => tracing::warn!(
-            "settings.json 无法解析（{reason}），备份也失败了（{e}），原件仍在 {backup} 该处未生成"
-        ),
+        Ok(()) => {
+            tracing::warn!(
+                "settings.json 无法解析（{reason}），原件已保留为 {backup}，本次回落默认值"
+            );
+            Some(PathBuf::from(backup))
+        }
+        Err(e) => {
+            // 早期这条写的是「原件仍在 {backup} 该处未生成」：把备份名当成了原件的位置，
+            // 读日志的人会去翻一个根本不存在的文件（review minor，实测措辞已纠正）。
+            tracing::warn!(
+                "settings.json 无法解析（{reason}），备份也失败了（{e}）；原件仍在 {}，备份 {backup} 未生成",
+                path.display()
+            );
+            None
+        }
     }
 }
 
@@ -405,8 +521,12 @@ fn default_secret_store() -> Arc<dyn SecretStore> {
         match KeyringSecretStore::new() {
             Ok(store) => Arc::new(store),
             Err(e) => {
-                // 理论不可达（见 `KeyringSecretStore::new` 的注释），真到达了也只报「用不了」，
-                // 绝不换成内存 store。
+                // 理论不可达（`Store::new()` 就是 `Ok(Self::new_internal(..))`，crate store.rs:35-40
+                // 实测；review 也确认了），真到达了也只报「用不了」，绝不换成内存 store。
+                // 已知瑕疵（**本轮不改**，理由见任务报告）：这条支给用户的话是
+                // 「当前平台没有凭据管理器」，而在 Windows 上初始化失败时说「平台不支持」并不准确 ——
+                // 原始原因只进了上面那条 `warn!`。因为这支不可达，为它新增一个错误变体
+                // 属于给不会发生的情形加防线（仓库纪律：边界之外不防御）。等它真 reachable 再说。
                 tracing::warn!("Windows 凭据管理器初始化失败，凭据操作将一律报错: {e}");
                 Arc::new(UnsupportedSecretStore)
             }
@@ -612,6 +732,97 @@ mod tests {
         );
     }
 
+    // ---- review M-2：load 的另外两条 IO 分支 ----
+    //
+    // 这两条在 Task 12 第一轮交付里**缺席**：审阅者的变异 MA（把 `NotFound` 改成报错）和
+    // MB（把所有 IO 错误吞成默认值）都在 34/34 全绿下存活。缺的不是「覆盖率数字」，
+    // 是两条真实存在的语义 —— 首次启动给默认值、读不动时报错 —— 现在没有任何东西钉住它们。
+
+    #[test]
+    fn first_run_reads_defaults_without_a_file() {
+        let d = tempfile::tempdir().unwrap();
+        // 连文件都没有（目录是空的）：这是每个用户第一次打开应用的形态，不是异常。
+        assert_eq!(names(d.path()), Vec::<String>::new());
+        let s = d.path().join("settings.json");
+        assert!(!s.exists(), "前提：文件不存在");
+        assert_eq!(
+            SettingsStore::new(d.path()).load().unwrap(),
+            Settings::default(),
+            "`NotFound` 必须走默认值，不是报错"
+        );
+        // 目录本身也不存在 —— Tauri 首次启动时 app data 目录还没建，同一个形态。
+        let absent = d.path().join("app data").join("v1");
+        assert_eq!(
+            SettingsStore::new(&absent).load().unwrap(),
+            Settings::default()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_reports_io_instead_of_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        // `settings.json` 位置上是个**目录**。Windows 实测（控制器与审阅者各跑过一次）：
+        // `read_to_string` 给 `PermissionDenied` / os error 5，既不是 `NotFound` 也不是解码失败。
+        // 这一支必须报错：把它吞成默认值 = 「一遇到读不动就替用户把设置清掉」，
+        // 正是 R84 反对的那种静默，只是从「解不开」下沉到了「读不到」。
+        std::fs::create_dir(d.path().join("settings.json")).unwrap();
+        let store = SettingsStore::new(d.path());
+        let err = store
+            .load()
+            .expect_err("读不到必须报 Err，不许降级成默认值");
+        assert!(
+            matches!(err, SettingsError::Io(_)),
+            "应当是 Io，实测：{err}"
+        );
+        assert!(err.to_string().contains("设置文件读写失败"), "{err}");
+        assert!(
+            corrupt_backups(d.path()).is_empty(),
+            "读不到 ≠ 损坏，不该产生 .corrupt- 备份"
+        );
+    }
+
+    // ---- review M-4：损坏回落要让调用方看得见 ----
+
+    #[test]
+    fn take_corrupt_backup_reports_the_fallback_and_is_consumed_once() {
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        assert_eq!(
+            store.take_corrupt_backup(),
+            None,
+            "没坏过就没有备份可报，别给 T13 一个假的"
+        );
+        std::fs::write(store.path(), "{ not json").unwrap();
+        assert_eq!(store.load().unwrap(), Settings::default());
+        let reported = store
+            .take_corrupt_backup()
+            .expect("损坏回落必须留下可出示的证据路径（R93）");
+        assert!(
+            reported.exists(),
+            "报出来的路径得真能打开，实测：{}",
+            reported.display()
+        );
+        assert_eq!(
+            reported.file_name().unwrap().to_str().unwrap(),
+            corrupt_backups(d.path())[0],
+            "报出来的名字要和磁盘上那个对得上"
+        );
+        assert_eq!(
+            store.take_corrupt_backup(),
+            None,
+            "同一次回落只许提示一次，否则每次重进设置页都会重复报错"
+        );
+        // 坏→修好，不许把旧证据留着继续骗人：下一次正常 load 不该再报同一个备份。
+        std::fs::write(store.path(), "{ not json again").unwrap();
+        std::fs::remove_file(store.path()).unwrap();
+        assert_eq!(store.load().unwrap(), Settings::default());
+        assert_eq!(
+            store.take_corrupt_backup(),
+            None,
+            "文件不在了就没有新的回落"
+        );
+    }
+
     // ---- R85：save 原子 ----
 
     #[test]
@@ -638,7 +849,8 @@ mod tests {
     #[test]
     fn save_routes_through_a_temp_file_before_replacing() {
         // 这条专防「原子写退化回 std::fs::write」：那种写法不留任何文件痕迹，
-        // 上面「无 .tmp 残留」那条对它照样绿（实测过，见报告 M5）。
+        // 上面「无 .tmp 残留」那条对它照样绿（review 变异 MH 实测：整段 temp+sync+rename
+        // 换成 `fs::write` 后只有**这一条**转红）。
         // 把 temp 的名字抢先占成一个目录，`File::create` 必然失败 ——
         // 只有真的走了 temp 这条路，save 才会报错，而直接覆盖目标文件的写法会照样「成功」。
         let d = tempfile::tempdir().unwrap();
@@ -669,6 +881,42 @@ mod tests {
         let store = SettingsStore::new(&nested);
         store.save(&Settings::default()).unwrap();
         assert!(store.path().exists());
+    }
+
+    #[test]
+    fn concurrent_saves_never_error_and_never_leave_a_temp_behind() {
+        // review M-3：temp 名字是固定的，而 T13 打算在 `spawn_blocking` 里用这个 store，
+        // 于是「两个线程同时 save」是设计形态。没有 `SettingsStore::state` 那把锁时，
+        // 第二个 `rename` 会因为自己的 temp 已被第一个 rename 搬走而报 `NotFound`。
+        let d = tempfile::tempdir().unwrap();
+        let store = Arc::new(SettingsStore::new(d.path()));
+        let models = ["qwen-a", "qwen-b", "qwen-c", "qwen-d", "qwen-e", "qwen-f"];
+        std::thread::scope(|s| {
+            for m in models {
+                let store = Arc::clone(&store);
+                s.spawn(move || {
+                    for _ in 0..8 {
+                        let st = Settings {
+                            model: m.to_string(),
+                            ..Default::default()
+                        };
+                        let e = store.save(&st);
+                        assert!(e.is_ok(), "{m} 的 save 不该失败，实测：{e:?}");
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            names(d.path()),
+            vec!["settings.json".to_string()],
+            "并发下也不许留下 .tmp 或半文件"
+        );
+        let got = store.load().unwrap();
+        assert!(
+            models.contains(&got.model.as_str()),
+            "最终内容必须是某一次完整写入，实测：{}",
+            got.model
+        );
     }
 
     // ---- R86：钳位与派生只留一处 ----
@@ -748,12 +996,22 @@ mod tests {
         let once = s.clone();
         s.normalize();
         assert_eq!(s, once, "normalize 必须幂等：load 与 save 各调一次才安全");
-        assert_eq!(s.reserve_output, u32::MAX);
+        // R97：reserve 被夹到 `u32::MAX - 1024`，预算因此能真的比它大 1024。
+        // 旧写法（不夹 reserve、只 `saturating_add`）在这里得到的是 reserve == budget == u32::MAX，
+        // `context.rs:102` 的 `saturating_sub` 照样把预算塌成 0 —— 钳位在最难的那条边界上失守。
         assert_eq!(
-            s.budget_tokens,
-            u32::MAX,
-            "u32 装不下 reserve+1024 时饱和取上限，不许溢出 panic"
+            s.reserve_output,
+            u32::MAX - BUDGET_HEADROOM,
+            "reserve 必须留出 headroom 的空间，否则后置条件守不住"
         );
+        assert_eq!(s.budget_tokens, u32::MAX, "不许溢出 panic");
+        assert!(
+            s.budget_tokens > s.reserve_output,
+            "normalize 的后置条件必须无条件成立：预算塌成 0 的形态就是「它记不住上文」"
+        );
+        // 后置条件也要在 `to_context_config` 那一侧兑现（同一个 bug 的下游形状）。
+        let ctx = s.to_context_config();
+        assert!(ctx.budget_tokens > ctx.reserve_output, "{ctx:?}");
     }
 
     #[test]
@@ -1046,6 +1304,87 @@ mod tests {
         assert!(
             dbg.contains("api_key.qwen-do"),
             "实测条目名取自 crate 的 `{{prefix}}{{user}}{{divider}}{{service}}{{suffix}}`，实得：{dbg}"
+        );
+    }
+
+    // ---- review M-1：`{:?}` 不许把秘密字节打出来 ----
+
+    #[cfg(windows)]
+    #[test]
+    fn credential_debug_never_prints_the_secret_bytes() {
+        // 前提先自证：`keyring_core::Error` 自己 derive 的 Debug 确实把 Vec<u8> 逐字节打印。
+        // 不写成断言的话，这条测试会在「上游哪天改了 Debug」之后悄悄失去意义。
+        let secret: Vec<u8> = b"sk-CANARY-0123456789".to_vec();
+        let upstream = format!("{:?}", keyring_core::Error::BadEncoding(secret.clone()));
+        assert!(
+            upstream.contains("115"),
+            "前提不成立（上游 Debug 变了，本条要重读）：{upstream}"
+        );
+
+        // 我们的 Debug 必须只走 Display。Display 侧本来就安全：那两个变体只会说
+        // "Password data is not valid UTF-8"，一个字节都不带。
+        for err in [
+            credential_error(keyring_core::Error::BadEncoding(secret.clone())),
+            SettingsError::Credential(Box::new(std::io::Error::other(
+                "凭据管理器读不到（测试注入）",
+            ))),
+        ] {
+            let dbg = format!("{err:?}");
+            assert!(
+                !dbg.contains("115") && !dbg.contains("sk-CANARY"),
+                "`{err:?}` 把秘密带出来了：{dbg}"
+            );
+        }
+        // 手写 Debug 的另一面：`UnsupportedPlatform` / `Io` / `Json` 三支仍然打得出来，
+        // 别把「不泄露」做成「什么都打不出」。
+        let p = format!("{:?}", SettingsError::UnsupportedPlatform);
+        assert!(p.contains("UnsupportedPlatform"), "{p}");
+    }
+
+    // ---- review R95：粘贴进来的 key 要 trim ----
+
+    #[cfg(windows)]
+    #[test]
+    fn a_pasted_key_is_trimmed_and_a_whitespace_only_one_clears() {
+        // 从浏览器/邮件里复制 key 常带尾部 `\r\n`。原样入库换来的是 API 侧一个 401，
+        // 而设置页显示 `sk-a…mnop` 一切正常 —— 没有任何线索指向真正的原因。
+        let d = tempfile::tempdir().unwrap();
+        let (store, _m) = mock_backed(d.path());
+        store
+            .set_api_key("  sk-abcdefghijklmnop\r\n")
+            .expect("trim 之后是非空，正常写入");
+        assert_eq!(
+            store.api_key().unwrap().as_deref(),
+            Some("sk-abcdefghijklmnop"),
+            "存进去的必须是 trim 后的那一串，空格与 \\r\\n 都不许跟着进凭据管理器"
+        );
+        // 纯空白 trim 完就是空串 → 走清除，而不是存一条空白条目（比没有更难查）。
+        store.set_api_key("sk-abcdefghijklmnop").unwrap();
+        store.set_api_key("  \r\n ").unwrap();
+        assert_eq!(store.api_key().unwrap(), None, "空白必须等价于「清除」");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_blank_stored_entry_reads_as_unconfigured_not_masked() {
+        // `mask_key("")` 返回的是「未配置」这三个字。若库里躺着一条空白条目（本模块写不进去，
+        // 但别的程序可以），`api_key_masked()` 就会给出 `Ok(Some("未配置"))` —— 和 `Ok(None)`
+        // 在界面上长得一模一样，把 R83 特意分开的两件事重新合起来。这里提前把它掰开。
+        let d = tempfile::tempdir().unwrap();
+        let (store, m) = mock_backed(d.path());
+        m.build(KEYRING_SERVICE, KEYRING_USER, None)
+            .unwrap()
+            .set_password("")
+            .expect("绕过 SettingsStore，直接往 mock 里塞一条空白条目");
+        assert_eq!(
+            store.api_key().unwrap().as_deref(),
+            Some(""),
+            "明文侧照实返回（库里就是有一条），不在 api_key() 里撒谎"
+        );
+        assert_eq!(
+            store.api_key_masked().unwrap(),
+            None,
+            "掩码侧空白必须收敛成 None，否则 UI 无从区分"
         );
     }
 
