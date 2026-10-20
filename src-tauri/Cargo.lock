@@ -3593,6 +3593,7 @@ dependencies = [
  "base64 0.23.1",
  "futures",
  "image",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",
@@ -3601,6 +3602,8 @@ dependencies = [
  "tauri-plugin-opener",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

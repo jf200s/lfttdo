@@ -83,6 +83,15 @@ impl AgentEvent {
     }
 }
 
+/// 事件出口的抽象（Task 9 建机制，Task 13 接实现）。
+/// 住在事件层而不是权限层：`PermissionGate` 要它，`AgentEvent` 也要它，放别处会形成
+/// `permission -> agent` 之外的反向依赖。实现方两件：生产的 `TauriEmitter`（持 app_handle
+/// 与 session_id）和测试的 `VecSink`。`Send + Sync` 是硬要求 —— gate 是 `Arc` 共享、
+/// 跨任务调用的，emit 会在任意一个 await 点上被调用。
+pub trait EventSink: Send + Sync {
+    fn emit(&self, e: AgentEvent);
+}
+
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ErrorWhere {
