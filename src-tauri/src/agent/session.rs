@@ -233,8 +233,21 @@ impl AgentSession {
                     }
                     // R59：内容就是拒绝理由本身。`ToolError::Failed` 的 Display 前缀是
                     // 「工具执行失败: 」，套上去模型读到的是双重包装（spec:263 说的是理由）。
+                    //
+                    // 归属必须看令牌，不能一律写「用户拒绝执行」：门里的 `已取消` /
+                    // `等待授权时收到中断` 是**用户按了停止**，不是用户否决了这个诉求。写成
+                    // 否决会让模型以为这条路被禁止而不再重试；「中断」才是它能接着做的事实。
+                    // 竞态方向是安全的：用户应答完 deny 再按停止会被归到「本轮已中断」，两句
+                    // 都仍为真，只影响落库措辞；反过来（把停止说成否决）才是说谎。
+                    // headless 的 `没有可应答的界面` 仍会带上「用户拒绝执行」——Plan A 生产里
+                    // 不可达（T13 装配必然 `with_sink`），等它真可达时再连同归属一起改。
                     Decision::Deny { reason } => {
-                        (ToolOutput::text(format!("用户拒绝执行：{reason}")), true)
+                        let who = if ctx.cancel.is_cancelled() {
+                            "本轮已中断"
+                        } else {
+                            "用户拒绝执行"
+                        };
+                        (ToolOutput::text(format!("{who}：{reason}")), true)
                     }
                 };
                 let preview = preview_of(&output);
@@ -1417,10 +1430,71 @@ mod tests {
         assert_paired("打断后接手的请求", &cont.reqs()[0]);
     }
 
+    #[tokio::test]
+    async fn cancel_while_a_popup_is_pending_backfills_the_call_and_says_interrupted() {
+        // 弹窗挂着时按停止，收场的是**权限门自己**（R43：session 的 `select!` 打不断一个
+        // 已经在 await 的 `check`）。这条组合路径此前只测到门的边界（`gate.rs` 自己的测试
+        // 看不到 history），而它正是 R56 那个悬空 `assistant(ToolCall)` 的第三个入口：
+        // 调用已经完整攒下、门回了 Deny、循环继续走到轮首才发现被打断。
+        // 这里同时钉两件事：①配对不变式在 Ask 入口也成立；②模型读到的归属是「中断」而不是
+        // 「用户拒绝执行」——用户按的是停止，把它写成否决会让模型以为诉求被禁而不再重试。
+        let mut rig = Rig::new(vec![
+            tool_round(0, &[("guarded", r#"{"text":"x"}"#)]),
+            deltas(&["不该走到这里"]),
+        ]);
+        let sink = rig.sink.clone();
+        let cancel = rig.session.cancel_handle();
+        let canceller = tokio::spawn(async move {
+            // 等到弹窗真的抵达 sink 才取消：否则测的是 `check` 里「已取消就不弹」那支。
+            wait_requests(&sink, 1).await;
+            cancel.cancel();
+        });
+
+        assert_eq!(rig.run("写个文件").await, StopReason::Interrupted);
+        canceller.await.unwrap();
+
+        assert_eq!(
+            rig.sink.kinds(),
+            [
+                "turn_start",
+                "tool_call",
+                "permission_request",
+                "permission_resolved",
+                "tool_result",
+                "done"
+            ],
+            "弹窗要被收回、调用要补结果，且中断之后不许再问第二轮"
+        );
+        assert_eq!(rig.sink.done(), Some(StopReason::Interrupted));
+        assert_eq!(
+            tool_results_of(rig.session.history()),
+            vec![(
+                "r0c0".to_string(),
+                true,
+                "本轮已中断：等待授权时收到中断".to_string()
+            )],
+            "理由取自权限门的取消臂，归属由 session 改成中断"
+        );
+        assert_eq!(rig.reqs().len(), 1, "取消之后不再问模型");
+        assert_eq!(
+            rig.session.history().last().map(|m| &m.role),
+            Some(&Role::User),
+            "history 结尾必须是工具结果，不能是带 tool_call 的 assistant"
+        );
+
+        // 和中断流式那条一样，动机也要验一遍：接手这段历史的会话第一个请求仍然配对。
+        let carried = rig.session.history().to_vec();
+        let mut cont = Rig::new(vec![deltas(&["接着说"])]);
+        cont.session.restore(carried);
+        assert_eq!(cont.run("继续").await, StopReason::EndTurn);
+        assert_paired("弹窗中断后接手的请求", &cont.reqs()[0]);
+    }
+
     // ---- R57 的后一半：配对不变量必须扛过滑窗切口 ----
 
-    /// 60 条成对历史 + 极小的 `window_messages`：切口一定落在成对的 tool 轮里
-    /// （Task 8 靠 advance 跳过孤儿结果）。窗口边界和循环边界是同一个 400 的两个入口，
+    /// 60 条成对历史 + `window_messages: 4`：窗口起点算出来是第 57 条，正是 `r28c0` 的
+    /// **工具结果**（成对历史里偶数下标是调用、奇数下标是结果），所以切口一定落在孤儿结果上，
+    /// 必须靠 Task 8 的 advance 前进一格才合法。窗口边界和循环边界是同一个 400 的两个入口，
     /// 所以这条不变量得在**模型实际看到的请求**上再验一遍。
     #[tokio::test]
     async fn a_windowed_long_history_still_pairs_every_tool_result_with_its_call() {
@@ -1445,7 +1519,7 @@ mod tests {
         let cfg = ContextConfig {
             reserve_output: 0,
             budget_tokens: 100_000,
-            window_messages: 5,
+            window_messages: 4,
         };
         let mut rig = Rig::with_context(
             cfg,
@@ -1459,13 +1533,23 @@ mod tests {
 
         let reqs = rig.reqs();
         assert_eq!(reqs.len(), 2);
-        assert!(
-            reqs[0].messages.len() <= 6,
-            "窗口 5 条 + system，切口必须真的裁掉了 60 条历史，实际 {}",
-            reqs[0].messages.len()
+        // 精确条数而不是 `<=`：4 = system + advance 之后剩下的 3 条。这个数同时钉住
+        // advance 的算术——起点 57 是孤儿结果，被跳过后窗口只剩 3 条历史。
+        assert_eq!(
+            reqs[0].messages.len(),
+            4,
+            "窗口 4 条 + system，切口必须真的裁掉 60 条历史并把孤儿结果跳掉，实际 {:?}",
+            reqs[0].messages.iter().map(|m| &m.role).collect::<Vec<_>>()
         );
-        assert!(
-            reqs[1].messages.len() <= 6,
+        assert_eq!(
+            reqs[0].messages[1].role,
+            Role::Assistant,
+            "advance 生效的话窗口第一条是 assistant(ToolCall)，不是孤儿工具结果：{:?}",
+            reqs[0].messages[1]
+        );
+        assert_eq!(
+            reqs[1].messages.len(),
+            4,
             "第二轮同样受窗口约束，实际 {}",
             reqs[1].messages.len()
         );
