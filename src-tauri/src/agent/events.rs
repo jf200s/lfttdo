@@ -420,4 +420,186 @@ mod tests {
             assert_eq!(v["t"], tag, "{e:?} 的 t 标签不符");
         }
     }
+
+    /// R160（F9 欠的债）：上面那条只断言 `v["t"]`，**嵌套层从来没有生产侧守卫** ——
+    /// `tool_call.call{id,name,risk,input}`、`ContentBlock` 的 `type` 标签、`ToolOutput` 的
+    /// `kind` 标签、`Decision` 手写的两个可选键（R98），目前全靠 T14 读一遍 Rust 源码。
+    /// 这里对 11 个变体各取实例，`to_value` 后与 `json!` 字面量**整块相等**：
+    /// 改名、挪层、加 `flatten` 都会打红，而逐字段取值比较对这三件事是聋的。
+    /// `permission_resolved` 破例给三份 decision —— `Deny` 的 `scope` 是**缺席**而不是
+    /// `null`，`Allow` 的 `reason` 同理，这是全事件里唯一有可选键的地方。
+    #[test]
+    fn every_event_serializes_its_full_json_shape() {
+        let view = || ToolCallView {
+            id: "c1".into(),
+            name: "fetch_url".into(),
+            risk: Risk::Read,
+            input: json!({ "url": "https://example.com/a" }),
+        };
+        // 四种块全放进去：`user_message` 因此顺带钉住 `ContentBlock` 的 `type` 标签、
+        // `ToolOutput` 的 `kind` 标签两支（文本与图片）和 `ImageMime` 的小写线上名。
+        // 事件的 `tool_result` 臂只有 `preview: String`，`kind` 标签只能从这条路进线。
+        let blocks = || {
+            vec![
+                ContentBlock::Text {
+                    text: "你好".into(),
+                },
+                ContentBlock::Image {
+                    data: "AAAA".into(),
+                    mime: ImageMime::Png,
+                },
+                ContentBlock::ToolCall {
+                    id: "c1".into(),
+                    name: "fetch_url".into(),
+                    input: json!({ "n": 1 }),
+                },
+                ContentBlock::ToolResult {
+                    call_id: "c1".into(),
+                    is_error: false,
+                    output: ToolOutput::text("抓到 42 字"),
+                },
+                ContentBlock::ToolResult {
+                    call_id: "c2".into(),
+                    is_error: true,
+                    output: ToolOutput::Image {
+                        data: "BBBB".into(),
+                        mime: ImageMime::Jpeg,
+                    },
+                },
+            ]
+        };
+        let cases: Vec<(AgentEvent, serde_json::Value)> = vec![
+            (
+                AgentEvent::TurnStart { turn: 3 },
+                json!({ "t": "turn_start", "turn": 3 }),
+            ),
+            (
+                AgentEvent::TextDelta {
+                    text: "你好".into(),
+                },
+                json!({ "t": "text_delta", "text": "你好" }),
+            ),
+            (
+                AgentEvent::UserMessage { blocks: blocks() },
+                json!({
+                    "t": "user_message",
+                    "blocks": [
+                        { "type": "text", "text": "你好" },
+                        { "type": "image", "data": "AAAA", "mime": "png" },
+                        { "type": "tool_call", "id": "c1", "name": "fetch_url", "input": { "n": 1 } },
+                        { "type": "tool_result", "call_id": "c1", "is_error": false,
+                          "output": { "kind": "text", "text": "抓到 42 字" } },
+                        { "type": "tool_result", "call_id": "c2", "is_error": true,
+                          "output": { "kind": "image", "data": "BBBB", "mime": "jpeg" } },
+                    ]
+                }),
+            ),
+            (
+                AgentEvent::tool_call(view()),
+                json!({
+                    "t": "tool_call",
+                    "call": { "id": "c1", "name": "fetch_url", "risk": "read",
+                              "input": { "url": "https://example.com/a" } },
+                    "risk": "read"
+                }),
+            ),
+            (
+                AgentEvent::permission_request("p1".into(), view()),
+                json!({
+                    "t": "permission_request",
+                    "id": "p1",
+                    "call": { "id": "c1", "name": "fetch_url", "risk": "read",
+                              "input": { "url": "https://example.com/a" } },
+                    "risk": "read"
+                }),
+            ),
+            (
+                AgentEvent::PermissionResolved {
+                    id: "p1".into(),
+                    decision: Decision::allow(Scope::Once),
+                },
+                json!({ "t": "permission_resolved", "id": "p1",
+                        "decision": { "allow": true, "scope": "once" } }),
+            ),
+            (
+                AgentEvent::PermissionResolved {
+                    id: "p1".into(),
+                    decision: Decision::allow(Scope::Session),
+                },
+                json!({ "t": "permission_resolved", "id": "p1",
+                        "decision": { "allow": true, "scope": "session" } }),
+            ),
+            (
+                // `scope` 必须**不出现**：写成 `"scope": null` 会让 TS 镜像的
+                // `{allow:false;reason}` 分支多一个它没声明的键，而 R98 的反序列化会因为
+                // `(false, Some(_), _)` 那一臂直接拒绝这条应答。
+                AgentEvent::PermissionResolved {
+                    id: "p1".into(),
+                    decision: Decision::deny("用户拒绝"),
+                },
+                json!({ "t": "permission_resolved", "id": "p1",
+                        "decision": { "allow": false, "reason": "用户拒绝" } }),
+            ),
+            (
+                AgentEvent::ToolResult {
+                    call_id: "c1".into(),
+                    is_error: false,
+                    ms: 1234,
+                    preview: "抓到 42 字".into(),
+                },
+                json!({ "t": "tool_result", "call_id": "c1", "is_error": false, "ms": 1234,
+                        "preview": "抓到 42 字" }),
+            ),
+            (
+                AgentEvent::Usage {
+                    input_tokens: 900,
+                    output_tokens: 21,
+                },
+                json!({ "t": "usage", "input_tokens": 900, "output_tokens": 21 }),
+            ),
+            (
+                AgentEvent::ContextCompacted {
+                    dropped: 7,
+                    summary_chars: 512,
+                },
+                json!({ "t": "context_compacted", "dropped": 7, "summary_chars": 512 }),
+            ),
+            (
+                // `at` 这个 Rust 字段名在线上叫 `where`（`#[serde(rename)]`）——
+                // 整块相等才守得住这条重命名，取 `json["where"]` 比是聋的。
+                AgentEvent::Error {
+                    at: ErrorWhere::Mcp,
+                    message: "spawn 失败".into(),
+                    fatal: true,
+                },
+                json!({ "t": "error", "where": "mcp", "message": "spawn 失败", "fatal": true }),
+            ),
+            (
+                AgentEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                },
+                json!({ "t": "done", "stop_reason": "end_turn" }),
+            ),
+        ];
+        // 13 条 = 11 个变体 + `permission_resolved` 的另外两份 decision。
+        // 这条去重断言是「别漏变体」的守卫：新增事件而不在这里补形状，红的是这里。
+        let mut seen: Vec<&str> = cases
+            .iter()
+            .filter_map(|(_, want)| want["t"].as_str())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            11,
+            "11 个变体必须各有至少一份全形状样本，漏一个就等于那一支的嵌套层没上锁"
+        );
+        for (e, want) in &cases {
+            assert_eq!(
+                &serde_json::to_value(e).unwrap(),
+                want,
+                "{e:?} 的整块线上形状不符（改名/挪层/加 flatten 都会走到这里）"
+            );
+        }
+    }
 }
