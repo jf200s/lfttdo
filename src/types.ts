@@ -7,6 +7,9 @@
 //   src-tauri/src/agent/types.rs:4-38     `ContentBlock`（tag 字段 `type`）/`ImageMime`/`ToolOutput`（tag 字段 `kind`）
 //   src-tauri/src/agent/types.rs:158-173  `ToolCallView`/`Risk`
 //   src-tauri/src/ipc.rs:24-32,146        `AgentPayload`（唯一 camelCase 的一层）+ 通道名 `"agent"`
+//   src-tauri/src/ipc.rs:488-500          `SettingsView`（`#[serde(flatten)]` ⇒ 线上拍平一层）
+//   src-tauri/src/settings.rs:231-250     `Mode`（`rename_all = "lowercase"`）/`Settings` 的 8 个键
+//   src-tauri/src/store/db.rs:239-246     `SessionRow`（无 `rename_all` ⇒ snake_case，R128）
 //
 // 本文件除类型外**只导出一个运行期值**：通道名 `AGENT_CHANNEL`（:115）。
 // Rust 侧它是 `const AGENT_CHANNEL: &str = "agent";`（ipc.rs:146），**私有、没有 `pub`**，
@@ -22,6 +25,11 @@
 //   2. `WIRE_TAGS` 不再手抄，而是 `Object.keys(probe)`，其中 `probe: Record<AgentEvent["t"], AgentEvent>`
 //      —— 镜像自身跟上了一支而 probe 忘了补，`tsc` 直接红（缺键是 TS2741）。
 //   3. `reducer.ts` 的 `switch` 有 `never` 穷尽守卫 —— 有支、有键而 reducer 漏写臂，也是 `tsc` 红。
+
+// 唯一一处跨模块引用，而且是 `import type`：编译后不产生代码，所以「本文件除 AGENT_CHANNEL
+// 外没有运行期产物」这条仍然成立。目的是让 `Settings.mode` 与 `applyTheme` 收的那一支永远是
+// 同一个联合 —— 把 `"light" | "dark"` 在这里再抄一遍就是第五份字面量（R169 刚清掉一份）。
+import type { Mode } from "./theme/theme";
 
 /** `Risk`（types.rs:167-173）：`rename_all = "lowercase"`。UI 只拿它画徽章，不参与决策（R114）。 */
 export type Risk = "read" | "write" | "exec";
@@ -65,6 +73,62 @@ export type ContentBlock =
 export type Decision =
   | { allow: true; scope: Scope }
   | { allow: false; reason: string };
+
+/**
+ * 前端**允许发出去**的内容块（R132）。`ContentBlock` 是四支联合、Rust 侧还 derive 了
+ * `Deserialize`（types.rs:4-24），拿它当入参类型等于让类型层能往历史里塞一条
+ * `type:"tool_result"` —— 那不是工具产生的「工具结果」，会污染下一轮模型上下文。
+ * 所以发送侧单独一支联合：只有 `text`（T16）和 `image`（T19）。
+ * 镜像的是 `send_message(state, session_id, blocks: Vec<ContentBlock>)` 的**可用子集**，
+ * 收窄发生在 TS 侧，Rust 一行没动（裁定就是这么要求的）。
+ */
+export type SendBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mime: ImageMime };
+
+/**
+ * `SessionRow`（db.rs:239-246）：`#[derive(Serialize)]`，**没有 `rename_all`** ⇒ 线上是
+ * snake_case（R128）。键名写成 `updatedAt` 的话 TS 不报错、运行时拿到 `undefined`，
+ * `sort((a,b)=>b.updatedAt-a.updatedAt)` 全是 `NaN` ⇒ 比较函数恒假、侧栏顺序变成「碰巧」，
+ * 而且**一声不响**。所以这一支必须有名字，排序断言必须有（Sidebar.test.tsx）。
+ * `updated_at` 是毫秒（R72），前端只拿它排序，不格式化。
+ */
+export interface SessionRow {
+  id: string;
+  title: string;
+  updated_at: number;
+}
+
+/**
+ * `Settings`（settings.rs:239-250）：8 个键，`serde` 无 `rename_all` ⇒ 全 snake_case；
+ * `mode` 是 `rename_all = "lowercase"` 的 `"light"|"dark"`（settings.rs:231-236），
+ * 和 `applyTheme` 收的那个 `Mode` 是同一支，所以这里**引用**它而不是再抄一份字面量。
+ * 数值一律 `number`：Rust 侧是 `u32`/`usize`，`font_size` 的 12..=24 钳位只有
+ * `settings.rs` 的 `normalize()` 那一处定义（R123），TS 侧不钳第二遍。
+ */
+export interface Settings {
+  base_url: string;
+  model: string;
+  reserve_output: number;
+  budget_tokens: number;
+  window_messages: number;
+  theme: string;
+  mode: Mode;
+  font_size: number;
+}
+
+/**
+ * `settings_get` 真正的返回形状（第 3 条裁定）：**不是** `Settings`。
+ * `ipc.rs:488-500` 是 `struct SettingsView { #[serde(flatten)] settings, api_key_masked, corrupt_backup }`
+ * ⇒ `#[serde(flatten)]` 把内层 8 个键**摊平到同一层**，线上是一层扁平对象，外加两个可空键：
+ * - `api_key_masked: Option<String>` —— `null` 表示未配置（R99：读不到走 `Err`，不在这个键里编故事）
+ * - `corrupt_backup: Option<PathBuf>` —— 字符串路径或 `null`（R102：紧跟那次 `load()` 取走）
+ * `setSettings` 反过来只收 `Settings` 那 8 个键，不许把整个 view 原样送回去。
+ */
+export interface SettingsView extends Settings {
+  api_key_masked: string | null;
+  corrupt_backup: string | null;
+}
 
 /**
  * `AgentEvent` 的 11 个 `t` 标签，源头是 events.rs:400-412 的
