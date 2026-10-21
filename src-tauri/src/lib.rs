@@ -8,6 +8,7 @@
 // 整条被剥掉，不会解析 `tauri` 路径。
 
 pub mod agent;
+pub mod image_prep;
 pub mod ipc;
 pub mod model;
 pub mod permission;

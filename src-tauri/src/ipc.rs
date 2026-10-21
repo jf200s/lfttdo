@@ -18,6 +18,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use tauri::ipc::InvokeBody;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio_util::sync::CancellationToken;
 
@@ -552,6 +553,36 @@ pub fn runtime_summary(state: State<'_, AppState>) -> String {
     )
 }
 
+/// raw body 取字节。字节只能克隆：`Request` 借的是 `InvokeMessage` 里的 `InvokeBody`，
+/// 而 `blocking` 要 `'static`。T3 实测 512 KB 往返中位 7.5 ms（15/15 全 `Ok`），
+/// 这次克隆在预算内，不是未量的开销。
+fn take_raw_body(body: &InvokeBody) -> Result<Vec<u8>, String> {
+    match body {
+        InvokeBody::Raw(bytes) => Ok(bytes.clone()),
+        // 不回显 value：这条字符串会进日志，而 body 内容大小不受控。
+        InvokeBody::Json(_) => Err(
+            "normalize_image 只接受 raw body，收到的是 json body（前端必须是 invoke(\"normalize_image\", bytes)）".into(),
+        ),
+    }
+}
+
+/// Task 18 Step 4：三入口拿到的字节 → `ContentBlock::Image`。
+///
+/// T3 的两条硬约束（实测，非推测）：
+/// 1. **raw 与 JSON 字段互斥** —— 这条命令一旦加第二个具名参数，前端就没法再把它整体当
+///    raw body 发。所以 max-edge / mime 这类旋钮只能内置（`image_prep::MAX_EDGE_PX`），
+///    或另开一条 JSON 命令。
+/// 2. `Request` 的文档注释写明 raw body 「on all platforms except Android」。本项目只发
+///    Windows，但这是**已知降级面**：真要跨端，兜底是走 JSON 传 base64。
+///
+/// 归一化是 CPU 活（解码 + 缩放 + 降质循环），而且 R139 之后 `image` 的 `rayon` 是关的，
+/// 单张 4000px 全在主线程串行 ⇒ 必须走 `blocking`，不能像 T3 探针那样写同步命令。
+#[tauri::command]
+pub async fn normalize_image(req: tauri::ipc::Request<'_>) -> Result<ContentBlock, String> {
+    let bytes = take_raw_body(req.body())?;
+    blocking(move || crate::image_prep::normalize_image(&bytes).map_err(|e| e.to_string())).await
+}
+
 /// 日志文件名。和 `settings.json`、`qwen-do.db` 同目录（R107）。
 const LOG_FILE: &str = "qwen-do.log";
 
@@ -671,6 +702,7 @@ pub fn run() {
             settings_get,
             settings_set,
             settings_set_api_key,
+            normalize_image,
             runtime_summary,
         ])
         .run(tauri::generate_context!())
@@ -1124,5 +1156,46 @@ mod tests {
         );
         drop(g);
         assert!(slot.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+    }
+
+    // ---- Task 18 Step 4：raw body → 归一化命令 ----
+
+    /// `InvokeBody::Raw` 里的字节必须原样交给归一化，一个字节都不许动：
+    /// 图片解码按内容判定格式（`with_guessed_format`），途中任何转码/裁剪都会让它判错。
+    #[test]
+    fn a_raw_body_is_handed_over_byte_for_byte() {
+        let bytes: Vec<u8> = (0..512).map(|i| (i % 251) as u8).collect();
+        let got = take_raw_body(&InvokeBody::Raw(bytes.clone())).expect("raw 必须收");
+        assert_eq!(got, bytes, "raw body 不许被改写");
+    }
+
+    /// JSON 分支必须**明确拒**，不许静默按空字节去解码。
+    /// R141：raw 与 JSON 字段互斥 —— 前端 `invoke("normalize_image", bytes)` 一旦写成
+    /// `invoke("normalize_image", { bytes })`，body 就变成 `Json`，这条测试是唯一能抓住它的地方。
+    #[test]
+    fn a_json_body_is_refused_and_named_as_json() {
+        let err = take_raw_body(&InvokeBody::Json(json!({ "bytes": "aGVsbG8=" })))
+            .expect_err("JSON body 必须拒收");
+        assert!(
+            err.contains("json"),
+            "报错要指名收到的形态，否则前端只能对着「图片无法识别」猜：{err}"
+        );
+    }
+
+    /// `generate_handler!` 是宏，漏登记不会编译报错，只会在运行时让前端收到
+    /// "command normalize_image not found" —— 单测碰不到，所以按本项目既有的「源码级守卫」
+    /// 一路（`tokens.test.ts` 解析 styles.css、T14 的线格式镜像）在这里直接读源码断言。
+    #[test]
+    fn the_normalization_command_is_registered_in_the_handler_list() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ipc.rs"));
+        let list = src
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split("]").next())
+            .expect("找不到 generate_handler 的登记表");
+        assert!(
+            list.contains("normalize_image,"),
+            "命令写了但没登记，前端调用只会拿到 not found：{list}"
+        );
     }
 }

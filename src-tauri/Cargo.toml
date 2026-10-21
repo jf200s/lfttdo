@@ -28,7 +28,17 @@ async-openai = { version = "0.42.2", features = ["chat-completion", "realtime"] 
 futures = "0.3.34"
 tokio = { version = "1.53.3", features = ["full"] }
 base64 = "0.23.1"
-image = "0.25.10"
+# R139：默认 features 会拉进 default-formats = avif(ravif)/bmp/dds/exr/ff/gif/hdr/ico/jpeg/
+# png/pnm/qoi/tga/tiff/webp + rayon。本任务只需要 **gif / jpeg / png / webp 解码** 与
+# **jpeg / png 编码**。安装包 <15MB 是验收线（Cargo.toml 里 reqwest 那条注释同一条红线），
+# 所以这里关掉默认 features，只点四个格式。
+# 注：`rayon` 关掉后单张 4000px 缩放是否变慢**未实测**，不许预防性加回来。
+image = { version = "0.25.10", default-features = false, features = [
+    "gif",
+    "jpeg",
+    "png",
+    "webp",
+] }
 rmcp = { version = "3.5.1", features = ["client", "transport-io", "transport-child-process"] }
 async-stream = "0.3.6"
 async-trait = "0.1.92"
@@ -60,6 +70,9 @@ strip = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# R138：`rand` 不是本 crate 的直接依赖，Cargo.lock 里的 0.9.5 / 0.10.3 **都是传递依赖**，
+# 传递依赖不能 `use rand::`。Step 1 的噪声图夹具用 `rand::rng()`（0.9 API），必须显式加。
+rand = "0.9"
 
 [target."cfg(windows)".dependencies]
 keyring-core = "1.0.1"
