@@ -1,0 +1,16 @@
+:root {
+  --bg-surface: #14161a;
+  --bg-raised: #1c1f26;
+  --bg-input: #22262e;
+  --text-primary: #e6e8ec;
+  --text-muted: #9aa1ad;
+  --accent: #6aa6ff;
+  --accent-text: #0b0d10;
+  --border: #2c313a;
+  --danger: #ff6b6b;
+  --code-bg: #101317;
+  --radius: 10px;
+  --font-size: 15px;
+  --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --bubble-max-w: 72ch;
+}

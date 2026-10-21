@@ -74,6 +74,13 @@ const MAX_RESERVE_OUTPUT: u32 = u32::MAX - BUDGET_HEADROOM;
 /// 也只有在夹过之后才不溢出。两条都只靠两个 `const` 之间的算术，没人检查 —— 所以这里编译期就查。
 const _: () = assert!(MAX_RESERVE_OUTPUT >= 1);
 
+/// `font_size` 的可读区间（R123，边界由 T15 定）。`applyTheme` 会把这个数原样写成 `<html>` 的
+/// inline `--font-size`，于是 0 变成「看不见字」、`u32::MAX` 变成「一行一个字」，两者都不报错 ——
+/// 和 `BUDGET_HEADROOM` 防的是同一类静默故障。钳在 `normalize()` 而不是 TS 里再钳一遍：
+/// 这里是设置归一的唯一真相（R86），`settings_get`、落盘、下一次读取共用同一份边界。
+const MIN_FONT_SIZE: u32 = 12;
+const MAX_FONT_SIZE: u32 = 24;
+
 /// 设置与凭据的失败面（R82）。仓库约定是每模块一个枚举，不用 `Result<_, String>`：
 /// T13 要能区分「没有条目」（显示「未配置」）与「读不到」（显示原因），
 /// 后者被降级成前者会让用户重设 key、覆盖掉其实还在库里的那一条（R83/R71 同病）。
@@ -279,7 +286,9 @@ impl Settings {
         if self.budget_tokens <= self.reserve_output {
             self.budget_tokens = self.reserve_output + BUDGET_HEADROOM;
         }
-        // font_size 本任务不钳（R86）：Plan A 里它 0 个消费者，边界等 T15/T16 定了再补。
+        // R123（边界由 T15 定，这里是唯一钳位处）：`applyTheme` 原样把它写成 inline `--font-size`，
+        // 0 → 看不见字、`u32::MAX` → 一行一个字，都不报错。TS 侧不再钳第二遍，免得两处边界漂移。
+        self.font_size = self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
     }
 
     /// 归一后的副本。派生方法用它，省掉「调用者忘了先 normalize」这条静默错误路径。
@@ -1108,6 +1117,57 @@ mod tests {
         // 后置条件也要在 `to_context_config` 那一侧兑现（同一个 bug 的下游形状）。
         let ctx = s.to_context_config();
         assert!(ctx.budget_tokens > ctx.reserve_output, "{ctx:?}");
+    }
+
+    #[test]
+    fn normalize_clamps_font_size_into_the_readable_range() {
+        // R123：`applyTheme` 把这个数原样写成 `<html>` 的 inline `--font-size`，
+        // 于是 0 是「字看不见」、`u32::MAX` 是「一行一个字」，两者都不报错。
+        for (input, want) in [
+            (0u32, MIN_FONT_SIZE),
+            (11, MIN_FONT_SIZE),
+            (12, MIN_FONT_SIZE),
+            (15, 15),
+            (24, MAX_FONT_SIZE),
+            (25, MAX_FONT_SIZE),
+            (999, MAX_FONT_SIZE),
+            (u32::MAX, MAX_FONT_SIZE),
+        ] {
+            let mut s = Settings {
+                font_size: input,
+                ..Default::default()
+            };
+            s.normalize();
+            assert_eq!(s.font_size, want, "font_size={input} 应钳到 {want}");
+        }
+    }
+
+    #[test]
+    fn font_size_is_the_clamped_value_after_a_save_and_load_round_trip() {
+        // 边界只在 `normalize()` 里定义一次，所以「读回来」「落盘的字节」两处都得是钳过的值，
+        // 而不是靠前端再钳一遍（那会造出第二份真相，T16 就无法确定自己拿到的是哪个数）。
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        store
+            .save(&Settings {
+                font_size: 999,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(store.load().unwrap().font_size, MAX_FONT_SIZE);
+        store
+            .save(&Settings {
+                font_size: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        let raw = std::fs::read_to_string(store.path()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            v["font_size"], MIN_FONT_SIZE,
+            "落盘的字节也得是钳过的值，别让下一次读取先看到 0：{raw}"
+        );
+        assert_eq!(store.load().unwrap().font_size, MIN_FONT_SIZE);
     }
 
     #[test]

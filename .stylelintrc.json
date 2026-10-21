@@ -1,0 +1,12 @@
+{
+  "extends": "stylelint-config-standard",
+  "rules": {
+    "color-no-hex": [
+      true,
+      {
+        "message": "组件内禁止硬编码颜色，请使用 var(--token)",
+        "severity": "error"
+      }
+    ]
+  }
+}

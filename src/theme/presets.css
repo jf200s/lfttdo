@@ -1,0 +1,100 @@
+/* 每个预设 × 每个明暗档各一块，块内写全 13 个 THEME_TOKENS，一个不漏（tokens.test.ts 钉这条）。
+   --font-size 刻意不进这些块：预设块的特异度高于 :root，而 applyTheme 写的是 <html> 的
+   inline style（特异度最高），块里的 --font-size 永远打不过 inline —— 留着就是永远不会生效、
+   却会让人误读成「这套预设的字号是 15」的死 CSS（R124）。 */
+
+[data-theme="noir"][data-mode="dark"] {
+  --bg-surface: #14161a;
+  --bg-raised: #1c1f26;
+  --bg-input: #22262e;
+  --text-primary: #e6e8ec;
+  --text-muted: #9aa1ad;
+  --accent: #6aa6ff;
+  --accent-text: #0b0d10;
+  --border: #2c313a;
+  --danger: #ff6b6b;
+  --code-bg: #101317;
+  --radius: 10px;
+  --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --bubble-max-w: 72ch;
+}
+
+[data-theme="noir"][data-mode="light"] {
+  --bg-surface: #f6f7f9;
+  --bg-raised: #ffffff;
+  --bg-input: #eef0f4;
+  --text-primary: #16181c;
+  --text-muted: #5d646f;
+  --accent: #2f6fd0;
+  --accent-text: #ffffff;
+  --border: #d8dce3;
+  --danger: #c0392b;
+  --code-bg: #f0f2f5;
+  --radius: 10px;
+  --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --bubble-max-w: 72ch;
+}
+
+[data-theme="paper"][data-mode="light"] {
+  --bg-surface: #f6f2e9;
+  --bg-raised: #fffdf7;
+  --bg-input: #ece5d8;
+  --text-primary: #1f1b14;
+  --text-muted: #6b6355;
+  --accent: #8a5a2b;
+  --accent-text: #fffdf7;
+  --border: #d9d0c0;
+  --danger: #a83c22;
+  --code-bg: #ece5d8;
+  --radius: 6px;
+  --font-family: Georgia, "Times New Roman", "Microsoft YaHei", serif;
+  --bubble-max-w: 68ch;
+}
+
+[data-theme="paper"][data-mode="dark"] {
+  --bg-surface: #1f1c16;
+  --bg-raised: #26221a;
+  --bg-input: #302b21;
+  --text-primary: #ece5d8;
+  --text-muted: #a2977f;
+  --accent: #d9a441;
+  --accent-text: #1f1c16;
+  --border: #443c2e;
+  --danger: #e07a5a;
+  --code-bg: #17140f;
+  --radius: 6px;
+  --font-family: Georgia, "Times New Roman", "Microsoft YaHei", serif;
+  --bubble-max-w: 68ch;
+}
+
+[data-theme="ocean"][data-mode="light"] {
+  --bg-surface: #eef4f8;
+  --bg-raised: #ffffff;
+  --bg-input: #dfeaf2;
+  --text-primary: #142633;
+  --text-muted: #5b7488;
+  --accent: #1c6ea3;
+  --accent-text: #ffffff;
+  --border: #c3d5e2;
+  --danger: #b03a2e;
+  --code-bg: #e3edf4;
+  --radius: 12px;
+  --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --bubble-max-w: 76ch;
+}
+
+[data-theme="ocean"][data-mode="dark"] {
+  --bg-surface: #0d1b26;
+  --bg-raised: #12242f;
+  --bg-input: #172d3a;
+  --text-primary: #dce8f0;
+  --text-muted: #8aa3b4;
+  --accent: #4fb3d9;
+  --accent-text: #08131a;
+  --border: #24404f;
+  --danger: #ff7a66;
+  --code-bg: #0a1620;
+  --radius: 12px;
+  --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --bubble-max-w: 76ch;
+}
