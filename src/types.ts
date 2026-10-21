@@ -123,10 +123,16 @@ export type ToolStatus = "running" | "ok" | "error";
 /**
  * 一张工具卡。`brief` 的 Produces 清单把它和 `PermCard` 列成具名类型，所以这里给名字，
  * `UiBlock` 直接用这两个名字拼 —— T16 收窄时不必再重抄 `Extract<UiBlock, { kind: "tool" }>`（评审 F3）。
+ * 三种写法**等价、可互换**：把变体内联进 `UiBlock` / 具名 interface 被 `UiBlock` 消费 /
+ * 事后再补一个 `Extract<UiBlock, …>` 别名。保证这件事的是文件末尾那条 `CardAliasEquivalence`
+ * 编译期断言（`SameShape` 双向互赋，一旦漂移直接 TS2344），不是这段注释。
  *
- * 为什么不写成 `export type ToolCard = Extract<UiBlock, { kind: "tool" }>`：那样 `UiBlock`
- * 与 `ToolCard` 互相引用，`tsc` 报 TS2456「Type alias circularly references itself」（实测）。
- * 于是名字住在变体上、`UiBlock` 引用名字，末尾再用编译期断言把两个方向钉回等价。
+ * 这里不写成 `export type ToolCard = Extract<UiBlock, { kind: "tool" }>`，要禁的只是**下面这一对同时成立**：
+ * (a) `UiBlock` 已经是「由具名变体拼出来的组合别名」（本文件正是这样），而 (b) 那个具名变体又反过来
+ * 取 `Extract<UiBlock, …>`。那时别名左右互相引用，`tsc` 报 TS2456「Type alias circularly references
+ * itself」（实测）。反过来，若 `UiBlock` 里那一支是**内联**写的，「内联变体 + 事后 `Extract` 别名」
+ * 编译得干干净净 —— 所以「`Extract` 写法不可能」这个说法过宽，准确的说法只有「(a) 与 (b) 不能并存」。
+ * 本文件的取舍：名字住在变体上、`UiBlock` 引用名字，末尾用编译期断言把两个方向钉回等价。
  */
 export interface ToolCard {
   kind: "tool";

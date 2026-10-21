@@ -77,7 +77,22 @@ async function readSource(relative: string): Promise<string> {
     readFileSync(path: URL, encoding: "utf8"): string;
   };
   // 相对起点是本文件 src/state/reducer.test.ts ⇒ 仓库根是 **../../**，不是 ../../../。
-  return fs.readFileSync(new URL(relative, import.meta.url), "utf8");
+  const url = new URL(relative, import.meta.url);
+  try {
+    return fs.readFileSync(url, "utf8");
+  } catch (err) {
+    // 缺文件时**仍然硬失败**，不许改成 skip —— 静默跳过的跨语言守卫等于没有守卫。
+    // 但这条红的**身份**必须写进消息里（评审 R176）：它是「源码读不到」的前置条件失败，
+    // 不是 reducer 的行为回归；否则读者会顺着「reducer 挂了」这条线索白查一遍状态机。
+    const why = relative.includes("src-tauri")
+      ? "这条跨语言守卫要求 src-tauri/ 与前端源码在**同一份检出**里；只检出前端、" +
+        "或 src-tauri/ 被裁掉时它必然红，红的是前置条件缺失"
+      : "这条用例直接读仓库里的 TS 源码，文件不在同样是前置条件缺失";
+    throw new Error(
+      `readSource 读不到 ${relative}（解析为 ${url}）—— ${why}，` +
+        `**不是 reducer 的行为回归**。原始错误：${String(err)}`,
+    );
+  }
 }
 
 /**
@@ -339,6 +354,28 @@ describe("reducer", () => {
     expect(s.toolIndex.c9).toBeUndefined();
   });
 
+  it("ignores an unknown ContentBlock tag instead of crashing", () => {
+    // 评审 R178a：`reducer.ts` 的 `userBlocks` 有一个 `default` 臂（:119-127），
+    // 它的**编译期**穷尽守卫由 `const _exhaustive: never = b` 钉（tsc），
+    // 但它的**运行期**行为此前没有任何用例覆盖 —— 姊妹函数 `reduce` 的 default 臂有
+    // 上面那条 "ignores an unknown event shape instead of crashing"，这一支是空白。
+    // 为什么必须有：db.rs:388 把 `m.blocks.clone()` **原样**上交，Rust 给 `ContentBlock`
+    // 加第 5 支时它会自己流进这个 default，而不是在编译期被拦下（线上数据不看 TS 的类型）。
+    // 文档化的行为是「惰性」：不崩、也不落块。下面两条断言各钉一半。
+    const before = initialState();
+    const ghostEvent: AgentEvent = {
+      t: "user_message",
+      blocks: [{ type: "brand_new_block_from_a_future_rust" } as unknown as ContentBlock],
+    };
+    expect(() => reduce(before, ghostEvent)).not.toThrow();
+    const s = reduce(before, ghostEvent);
+    // 用户气泡照样开（`user_message` 的归档行为不因为块认不出来而退化），但里面**一块都没有**。
+    expect(s.turns).toHaveLength(1);
+    expect(s.turns[0].role).toBe("user");
+    expect(s.turns[0].blocks).toEqual([]);
+    expect(toolCount(s)).toBe(0);
+  });
+
   // ==== R112/R113：turn 边界与身份 ====
 
   it("opens a second turn for the second turn_start even mid-stream", () => {
@@ -437,24 +474,47 @@ describe("reducer", () => {
     // 锚点在文件里必须唯一，否则切片起点就是在赌其中哪一个。
     expect(src.split(anchor).length - 1).toBe(1);
 
-    // 切片**必须有界**：只取 `let tags = [` 到**下一个** `];` 之间的那一段。
-    // 从锚点一路切到文件末尾会把后续计划里新增的测试字符串一起吞进来，
-    // 于是这条用例会越来越宽，最后谁都读不出它到底在钉什么。
+    // 切片**必须有界**（只能取到下一个 `];`）**且必须由锚点定界**（评审 R175）。
+    // 旧写法只做到了前一半：`anchor` 买来的是上面那条唯一性断言，`indexOf(openMarker)` 却
+    // 仍然从字节 0 起搜 —— 于是真正的起点由 marker 决定，锚点形同虚设。实测的洞：
+    // 在锚点**之前**的 `decision_allow_field_always_agrees_with_its_variant` 里塞一份
+    // 完整的 11 支影子名单，同时把锚点后那份真名单删掉一支，本用例照样全绿。
+    // 现在把搜索起点推到锚点文本之后：锚点前面发生什么都不再参与判定。
     const openMarker = "let tags = [";
-    const open = src.indexOf(openMarker);
-    expect(open, "events.rs 里找不到 `let tags = [` —— 名单的锚点被改名了").toBeGreaterThanOrEqual(0);
+    const open = src.indexOf(openMarker, src.indexOf(anchor) + anchor.length);
+    expect(
+      open,
+      "锚点之后找不到 `let tags = [` —— 名单被改名、被挪到锚点之前，或那条 Rust 测试整个没了",
+    ).toBeGreaterThanOrEqual(0);
     const bodyStart = open + openMarker.length;
     const close = src.indexOf("];", bodyStart);
     expect(close, "`let tags = [` 之后找不到 `];` —— 切片没有收口").toBeGreaterThan(bodyStart);
 
     const slice = src.slice(bodyStart, close);
-    const rust = [...slice.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
-    // 两条都要：只比集合的话，切片一旦被收紧成空列表就会「两边都缺同一支」地悄悄通过。
-    expect(rust).toHaveLength(11); // 这个数字锚在 events.rs:358 的 (11, 11) 断言上
-    expect(WIRE_TAGS).toHaveLength(11);
+    // 字符类必须含数字（评审 R176）。旧的 `[a-z_]+` 会把任何带数字的标签**静默丢掉**：
+    // 实测把真名单里的 `"text_delta"` 改名成 `"text_delta2"`，红的是
+    // 「expected [...] to have a length of 11 but got 10」—— 一支被正则吞掉的标签
+    // 表现得像 Rust 真少了一支，而且名单被截断成 `…(8)`，谁都读不出是哪一支。
+    const rust = [...slice.matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]);
+    // 三条都要：只比集合的话，切片一旦被收紧成空列表就会「两边都缺同一支」地悄悄通过。
+    // 消息里必须**打印读到的名单**（评审 R176/R177）：12 支的红要能点出多出来那一支的名字，
+    // 只报一个数字的话，改的人还得先去 events.rs 里数一遍。
+    const handoff =
+      "这个数字锚在 events.rs:358 那条 (11, 11) 断言上；" +
+      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那张 tags 表 + 那个 (11, 11)）、" +
+      "src/types.ts 的 AgentEvent、本文件的 probe 表，" +
+      "以及本文件那三条 toHaveLength(11) 计数（:462 的 WIRE_TAGS、:507 的 rust、:508 的 WIRE_TAGS）";
+    expect(rust, `events.rs 的 tags 表读到 ${rust.length} 支：${JSON.stringify(rust)}。${handoff}`).toHaveLength(11);
+    expect(WIRE_TAGS, `TS 侧镜像只有 ${WIRE_TAGS.length} 支：${JSON.stringify(WIRE_TAGS)}。${handoff}`).toHaveLength(11);
     // 集合相等，**不**比顺序：Rust 那边把 tags 数组重新排序不影响线格式，
     // 断言顺序只会造出一个假红。
-    expect(new Set(rust)).toEqual(new Set(WIRE_TAGS));
+    // 差集要**点名**（评审 R176）：两边各多出哪几支直接写进消息，别让人去猜 diff。
+    const onlyInRust = rust.filter((t) => !(WIRE_TAGS as string[]).includes(t));
+    const onlyInTs = WIRE_TAGS.filter((t) => !rust.includes(t));
+    expect(
+      new Set(rust),
+      `Rust 名单与 TS 镜像不等价：Rust 多出 ${JSON.stringify(onlyInRust)}、TS 多出 ${JSON.stringify(onlyInTs)}。${handoff}`,
+    ).toEqual(new Set(WIRE_TAGS));
   });
 
   // ==== R114/R115/R116：不许替线格式发明真相 ====
