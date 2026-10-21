@@ -58,7 +58,7 @@ export function Composer({
   /**
    * `pending` 的**同步影子**（`App.tsx` 的 `activeRef`/`bufRef` 同一手法）：
    * 归一化是异步的，只读 state 的话「连投两批」会把 4 张的额度算重。
-   * 写这一支的地方只有 `pushPending` / `clearPending` 两处，所以可审。
+   * 写这一支的地方只有 `pushPending` / `removePending` / `dropSent` 三处，所以可审。
    */
   const pendingRef = useRef<PendingImage[]>([]);
 
@@ -71,9 +71,17 @@ export function Composer({
     setPending(pendingRef.current);
   };
 
-  const clearPending = () => {
-    pendingRef.current = [];
-    setPending([]);
+  /**
+   * 只摘掉**这一次发出去的那几张**，不是「清空待发区」。
+   *
+   * 归一化是异步的，`submit` 在 `await onSend` 之后才清理；那段时间里回来的图（用户贴完
+   * 图直接回车，`normalize_image` 的 promise 还挂着）既不在发出去的载荷里、也不该被算作
+   * 已发。整区清空的症状和 0650036 修掉的「已忽略 N 张永不消失」同一族：界面先承诺缩略图，
+   * 然后无声吞掉它 —— 用户只会以为那张图从没贴上。
+   */
+  const dropSent = (sent: PendingImage[]) => {
+    pendingRef.current = pendingRef.current.filter((p) => !sent.includes(p));
+    setPending(pendingRef.current);
   };
 
   /** 移除第 `index` 张：同时腾出额度（`pendingRef` 是额度的读数来源）。 */
@@ -131,7 +139,7 @@ export function Composer({
   };
 
   /**
-   * Step 2 第 8 条：`setText("")` / `clearPending()` 都移到 `await` **之后** ——
+   * Step 2 第 8 条：`setText("")` / `dropSent(…)` 都移到 `await` **之后** ——
    * 发失败时用户准备好的图和那句话必须原样留在输入区（清空的症状是「只能重新贴一遍」）。
    * 这里的 `catch` 有意不显示任何东西：发送失败的原文由调用方（`App` 的 notice）上屏，
    * 在这一层再抄一遍就是同一件事两个来源。
@@ -143,7 +151,10 @@ export function Composer({
     if ((t === "" && pending.length === 0) || streaming) return;
     // Step 2 第 7 条：顺序固定图在前、文本在最后；文本为空时**不产出**空的 text 块
     // （`App.test.tsx` 那十三条钉的就是无图发送仍是 `[{type:"text",text}]`，R216②）。
-    const blocks: SendBlock[] = pending.map((p) => p.block);
+    // 取 `pendingRef`（同步影子）而不是 `pending`：这份快照同时是 `dropSent` 的删除依据，
+    // 两者必须是同一个列表，否则「按身份移除」会移除成另一批。
+    const sent = pendingRef.current;
+    const blocks: SendBlock[] = sent.map((p) => p.block);
     if (t !== "") blocks.push({ type: "text", text: t });
     try {
       await onSend(blocks);
@@ -151,7 +162,7 @@ export function Composer({
       return;
     }
     setText("");
-    clearPending();
+    dropSent(sent);
     // 「已忽略 N 张」和逐文件错误描述的是**这份草稿**，草稿发出去了它们就该一起走。
     // 少这两行的症状是真的：某一次投了 5 张被挡掉 1 张，此后每一条消息都挂着那句
     // 「已忽略 1 张」，用户会以为界面坏了 —— 而它连「这次到底成没成」都不再能说清。
@@ -207,8 +218,16 @@ export function Composer({
             onChange={(e) => setText(e.target.value)}
           />
           {streaming ? (
-            <button type="button" className="stop" disabled={stopRequested} onClick={stop}>
-              停止
+            <button
+              type="button"
+              className="stop"
+              disabled={stopRequested}
+              onClick={stop}
+            >
+              {/* spec:475：点击后「立即禁用并显示停止中…」。文案与 `stopRequested` 同一个
+                  真相，所以不需要第三个状态位 —— 按钮灰着而字还是「停止」，用户读到的是
+                  「点不动」，不是「已经在路上了」。 */}
+              {stopRequested ? "停止中…" : "停止"}
             </button>
           ) : (
             <button type="submit" className="send">

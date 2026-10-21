@@ -291,10 +291,14 @@ describe("App", () => {
 
     fireEvent.click(stop);
     expect(h.interrupt).toHaveBeenCalled();
+    // spec:475 的后半句：点击之后除了自禁用，还要把话改成「停止中…」。中断是真异步的，
+    // 按钮上这几个字是用户唯一看得见的「已经在路上了」；仍写着「停止」的症状是他以为
+    // 没点着、再点一次，而第二次 `interrupt()` 什么也不会改变。
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "停止中…" })).toBeDisabled(),
+    );
     // 禁用必须由 `streaming` 这一个真相撑着：`interrupt()` 的 promise 已经完成，
     // 但这一轮还没结束（done 没来），按钮不许自己活过来。
-    await waitFor(() => expect(h.interrupt).toHaveBeenCalled());
-    expect(screen.getByRole("button", { name: /停止/ })).toBeDisabled();
     expect(box).toBeDisabled();
 
     act(() => h.emit("B", { t: "done", stop_reason: "interrupted" }));

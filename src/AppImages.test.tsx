@@ -160,4 +160,66 @@ describe("App 图片接线", () => {
     expect(screen.getByTestId("thumb-0")).toHaveAccessibleName("截图.png");
     expect(h.sendMessage).not.toHaveBeenCalled();
   });
+
+  // 评审 #29 规格轴：`库里那一行 → 重放气泡里的图` 是整条视觉链上唯一没人断言的一环。
+  // 它不是洁癖 —— 1aafbe2 修的那个 bug（`data:png;base64,…` 不是合法 data URL，图直接不显示）
+  // 就住在 `MessageBubble` 的 image 支，而直播与重放共用这一个组件：当时靠乐观插入看得见，
+  // 重开这条会话就看不见。直播那半边已由第一条用例钉住，这条钉另外半边，
+  // 并且把两侧的 src **写成同一个字符串**，这样「两条路各修一半」当场可红。
+  // 变异判据：把 `MessageBubble.tsx` 的 `data:image/${mime}` 改回 `data:${mime}` ⇒ 这两条一起红。
+  it("renders a replayed image with the very same data URL the live path uses", async () => {
+    h.replaySession.mockResolvedValue([
+      { t: "user_message", blocks: [imageBlock] },
+    ]);
+    render(<App />);
+    await settled();
+    const bubble = await screen.findByTestId("bubble-user");
+    const thumb = bubble.querySelector("img.thumb");
+    expect(thumb).not.toBeNull();
+    expect(thumb).toHaveAttribute("src", "data:image/png;base64,AAAA");
+  });
+
+  // 评审 #29（前端与配置）：归一化是异步的，而 `submit` 在那次 `await` 之后清一次待发区。
+  // 于是「贴图的 await 还挂着、用户已经按了回车」这段时间里回来的那张图会被一起清掉 ——
+  // 症状与 0650036 修掉的「已忽略 N 张永不消失」同一族：界面先承诺，然后无声吞掉。
+  // 该留下的判据是**归属**：这张图没进那次 `send_message` 的载荷，它就属于下一条消息，
+  // 必须原样留在待发区让用户再按一次发送，而不是被上一次发送的清理带走。
+  it("keeps an image whose normalize lands while the send is in flight", async () => {
+    let resolveNormalize: (b: ContentBlock) => void = () => {};
+    let resolveSend: () => void = () => {};
+    h.normalize.mockImplementation(
+      () =>
+        new Promise<ContentBlock>((r) => {
+          resolveNormalize = r;
+        }),
+    );
+    h.sendMessage.mockImplementation(
+      () =>
+        new Promise<void>((r) => {
+          resolveSend = r;
+        }),
+    );
+
+    render(<App />);
+    await settled();
+    dropPng(7); // 归一化故意悬着：此刻待发区还是空的
+    fireEvent.change(screen.getByRole("textbox", { name: "输入消息" }), {
+      target: { value: "先看这个" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled());
+    // 载荷里只有文本：那张图当时还不存在，不许替用户把它塞进这一条消息。
+    expect(h.sendMessage).toHaveBeenCalledWith("B", [
+      { type: "text", text: "先看这个" },
+    ]);
+
+    resolveNormalize(imageBlock);
+    await screen.findByTestId("thumb-0");
+    resolveSend();
+    // 输入框变空 = 成功路径的清理确实跑过了；在这之后图还在，才是「只撤发出去的那几张」。
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(""),
+    );
+    expect(screen.getByTestId("thumb-0")).toHaveAccessibleName("截图.png");
+  });
 });
