@@ -145,7 +145,8 @@ function stripComments(src: string): string {
  * 类型写成 `Record<AgentEvent["t"], AgentEvent>` 是这套守卫的核心（评审 F1③）：
  * 名单**不再手抄**，而是 `Object.keys(probe)` 从镜像自己推出来。于是
  * `types.ts` 的 union 多了一支而这里忘了补键 ⇒ 缺键直接 TS2741，`tsc` 红。
- * 键的插入顺序按 events.rs:400-412 排，`Object.keys` 保序，所以下面那条跨语言用例
+ * 键的插入顺序按 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 里那张 `tags` 表排，
+ * `Object.keys` 保序，所以下面那条跨语言用例
  * 拿到的就是「按 Rust 名单顺序的镜像标签表」。
  */
 const probe: Record<AgentEvent["t"], AgentEvent> = {
@@ -355,12 +356,13 @@ describe("reducer", () => {
   });
 
   it("ignores an unknown ContentBlock tag instead of crashing", () => {
-    // 评审 R178a：`reducer.ts` 的 `userBlocks` 有一个 `default` 臂（:119-127），
+    // 评审 R178a：`reducer.ts` 的 `userBlocks` 有一个 `default` 臂，
     // 它的**编译期**穷尽守卫由 `const _exhaustive: never = b` 钉（tsc），
     // 但它的**运行期**行为此前没有任何用例覆盖 —— 姊妹函数 `reduce` 的 default 臂有
     // 上面那条 "ignores an unknown event shape instead of crashing"，这一支是空白。
-    // 为什么必须有：db.rs:388 把 `m.blocks.clone()` **原样**上交，Rust 给 `ContentBlock`
-    // 加第 5 支时它会自己流进这个 default，而不是在编译期被拦下（线上数据不看 TS 的类型）。
+    // 为什么必须有：`store/db.rs` 的 `events_from_messages` 把 `m.blocks.clone()` **原样**上交，
+    // Rust 给 `ContentBlock` 加第 5 支时它会自己流进这个 default，
+    // 而不是在编译期被拦下（线上数据不看 TS 的类型）。
     // 文档化的行为是「惰性」：不崩、也不落块。下面两条断言各钉一半。
     const before = initialState();
     const ghostEvent: AgentEvent = {
@@ -459,7 +461,8 @@ describe("reducer", () => {
     // 名单来自 `Object.keys(probe)`，probe 的类型是 `Record<AgentEvent["t"], AgentEvent>`：
     // 镜像有第 12 支而 probe 没补 → tsc 红；probe 补了而 reducer 没写臂 → reducer 的
     // never 守卫红（tsc）+ 这里的 swallowed 断言红。三层都在（评审 F1③）。
-    expect(WIRE_TAGS).toHaveLength(11); // 这个数字锚在 events.rs:358 那条 (11, 11) 断言上
+    // R202：锚点写 Rust 的测试函数名，不写行号 —— 行号每次上游插删就指偏，名字不会。
+    expect(WIRE_TAGS).toHaveLength(11); // 锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 那条 (11, 11) 断言上
     const base = replay([start(1), d("在写正文"), toolCall("c1"), permRequest("p1")]);
     const swallowed = WIRE_TAGS.filter((tag) => reduce(base, probe[tag]) === base);
     expect(swallowed).toEqual([]);
@@ -473,19 +476,29 @@ describe("reducer", () => {
     const anchor = "every_agent_event_variant_serializes_its_t_tag";
     // 锚点在文件里必须唯一，否则切片起点就是在赌其中哪一个。
     expect(src.split(anchor).length - 1).toBe(1);
+    const anchorIdx = src.indexOf(anchor);
 
     // 切片**必须有界**（只能取到下一个 `];`）**且必须由锚点定界**（评审 R175）。
     // 旧写法只做到了前一半：`anchor` 买来的是上面那条唯一性断言，`indexOf(openMarker)` 却
     // 仍然从字节 0 起搜 —— 于是真正的起点由 marker 决定，锚点形同虚设。实测的洞：
     // 在锚点**之前**的 `decision_allow_field_always_agrees_with_its_variant` 里塞一份
-    // 完整的 11 支影子名单，同时把锚点后那份真名单删掉一支，本用例照样全绿。
+    // 完整的 11 支影子名单，同时把锚点后那份真名单删掉一支，本用例照样全绿（评审 Q01）。
     // 现在把搜索起点推到锚点文本之后：锚点前面发生什么都不再参与判定。
     const openMarker = "let tags = [";
-    const open = src.indexOf(openMarker, src.indexOf(anchor) + anchor.length);
+    const open = src.indexOf(openMarker, anchorIdx + anchor.length);
     expect(
       open,
       "锚点之后找不到 `let tags = [` —— 名单被改名、被挪到锚点之前，或那条 Rust 测试整个没了",
     ).toBeGreaterThanOrEqual(0);
+    // R198（评审 MIN1 / 变异 Q01c）：`indexOf` 买到的是「锚点之后的**第一个**」，
+    // 语义上却一直在用它当「锚点所属的那一张」。在锚点之后、真表之前再插一份 `let tags = [`，
+    // 切片就换了一张表，而实测 rc=0 存活 —— 因为「第一个」根本不承诺唯一。
+    // 对本用例**实际读取的窗口**（锚点起到文件末尾）做全量计数：这个窗口里只许有一份表。
+    expect(
+      [...src.slice(anchorIdx).matchAll(/let tags = \[/g)],
+      "锚点之后不止一份 `let tags = [` —— indexOf 只读第一份，多出来的那张影子表没人守（R198 / Q01c）。" +
+        "要么把重复的表删掉，要么把锚点改成真正拥有这份名单的那条 Rust 测试",
+    ).toHaveLength(1);
     const bodyStart = open + openMarker.length;
     const close = src.indexOf("];", bodyStart);
     expect(close, "`let tags = [` 之后找不到 `];` —— 切片没有收口").toBeGreaterThan(bodyStart);
@@ -499,11 +512,16 @@ describe("reducer", () => {
     // 三条都要：只比集合的话，切片一旦被收紧成空列表就会「两边都缺同一支」地悄悄通过。
     // 消息里必须**打印读到的名单**（评审 R176/R177）：12 支的红要能点出多出来那一支的名字，
     // 只报一个数字的话，改的人还得先去 events.rs 里数一遍。
+    // R202（评审 NIT2）：失败消息里**一律不许写行号** —— 本文件的行号每加一条断言就整体下移
+    // （本轮自己插了 21 行就重算过一次，而没有任何测试守着它），评审引用的 Rust 行号也已经指偏
+    // （`events.rs:358` 指到函数名那一行、`(11, 11)` 在它下面十几行）。定位改用**测试函数名**。
     const handoff =
-      "这个数字锚在 events.rs:358 那条 (11, 11) 断言上；" +
-      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那张 tags 表 + 那个 (11, 11)）、" +
+      "这个计数锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 里那条 " +
+      "`assert_eq!((events.len(), tags.len()), (11, 11))` 断言上；" +
+      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那个测试里的 tags 表和 (11, 11)）、" +
       "src/types.ts 的 AgentEvent、本文件的 probe 表，" +
-      "以及本文件那三条 toHaveLength(11) 计数（:462 的 WIRE_TAGS、:507 的 rust、:508 的 WIRE_TAGS）";
+      "以及本文件那三处计数断言（用例 `handles every one of the 11 wire t tags without falling through to default` " +
+      "里的 WIRE_TAGS，和**本用例**里的 rust 与 WIRE_TAGS 两条 toHaveLength）";
     expect(rust, `events.rs 的 tags 表读到 ${rust.length} 支：${JSON.stringify(rust)}。${handoff}`).toHaveLength(11);
     expect(WIRE_TAGS, `TS 侧镜像只有 ${WIRE_TAGS.length} 支：${JSON.stringify(WIRE_TAGS)}。${handoff}`).toHaveLength(11);
     // 集合相等，**不**比顺序：Rust 那边把 tags 数组重新排序不影响线格式，

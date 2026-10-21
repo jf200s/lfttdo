@@ -29,6 +29,12 @@ const presets = readFileSync(pathOf("./presets.css"), "utf8");
 // 旧形态只扫 `#rrggbb`，于是 `box-shadow: 0 2px 2px rgb(0 0 0 / 20%)` 从两道闸中间穿过去，
 // 而 minifier 还会把它写回成 `#0003` 塞进产物 —— 将来谁拿 hex 扫产物验收会得到一条无根的红。
 // 带 `g`：测试名承诺「every」，就该把一个文件里的全部走样都报出来，而不是看见第一颗就收工。
+// R203 NIT5 —— 这条闸**实际覆盖的记号形式**就是正则里那两类：hex 字面量，和
+// `rgb()` / `rgba()` / `hsl()` / `hsla()` 函数记号。**CSS 具名色不在覆盖范围内**：
+// 实测往 `src/styles.css` 写 `color: red`，`npx vitest run` 和 `npm run lint:css` 双双 rc=0
+// （stylelint 那半边只有 `color-no-hex`，它同样不管具名色）。
+// 不许为了让这句承诺成立去扩正则覆盖具名色 —— 那得先安置 `background: transparent`
+// 这一类合法关键字，否则就是新的假阳，且超出本轮委托面。
 const HARDCODED_COLOR =
   /#[0-9a-fA-F]{3,8}\b|\b(?:rgb|rgba|hsl|hsla)\s*\(/g;
 
@@ -137,6 +143,16 @@ function relativeLuminance(value: string): number {
   return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
 }
 
+/**
+ * WCAG 对比度：亮度高的一支进分子，所以参数顺序无关（R201 用它守 hover 态的可辨识度）。
+ * 只吃 `relativeLuminance` 认得出的写法 —— 预设块里那四支色值全是 `#rrggbb`。
+ */
+function contrast(first: string, second: string): number {
+  const l1 = relativeLuminance(first);
+  const l2 = relativeLuminance(second);
+  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+}
+
 /** 组件样式里 `button` 静止态与 `:active` 各取哪个 token（按层叠顺序，后写的算）。 */
 function buttonBackgrounds(css: string): { rest: string; active: string } {
   let rest = "";
@@ -190,9 +206,20 @@ describe("theme tokens", () => {
       expect(bodies.has(key), `预设块 ${key} 被重复定义`).toBe(false);
       bodies.set(key, m[3]);
     }
-    expect([...bodies.keys()].sort()).toEqual(
-      THEME_NAMES.flatMap((t) => [`${t}/dark`, `${t}/light`]).sort(),
-    );
+    // R199（评审 MIN2）：这块的集合相等是**裸 set diff**，而它守着的正则只认属性选择器的规范形
+    // `[data-theme="x"][data-mode="y"]`（R171 刻意收紧，等价序 `[data-mode="y"][data-theme="x"]`
+    // 在 CSS 里合法、渲染也一样，但会整块掉出集合）。掉出集合时红的是**拼写**，不是层叠也不是漏项 ——
+    // 那条身份必须写进消息，否则改的人会去动名单或去放宽正则（两条都不许）。
+    const expectedKeys = THEME_NAMES.flatMap((t) => [`${t}/dark`, `${t}/light`]).sort();
+    const foundKeys = [...bodies.keys()].sort();
+    expect(
+      foundKeys,
+      `预设块读到的键集合与 THEME_NAMES × {dark, light} 不等价：读到 ${JSON.stringify(foundKeys)}，` +
+        `期望 ${JSON.stringify(expectedKeys)}。少的那一块若**在文件里看得见**，先查它的属性顺序 —— ` +
+        `本用例只认规范形 [data-theme="…"][data-mode="…"]（R171 刻意收紧），` +
+        `写成等价序 [data-mode="…"][data-theme="…"] 是合法 CSS、计算值一模一样，但会整块掉出集合。` +
+        `红的是拼写不是漏项：把选择器改回规范形即可，**不许**为此放宽正则、也不许把等价序加进期望集合。`,
+    ).toEqual(expectedKeys);
 
     for (const theme of THEME_NAMES) {
       for (const mode of ["dark", "light"]) {
@@ -235,7 +262,11 @@ describe("theme tokens", () => {
   // `error TS2554: Expected 4 arguments, but got 5`（`as never` 只放宽类型、不管实参个数），
   // 而本任务的判据要求 `npx tsc --noEmit` rc=0，所以改成通过放宽签名的引用传这个多余实参。
   it("has no hook for writing --accent inline", () => {
-    expect(applyTheme.length).toBe(4);
+    expect(
+      applyTheme.length,
+      "applyTheme 的形参数量不再是 4 —— R122 明令删掉的第 5 个 `accent` 参数被加回来了" +
+        "（哪怕声明成可选，arity 也会先红在这里）",
+    ).toBe(4);
 
     const probe = makeSpyElement();
     const callWithExtraAccent = applyTheme as unknown as (
@@ -274,29 +305,46 @@ describe("theme tokens", () => {
     expect(resolveTheme("")).toEqual({ theme: "noir", fellBack: true });
   });
 
-  // F9 / R120：层叠顺序零守卫。评审 M15 对调 `main.tsx:3/:4` 两行 import，实测 6 passed，
+  // F9 / R120：层叠顺序零守卫。评审 M15 对调 `main.tsx` 的两行主题 import，实测 6 passed，
   // 而产物里顺序**真的翻了**（presets idx=0、:root idx=1973）。
-  // 诚实附注：这条对调今天不改变渲染（预设块特异度 0,2,0 恒高于 :root 的 0,1,0；唯一一对同特异度
-  // 的 :root 规则声明的属性集合不相交），所以它是防御性约定。真正的风险是 T16/T19 一旦有组件样式
-  // 在 :root 上声明自定义属性，顺序立刻变承重 —— 下面那个 for-all 子句就是给那时准备的雷线，
-  // 故意不硬编码第三个文件名（T16 会新建 src/styles.css）。
+  // 诚实附注：这两行互换今天不改变渲染（预设块特异度 0,2,0 恒高于 :root 的 0,1,0；唯一一对同特异度
+  // 的 :root 规则声明的属性集合不相交），所以它是防御性约定。真正的风险是组件样式在 :root 上
+  // 声明自定义属性，顺序立刻变承重 —— 下面那个 for-all 子句就是给那时准备的雷线，
+  // 故意不硬编码第三个文件名（T16 新建的是 src/styles.css，将来还会再多）。
+  // R197（评审 MAJ1）：for-all 循环只看得见 `main.tsx` 里**字面的 `.css` import**，看不见真正的
+  // 层叠路径 —— 把 `import App from "./App"` 提到两份主题样式表之前，组件模块自己（或它将来任何
+  // 一行）带来的样式就会排在主题声明之前，而实测该变异 rc=0 存活（评审 G1）。
+  // 所以顺序现在钉在**模块导入**这一层，不再只钉在文件名这一层。
   it("imports tokens before presets before every other stylesheet", () => {
     const source = readFileSync(pathOf("../main.tsx"), "utf8");
-    const cssImports = [
-      ...source.matchAll(/^\s*import\s+["']([^"']+\.css)["']/gm),
-    ].map((m) => m[1]);
-    const at = (suffix: string): number =>
-      cssImports.findIndex((p) => p.endsWith(suffix));
+    // 坐标系统是 main.tsx 里**全部** import 语句的出现顺序 —— 层叠由它决定，不是由 `.css` 子集决定。
+    const importLines = [...source.matchAll(/^[ \t]*import[^\n]*/gm)].map((m) => m[0]);
+    const at = (needle: string): number =>
+      importLines.findIndex((line) => line.includes(needle));
     const tokensAt = at("theme/tokens.css");
     const presetsAt = at("theme/presets.css");
+    const appAt = at('import App from "./App"');
     expect(tokensAt, "main.tsx 不再导入 theme/tokens.css").toBeGreaterThanOrEqual(0);
     expect(presetsAt, "main.tsx 不再导入 theme/presets.css").toBeGreaterThanOrEqual(0);
+    expect(
+      appAt,
+      'main.tsx 不再以 `import App from "./App"` 的形式导入 App —— 层叠顺序闸丢掉了它的参照点（R197）',
+    ).toBeGreaterThanOrEqual(0);
     expect(tokensAt).toBeLessThan(presetsAt);
-    for (let i = 0; i < cssImports.length; i += 1) {
-      if (i === tokensAt || i === presetsAt) continue;
+    expect(
+      presetsAt,
+      `App 模块排在第 ${appAt} 位、theme/presets.css 排在第 ${presetsAt} 位：` +
+        "组件模块的导入排在了 theme/presets.css 之前（R197）。这份文件里看不到它带进来的样式，" +
+        "所以 for-all 那个循环根本看不见这条层叠路径 —— 它正是评审 G1 从两道闸中间穿过去的洞。",
+    ).toBeLessThan(appAt);
+    for (let i = 0; i < importLines.length; i += 1) {
+      // 只判字面的 `.css` 导入；`theme/` 那两份是参照点本身。
+      if (!/["'][^"']*\.css["']/.test(importLines[i]) || i === tokensAt || i === presetsAt) {
+        continue;
+      }
       expect(
         presetsAt,
-        `组件样式 ${cssImports[i]} 排在了 theme/presets.css 之前`,
+        `组件样式 ${importLines[i]} 排在了 theme/presets.css 之前`,
       ).toBeLessThan(i);
     }
   });
@@ -362,11 +410,50 @@ describe("theme tokens", () => {
     }
   });
 
+  // R201（评审 W1/W2）：token 被六块声明得整整齐齐，但没有一条闸问过它「值对不对得起它的名字」——
+  // 双向集合闸只比**声明名**，所以把六块的 --accent-hover 全抄成同块的 --accent，集合断言、块数断言、
+  // 上面那条按下去的亮度比较一道都不响（评审实测 W1–W5/P12/P13 全部存活）。
+  // 本轮只做最便宜的一条消费判据：--accent-hover 对**同块**两支背景的 WCAG 对比度必须
+  // **严格高于**同块 --accent 对同一支背景的对比度。评审已独立算过六块六个方向全部成立
+  // ⇒ 今天不会假阳；用严格大于而不是「不低于」，正是为了「hover 被抄成 accent 同值」这种走样必须红。
+  // W3/W4/W5（--shadow / --code-bg / --border 的消费）不在本轮委托面里。
+  it("keeps --accent-hover more readable than --accent on both surfaces in all six presets", () => {
+    const blocks = [
+      ...stripComments(presets).matchAll(
+        /^\[data-theme="([a-z-]+)"\]\[data-mode="(light|dark)"\]\s*\{([^}]*)\}/gm,
+      ),
+    ];
+    expect(
+      blocks,
+      "预设块不是 6 块 —— 这条对比度判据的覆盖面会跟着少一块（R201）",
+    ).toHaveLength(6);
+    for (const m of blocks) {
+      const key = `${m[1]}/${m[2]}`;
+      const values = presetTokenValues(m[3]);
+      for (const bg of ["--bg-surface", "--bg-raised"]) {
+        const rest = contrast(values["--accent"], values[bg]);
+        const hover = contrast(values["--accent-hover"], values[bg]);
+        expect(
+          hover,
+          `${key}：--accent-hover 对 ${bg} 的对比度 ${hover.toFixed(3)} 不严格高于 ` +
+            `--accent 的 ${rest.toFixed(3)} —— 悬停态和普通态在可读性上没有区别，` +
+            `presets.css 顶部 R168 那句「hover 必须比同块的 --accent 更醒目」就是没有消费者的口头承诺（R201）`,
+        ).toBeGreaterThan(rest);
+      }
+    }
+  });
+
 
   // R126 ②：仓库没有 CI，`npm run lint:css` 只有「有人记得跑」才会跑，而 `npm test` 一定跑。
-  // 两道闸各保一层：这条守住「硬编码颜色不许进组件样式」，stylelint 守住有人跑时的全量规则。
-  // 豁免面就是 src/theme/ 那两个具名文件（它们**是**色值表），与 package.json:11 的否定 glob
-  // recipe 是同一份豁免，两边都要能审。
+  // 两道闸各保一层：这条守住「hex 与函数记号形式的硬编码颜色不许进组件样式」（记号范围见
+  // `HARDCODED_COLOR` 上面的 R203 NIT5 附注 —— 具名色两处都不守），stylelint 守住有人跑时的全量规则。
+  // R200（评审 MIN3）：**豁免面两处不同源，各自独立维护，别再宣称「同一份」**。实测新建
+  // `src/theme/legacy.css` 塞 `#ff0000` ⇒ stylelint rc=2 而本用例 rc=0。因为：
+  //   · 本用例按**目录**豁免 —— `listCss` 收全 `src/**` 的 .css，命中 `theme/` 路径就整份跳过，
+  //     将来任何新建于 src/theme/ 下的样式表都会自动被豁免掉；
+  //   · `lint:css` 按**文件**豁免 —— `package.json` 的否定 glob 只点名 tokens.css 与 presets.css
+  //     两个具名文件，theme/ 下的第三个文件照扫。
+  // R170 明令不许新增 stylelint 规则，`package.json` 也不在本轮委托面里，所以这里只把注释改成实际情形。
   // 和上面收预设块时同一个纪律、只是方向相反：**先剥注释再扫**。注释里的色值不参与渲染，
   // 拿它充当「这里有硬编码颜色」的证据就是假阳（本轮实跑就被自己写的注释绊了一次），
   // 而拿它充当「这里没有硬编码颜色」的证据就是 M2 那一类假阴。规则体才是判据。
