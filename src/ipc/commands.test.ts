@@ -86,6 +86,20 @@ describe("ipc commands", () => {
     expect(invoke).toHaveBeenCalledWith("interrupt");
   });
 
+  // R147：`normalize_image` **只吃 raw body**（`ipc.rs:564` 对 json body 直接 Err）。
+  // 写成 `invoke("normalize_image", { bytes })` 会进 `InvokeBody::Json`，症状是「每次贴图都
+  // 报错」而原因藏在 IPC 形状里，UI 测试根本看不出是形状错了 —— 所以这一条只能在命令层钉。
+  it("hands the image bytes to normalize_image as a raw body, not a wrapped field", async () => {
+    const bytes = new ArrayBuffer(8);
+    await api.normalize(bytes);
+    const [cmd, arg] = invoke.mock.calls[0];
+    expect(cmd).toBe("normalize_image");
+    // 同一个对象原样交出去：`{ bytes }` 包一层的话这两条都红（`toBe` 比身份、`instanceof`
+    // 比形状），而 JS 侧写不出第三种「看起来对」的传法。
+    expect(arg).toBe(bytes);
+    expect(arg).toBeInstanceOf(ArrayBuffer);
+  });
+
   // 第 7 条：通道名必须来自导入的常量。抄字面量 `"agent"` 的代价是将来改名时
   // TS 一侧一声不响，而 `types.ts` 那份镜像是唯一的名字来源。
   it("subscribes on the mirrored channel constant and forwards both halves", () => {
