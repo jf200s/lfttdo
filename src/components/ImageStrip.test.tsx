@@ -268,6 +268,15 @@ describe("Composer 图片入口", () => {
     expect(input).toHaveAttribute("type", "file");
     expect(input).toHaveAttribute("multiple");
     expect(input).toHaveAttribute("accept", "image/*");
+    // jsdom 的 file input 读 `value` 恒为 `""`（它不接受程序赋值的那份文件名），所以原先
+    // 「选完之后 value 是空」这条断言对生产代码是**聋的**：删掉 `e.target.value = ""`
+    // 也不会红，而那正是「第二次选同一个文件没反应」的真 bug。
+    // 把 `value` 做成 own 可写属性、初值写成浏览器真实会填进去的 `C:\fakepath\…`，
+    // 这条断言才开始描述实现（变异判据：删掉 ImageStrip.tsx 的那一行 ⇒ 这条红）。
+    Object.defineProperty(input, "value", {
+      writable: true,
+      value: "C:\\fakepath\\选取.png",
+    });
     fireEvent.change(input, { target: { files: [png(11, "选取.png")] } });
     await screen.findByTestId("thumb-0");
     expect(onNormalize).toHaveBeenCalledTimes(1);
@@ -352,5 +361,77 @@ describe("Composer 图片入口", () => {
     const msg = await screen.findByTestId("image-error");
     expect(msg.textContent).toContain("怪图.png");
     expect(screen.queryByTestId("thumb-0")).toBeNull();
+  });
+
+  // 修复轮 F1：提示与错误描述的是**这份草稿**，草稿发出去了它们必须跟着走。
+  // 少那两行 reset 的真实症状是「某一次投了 5 张被挡掉 1 张，此后每一条消息都挂着
+  // 已忽略 1 张」—— 界面从此不再能说清这一次到底成没成。
+  it("drops the overflow note once a send succeeds", async () => {
+    const onNormalize = okNormalize();
+    const onSend = okSend();
+    render(
+      <Composer
+        streaming={false}
+        onSend={onSend}
+        onStop={vi.fn()}
+        onNormalize={onNormalize}
+      />,
+    );
+    dropOn([1, 2, 3, 4, 5].map((n) => png(n, `第${n}张.png`)));
+    await screen.findByTestId("thumb-3");
+    expect(screen.getByTestId("image-overflow")).toHaveTextContent("已忽略 1 张");
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("image-overflow")).toBeNull();
+  });
+
+  it("drops a per-file error note once a later send succeeds", async () => {
+    // 第一次归一化失败、第二次成功：界面上应当同时出现「一条错误」和「一张待发图」，
+    // 发送成功后错误消失、图也发出去了。
+    let n = 0;
+    const onNormalize = vi.fn((_bytes: ArrayBuffer) => {
+      n += 1;
+      return n === 1
+        ? Promise.reject(new Error("图片太大"))
+        : Promise.resolve(okBlock);
+    });
+    const onSend = okSend();
+    render(
+      <Composer
+        streaming={false}
+        onSend={onSend}
+        onStop={vi.fn()}
+        onNormalize={onNormalize}
+      />,
+    );
+    dropOn([png(1, "坏.png")]);
+    await screen.findByTestId("image-error");
+    dropOn([png(2, "好.png")]);
+    await screen.findByTestId("thumb-0");
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("image-error")).toBeNull();
+    // 发出去的仍是那四元组形状的图片块（清提示不许顺手改载荷）。
+    expect(onSend.mock.calls[0][0]).toEqual([okBlock]);
+  });
+
+  // 同一条规则的另一半：发**失败**时不许清 —— 那正是用户还要再看一眼错误的时候。
+  it("keeps the notes when the send fails", async () => {
+    const onNormalize = okNormalize();
+    const onSend = vi.fn(() => Promise.reject("网络断了"));
+    render(
+      <Composer
+        streaming={false}
+        onSend={onSend}
+        onStop={vi.fn()}
+        onNormalize={onNormalize}
+      />,
+    );
+    dropOn([1, 2, 3, 4, 5].map((n) => png(n, `第${n}张.png`)));
+    await screen.findByTestId("thumb-3");
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("image-overflow")).toBeInTheDocument();
+    expect(screen.getByTestId("thumb-0")).toHaveAccessibleName("第1张.png");
   });
 });
