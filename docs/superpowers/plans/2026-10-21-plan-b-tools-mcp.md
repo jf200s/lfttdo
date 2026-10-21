@@ -585,7 +585,7 @@ git commit -m "fix: wire configured roots into the tool context so read_file can
 ```rust
 #[test]
 fn production_registry_ships_fetch_url_and_read_file() {
-    let r = crate::ipc::build_production_registry(/* ... */);
+    let r = crate::ipc::build_production_registry();
     let names: Vec<String> = r.defs().into_iter().map(|d| d.name).collect();
     assert_eq!(names, vec!["fetch_url", "read_file"],
         "模型看到的工具集必须是这份名单；echo/guarded 这类测试工具绝不能进生产（它们只活在 #[cfg(test)]）");
@@ -595,6 +595,20 @@ fn production_registry_ships_fetch_url_and_read_file() {
 ```
 
 把 `ipc.rs` 里内联的 registry 构造抽成 `pub fn build_production_registry() -> Arc<ToolRegistry>`，本任务唯一允许的 `ipc.rs` 重构。
+
+**三条实测过的接口事实，省掉一轮试错**：
+
+1. **它是零参的**，上面那行照抄即可。今天的生产构造点只有一处：`ipc.rs:685` 的
+   `registry: Arc::new(ToolRegistry::new())`（在 setup 闭包里）；`ipc.rs:940` 那处是**测试夹具自己的**，
+   不许一起改。工具不需要 `AppState`，所以没有理由给它参数。
+2. **`defs()` 的顺序是按名字典序，不是注册顺序** —— `registry.rs:119` 的容器是
+   `RwLock<BTreeMap<String, Arc<dyn Tool>>>`，`defs()`（:143-147）直接 `.values()` 遍历。
+   所以 `vec!["fetch_url", "read_file"]` 这个字面顺序是**稳定的**，
+   但**不要**为了让它通过去加 `.sort()` 或改成集合比较：那样等于把「顺序由 BTreeMap 决定」这件事藏起来。
+   这条对 T33 的 `remove_prefix` + 重新注册同样要紧：MCP 工具重挂之后名字序不变，
+   界面与模型侧看到的工具列表不会因为重连而抖动。
+3. `risk_of("delete_everything") == Risk::Exec` 靠的是 `ToolRegistry::risk_of` 对未知工具的兜底（Plan A T9 已建），
+   **不需要**为本任务改动它；若你发现它不对，停下来报告，别在本任务里顺手修注册表。
 
 - [ ] **Step 2: 写前端失败测试 —— 卡片渲染真内容，不硬编码颜色**
 
@@ -942,65 +956,235 @@ git commit -m "feat: map mcp mixed content arrays onto the same image pipeline a
 前置事实（不改就等于没实现）：`gate.rs:124` 在看到 `Risk::Read` 时**立刻**返回 Allow，`RuleTable::lookup` 根本没有机会说话；而 spec 5.2 第 1 点要求「添加 server 时默认 Ask」。这两件事现在直接矛盾，本任务解决它。
 
 **Files:**
-- Modify: `src-tauri/src/permission/gate.rs`（查表顺序 + server 前缀匹配）
-- Modify: `src-tauri/src/tools/registry.rs`（`remove_prefix`、`scope_of`）
-- Modify: `src-tauri/src/agent/session.rs`（`ToolCallView` 带上 scope）
-- Test: 三处内联
+- Modify: `src-tauri/src/permission/gate.rs`（`RuleTable` 加一张 trust 表 + `verdict_for`；`check` 里 Read 那记提前 return 加条件；`rule_key` 的 Read 分支按名字取 server 作用域）
+- Modify: `src-tauri/src/tools/registry.rs`（**只加 `remove_prefix`**）
+- Test: 两处内联（`gate.rs`、`registry.rs`）
+- **不动 `src-tauri/src/agent/session.rs`、不动 `ToolCallView`**（R212，见下）
+
+**R212 —— 原计划写「`ToolCallView` 带上 scope」，删掉这条。它是一个跨语言改动，而且是免费的：**
+`ToolCallView` 在 `src/types.ts` 有镜像，动它的字段就要同时动 `reducer.ts` 与 T14 那条线格式守卫测试
+（和 T32 加 `ToolOutput` 多部分时踩的是同一道闸）。而 scope **根本不需要新字段**：
+`rule_key(&self, call)` 已经同时拿着 `call.name` 与 `call.input`，
+MCP 的 server 名直接从 `mcp__{server}__{tool}` 这个**已定死的命名格式**里取（T30 的产物），
+`fetch_url` 的主机名从 `input.url` 取 —— 两者都是 `(name, input)` 的纯函数。
+⇒ **`scope_of` 住在 `gate.rs` 里做自由函数，不做 `ToolRegistry` 的方法**：
+注册表手上只有名字没有 risk→scope 的策略，而 gate 才是策略的唯一定居地（R45 同一条理由）。
+加一个 `ToolRegistry::scope_of` 等于让 gate 反过来依赖注册表，而 `PermissionGate` 今天不认识它。
+
+**实测过的现场（`90bb415` 的 `gate.rs`，照抄进测试，别再猜）：**
+
+- 入口是 `pub async fn check(&self, call: &ToolCallView, cancel: &CancellationToken) -> Decision`
+  （:120）—— 第二个参数是**取消令牌**，不是 sink。sink 走 `with_sink(self, ...)`（:64）或 `set_sink(&self, ...)`（:77）。
+- `PermissionGate` 是 `#[derive(Clone, Default)]`（:35）：`pending` / `rules` / `sink` 三个字段都是 `Arc`，
+  所以 **`Clone` 出来的 gate 共享同一张待答表** —— 这就是 `resolve` 能从 IPC 命令打进等待中 `check` 的原因，
+  也是测试里「先拿 gate、再 clone 一份去 resolve」能成立的原因。
+  `with_rules(self, rules: **Arc<RuleTable>**)`（:69）、`rules(&self) -> Arc<RuleTable>`（:81）。
+- **`RuleTable` 没有 `new()`，也没有 `default_mvp()`** —— 它只有 `#[derive(Default)]`（:16）
+  加两个方法：`lookup(&self, key: &str) -> Option<Decision>`（:22）、`remember_session(&self, key: &str)`（:30）。
+  `default_mvp()` 是 R45 **已经删掉**的东西（全计划零调用方），本任务**不许把它造回来**。
+  构造写 `Arc::new(RuleTable::default())`。
+- `lookup` 命中的语义是「会话级放行 ⇒ `Decision::allow(Scope::Session)`，**静默、不发弹窗**」；
+  键由 `rule_key(&self, call: &ToolCallView) -> String`（:93）生成，格式 `{name}|{scope_token}`，
+  今天 `Risk::Read` 那一支**恒为 `"read"`** —— 本任务要改的就是这一支。
+  注释里那条红线要守住：**键绝不能是裸工具名**（裸名会把「本会话允许写一次」变成「本会话可写任意路径」）。
+- Read 自动放行是 `check` 里第 122-124 行的一记 **`return Decision::allow(Scope::Once)`**，
+  写在 `if let Some(d) = self.rules.lookup(&key)`（:126）**之前**。
+  ⇒ **本任务的改法不是「调整查表顺序」，而是「给这记 return 加条件」**。
+  规定的形状（照抄即可，别再自创）：
+  ```text
+  check(call, cancel):
+    key  = rule_key(call)                       // 含新的 scope 规则
+    scope = scope_of(&call.name, &call.input)
+    if let Some(d) = rules.lookup(&key) { return d }        // 会话级放行：静默，优先级最高
+    match rules.verdict_for(&call.name, &scope) {            // override：优先级次之
+        Auto  => return Decision::allow(Scope::Once),
+        Block => return Decision::deny(format!("server `{}` 被设为 Block", ...)),
+        Ask   => {}                                           // 落下去弹窗
+    }
+    if matches!(call.risk, Risk::Read) { return Decision::allow(Scope::Once) }  // MVP 默认，仍在 check 一处
+    // …原有弹窗 await 路径不动
+  ```
+  **不要**把「MVP 默认 Read=Auto」搬进 `verdict_for` 的默认分支：那等于把同一条策略从一处拆成两处
+  （R45 当年就是因为这个删掉 `default_mvp()`）。`verdict_for` 只回答「有没有 override」。
+- **`Decision` 只有两个变体**：`Allow { scope: Scope }` / `Deny { reason: String }`
+  （`events.rs:135-138`），助手只有 `allow(scope)`、`deny(reason)`、`allowed()`。
+  ⇒ **没有 `denied_until_answered()`**。
+  「Ask 正在等人答」在这个类型里不是一个可返回的值 —— 它是 `check` 挂在那里 await 的**状态**。
+  所以判「Ask 生效」有两条真判据：sink 里出现 **1 条 `permission_request`**，且
+  `pending_len()`（`pub(crate)`，:231）**为 1**。不许为了断言给 `Decision` 加第三个变体
+  （线格式类型，加一个变体就要动 `src/types.ts` 镜像与 T14 守卫 ⇒ 顺手扩大面）。
+  `Verdict::{Auto, Ask, Block}` 是本任务**新的内部枚举，不进线格式**。
+  测试里也别造 `pending_key()` 这种不存在的东西 —— 键直接用公开的 `gate.rule_key(&call)` 断言。
 
 **Interfaces:**
-- Consumes: `Decision`、`RuleTable`、`ToolCallView`
+- Consumes: `Decision`、`RuleTable`、`ToolCallView`（**都不改形状**）、既有测试夹具
+  `VecSink`（:258，带 `events()` / `request_ids()` / `resolved()`）、
+  `wait_requests(&sink, n)`（:290）、`pending_request(&gate, &call, &cancel, &sink, n)
+  -> (JoinHandle<Decision>, String)`（:316）、`call(name, risk)`（:305）
 - Produces:
-  - `RuleTable::set_server_trust(&self, server: &str, Verdict)`、`Verdict::{Auto, Ask, Block}`
-  - `RuleTable::verdict_for(&self, name: &str, scope: &str) -> Verdict` —— **唯一判定入口**，顺序：精确 `name|scope` override → server 前缀 override → 按 Risk 默认（`Read`=Auto、`Write`/`Exec`=Ask）
-  - `ToolRegistry::remove_prefix(&self, prefix: &str) -> Vec<String>`
-  - `ToolRegistry::scope_of(&self, name: &str, input: &Value) -> String`（默认实现：`Read` ⇒ `"read"`；`fetch_url` ⇒ 主机名；MCP ⇒ server 名）
+  - `Verdict { Auto, Ask, Block }` —— `gate.rs` 内的**私有**枚举，不进线格式、不 `pub`出模块
+  - `RuleTable::set_server_trust(&self, server: &str, verdict: Verdict)`（`&self` + 内部 `RwLock`，与 `remember_session` 同形）
+  - `RuleTable::server_trust(&self, server: &str) -> Option<Verdict>`（T35 的界面要读回当前档位）
+  - `RuleTable::verdict_for(&self, name: &str, scope: &str) -> Option<Verdict>`
+    —— **只回答「有没有 override」**，顺序：精确 `{name}|{scope}` override → server 前缀 override → `None`。
+    返回 `Option` 而不是给 `Verdict` 加 `Default` 一档，就是为了不逼 `check` 去猜默认。
+  - `pub(crate) fn scope_of(name: &str, input: &Value) -> String` —— **自由函数，住在 `gate.rs`**（R212）：
+    `mcp__{server}__{tool}` ⇒ `server`；`fetch_url` ⇒ `input.url` 的小写主机名（去端口，解析失败 ⇒ `"read"`）；
+    其余按现有 `rule_key` 的 risk 分支不变
+  - `ToolRegistry::remove_prefix(&self, prefix: &str) -> Vec<String>`（返回被摘掉的名字，供 T35 的日志与界面用）
 
 - [ ] **Step 1: 写失败测试 —— 默认 Ask 的 MCP 工具必须弹窗**
 
 ```rust
 #[tokio::test]
-async fn a_server_defaulted_to_ask_pops_exactly_one_request_per_call() {
-    let rules = RuleTable::new();
+async fn a_server_defaulted_to_ask_pops_exactly_one_request() {
+    let sink = Arc::new(VecSink::default());
+    let rules = Arc::new(RuleTable::default());
     rules.set_server_trust("search", Verdict::Ask);
-    let gate = PermissionGate::new().with_rules(rules.clone()).with_sink(sink.clone());
-    let d = gate.check(&view("mcp__search__web_search", Risk::Read, json!({"q":"x"})), &never_cancelled()).await;
-    assert!(d.denied_until_answered(), "server 设了 Ask 却被 Read 自动放行，信任级别就是废纸");
-    assert_eq!(sink.events().len(), 1, "一次调用一个 permission_request");
-    assert_eq!(pending_key(&gate).await, "mcp__search__web_search|search", "key 必须带 server 作用域");
+    let gate = PermissionGate::new().with_sink(sink.clone()).with_rules(rules);
+    let cancel = CancellationToken::new();
+    let c = ToolCallView {
+        id: "c1".into(),
+        name: "mcp__search__web_search".into(),
+        risk: Risk::Read,
+        input: json!({"q": "x"}),
+    };
+
+    // 关键：`check` 在 Ask 路径上是**等人应答才返回**的。直接 `gate.check(..).await`
+    // 就是让测试进程挂住 —— 本文件 :333 那段注释记过一次真实事故
+    // （把 Read 变异成「问人」之后整个 test binary 卡死）。必须用现成的 pending_request 起任务。
+    let (h, id) = pending_request(&gate, &c, &cancel, &sink, 1).await;
+
+    assert_eq!(
+        gate.rule_key(&c),
+        "mcp__search__web_search|search",
+        "键必须带 server 作用域；仍是 `read` 就说明 MCP 工具共用一个键，问一次买断所有 server"
+    );
+    assert_eq!(gate.pending_len(), 1, "Ask 的真相是挂在待答表里，不是 Decision 的第三个变体");
+
+    gate.resolve(&id, Decision::allow(Scope::Once));
+    let d = tokio::time::timeout(Duration::from_secs(2), h)
+        .await
+        .expect("resolve 之后 check 仍不返回：应答臂断了")
+        .expect("check 任务不该 panic");
+    assert!(d.allowed(), "答了 Allow 就该放行");
+    assert_eq!(sink.request_ids().len(), 1, "一次调用只发一条 permission_request");
 }
 ```
 
-- [ ] **Step 2: 写失败测试 —— `Block` 之后模型仍拿到 tool_result**
+**这条测试的红必须在「Read 提前 return」那一行**：今天的代码在 `check` 第 122-124 行就 return 了，
+`sink` 一条请求都不会有 ⇒ `pending_request` 里的 `wait_requests` 会跑满 1000 次让权后 panic 红。
+先跑出这个红（红因是 panic 消息「等不到第 1 条 PermissionRequest」，不是超时挂死），再动实现。
+
+- [ ] **Step 2: 写失败测试 —— `Block` 不等、不发弹窗，但模型仍拿到 tool_result**
 
 ```rust
 #[tokio::test]
-async fn a_blocked_server_denies_without_waiting_and_the_loop_still_backfills() {
+async fn a_blocked_server_denies_without_waiting() {
+    let sink = Arc::new(VecSink::default());
+    let rules = Arc::new(RuleTable::default());
     rules.set_server_trust("evil", Verdict::Block);
-    let d = gate.check(&view("mcp__evil__x", Risk::Read, json!({})), &never_cancelled()).await;
-    assert!(matches!(d, Decision::Deny { reason, .. } if reason.contains("evil")));
-    // session 侧：Deny ⇒ ToolOutput::text(reason) + is_error=true，history 仍 push（session.rs:228-257 现成路径）
+    let gate = PermissionGate::new().with_sink(sink.clone()).with_rules(rules);
+    let cancel = CancellationToken::new();
+
+    // Block **不 await**，所以这里可以直接 `.await` 拿返回值；但仍要包 timeout ——
+    // 判据是「它在 2 秒内自己收了场」，而不是「看起来返回了 Deny」。
+    // 万一实现把它写成了弹窗路径，这条必须**红**，不许挂住整个 test binary（同 :333 的事故）。
+    let d = tokio::time::timeout(
+        Duration::from_secs(2),
+        gate.check(&call("mcp__evil__x", Risk::Read), &cancel),
+    )
+    .await
+    .expect("Block 走成了等人应答：Block 的整个意义就是不问")
+    .unwrap();
+
+    assert!(matches!(&d, Decision::Deny { reason } if reason.contains("evil")),
+        "拒绝理由必须指名是哪个 server，否则模型和用户都看不出被谁挡了：{d:?}");
+    assert!(sink.events().is_empty(), "Block 不许产生任何 permission_request，一条都不行");
+    assert_eq!(gate.pending_len(), 0, "Block 不该在待答表里留下条目");
 }
 ```
 
-`Block` **不许**等待、**不许**发 `permission_request`；判据是 sink 里事件数为 0。这一条要跑在 `session.rs` 的集成测试里（`VecSink` + `ScriptedModel` 剧本），不只是 gate 单元测试。
+`call(name, risk)` 是既有夹具（:305），它的 `input` 固定是 `{"path":"/tmp/x"}` ——
+对 MCP 判定没影响（server 名从 `call.name` 取，不看 input），所以这里**不必**新造 call 的变体。
 
-- [ ] **Step 3: 写失败测试 —— 改信任级别要真的换掉已注册工具**
+**session 侧那半单独测**：`Deny` 进 `run_turn` 之后要变成一条 `tool_result`（`is_error=true`、
+正文是那句 reason）且 `history` 照常 push —— 用 `agent/session.rs` 现成的 `VecSink` + `ScriptedModel`
+剧本（Plan A T10 已建，`session.rs` 的测试 mod 里直接有先例），断言**事件序列**里
+`tool_call → tool_result` 成对出现。**这一条不许只靠 gate 单测冒充**：gate 正确但装配漏回填，
+用户看到的就是「工具卡住」，而那正是 spec 列为最坏情况的一类。
+
+- [ ] **Step 3: 写失败测试 —— `remove_prefix` 摘得干净、不误伤别人**
 
 ```rust
+/// 只活在 `mod tests` 里：`RiskOverrideTool` 的名字钉死是 `"guarded"`，造不出
+/// `mcp__{server}__{tool}` 形状的名字，所以本任务需要一个可指名量的测试工具。
+/// **不许**把它放进 `tools/echo.rs` 变成生产可见 —— T27 那条「生产工具名单恰好是
+/// `["fetch_url","read_file"]`」的断言就是防这个的。
+struct NamedTool(&'static str);
+
+#[async_trait]
+impl Tool for NamedTool {
+    fn meta(&self) -> ToolMeta {
+        ToolMeta {
+            name: self.0.to_string(),
+            description: "命名测试工具".into(),
+            risk: Risk::Read,
+            input_schema: json!({"type": "object"}),
+        }
+    }
+    async fn execute(&self, input: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(input.to_string()))
+    }
+}
+
 #[tokio::test]
-async fn switching_trust_reregisters_without_duplicating_or_losing_others() {
-    let r = registry_with(mcp_tools("search", ["a", "b"]), trust = Verdict::Ask);
-    assert_eq!(r.defs().len(), 2);
-    r.remove_prefix("mcp__search__");            // T33 新增
-    register_mcp_tools(&r, "search", ["a", "b"], Verdict::Auto);
-    assert_eq!(r.defs().len(), 2, "重注册后不许变 4 条（重复注册会喂给模型两份同名工具）");
-    assert!(r.get("mcp__search__a").is_some());
+async fn remove_prefix_drops_the_whole_server_and_nothing_else() {
+    let r = ToolRegistry::new();
+    for n in ["mcp__search__a", "mcp__search__b", "mcp__other__c", "fetch_url"] {
+        r.register(Arc::new(NamedTool(n)));
+    }
+    let removed = r.remove_prefix("mcp__search__");
+    assert_eq!(removed, vec!["mcp__search__a", "mcp__search__b"],
+        "返回摘掉的名字，T35 的日志/界面要知道掉了哪些");
+    assert_eq!(r.defs().len(), 2, "别的 server 与内置工具一条不许掉");
+    assert!(r.get("mcp__other__c").is_some() && r.get("fetch_url").is_some());
+
+    // 前缀**必须带尾部的 `__`**。真正的风险不是重复注册 —— `register` 同名是覆盖语义
+    // （registry.rs:116「同名后注册者覆盖先注册者」，`defs()` 本来就不会出双份），
+    // 而是**过收**：server 叫 `search_v2` 时，用 `"mcp__search"` 去摘会把别人整台 server 一起带走，
+    // 而 `"mcp__search__"` 不会。这条断言就是这个区别，别把它当排版删掉。
+    let r2 = ToolRegistry::new();
+    for n in ["mcp__search__a", "mcp__search_v2__b"] {
+        r2.register(Arc::new(NamedTool(n)));
+    }
+    assert_eq!(r2.remove_prefix("mcp__search__"), vec!["mcp__search__a"],
+        "按 server 摘必须精确到 `mcp__{server}__`；少了尾部下划线就会连坐另一台 server");
+    assert!(r2.get("mcp__search_v2__b").is_some(), "被连坐的那台必须还在");
+
+    // 空摘必须无害
+    r2.remove_prefix("mcp__never_existed__");
+    assert_eq!(r2.defs().len(), 1);
 }
 ```
 
-- [ ] **Step 4: 写失败测试 —— `fetch_url` 的 per-domain 作用域（为切片 6 的「问一次」预留，现在不启用弹窗）**
+**`defs()` 是字典序**（`registry.rs:119` 的容器是 `BTreeMap`），所以 `removed` 那行的
+字面顺序不是巧合，也不该改成集合比较。信任级别切换本身（`set_server_trust` → 重注册）
+是 **T35 的命令**在做，本任务只提供三件原语：`set_server_trust` / `remove_prefix` / `scope_of`。
+**因此这里不写「换档位后判定变了」的端到端断言** —— 那是 T35/T37 的验收面，提前写只会变成
+依赖不存在接口的假测试。
 
-`scope_of("fetch_url", {"url":"https://News.Example/a"})` ⇒ `"news.example"`（小写、去端口、非 URL 输入 ⇒ `"read"`）。这条现在不影响判定（默认 Auto），但它是**唯一**让「以后都允许」有作用域的机制；测试只钉 `rule_key` 的形状：`"fetch_url|news.example"`。
+- [ ] **Step 4: 写失败测试 —— `scope_of` 的形状（内置 Read 仍零弹窗）**
+
+`scope_of` 是 `gate.rs` 里的自由函数（R212），测试直接调它，不必绕 `check`：
+- `scope_of("fetch_url", json!({"url":"https://News.Example:443/a"}))` ⇒ `"news.example"`（小写、去端口）
+- `scope_of("fetch_url", json!({"url":"not a url"}))` ⇒ `"read"`（解析失败退回默认令牌，**不许 panic**）
+- `scope_of("mcp__search__web_search", json!({}))` ⇒ `"search"`
+- `scope_of("read_file", json!({"path":"/tmp/x"}))` ⇒ `"read"`（内置 Read 的既有行为，一个字不许变）
+
+并且钉 `rule_key` 的两条端到端形状：`"fetch_url|news.example"`、`"mcp__search__web_search|search"`。
+这条现在**不影响判定**（生产里 `fetch_url` 默认 Auto，弹窗一个都不发 ⇒ 零弹窗验收仍然成立），
+它是唯一让「以后都允许」有作用域边界的机制 —— per-domain 授权与全局授权的区别全在这里。
 
 - [ ] **Step 5: 不许改坏的既有行为（回归钉子）**
 
