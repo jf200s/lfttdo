@@ -6,7 +6,9 @@ export type Mode = "light" | "dark";
  *  所以这里少列一个就等于漏项测试少守一个（R124）。
  *  `--accent-hover`（R168）与 `--shadow`（R170）是 T15 修复轮补进来的两项：前者是因为
  *  `a:hover` 曾经退回 `--text-primary`，让链接悬停比静止时**更不显眼**；后者是因为
- *  `App.css` 里剩了一条两道闸都看不见的 `rgb(0 0 0 / 20%)`，而 minifier 会把它写回成 `#0003`。 */
+ *  `styles.css` 的 `box-shadow` 曾经直接写死一条 `rgb(0 0 0 / 20%)`，两道 hex 闸都看不见它，
+ *  而 minifier 会把它写回成 `#0003` 塞进产物 —— 所以它现在只能取 `var(--shadow)`，
+ *  值由 `tokens.css` 给基座默认、`presets.css` 的六个预设块（三套 × 明/暗）各自覆盖。 */
 export const THEME_TOKENS = [
   "--bg-surface",
   "--bg-raised",

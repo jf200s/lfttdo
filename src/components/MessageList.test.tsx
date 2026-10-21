@@ -162,15 +162,19 @@ describe("MessageList", () => {
     expect(screen.getByText(/已压缩早期对话/)).toBeInTheDocument();
   });
 
-  it("does not render a hard-coded color anywhere", () => {
+  it("renders no inline style attribute, the only place a component could hide a color", () => {
+    // 评审 #29：这条过去断的是「`container.outerHTML` 里没有 `#rrggbb`」，而它按构造不可能红 ——
+    // 类规则不会被 jsdom 内联进 DOM，把 `styles.css` 的 `var()` 全换成 hex 它照样绿；
+    // 组件真写了 `style={{ color: "#f00" }}`，CSSOM 序列化回来是 `rgb(255, 0, 0)`，`#` 也抓不到。
+    // 现在钉的是结构：这条渲染路径上不产出 `style` 属性，颜色一律来自样式表里的 token。
+    // 样式表与 TSX 源码那两层由 `tokens.test.ts` 的两条源码闸守着（CSS 一条、TS 一条）。
     const s = state({
       turns: [
         { id: 1, role: "assistant", blocks: [{ kind: "text", text: "x" }] },
       ],
     });
     const { container } = render(<MessageList state={s} onRespond={() => {}} />);
-    const inline = container.outerHTML;
-    expect(inline).not.toMatch(/#[0-9a-f]{3,8}\b/i);
+    expect(container.querySelector("[style]")).toBeNull();
   });
 
   // ---- 以下是 Step 0 裁定要求补的断言（第 9 条 / 第 10 条 / 要求 3、7、11） ----

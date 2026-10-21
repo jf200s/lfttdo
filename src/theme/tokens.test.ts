@@ -93,6 +93,21 @@ function stripCodeComments(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 }
 
+/**
+ * 收 `src/` 下全部**非测试**的 `.ts` / `.tsx`。测试文件豁免的理由与 CSS 闸豁免 `theme/`
+ * 同一件事的两面：预设块与令牌名单的断言里满是不许当假阳处理的色值。
+ */
+function listCode(dir: string): string[] {
+  const found: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const child = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) found.push(...listCode(child));
+    else if (/\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name))
+      found.push(child);
+  }
+  return found;
+}
+
 /** 收全部顶层规则：`[选择器串, 规则体]`。剥注释 —— 注释里的字面量不是证据（评审 M2）。 */
 function rules(css: string): [string, string][] {
   return [...stripComments(css).matchAll(/([^{}]+)\{([^}]*)\}/g)].map((m) => [
@@ -462,6 +477,25 @@ describe("theme tokens", () => {
     for (const file of listCss(srcDir)) {
       if (/[\\/]+theme[\\/]/.test(file)) continue;
       const hits = stripComments(readFileSync(file, "utf8")).match(
+        HARDCODED_COLOR,
+      );
+      if (hits) offenders.push(`${file} -> ${[...new Set(hits)].join(", ")}`);
+    }
+    expect(offenders, offenders.join("\n")).toEqual([]);
+  });
+
+  // 评审 #29 标准轴（前端与配置）：色值闸过去只扫 `.css`，于是 TSX 是唯一没人看的入口。
+  // 组件里写 `style={{ color: "#f00" }}` 时三道闸全绿 —— vitest 的 CSS 闸不收 .tsx，
+  // stylelint 的 `color-no-hex` 只管 CSS 文件，而 `MessageList.test.tsx` 那条按构造不可能红
+  // （jsdom 从不把类规则内联进 DOM；React 的内联样式经 CSSOM 回来是 `rgb(255, 0, 0)`，
+  // 连 `#` 那一支都抓不到）。主题纪律承诺的是「颜色只能来自 `var(--token)`」，
+  // 那么判据就该落在**源码**上，不管它最终怎么渲染。
+  // 覆盖面与 CSS 闸同一档：hex 字面量 + `rgb/rgba/hsl/hsla` 函数记号；具名色两处都不守
+  // （R203 NIT5 的附注仍然成立）。先剥注释再扫，同一个理由：注释里的色值不参与渲染。
+  it("keeps every hardcoded color out of component source too", () => {
+    const offenders: string[] = [];
+    for (const file of listCode(srcDir)) {
+      const hits = stripCodeComments(readFileSync(file, "utf8")).match(
         HARDCODED_COLOR,
       );
       if (hits) offenders.push(`${file} -> ${[...new Set(hits)].join(", ")}`);

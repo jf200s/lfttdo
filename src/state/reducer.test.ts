@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { AGENT_CHANNEL } from "../types";
 import {
@@ -67,19 +68,16 @@ function deepFreeze<T>(value: T): T {
 }
 
 /**
- * 读仓库源码用的最小 `node:fs` 具名。本仓库**没有** `@types/node`，也不许安装，
- * 于是静态 `import { readFileSync } from "node:fs"` 会报 TS2591 并打断 `npm run build`（实测）。
- * 把说明符宽化成 `string` 让 tsc 不去解析它（结果是 `Promise<any>`），再在本地把用到的
- * 那一个函数标注出来 —— 类型仍然在本文件里闭环，运行期由 node 正常解析 `node:fs`。
+ * 读仓库源码用的 `node:fs`：普通静态导入。`@types/node` 已装好，并且 `tsconfig.json`
+ * 里点名了 `"types": ["node"]`（R165 —— 只装包不会自动进 program），所以当年那个把
+ * 说明符宽化成 `string`、再在本地手写一份签名的 `import("node:fs" as string)` 绕的是
+ * 一个已经不存在的错误；它同时让 `readSource` 白变成一个 `async`。
  */
-async function readSource(relative: string): Promise<string> {
-  const fs = (await import("node:fs" as string)) as {
-    readFileSync(path: URL, encoding: "utf8"): string;
-  };
+function readSource(relative: string): string {
   // 相对起点是本文件 src/state/reducer.test.ts ⇒ 仓库根是 **../../**，不是 ../../../。
   const url = new URL(relative, import.meta.url);
   try {
-    return fs.readFileSync(url, "utf8");
+    return readFileSync(url, "utf8");
   } catch (err) {
     // 缺文件时**仍然硬失败**，不许改成 skip —— 静默跳过的跨语言守卫等于没有守卫。
     // 但这条红的**身份**必须写进消息里（评审 R176）：它是「源码读不到」的前置条件失败，
@@ -468,11 +466,11 @@ describe("reducer", () => {
     expect(swallowed).toEqual([]);
   });
 
-  it("still mirrors the tag list that events.rs actually serializes", async () => {
+  it("still mirrors the tag list that events.rs actually serializes", () => {
     // 评审 F1④：这条才是「Rust 加第 12 支而前端镜像没跟上」的唯一机器判据。
     // 之前 WIRE_TAGS 是手抄字面量，全仓库没有任何一条测试把它和 events.rs 连起来 ——
     // Rust 加一支、镜像不动 ⇒ 测试与 tsc 双双全绿，那条事件在 reduce 的 default 里被静默吞掉。
-    const src = await readSource("../../src-tauri/src/agent/events.rs");
+    const src = readSource("../../src-tauri/src/agent/events.rs");
     const anchor = "every_agent_event_variant_serializes_its_t_tag";
     // 锚点在文件里必须唯一，否则切片起点就是在赌其中哪一个。
     expect(src.split(anchor).length - 1).toBe(1);
@@ -662,7 +660,7 @@ describe("reducer", () => {
     }
   });
 
-  it("keeps reducer.ts itself free of clock, randomness and global reads", async () => {
+  it("keeps reducer.ts itself free of clock, randomness and global reads", () => {
     // 评审 F2②：上一条用「推开时钟」抓时钟读取，这一条从**源码**层面把 R119 那句
     // 「请保持纯函数」钉成机器判据。两者互补：事件级断言受攻击面选择影响
     // （notice() 只是可达位置之一，把时钟当单调 id 塞进 Turn.id 同样能骗过事件级比较），
@@ -670,7 +668,7 @@ describe("reducer", () => {
     //
     // 坑（必须剥注释）：`reducer.ts` 的纪律注释里**明写**着「不用 Date.now()、不用 Math.random()」，
     // 所以拿原文做 `not.toContain` 会在干净代码上直接红。
-    const code = stripComments(await readSource("./reducer.ts"));
+    const code = stripComments(readSource("./reducer.ts"));
     for (const read of ["Date.now(", "Math.random(", "new Date(", "performance.now(", "globalThis"]) {
       expect(code, `reducer.ts 的正文里出现了 ${read} —— replay 不再可复现（R119）`).not.toContain(read);
     }
