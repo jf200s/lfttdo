@@ -164,14 +164,23 @@ export default function App() {
     };
   }, [notice, openSession]);
 
+  /**
+   * R205/T19：这一层收到的已经是**要发出去的块**（图在前、文本在后，由 `Composer` 拼好），
+   * App 只负责「乐观插入 + 上线」，不再自己造 `[{type:"text",text}]` —— 造第二份就等于
+   * 让「发了什么」有两个答案（`Composer` 那份、和这里这份）。
+   *
+   * 失败时**必须把 rejection 传回去**（下面两处 `throw`）：`Composer` 靠它决定「待发图留不留」
+   * （Step 2 第 8 条）。只 `notice(...)` 然后正常返回的话，Composer 会以为发送成功，
+   * 把用户刚贴的四张图清空 —— 症状是「图没了、什么也没发出去」，比报错更糟。
+   * `AppImages.test.tsx` 两条分别钉这两处（变异判据：删 `throw e`、或把 `throw` 换回 `return`）。
+   */
   const send = useCallback(
-    async (text: string) => {
+    async (blocks: SendBlock[]) => {
       const sid = activeRef.current;
       if (sid === null) {
         notice("还没有可用的会话，先新建一条");
-        return;
+        throw new Error("没有可用的会话");
       }
-      const blocks: SendBlock[] = [{ type: "text", text }];
       // R117：直播路径里事件流**从来没有** `user_message`（db.rs:380），这句话由这里
       // 乐观插入，用的就是重放那条同一个 `appendUserTurn` —— 一份实现、两个入口。
       setUi((s) => appendUserTurn(s, blocks));
@@ -179,6 +188,7 @@ export default function App() {
         await api.sendMessage(sid, blocks);
       } catch (e) {
         notice(`发送失败：${String(e)}`);
+        throw e;
       }
     },
     [notice],
@@ -201,6 +211,20 @@ export default function App() {
     // 只打断，不改状态：`streaming` 的唯一出口是 `done`（R112），不做乐观恢复。
     api.interrupt().catch((e) => notice(`打断当前这一轮失败：${String(e)}`));
   }, [notice]);
+
+  /**
+   * T19：`Composer` 的归一化入口，接 `commands.ts` 平铺导出的 `normalize`（R206：不新造 `api` 对象）。
+   *
+   * 这里包一层闭包而不是直接传 `api.normalize`，是有意的：`import * as api` 的**属性取值**
+   * 发生在渲染期，而 `App.test.tsx` 那十三条（R216②：一条都不许改）的 mock 工厂里没有
+   * `normalize` 这一支 —— 直接传会让 vitest 抛「No "normalize" export is defined on the mock」，
+   * 十三条全红，红的还是「不该动的测试」。包一层把取值推迟到**真的贴了图**才发生。
+   * 身份由 `useCallback(…, [])` 保持稳定，且不进任何 effect 依赖（R208 的那条死循环）。
+   */
+  const normalize = useCallback(
+    (bytes: ArrayBuffer) => api.normalize(bytes),
+    [],
+  );
 
   const usageText =
     ui.usage === null
@@ -271,7 +295,12 @@ export default function App() {
           </ul>
         ) : null}
         <MessageList state={ui} onRespond={onRespond} />
-        <Composer streaming={ui.streaming} onSend={send} onStop={stop} />
+        <Composer
+          streaming={ui.streaming}
+          onSend={send}
+          onStop={stop}
+          onNormalize={normalize}
+        />
         <div className="statusbar" data-testid="usage">
           {usageText}
         </div>

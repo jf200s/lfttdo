@@ -7,6 +7,7 @@ import { AGENT_CHANNEL } from "../types";
 import type {
   AgentEvent,
   AgentPayload,
+  ContentBlock,
   Decision,
   SendBlock,
   SessionRow,
@@ -64,6 +65,20 @@ export const setSettings = (settings: Settings) =>
 /** 明文 key 只进这一条命令：不打印、不日志、不进返回值（spec:473）。空串按清除处理（R88）。 */
 export const setApiKey = (apiKey: string) =>
   invoke("settings_set_api_key", { apiKey });
+
+/**
+ * 把一张图的原始字节交给 Rust 归一化，回来的就是可以直接进 `send_message` 的那一支
+ * `ContentBlock`（`image`，已按上限缩放/转码）。
+ *
+ * **IPC 形状只许这一种**（R147，T3 实测：raw body 与 JSON 字段互斥）：第二参必须是
+ * 整块 `ArrayBuffer`/`Uint8Array` **本身**。写成 `{ bytes }` 会进 `InvokeBody::Json`，
+ * 被 `ipc.rs:564` 直接 Err —— 症状是「每次贴图都报错」，原因藏在形状里。
+ *
+ * 这里**不做**任何本地大小预判（R195）：那道闸在 Rust，且它的顺序在格式识别之前，
+ * 前端再摆一道只会造出第二套真相和与之冲突的文案。
+ */
+export const normalize = (bytes: ArrayBuffer) =>
+  invoke<ContentBlock>("normalize_image", bytes);
 
 /**
  * 订阅 `agent` 通道。通道名用 `../types` 里导入的常量，不再抄字面量（第 7 条：

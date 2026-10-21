@@ -382,3 +382,103 @@ a:hover {
 }
 
 /* ==== 输入区 ==== */
+
+/* T19 三入口的落点：`drop-zone` 那一层包住「待发图条 + 输入行」，拖进来的东西只进这一层。
+   `.composer` 保持 T16 那一行 flex 不变（现在它只有一个子元素），
+   原本的「文本框 + 按钮」横排挪进 `.composer-row`，竖排由 `.composer-main` 接力。
+   颜色一律 `var(--token)`，本文件不声明任何 `--*`（R207 + 文件头那两条纪律）。 */
+.composer-main {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.composer-row {
+  display: flex;
+  gap: 8px;
+}
+
+.image-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.image-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.image-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background-color: var(--bg-input);
+}
+
+/* 缩略图按固定方块裁切（`object-fit` 而不是 `max-width`）：四张比例各不相同的截图
+   排在一条里时，不裁的话整条高度随图抖动。气泡里那张仍用 `.thumb`（整图，不裁）。 */
+.image-thumb {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: var(--radius);
+}
+
+.image-name {
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 0.75em;
+}
+
+.image-remove {
+  padding: 2px 6px;
+}
+
+.image-errors {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* 提示行与错误行共用一套静止态，错误那一支再抬到 `--danger` ——
+   和 `.app-notice` 那一对是同一个语义（静止 muted、异常才描边），不是新造第三套。 */
+.image-note,
+.image-error {
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background-color: var(--bg-raised);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.image-error {
+  border-color: var(--danger);
+  color: var(--text-primary);
+}
+
+/* 原生 file 控件的边框/阴影由基座那一节管（它是控件），这里只把它收进条里的宽度预算，
+   免得四张图排一行时长文件名把整条撑破。 */
+.image-file-input {
+  max-width: 100%;
+  padding: 4px 8px;
+  color: var(--text-muted);
+  background-color: var(--bg-input);
+}
