@@ -904,4 +904,96 @@ mod image_degradation {
             "降级必须真的把粗估拉下来，否则滑窗照旧多裁文本"
         );
     }
+
+    /// 一条消息里的**图片块张数**。`count_images` 与它分开写是有意的：这两个数在
+    /// 「一条消息带多张图」的夹具上才会分叉，而那条分叉正是下面第一条测试的全部内容。
+    fn images_of(m: &Message) -> usize {
+        m.blocks
+            .iter()
+            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .count()
+    }
+
+    fn count_images(msgs: &[Message]) -> usize {
+        msgs.iter().map(images_of).sum()
+    }
+
+    fn img_png() -> ContentBlock {
+        ContentBlock::Image {
+            data: "AAAA".into(),
+            mime: ImageMime::Png,
+        }
+    }
+
+    #[test]
+    fn the_cap_counts_images_not_messages_when_one_message_carries_several() {
+        // 6 张图 / 额度 3：降级必须落在「图片出现顺序」的前 3 张 —— 「轮 1」、「轮 2」
+        // 和这条四图消息里的第 1 张，保留它自己的后 3 张。
+        // 若实现按**消息下标**保留最近 3 条，这条消息的 4 张会整条保命，请求里变 5 张图，
+        // 而 PNG_TOKENS 按张收钱 —— 症状正是本任务要消掉的「聊到 20 轮突然 400」。
+        let four = Message::user(vec![
+            ContentBlock::Text {
+                text: "一次四张".into(),
+            },
+            img_png(),
+            img_png(),
+            img_png(),
+            img_png(),
+        ]);
+        let hist = vec![with_image("轮 1"), with_image("轮 2"), four];
+        let built = ContextBuilder::new(ContextConfig::default()).build(&hist);
+        assert_eq!(
+            count_images(&built.messages),
+            KEEP_IMAGE_RECENT,
+            "跨消息也必须总共只留 KEEP_IMAGE_RECENT 张"
+        );
+        let last = built.messages.last().unwrap();
+        assert_eq!(
+            images_of(last),
+            3,
+            "同一条消息内部也要从最旧那张开始降级，不是整条保命"
+        );
+        assert_eq!(
+            last.blocks.len(),
+            5,
+            "只换块内容、不删块：1 文本 + 1 占位 + 3 图片"
+        );
+        assert!(
+            built.messages[1].text_of().contains(PLACEHOLDER),
+            "「轮 1」的图必须被降级并留下痕迹"
+        );
+        assert!(
+            built.messages[2].text_of().contains(PLACEHOLDER),
+            "「轮 2」的图同样"
+        );
+        assert_eq!(built.dropped, 0, "同 R151：这条测的是降级，不是截窗");
+    }
+
+    #[test]
+    fn fewer_images_than_the_cap_degrades_nothing_and_never_underflows() {
+        // `keep_from` 用 `saturating_sub`：写成 `len - keep_recent` 在「2 张 < 保留 3 张」
+        // 时 usize 下溢成 18446744073709551615，`&image_positions[..keep_from]` 当场 panic。
+        // 那是「用户上传第一张图就崩」的路径，不是边角。
+        let hist = vec![with_image("轮 1"), with_image("轮 2")];
+        let built = ContextBuilder::new(ContextConfig::default()).build(&hist);
+        assert_eq!(count_images(&built.messages), 2, "未超额度时一张都不许动");
+        assert!(
+            !built
+                .messages
+                .iter()
+                .any(|m| m.text_of().contains(PLACEHOLDER)),
+            "没降级就不许出现占位文字"
+        );
+        assert!(built.messages.iter().all(|m| images_of(m) <= 1));
+        // `keep_recent == 0` 的另一头：额度为零时全额降级，但不许吃掉文本。
+        let mut all = hist.clone();
+        degrade_old_images(&mut all, 0);
+        assert_eq!(count_images(&all), 0, "keep_recent=0 必须一张不留");
+        assert!(
+            all.iter()
+                .filter(|m| m.role == Role::User)
+                .all(|m| m.text_of().starts_with("轮 ")),
+            "全额降级也只替换图片块"
+        );
+    }
 }
