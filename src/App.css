@@ -8,6 +8,10 @@
 
 :root {
   font-family: var(--font-family);
+
+  /* R123 的 font_size 钳位（12..=24，唯一落点在 settings.rs 的 normalize()）在全仓只有这一行消费者：
+     applyTheme 写到 <html> 上的 inline --font-size 只有被这里读走才会真的变成字号。
+     重写本文件时必须保留 `font-size: var(--font-size)`，否则「字号设置」当场变装饰（F11）。 */
   font-size: var(--font-size);
   line-height: 24px;
   font-weight: 400;
@@ -52,7 +56,13 @@ a {
 }
 
 a:hover {
-  color: var(--text-primary);
+  /* R168：静止态是 --accent，悬停态必须比它**更醒目**。以前这里用 --text-primary，
+     那是把链接整体换成正文那一档颜色（实测六块 --text-primary 饱和度 0.12-0.44、
+     对底色的对比度 13.6-16.6 —— 对比度其实更高，丢的是「这是一条链接」的色相身份），
+     于是「悬停 = 变成正文」，在聊天界面里会被用户当成链接坏了。
+     现在用 --accent-hover：与同块 --accent 同色系（实测色相差 ≤1°）、饱和度不降、
+     对同块 --bg-surface 与 --bg-raised 的对比度都严格升高。 */
+  color: var(--accent-hover);
 }
 
 h1 {
@@ -71,7 +81,10 @@ button {
   background-color: var(--bg-raised);
   outline: none;
   transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgb(0 0 0 / 20%);
+
+  /* R170：这条以前写死 `rgb(0 0 0 / 20%)` —— `color-no-hex` 和「只扫 hex」的测试闸都看不见它，
+     而 minifier 会把它写回成 `#0003` 塞进产物。阴影深浅跟着预设走，所以收进 --shadow。 */
+  box-shadow: 0 2px 2px var(--shadow);
 }
 
 button {

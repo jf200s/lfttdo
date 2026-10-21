@@ -2,8 +2,11 @@ export const THEME_NAMES = ["noir", "paper", "ocean"] as const;
 export type ThemeName = (typeof THEME_NAMES)[number];
 export type Mode = "light" | "dark";
 
-/** 预设块负责拥有的 token。`tokens.test.ts` 逐块断言「每个预设覆盖这 13 个、一个不漏」，
- *  所以这里少列一个就等于漏项测试少守一个（R124）。 */
+/** 预设块负责拥有的 token。`tokens.test.ts` 逐块断言「每个预设覆盖这 15 个、一个不漏」，
+ *  所以这里少列一个就等于漏项测试少守一个（R124）。
+ *  `--accent-hover`（R168）与 `--shadow`（R170）是 T15 修复轮补进来的两项：前者是因为
+ *  `a:hover` 曾经退回 `--text-primary`，让链接悬停比静止时**更不显眼**；后者是因为
+ *  `App.css` 里剩了一条两道闸都看不见的 `rgb(0 0 0 / 20%)`，而 minifier 会把它写回成 `#0003`。 */
 export const THEME_TOKENS = [
   "--bg-surface",
   "--bg-raised",
@@ -11,11 +14,13 @@ export const THEME_TOKENS = [
   "--text-primary",
   "--text-muted",
   "--accent",
+  "--accent-hover",
   "--accent-text",
   "--border",
   "--danger",
   "--code-bg",
   "--radius",
+  "--shadow",
   "--font-family",
   "--bubble-max-w",
 ];
