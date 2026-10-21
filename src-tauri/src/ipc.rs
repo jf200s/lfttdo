@@ -16,7 +16,7 @@ use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::tools::registry::ToolRegistry;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::ipc::InvokeBody;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -93,10 +93,10 @@ impl Coalescer {
     // R109：锁中毒不 panic 整条流。这三把锁只保护一个 String / 一个 Instant，
     // 中毒后继续用是安全的（没有跨锁不变量）。
     fn buf(&self) -> std::sync::MutexGuard<'_, String> {
-        self.buf.lock().unwrap_or_else(|e| e.into_inner())
+        guard(&self.buf)
     }
     fn last_flush(&self) -> std::sync::MutexGuard<'_, Instant> {
-        self.last_flush.lock().unwrap_or_else(|e| e.into_inner())
+        guard(&self.last_flush)
     }
 }
 
@@ -158,14 +158,11 @@ const AGENT_CHANNEL: &str = "agent";
 /// 所以 `session_create` 与 `auto_title` 必须读同一个常量，不许各写一遍字面量。
 pub const DEFAULT_TITLE: &str = "新对话";
 
-/// R109：命令层不许 `.lock().unwrap()`。`AppState` 的锁是长命的，一次别处的 panic
-/// 会把中毒的 Mutex 变成之后**每条**命令都 panic。沿用仓库既有处置
-/// （`settings.rs` 的 `lock()`、`db.rs:99`）：中毒就继续用内层值。
-/// 这些锁保护的全是单点状态（一个 `String`、一个令牌、一个缓冲），没有跨锁不变量，
-/// 所以吞掉 poison 不会让人读到撕裂的形状。
-fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
+// R109 的处置本身住在 `crate::lock`（与 `settings.rs`、`store/db.rs`、
+// `permission/gate.rs`、`tools/registry.rs` 共用一份）。命令层的锁全是长命的，一次别处的
+// panic 不许变成之后每条命令都 panic；这些锁保护的全是单点状态（一个 `String`、一个令牌、
+// 一个缓冲），没有跨锁不变量，所以吞掉 poison 不会让人读到撕裂的形状。
+use crate::lock::guard;
 
 /// 生产出口：把 payload 发进 tauri 的 `agent` 通道。
 /// 这是 `Publish` 的**唯一**生产实现 —— 合帧与路由逻辑全在 `TauriEmitter` 里，与 tauri 无关。
@@ -618,18 +615,15 @@ struct SharedFile(Arc<Mutex<std::fs::File>>);
 
 impl std::io::Write for SharedFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).write(buf)
+        guard(&self.0).write(buf)
     }
 
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .write_all(buf)
+        guard(&self.0).write_all(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).flush()
+        guard(&self.0).flush()
     }
 }
 
@@ -678,9 +672,10 @@ fn init_logging(dir: &Path) -> Option<PathBuf> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        // `dialog:allow-open` 在 capabilities 里（spec:459 / T15 的图片附件入口），
-        // 权限要对得上，插件就必须真的注册 —— 只写权限不装插件会在 build 时炸（R108）。
-        .plugin(tauri_plugin_dialog::init())
+        // 没有任何外部插件：图片附件入口是原生 `<input type="file">`（R144），
+        // 前端因此既不需要 dialog 也不需要 fs 权限。曾经的 `tauri_plugin_dialog`
+        // 与 capabilities 里的 `dialog:allow-open` 一起在评审 #29 摘掉，理由写在
+        // `Cargo.toml` 与 `capabilities/default.json` 里。
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;

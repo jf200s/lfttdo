@@ -421,10 +421,11 @@ fn request_build_err(e: OpenAIError) -> ModelError {
 /// 这条错误整行显示给用户。200 字符足够看出「回来的不是 JSON，是网关/登录页」。
 const RAW_BODY_KEEP: usize = 200;
 
+/// 切法共用 `crate::text::head_chars`（与 `assistant_acc::args_snippet`、事件流预览、
+/// 会话标题同一份实现）；这里只决定标记文案，因为用户要的只是「后头还有，别当没看见」。
 fn body_snippet(raw: &str) -> String {
-    let mut it = raw.chars();
-    let head: String = it.by_ref().take(RAW_BODY_KEEP).collect();
-    if it.next().is_some() {
+    let (head, dropped) = crate::text::head_chars(raw, RAW_BODY_KEEP);
+    if dropped > 0 {
         format!("{head}…（正文已截断）")
     } else {
         head

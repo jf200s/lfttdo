@@ -211,7 +211,7 @@ impl AgentSession {
                     risk,
                     input: input.clone(),
                 };
-                // 构造函数负责钉住「顶层 risk == call.risk」这个不变量（events.rs:69）。
+                // 构造函数负责钉住「顶层 risk == call.risk」这个不变量（agent/events.rs:75）。
                 self.deps.sink.emit(AgentEvent::tool_call(view.clone()));
 
                 // 取消臂住在 gate 内部（R43）：弹窗挂着的时候按停止，`select!` 打不断

@@ -125,11 +125,11 @@ impl ToolRegistry {
     }
 
     pub fn register(&self, t: Arc<dyn Tool>) {
-        self.tools.write().unwrap().insert(t.meta().name.clone(), t);
+        crate::lock::write(&self.tools).insert(t.meta().name.clone(), t);
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.read().unwrap().get(name).cloned()
+        crate::lock::read(&self.tools).get(name).cloned()
     }
 
     /// 未知工具按 `Risk::Exec`：这是唯一安全的默认值，因为 `Exec` 在权限门里必定弹窗，

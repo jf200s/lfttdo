@@ -103,19 +103,17 @@ impl AssistantAcc {
 }
 
 /// **R32**：解析失败时写进消息的原始片段上限，单位是**字符**不是字节。
-/// 与 `openai_compat` 的 `RAW_BODY_KEEP`（`openai_compat.rs:438`）取同一个 200，理由共用：
+/// 与 `openai_compat` 的 `RAW_BODY_KEEP` 取同一个 200，理由共用：
 /// 200 个字符足够看出坏在哪，再多就只是把垃圾搬走。区别在于那边截的是**日志**，
 /// 这里截的是**消息内容**——这条 `Value` 会被 `assistant_msg` 重新序列化进下一轮的
 /// `arguments`（`openai_compat.rs:315`）、计入 Task 8 的滑窗预算、由 Task 11 落库，
 /// 整块内联等于让一坨截断输出永久骑在之后每一个请求上。
 const RAW_ARGS_KEEP: usize = 200;
 
-/// 按字符边界截断，不用 `&raw[..n]`：这里的输入是模型输出，中日韩字符一个占 3 字节，
-/// 按字节下标切片会在非边界上 panic。丢弃的字符数写进标记，失败保持可归因。
+/// 按字符边界截断（切法共用 `crate::text::head_chars`，不在这里复制）。
+/// 丢弃的字符数写进标记，失败保持可归因。
 fn args_snippet(raw: &str) -> String {
-    let mut it = raw.chars();
-    let head: String = it.by_ref().take(RAW_ARGS_KEEP).collect();
-    let dropped = it.count();
+    let (head, dropped) = crate::text::head_chars(raw, RAW_ARGS_KEEP);
     if dropped == 0 {
         head
     } else {

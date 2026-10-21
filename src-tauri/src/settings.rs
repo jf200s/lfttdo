@@ -65,7 +65,7 @@ const BUDGET_HEADROOM: u32 = 1024;
 
 /// `reserve_output` 的上限（R97）：留出 `BUDGET_HEADROOM` 的空间，好让 normalize 的后置条件
 /// `budget_tokens > reserve_output` **无条件**成立。不夹这一道，`reserve_output = u32::MAX`
-/// 时 `saturating_add` 只能把预算也顶到 `u32::MAX`，两者相等，`context.rs:102` 的
+/// 时 `saturating_add` 只能把预算也顶到 `u32::MAX`，两者相等，`context.rs:117` 的
 /// `saturating_sub` 照样把预算塌成 0 —— 那就是 `BUDGET_HEADROOM` 的注释说这段钳位要防的事，
 /// 等于钳位函数在自己最难的那条边界上没兑现承诺。
 const MAX_RESERVE_OUTPUT: u32 = u32::MAX - BUDGET_HEADROOM;
@@ -409,7 +409,7 @@ impl SettingsStore {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock::guard(&self.state)
     }
 
     pub fn path(&self) -> PathBuf {
@@ -1103,7 +1103,7 @@ mod tests {
         assert_eq!(s, once, "normalize 必须幂等：load 与 save 各调一次才安全");
         // R97：reserve 被夹到 `u32::MAX - 1024`，预算因此能真的比它大 1024。
         // 旧写法（不夹 reserve、只 `saturating_add`）在这里得到的是 reserve == budget == u32::MAX，
-        // `context.rs:102` 的 `saturating_sub` 照样把预算塌成 0 —— 钳位在最难的那条边界上失守。
+        // `context.rs:117` 的 `saturating_sub` 照样把预算塌成 0 —— 钳位在最难的那条边界上失守。
         assert_eq!(
             s.reserve_output,
             u32::MAX - BUDGET_HEADROOM,

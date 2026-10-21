@@ -83,18 +83,22 @@ impl ContextBuilder {
     /// 已知取舍：历史里的 system 备注一律排在保留 tail **之前**，与它们在历史中的位置无关
     /// （今天的摘要备注就该在最前）；切片 5 若引入需要按时序穿插的系统备注，要改这里。
     pub fn build(&self, history: &[Message]) -> Built {
-        let system = Message::system_note(SYSTEM_PROMPT);
-        // 保留历史里已有的 system 备注（Plan C 的摘要消息走这一路），
-        // 但去掉与本机 SYSTEM_PROMPT 重复的那条，避免同一提示词进两次。
-        let notes: Vec<Message> = history
-            .iter()
-            .filter(|m| m.role == Role::System)
-            .filter(|m| m.text_of() != SYSTEM_PROMPT)
-            .cloned()
-            .collect();
+        // 请求头部 = 本机 SYSTEM_PROMPT + 历史里已有的 system 备注（Plan C 的摘要消息走
+        // 这一路），但去掉与 SYSTEM_PROMPT 重复的那条，避免同一提示词进两次。
+        let mut head: Vec<Message> = vec![Message::system_note(SYSTEM_PROMPT)];
+        head.extend(
+            history
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .filter(|m| m.text_of() != SYSTEM_PROMPT)
+                .cloned(),
+        );
+        // 头部只估一次就够，靠的是 `estimate_tokens` 的**逐消息相加**性质（见该函数：
+        // 每条各加 `MSG_TOKEN_OVERHEAD` 与各块权重，块之间没有任何耦合项）。
+        let head_est = estimate_tokens(&head);
 
         // R148：历史图片的降级点**只有这一处**，跑在窗口循环之前、作用在整段非 system
-        // 历史上。放在循环之后（`cand` 上）会让 `keep` 按「图片仍在」的预算裁掉更多文本，
+        // 历史上。放在循环之后（拼好的请求上）会让 `keep` 按「图片仍在」的预算裁掉更多文本，
         // 并让 `est_input_tokens` 虚高于实际发出的请求。
         // 这里 clone 成 owned `Vec<Message>` 而不是继续用 `Vec<&Message>`：降级要改块内容，
         // 而 `history` 是调用方（Task 10 的循环）的数据，就地改等于偷偷把「模型看到的图」
@@ -130,18 +134,22 @@ impl ContextBuilder {
             }
             // keep 由最终的 start 反推：被 advance 跳过的孤儿工具结果同样要计入 dropped。
             keep = conversational.len() - start;
-            // owned 之后无需再逐条 clone：降级已经在整段历史上跑过一次（见上）。
-            let tail: Vec<Message> = conversational[start..].to_vec();
-            let mut cand = vec![system.clone()];
-            cand.extend_from_slice(&notes);
-            cand.extend(tail);
-            // est 与 messages.len() 都必须来自 advance 之后的 cand。
-            let est = (estimate_tokens(&cand) as f64 * self.calibration) as usize;
+            // 判据算的是 `head_est + 尾部切片`，而不是「把 head 与 tail 拼成一坨再整体估」：
+            // 拼接要在每一轮复制整段尾部，而降级后的尾部仍可能带着 `KEEP_IMAGE_RECENT` 张图、
+            // 单张 base64 上限 5 MB（`image_prep.rs` 的 `MAX_BASE64_BYTES`）—— 最多 40 轮
+            // × 十几 MB 就是几百 MB 级的纯 memcpy，还发生在第一个字节出门之前。
+            // 两者数值相等（相加性，见上），所以出口只需 clone 一次。
+            let est = ((head_est + estimate_tokens(&conversational[start..])) as f64
+                * self.calibration) as usize;
             // `keep <= 1` 而非 `keep == 1`：keep 可以是 0（空历史、window_messages: 0、
             // 或 budget_tokens: 0），此时 `keep -= 1` 会 usize 下溢并在 debug 直接 panic。
             if est <= budget || keep <= 1 {
+                // est 与 messages 都出自 advance 之后的同一个 `start`，所以 est 必然等于
+                // 实际发出那条请求的粗估（`a_cut_request_reports_the_estimate...` 钉这条）。
+                let mut messages = head.clone();
+                messages.extend_from_slice(&conversational[start..]);
                 return Built {
-                    messages: cand,
+                    messages,
                     dropped: conversational.len() - keep,
                     est_input_tokens: est as u32,
                 };
@@ -595,6 +603,50 @@ mod tests {
             "超预算 {total}（预算 = 20_000 - 4_096 = 15_904）"
         );
         assert!(built.messages.len() < 40);
+    }
+
+    #[test]
+    fn a_cut_request_reports_the_estimate_of_the_messages_it_actually_built() {
+        // 判据 = 「`est_input_tokens` 就是这次发出去的那条请求的粗估」，而且必须测在
+        // **真的裁了**的路径上：不裁的路径里 `messages` 就是整段历史，两者天然相等，
+        // 测不出「循环里的算式和出口拼装的清单不一致」这类错。这条不一致不是洁癖：
+        // 切片 5 的校准要算 `input_tokens ÷ est_input_tokens`（`set_calibration` 的文档），
+        // est 虚高 → factor 长期 < 1 → 预算越放越宽，最终把请求顶到端点的 400。
+        //
+        // 三种块都在预算里：`SYSTEM_PROMPT`、历史里保留的 system 备注（`notes`，它住在
+        // system 与 tail **之间**，最容易漏算）、以及带图的 tail（图是定值 900，与
+        // base64 长度无关 —— 见 `image_blocks_cost_a_fixed_high_amount_not_by_base64_length`）。
+        let cfg = ContextConfig {
+            reserve_output: 100,
+            budget_tokens: 1_000,
+            window_messages: 40,
+        };
+        let mut hist = vec![
+            Message::system_note(&"历史里的摘要备注，它同样占预算。".repeat(4)),
+            Message::user(vec![
+                ContentBlock::Text {
+                    text: "看一下这张图".into(),
+                },
+                ContentBlock::Image {
+                    data: "AAAA".into(),
+                    mime: ImageMime::Png,
+                },
+            ]),
+        ];
+        for i in 0..12 {
+            hist.push(u(&("句子".repeat(150) + &format!(" {i}"))));
+        }
+        let built = ContextBuilder::new(cfg).build(&hist);
+        assert!(
+            built.dropped > 1,
+            "本例必须走到裁剪，否则没测到循环（dropped={})",
+            built.dropped
+        );
+        assert_eq!(
+            built.est_input_tokens,
+            estimate_tokens(&built.messages) as u32,
+            "est 与实际发出的消息对不上"
+        );
     }
 
     #[test]

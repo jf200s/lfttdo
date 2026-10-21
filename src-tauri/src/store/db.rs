@@ -97,7 +97,7 @@ impl Db {
     /// 这层 `Mutex` 不可重入：`Db` 的方法都是「先取锁再碰连接」，将来谁在持锁期间
     /// 再调一个 `Db` 方法，就是自己等自己 —— 表现是界面卡死而不是报错，所以别试。
     fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        crate::lock::guard(&self.conn)
     }
 
     pub fn journal_mode(&self) -> Result<String, rusqlite::Error> {
@@ -218,7 +218,7 @@ impl Db {
     }
 
     /// 取最近一句**真人**发言当会话标题。两个坑都在 role 上（R75），要**两道**筛选才挡得住：
-    /// ① `Message::tool` 的 role 也是 `User`（`types.rs:77`）—— 不跳过就返回 `Some("")`，
+    /// ① `Message::tool` 的 role 也是 `User`（`agent/types.rs:105`）—— 不跳过就返回 `Some("")`，
     /// T13 拿它当标题会把会话改名成空串。纯结果行的 `text_of()` 是空串，「非空文本」那道
     /// 顺带就挡住了；但**带字的工具行**（Text + ToolResult 混在一行）只有 `is_tool_row` 挡得住，
     /// 变异实验实测：只留「非空文本」这一道，标题会变成工具附带的说明。
@@ -233,7 +233,7 @@ impl Db {
             .filter(|m| m.role == Role::User && !is_tool_row(m))
             .map(|m| m.text_of())
             .find(|t| !t.is_empty())
-            .map(|t| truncate_chars(&t, TITLE_CHARS)))
+            .map(|t| crate::text::truncate_display(&t, TITLE_CHARS)))
     }
 }
 
@@ -311,15 +311,6 @@ fn is_tool_row(m: &Message) -> bool {
     m.blocks
         .iter()
         .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
-}
-
-fn truncate_chars(t: &str, max: usize) -> String {
-    // 按字符切而不是字节下标：中日韩一个字符 3 字节，`&t[..40]` 会在非 UTF-8 边界 panic。
-    let mut s: String = t.chars().take(max).collect();
-    if t.chars().count() > max {
-        s.push('…');
-    }
-    s
 }
 
 /// 重放映射（spec 6.2）：把持久化消息换成等价事件序列，前端用**同一个 reducer** 得到界面。
@@ -684,7 +675,7 @@ mod tests {
         );
     }
 
-    /// R75：工具结果行的 role **也是 User**（`types.rs:77` 的决定）。不跳过的话，
+    /// R75：工具结果行的 role **也是 User**（`agent/types.rs:105` 的决定）。不跳过的话，
     /// 第一个工具轮之后这里返回 `Some("")`，T13（plan:2972）拿它当标题就把会话改名成空串。
     /// 末尾那条**混了 Text 的工具行**才是这条裁定的真证据：纯结果行靠「文本非空」那道就挡住了，
     /// 带字的工具行只能按块种类判（与 `events_from_messages` 的 R69 同一个规则）。

@@ -10,10 +10,12 @@
 pub mod agent;
 pub mod image_prep;
 pub mod ipc;
+pub mod lock;
 pub mod model;
 pub mod permission;
 pub mod settings;
 pub mod store;
+pub mod text;
 pub mod tools;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -20,7 +20,7 @@ impl RuleTable {
     /// 命中即视为会话级放行。MVP 策略「Read 一律 Auto」不住在这里，住在 `check`
     /// （R45：曾经想过 `default_mvp()` 的别名，全计划零调用方，删）。
     pub fn lookup(&self, key: &str) -> Option<Decision> {
-        if self.auto_keys.read().unwrap().contains(key) {
+        if crate::lock::read(&self.auto_keys).contains(key) {
             return Some(Decision::allow(Scope::Session));
         }
         None
@@ -28,7 +28,7 @@ impl RuleTable {
 
     /// 只登记会话级放行；`Scope::Once` 绝不进这里，否则一次确认就买断整个会话。
     pub fn remember_session(&self, key: &str) {
-        self.auto_keys.write().unwrap().insert(key.to_string());
+        crate::lock::write(&self.auto_keys).insert(key.to_string());
     }
 }
 
@@ -75,7 +75,11 @@ impl PermissionGate {
     /// 换掉出口（Task 13 在 `send_message` 开头调用）。锁只保护「换个 Arc」这个动作，
     /// `check` 里是先把 Arc clone 出来再释放锁，**任何 await 都不跨这把锁**（R42）。
     pub fn set_sink(&self, sink: Arc<dyn EventSink>) {
-        *self.sink.lock().unwrap() = Some(sink);
+        // 旧 sink 必须在锁**外**被 drop：`EventSink` 是 dyn 的，它的 `Drop` 里若有任何东西
+        // 回头调本方法（或读这把锁），持锁期间就是自己等自己 —— 症状是界面卡死而不是报错。
+        // guard 是这条 `let` 的临时量，语句结束即释放，`old` 才真正活到函数末尾。
+        let old = crate::lock::guard(&self.sink).replace(sink);
+        drop(old);
     }
 
     pub fn rules(&self) -> Arc<RuleTable> {
@@ -129,7 +133,7 @@ impl PermissionGate {
         }
 
         // 先 clone Arc、立刻释放锁：下面每一个 await 都不得持有 sink 的 Mutex（R42）。
-        let Some(sink) = self.sink.lock().unwrap().clone() else {
+        let Some(sink) = crate::lock::guard(&self.sink).clone() else {
             // headless（没接界面）绝不等于全授权（R44）。
             return Decision::deny("没有可应答的界面");
         };
@@ -140,7 +144,7 @@ impl PermissionGate {
 
         let (tx, rx) = oneshot::channel();
         let id = uuid::Uuid::new_v4().to_string();
-        self.pending.lock().unwrap().insert(id.clone(), tx);
+        crate::lock::guard(&self.pending).insert(id.clone(), tx);
         sink.emit(AgentEvent::permission_request(id.clone(), call.clone()));
 
         let waited = tokio::select! {
@@ -155,7 +159,7 @@ impl PermissionGate {
         match waited {
             Waited::Cancelled => {
                 // 必须摘掉 sender，且必须告诉前端把弹窗收掉。
-                self.pending.lock().unwrap().remove(&id);
+                crate::lock::guard(&self.pending).remove(&id);
                 let d = Decision::deny("等待授权时收到中断");
                 sink.emit(AgentEvent::PermissionResolved {
                     id,
@@ -170,14 +174,14 @@ impl PermissionGate {
             // 屏幕上**需要被收掉；这支的应答通道已经先没了，再发一条 PermissionResolved 等于
             // 替前端宣布一个它从未做过的决定。若哪天这支变得可达，连同 emit 一起补。
             Waited::WindowGone => {
-                self.pending.lock().unwrap().remove(&id);
+                crate::lock::guard(&self.pending).remove(&id);
                 Decision::deny("确认窗口已关闭")
             }
             Waited::Answered(d) => {
                 // 冗余保险：`resolve` 是「先摘出来再 send」，走到这支时条目通常已经不在表里了。
                 // 留着是因为它同样保证「应答过的请求不会漏在 pending 里」，而这条性质由
                 // `write_risk_asks_and_resolves` 的 `pending_len() == 0` 钉住（两处一起改才会红）。
-                self.pending.lock().unwrap().remove(&id);
+                crate::lock::guard(&self.pending).remove(&id);
                 if let Decision::Allow {
                     scope: Scope::Session,
                 } = d
@@ -196,7 +200,11 @@ impl PermissionGate {
     /// 由 IPC 命令（Task 13 的 `respond`）调用。返回 false = 没有这个待决请求
     /// （重复应答、已取消、或 id 是伪造的），调用方据此报错而不是静默。
     pub fn resolve(&self, id: &str, d: Decision) -> bool {
-        match self.pending.lock().unwrap().remove(id) {
+        // 取出与发送分两步：这把锁的临界区只许包含「动这张表」，`tx.send` 是给别人的动作。
+        // 今天 `oneshot::send` 不阻塞，所以这只是一道形状上的防线；将来谁把 pending 换成
+        // 会阻塞的通道（带锁的 mpsc、或要回调前端的 send），持锁发送就变成死锁。
+        let taken = crate::lock::guard(&self.pending).remove(id);
+        match taken {
             Some(tx) => tx.send(d).is_ok(),
             None => false,
         }
