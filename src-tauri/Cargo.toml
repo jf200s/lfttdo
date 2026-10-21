@@ -19,7 +19,9 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
+# `dialog:allow-open` 是 capabilities 里唯一的外部插件权限（spec:459 / T15 的图片附件入口），
+# 所以插件必须真的注册 —— 只写权限不装插件会在 build 时炸（R108）。
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-openai = { version = "0.42.2", features = ["chat-completion", "realtime"] }
@@ -38,6 +40,14 @@ tokio-util = "0.7.20"
 uuid = { version = "1.28.0", features = ["v4"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tracing = "0.1.44"
+# R107：GUI 进程没有控制台，日志必须落到 app data 目录里的文件，否则 settings.rs 那两条
+# `warn!`（R87）和 spec:543「全文搜索日志文件」都凭空消失。
+# 只开 fmt + std：不引 `tracing-appender`（滚动/非阻塞全家桶，<15MB 安装包是验收线），
+# 不引 `env-filter`（没有人需要按 target 过滤），不引 `ansi`（写文件不需要颜色）。
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "std",
+] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
