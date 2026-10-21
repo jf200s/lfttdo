@@ -120,4 +120,25 @@ describe("ipc commands", () => {
     off();
     return Promise.resolve().then(() => expect(unlisten).toHaveBeenCalled());
   });
+
+  // 评审 #29（前端与配置）：清理函数原来只挂 `onfulfilled`，`listen()` 一旦 reject
+  // （窗口已销毁是真实的一种）就留下一条没人处理的 promise。断言的不是「`off()` 不抛」——
+  // 它从来不抛 —— 而是 Node 层面确实没有 `unhandledRejection` 冒出来，那才是这条修复的
+  // 可观测后果。摘掉第二支参数，这条就红。
+  it("swallows a rejected listen instead of leaking an unhandled rejection", async () => {
+    const seen: unknown[] = [];
+    const onRejection = (r: unknown) => seen.push(r);
+    process.on("unhandledRejection", onRejection);
+    try {
+      listen.mockRejectedValue(new Error("窗口已销毁"));
+      const off = api.subscribeAgent(() => {});
+      off();
+      // `unhandledRejection` 在微任务队列清空**之后**的宏任务里才发，所以这里必须真的
+      // 让出一个 timer：只 `await Promise.resolve()` 会稳定地看不见它。
+      await new Promise((r) => setTimeout(r, 0));
+      expect(seen).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
 });

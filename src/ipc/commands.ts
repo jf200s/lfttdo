@@ -95,6 +95,13 @@ export function subscribeAgent(
     onEvent(p.payload.sessionId, p.payload.event),
   );
   return () => {
-    un.then((f) => f());
+    // `listen()` 自己也可能 reject（窗口已销毁是真实的一种）。这条清理函数住在
+    // `useEffect` 的返回位上，没人会 await 它，所以少一支 `onrejected` 就是一次
+    // unhandled rejection —— 症状不是崩，是控制台被无视的错误淹掉，而这条路径平时不响。
+    // 这里刻意不往上抛：卸载时 `App` 已经不再订阅，通知面无从可上。
+    void un.then(
+      (f) => f(),
+      () => {},
+    );
   };
 }
