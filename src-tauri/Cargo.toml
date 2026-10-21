@@ -19,9 +19,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-# `dialog:allow-open` 是 capabilities 里唯一的外部插件权限（spec:459 / T15 的图片附件入口），
-# 所以插件必须真的注册 —— 只写权限不装插件会在 build 时炸（R108）。
-tauri-plugin-dialog = "2"
+# 这里**没有**外部插件。曾经有 `tauri-plugin-dialog`：它只为兑现 capabilities 里的
+# `dialog:allow-open`（spec:459 的图片附件入口），而 R144 把入口换成了原生
+# `<input type="file">`（前端拿不到路径 ⇒ 不需要 dialog，也不需要任何 fs 权限）。
+# 权限与插件注册一起摘掉，评审 #29 标准轴 3。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-openai = { version = "0.42.2", features = ["chat-completion", "realtime"] }
@@ -39,7 +40,6 @@ image = { version = "0.25.10", default-features = false, features = [
     "png",
     "webp",
 ] }
-rmcp = { version = "3.5.1", features = ["client", "transport-io", "transport-child-process"] }
 async-stream = "0.3.6"
 async-trait = "0.1.92"
 thiserror = "2.0.21"
@@ -73,6 +73,12 @@ tempfile = "3.27.0"
 # R138：`rand` 不是本 crate 的直接依赖，Cargo.lock 里的 0.9.5 / 0.10.3 **都是传递依赖**，
 # 传递依赖不能 `use rand::`。Step 1 的噪声图夹具用 `rand::rng()`（0.9 API），必须显式加。
 rand = "0.9"
+# T4 探针（`examples/mcp_probe.rs`，Plan A 切片 0 的风险验证）是 `rmcp` 在本 crate 里
+# 唯一的用户，而 `src/` 零引用 —— MCP 客户端是 Plan B 的活。留在 `[dependencies]`
+# 就等于把一整套 client + child-process 传输链编进发布产物，直接顶到 <15MB 那条验收线
+# 上（评审 #29 规格轴：Plan B 依赖提前进产物）。`examples/` 用得到 `[dev-dependencies]`，
+# 所以探针照旧可跑；Plan B 把它移回 `[dependencies]` 的那天，它才有生产用户。
+rmcp = { version = "3.5.1", features = ["client", "transport-io", "transport-child-process"] }
 
 [target."cfg(windows)".dependencies]
 keyring-core = "1.0.1"

@@ -1,13 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "前端只允许事件、对话框与自定义命令；无 shell、无全局文件系统权限",
+  "description": "前端只允许事件与自定义命令；无 shell、无文件系统、无窗口尺寸/拖拽权限",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    "core:event:default",
-    "dialog:allow-open",
-    "core:window:allow-set-size",
-    "core:window:allow-start-dragging"
-  ]
+  "permissions": ["core:default", "core:event:default"]
 }
