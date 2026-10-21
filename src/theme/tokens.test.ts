@@ -66,14 +66,11 @@ function makeSpyElement(): {
 }
 
 /**
- * F10 / R169：这是 `Settings::default()`（src-tauri/src/settings.rs:265-267 的
- * `theme: "noir"` / `mode: Mode::Dark` / `font_size: 15`）的**第三份拷贝**，
- * `tokens.css` 的 `--font-size: 15px` 是第四份。四处今天逐字相等 —— 这正是它危险的原因：
- * 任何一处单独改动都静默成立，而 cargo test / vitest / tsc 全绿。
- * ⚠️ T16 用真实 `settings_get` 驱动 `applyTheme` 之后，`main.tsx:12` 那一行必须消失，
- * 届时请连这条测试一起删（R169 把它写成 T16 的验收项，不是长期资产）。
+ * F10 / R169 已经由 T16 执行完毕：`main.tsx` 里那行硬编码的启动期 `applyTheme` 调用
+ * 和这个 `BOOT_DEFAULTS` 常量一起删掉了（"不许留成「有名单没消费者」的第二套真相"）。
+ * 取而代之的是下面那条「main.tsx 里不许再出现 applyTheme」的守卫 —— 同一件事的反面，
+ * 这次的判据是「它不在」而不是「它在且等于 Rust 的默认值」。
  */
-const BOOT_DEFAULTS = { theme: "noir", mode: "dark", fontSize: 15 } as const;
 
 function listCss(dir: string): string[] {
   const found: string[] = [];
@@ -84,6 +81,77 @@ function listCss(dir: string): string[] {
   }
   return found;
 }
+
+/** 剥注释的 TS 版：行注释也要剥，否则注释里提到的 `applyTheme(` 会被当成一次调用（假阳）。 */
+function stripCodeComments(src: string): string {
+  return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+}
+
+/** 收全部顶层规则：`[选择器串, 规则体]`。剥注释 —— 注释里的字面量不是证据（评审 M2）。 */
+function rules(css: string): [string, string][] {
+  return [...stripComments(css).matchAll(/([^{}]+)\{([^}]*)\}/g)].map((m) => [
+    m[1],
+    m[2],
+  ]);
+}
+
+/** 预设块 → `token -> 原样值`。只给这条性质检查用，不参与上面那些双向集合断言。 */
+function presetTokenValues(body: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of body.matchAll(/(--[a-z][a-z0-9-]*)\s*:\s*([^;]+);/g)) {
+    out[m[1]] = m[2].trim();
+  }
+  return out;
+}
+
+/** 支持 `#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa` 与 `rgb()`/`rgba()`（含现代斜杠语法）。 */
+function toRgb(value: string): [number, number, number] {
+  const hex = /^#([0-9a-f]{3,8})$/i.exec(value.trim());
+  if (hex) {
+    const h = hex[1];
+    const digits =
+      h.length === 3 || h.length === 4
+        ? [...h].map((c) => c + c)
+        : [...h.match(/.{2}/g)!];
+    return [
+      parseInt(digits[0], 16),
+      parseInt(digits[1], 16),
+      parseInt(digits[2], 16),
+    ];
+  }
+  const fn = /rgba?\(([^)]+)\)/i.exec(value.trim());
+  if (fn) {
+    const parts = fn[1].trim().split(/[\s,/]+/).map(Number);
+    return [parts[0], parts[1], parts[2]];
+  }
+  throw new Error(`这条性质检查认不出的颜色写法：${value}`);
+}
+
+/** WCAG 相对亮度（和对比度用的是同一个 L）。 */
+function relativeLuminance(value: string): number {
+  const [r, g, b] = toRgb(value);
+  const lin = (c: number): number => {
+    const s = c / 255;
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+}
+
+/** 组件样式里 `button` 静止态与 `:active` 各取哪个 token（按层叠顺序，后写的算）。 */
+function buttonBackgrounds(css: string): { rest: string; active: string } {
+  let rest = "";
+  let active = "";
+  for (const [selector, body] of rules(css)) {
+    const bg = /background-color:\s*var\((--[a-z-]+)\)/.exec(body);
+    if (!bg) continue;
+    for (const s of selector.split(",").map((x) => x.trim())) {
+      if (/^button:active\b/.test(s)) active = bg[1];
+      else if (/^button$/.test(s)) rest = bg[1];
+    }
+  }
+  return { rest, active };
+}
+
 
 describe("theme tokens", () => {
   // F2 / M3：完整性测试只问「CSS ⊇ 名单」，从不问「名单 ⊇ 实际声明」，于是从
@@ -233,24 +301,67 @@ describe("theme tokens", () => {
     }
   });
 
-  it("pins the boot-time applyTheme call until T16 replaces it", () => {
-    const source = readFileSync(pathOf("../main.tsx"), "utf8");
-    const call = source.match(
-      /applyTheme\(\s*document\.documentElement\s*,\s*"([a-z-]+)"\s*,\s*"([a-z-]+)"\s*,\s*(\d+)\s*\)/,
+  // R169 的另一半：硬编码那一行**必须不在**。注释里提到 applyTheme 不算调用，所以先剥注释。
+  it("leaves settings as the only source of the applied theme", () => {
+    const code = stripCodeComments(readFileSync(pathOf("../main.tsx"), "utf8"));
+    expect(code, "main.tsx 又出现了启动期硬编码的 applyTheme 调用").not.toMatch(
+      /applyTheme\s*\(/,
     );
-    // 匹配不到就是 T16 已经把这行换成真实设置驱动了 —— 那是好事，请连本条测试一起删（R169）。
+    expect(code).not.toMatch(/resolveTheme\s*\(/);
+    // 但第一帧仍然要有兜底字号：设置回来之前不许退回浏览器的 16px。
+    // 这条不再钉死 15 —— 钉死数字就是再造一份默认值（R169 的根因）。
+    expect(stripComments(tokens)).toMatch(/--font-size:\s*\d+px;/);
+    // T15 评审 F11：`--font-size` 必须真的有人消费。`applyTheme` 把它写成 `<html>` 的
+    // inline 变量，只有组件样式里出现 `font-size: var(--font-size)` 它才会变成字号；
+    // 少了这一行，`settings.rs` 那套 12..=24 的钳位（R123）就是装饰。
     expect(
-      call,
-      "main.tsx 里找不到启动期 applyTheme(document.documentElement, ...) 硬编码调用",
-    ).toBeTruthy();
-    expect([call![1], call![2], Number(call![3])]).toEqual([
-      BOOT_DEFAULTS.theme,
-      BOOT_DEFAULTS.mode,
-      BOOT_DEFAULTS.fontSize,
-    ]);
-    // 第四份拷贝也在：:root 的兜底字号必须和启动值一致，否则第一帧和首帧后不同字号。
-    expect(tokens).toContain(`--font-size: ${BOOT_DEFAULTS.fontSize}px;`);
+      stripComments(readFileSync(pathOf("../styles.css"), "utf8")),
+      "styles.css 不再消费 --font-size（字号设置失效）",
+    ).toMatch(/font-size:\s*var\(--font-size\)/);
   });
+
+  // R133 / 评审 F9 的那道层叠纪律：**组件样式里不许声明任何 `--*`**。
+  // 一旦声明，它和 tokens.css 的 `:root` 就是同特异度的两份真相，而唯一守着先后的是
+  // import 顺序 —— 这条把「先后」这个变量本身消掉了。
+  it("keeps every custom-property declaration out of component stylesheets", () => {
+    const offenders: string[] = [];
+    for (const file of listCss(srcDir)) {
+      if (/[\\/]+theme[\\/]/.test(file)) continue;
+      const body = stripComments(readFileSync(file, "utf8"));
+      for (const m of body.matchAll(/(?:^|[{;])\s*(--[a-z][a-z0-9-]*)\s*:/g)) {
+        offenders.push(`${file} -> ${m[1]}`);
+      }
+    }
+    expect(offenders, offenders.join("\n")).toEqual([]);
+  });
+
+  // R181：按下态必须比静止态**暗**，六块全过。
+  // 为什么做成性质检查而不是钉死某个值：`--bg-input` 的明暗方向本身随 mode 翻转
+  // （三个 dark 块更亮、三个 light 块更暗），所以「这里用 --bg-input」在 light 三块看着对、
+  // 在 dark 三块是反的 —— 那支 token 的语义是「输入区底色」，不是「按下凹陷」。
+  // 变异：把 styles.css 的 `button:active` 改回 `--bg-input`，dark 那三块当场红。
+  it("keeps the pressed state darker than the resting state in all six presets", () => {
+    const css = readFileSync(pathOf("../styles.css"), "utf8");
+    const { rest, active } = buttonBackgrounds(css);
+    expect(active, "button:active 的底色没取 --bg-surface").toBe("--bg-surface");
+    expect(rest, "button 静止态的底色没取 --bg-raised").toBe("--bg-raised");
+
+    const blocks = [
+      ...stripComments(presets).matchAll(
+        /^\[data-theme="([a-z-]+)"\]\[data-mode="(light|dark)"\]\s*\{([^}]*)\}/gm,
+      ),
+    ];
+    expect(blocks).toHaveLength(6);
+    for (const m of blocks) {
+      const key = `${m[1]}/${m[2]}`;
+      const values = presetTokenValues(m[3]);
+      expect(
+        relativeLuminance(values[active]),
+        `${key}：按下态(${active})不比静止态(${rest})暗，按下去看不出按下了`,
+      ).toBeLessThan(relativeLuminance(values[rest]));
+    }
+  });
+
 
   // R126 ②：仓库没有 CI，`npm run lint:css` 只有「有人记得跑」才会跑，而 `npm test` 一定跑。
   // 两道闸各保一层：这条守住「硬编码颜色不许进组件样式」，stylelint 守住有人跑时的全量规则。

@@ -1,0 +1,384 @@
+/* 界面样式。两条纪律（Step 0 第 5 条 = R133）：
+   ① 这里**不声明任何 `--*` 自定义属性**。色值表只有 `src/theme/tokens.css` 与
+      `src/theme/presets.css` 两处；一旦组件样式里也声明 `--*`，同特异度的 `:root`
+      就开始讲先后，而那条先后今天只由 `main.tsx` 的 import 顺序和一个读取它的测试守着。
+   ② 一律 `var(--token)`，无一处 hex、也无 rgb()/hsl()（`color-no-hex` 与 `npm test`
+      里那道 hex 闸都只盯 hex，`rgb()` 是已知盲区 —— R170）。
+   import 顺序在 `main.tsx`：tokens → presets → 本文件。 */
+
+/* `font-size: var(--font-size)` 是全仓 `--font-size` 的唯一消费者（T15 评审 F11）：
+   `applyTheme` 把它写成 `<html>` 的 inline 变量，只有这里读走它才会真的变成字号，
+   否则 `settings.rs` 那一整套 12..=24 的钳位（R123）当场变装饰。从 `App.css` 原样搬来。 */
+:root {
+  font-family: var(--font-family);
+  font-size: var(--font-size);
+  line-height: 1.5;
+  color: var(--text-primary);
+  background-color: var(--bg-surface);
+  font-synthesis: none;
+  text-rendering: optimizelegibility;
+}
+
+body {
+  margin: 0;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* ==== 通用控件（基座）====
+   这一节必须排在**所有**带伪类或带父类的控件选择器之前：`no-descending-specificity`
+   按「最后一个复合选择器」认定同一目标，`input` 晚于 `.deny-reason input`、
+   `button` 晚于 `button:hover:not(:disabled)` 都会红。按钮的阴影也写在这里，
+   因为同一组里的裸 `button` 一旦排到 `.card`/`.bubble` 那组末尾（文件底部），
+   就又站到 `button:hover` 后面去了。阴影一律取 `var(--shadow)`：
+   R170 那条 `rgb(0 0 0 / 20%)` 两道闸（`color-no-hex` 与 `npm test` 的 hex 闸）都看不见，
+   而 minifier 会把它写回 `#0003` 塞进产物。 */
+
+button,
+input,
+textarea {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  font: inherit;
+  color: var(--text-primary);
+  background-color: var(--bg-raised);
+  box-shadow: 0 2px 2px var(--shadow);
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+/* R181：按下态取 `--bg-surface`。六块预设里它都比静止态的 `--bg-raised` **更暗**
+   （`tokens.test.ts` 那条性质断言逐块算相对亮度，别钉死某个 hex）。
+   `--bg-input` 在这里不行：它的明暗方向本身随 mode 翻转（三个 dark 块更亮、三个 light 块
+   更暗），它表达的语义是「输入区底色」而不是「按下凹陷」。 */
+button:active:not(:disabled) {
+  border-color: var(--accent);
+  background-color: var(--bg-surface);
+}
+
+a {
+  color: var(--accent);
+}
+
+a:hover {
+  color: var(--accent-hover);
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  height: 100vh;
+}
+
+/* ==== 侧栏 ==== */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-right: 1px solid var(--border);
+  background-color: var(--bg-surface);
+  overflow-y: auto;
+}
+
+.session-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.session-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-radius: var(--radius);
+  border: 1px solid transparent;
+}
+
+.session-item[data-active="true"] {
+  border-color: var(--accent);
+  background-color: var(--bg-raised);
+}
+
+.session-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.rename-form {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 4px;
+}
+
+/* ==== 主面板 ==== */
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  height: 100%;
+  background-color: var(--bg-surface);
+}
+
+.message-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* ==== 横幅与提示 ==== */
+
+.fatal {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  background-color: var(--bg-raised);
+  color: var(--danger);
+}
+
+.app-notices,
+.notices {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.app-notice,
+.notice {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background-color: var(--bg-raised);
+  color: var(--text-muted);
+}
+
+.app-notice {
+  border-color: var(--danger);
+  color: var(--text-primary);
+}
+
+.notice-count {
+  color: var(--text-muted);
+}
+
+/* ==== 气泡 ==== */
+
+.bubble {
+  max-width: var(--bubble-max-w);
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background-color: var(--bg-raised);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-wrap: anywhere;
+}
+
+.bubble-user {
+  align-self: flex-end;
+  background-color: var(--bg-input);
+}
+
+.bubble-assistant {
+  align-self: flex-start;
+}
+
+/* 流式进行中的那一块：纯文本，保留换行，不解析半截 Markdown（要求 2）。 */
+.plain {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+}
+
+.thumb {
+  max-width: 100%;
+  border-radius: var(--radius);
+}
+
+/* ==== Markdown 产出 ==== */
+
+.md {
+  color: var(--text-primary);
+}
+
+.md > :first-child {
+  margin-top: 0;
+}
+
+/* 链接的静止/悬停态只有「通用控件」那一节的 `a` / `a:hover` 两条：
+   再写一条 `.md a` 就是同一个属性两个来源，而且会撞 `no-descending-specificity`。 */
+
+.md pre,
+.md code {
+  background-color: var(--code-bg);
+  border-radius: var(--radius);
+}
+
+.md pre {
+  padding: 8px 10px;
+  overflow-x: auto;
+}
+
+.md blockquote {
+  margin: 0;
+  padding-left: 10px;
+  border-left: 2px solid var(--border);
+  color: var(--text-muted);
+}
+
+.md table {
+  border-collapse: collapse;
+}
+
+.md td,
+.md th {
+  border: 1px solid var(--border);
+  padding: 4px 6px;
+}
+
+/* ==== 工具卡 / 权限卡 ==== */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background-color: var(--bg-input);
+}
+
+.card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.badge {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+.perm[data-state="pending"] {
+  border-color: var(--accent);
+}
+
+.tool[data-status="error"],
+.perm[data-state="denied"] {
+  border-color: var(--danger);
+}
+
+.perm[data-state="allowed"] {
+  border-color: var(--accent);
+}
+
+.tool-status,
+.tool-ms,
+.perm-state,
+.perm-note {
+  color: var(--text-muted);
+  margin: 0;
+}
+
+.io {
+  margin: 0;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-radius: var(--radius);
+  background-color: var(--code-bg);
+  color: var(--text-primary);
+  font-size: 0.9em;
+}
+
+.perm-actions,
+.deny-reason {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.deny-reason input {
+  flex: 1 1 120px;
+}
+
+/* ==== 输入区 ==== */
+
+.composer {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+  background-color: var(--bg-raised);
+}
+
+.composer-input {
+  flex: 1 1 auto;
+  resize: vertical;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  background-color: var(--bg-input);
+  font-family: inherit;
+}
+
+.statusbar {
+  padding: 4px 12px 8px;
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+/* 卡片和气泡不是控件，基座那一节管不到，阴影在这里补上。
+   控件（含 `.composer-input`）的阴影已在基座里，重复写一遍等于同一个属性两个来源。 */
+.card,
+.bubble {
+  box-shadow: 0 2px 2px var(--shadow);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+}
+
+/* ==== 输入区 ==== */
