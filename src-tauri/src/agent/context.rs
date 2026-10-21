@@ -93,8 +93,18 @@ impl ContextBuilder {
             .cloned()
             .collect();
 
-        let conversational: Vec<&Message> =
-            history.iter().filter(|m| m.role != Role::System).collect();
+        // R148：历史图片的降级点**只有这一处**，跑在窗口循环之前、作用在整段非 system
+        // 历史上。放在循环之后（`cand` 上）会让 `keep` 按「图片仍在」的预算裁掉更多文本，
+        // 并让 `est_input_tokens` 虚高于实际发出的请求。
+        // 这里 clone 成 owned `Vec<Message>` 而不是继续用 `Vec<&Message>`：降级要改块内容，
+        // 而 `history` 是调用方（Task 10 的循环）的数据，就地改等于偷偷把「模型看到的图」
+        // 和「用户界面/库里存的」分叉掉，那份分叉不可逆。
+        let mut conversational: Vec<Message> = history
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .cloned()
+            .collect();
+        degrade_old_images(&mut conversational, KEEP_IMAGE_RECENT);
 
         let mut keep = conversational.len().min(self.cfg.window_messages);
         let budget = self
@@ -115,15 +125,13 @@ impl ContextBuilder {
             // 夹住，最多 len 步；外层每轮 `keep -= 1` 让下一轮的起始 start 更大，
             // 故被跳过的 ToolResult 不会被重新包含，`start` 也不可能越过 len（无越界、
             // 无下溢：`keep` 由 `len - start` 反推，start ≤ len）。
-            while start < conversational.len() && has_tool_result(conversational[start]) {
+            while start < conversational.len() && has_tool_result(&conversational[start]) {
                 start += 1;
             }
             // keep 由最终的 start 反推：被 advance 跳过的孤儿工具结果同样要计入 dropped。
             keep = conversational.len() - start;
-            let tail: Vec<Message> = conversational[start..]
-                .iter()
-                .map(|m| (*m).clone())
-                .collect();
+            // owned 之后无需再逐条 clone：降级已经在整段历史上跑过一次（见上）。
+            let tail: Vec<Message> = conversational[start..].to_vec();
             let mut cand = vec![system.clone()];
             cand.extend_from_slice(&notes);
             cand.extend(tail);
@@ -195,8 +203,48 @@ fn has_tool_result(m: &Message) -> bool {
         .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
+/// 保留的最近图片张数（按**图片出现顺序**数，一条消息可以带多张）。
+pub const KEEP_IMAGE_RECENT: usize = 3;
+
+/// 降级后留在原位的可见痕迹。刻意不是空串：图片静默消失会让用户以为模型看到了图。
+const DEGRADED_IMAGE_NOTE: &str = "[图片已移除以节省上下文]";
+
+/// 把除最近 `keep_recent` **张**之外的历史图片块替换成 [`DEGRADED_IMAGE_NOTE`] 文本块。
+///
+/// 按图片出现顺序而不是消息下标计数：一条消息可以带多张图，按消息数保留会让真实张数
+/// 浮动（「一轮 3 张图」+ `keep_recent = 3` 会留下 4 张），而 `PNG_TOKENS` 是按张收钱的。
+/// 只替换 `ContentBlock::Image`，同条消息的 `Text` 块一律不动 —— 把用户的文本降级掉
+/// 比把图片降级掉更糟，而且是不可逆的信息丢失。
+///
+/// **调用位置只能在 [`ContextBuilder::build`] 的窗口循环之前、作用在整段历史上**
+/// （R148）：循环用 `estimate_tokens(&cand)` 决定 `keep`，`Built.est_input_tokens` 又是
+/// 界面状态条显示的数。降级若在 est 之后，滑窗会按「图片仍在」的预算多裁掉几轮文本，
+/// est 也会虚高到与实际发出的请求不符。同一个 build 里不许有第二个降级点。
+///
+/// 不碰 `ContentBlock::ToolResult` 里的 `ToolOutput::Image`：Plan A 的 registry 为空，
+/// 工具结果进历史今天不可达，为它扩实现会让「图片降级」和「工具结果图片」两套规则混在
+/// 一起（R150）。工具结果图片的降级随 Plan B 的工具注册一起做。
+pub fn degrade_old_images(msgs: &mut Vec<Message>, keep_recent: usize) {
+    let mut image_positions: Vec<(usize, usize)> = Vec::new();
+    for (mi, m) in msgs.iter().enumerate() {
+        for (bi, b) in m.blocks.iter().enumerate() {
+            if matches!(b, ContentBlock::Image { .. }) {
+                image_positions.push((mi, bi));
+            }
+        }
+    }
+    // `saturating_sub`：图片总数不足 keep_recent 时一个都不许降级（`len - keep` 会下溢）。
+    let keep_from = image_positions.len().saturating_sub(keep_recent);
+    for &(mi, bi) in &image_positions[..keep_from] {
+        msgs[mi].blocks[bi] = ContentBlock::Text {
+            text: DEGRADED_IMAGE_NOTE.into(),
+        };
+    }
+}
+
 // 覆盖 spec :503 交给本片的「预算计算」与「丢弃兜底不报错」两条；
-// 「图片降级」「摘要失败降级」分别归 Task 20 与切片 5。
+// 「图片降级」由 Task 20 落在本文件（见 `degrade_old_images` 与 `mod image_degradation`），
+// 「摘要失败降级」仍归切片 5。
 
 #[cfg(test)]
 mod tests {
@@ -733,5 +781,127 @@ mod tests {
             ceiling.build(&hist).est_input_tokens
         );
         assert_eq!(huge.build(&hist).messages.len(), 2);
+    }
+}
+
+// ---- Task 20：历史图片降级 ----
+
+/// 历史图片必须在**组装请求前**被降级成文本占位，只保留最近 `KEEP_IMAGE_RECENT` 张。
+/// 两条动机：① 单图固定 900/800 token，长对话不降级会一路撞到 400；
+/// ② 多数兼容端点不接受出现在非最近位置的历史图片。
+#[cfg(test)]
+mod image_degradation {
+    use super::*;
+    use crate::agent::types::ImageMime;
+
+    /// 一条「文本 + 图片」的用户消息 —— Task 10 循环真实产出的形态（图片挂在用户消息上，
+    /// 而不是只有工具结果里），用的是 `agent::types` 的真实变体。
+    fn with_image(tag: &str) -> Message {
+        Message::user(vec![
+            ContentBlock::Text { text: tag.into() },
+            ContentBlock::Image {
+                data: "AAAA".into(),
+                mime: ImageMime::Png,
+            },
+        ])
+    }
+
+    const PLACEHOLDER: &str = "[图片已移除以节省上下文]";
+
+    #[test]
+    fn only_the_most_recent_images_survive_to_the_request() {
+        // 钉成字面量：本测试其余断言的期望值都是从 `KEEP_IMAGE_RECENT` 推出来的，
+        // 不钉住常量的话「把 3 改成 1」会让实现和断言一起搬家（假绿）。
+        assert_eq!(KEEP_IMAGE_RECENT, 3, "保留张数本身要有独立锚点");
+
+        // 35 条带图历史（brief 原文是 10 条）：10 条离预算太远，降级与否都不截窗，
+        // 于是 R151 要的 `dropped == 0` 谁都骗不动。35 条按未降级计价 31785 > 预算 27904
+        // 会截窗、按降级后计价 3363 ≪ 预算不截窗，正好把「降级必须在循环之前」钉死。
+        let hist: Vec<Message> = (0..35).map(|i| with_image(&format!("轮 {i}"))).collect();
+        let built = ContextBuilder::new(ContextConfig::default()).build(&hist);
+        let imgs = built
+            .messages
+            .iter()
+            .filter(|m| {
+                m.blocks
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. }))
+            })
+            .count();
+        assert_eq!(
+            imgs, KEEP_IMAGE_RECENT,
+            "历史图片必须降级，否则聊到 20 轮突然 400 且极难排查"
+        );
+        assert_eq!(
+            built.dropped, 0,
+            "这条测的是降级，不是截窗；截窗把图片裁掉了也会一样绿"
+        );
+        // R148：降级跑在窗口循环**之前**，所以 est 必须是「降级之后」的数 ——
+        // 它是界面状态条要显示的那个数，也必须与真正发出的请求一致。
+        // 把降级挪到 return 前的 `cand` 上，est 就会按「图片仍在」计价而虚高。
+        assert_eq!(
+            built.est_input_tokens,
+            estimate_tokens(&built.messages) as u32,
+            "est_input_tokens 必须描述实际发出的（已降级的）消息"
+        );
+    }
+
+    #[test]
+    fn degraded_image_leaves_an_explicit_placeholder_not_an_empty_text() {
+        let hist: Vec<Message> = (0..6).map(|i| with_image(&format!("轮 {i}"))).collect();
+        let built = ContextBuilder::new(ContextConfig::default()).build(&hist);
+        let old = &built.messages[1];
+        let t = old.text_of();
+        assert!(
+            t.contains(PLACEHOLDER),
+            "必须留下可见痕迹，否则用户以为模型看到了图"
+        );
+    }
+
+    #[test]
+    fn degradation_never_drops_the_text_of_a_message() {
+        // 降级只许替换 Image 块，不许连带把用户自己的文本一起换掉/清空。
+        let hist: Vec<Message> = vec![
+            with_image("轮 1"),
+            with_image("轮 2"),
+            with_image("轮 3"),
+            with_image("轮 4"),
+        ];
+        let built = ContextBuilder::new(ContextConfig::default()).build(&hist);
+        for m in built.messages.iter().filter(|m| m.role == Role::User) {
+            assert!(m.text_of().starts_with("轮 "), "文本必须原样保留");
+        }
+        // 夹具必须真的发生降级，否则上面那个循环只是在复述「没降级时文本还在」，
+        // 本测试就永远测不到它想测的那件事（同 a_sentence_with_punctuation… 的夹具守卫）。
+        assert!(
+            built
+                .messages
+                .iter()
+                .any(|m| m.text_of().contains(PLACEHOLDER)),
+            "4 张图 + 保留 3 张，必须真的有一条被降级"
+        );
+    }
+
+    #[test]
+    fn estimated_tokens_drop_after_degradation() {
+        // R152：base64 长度不参与计价（PNG_TOKENS 是固定值），所以夹具用 "AAAA" 就够，
+        // 断言与写 200_000 个字符时逐字相同，只是省下内存。
+        let big = || {
+            Message::user(vec![
+                ContentBlock::Text { text: "x".into() },
+                ContentBlock::Image {
+                    data: "AAAA".into(),
+                    mime: ImageMime::Png,
+                },
+            ])
+        };
+        let hist: Vec<Message> = (0..8).map(|_| big()).collect();
+        let with_all = estimate_tokens(&hist);
+        let mut degraded = hist.clone();
+        degrade_old_images(&mut degraded, KEEP_IMAGE_RECENT);
+        assert!(
+            estimate_tokens(&degraded) < with_all,
+            "降级必须真的把粗估拉下来，否则滑窗照旧多裁文本"
+        );
     }
 }
