@@ -155,6 +155,10 @@ pub struct ToolCtx {
 pub enum AgentEvent {
     TurnStart { turn: u32 },
     TextDelta { text: String },
+    /// 落地时补（T11 / R68）：本支**只有重放路径发**，live 事件流里从来没有它
+    /// —— 用户那句话在 live 时由前端乐观插入。少了这一支，重开后用户的话只能塞进
+    /// `text_delta` ⇒ 落进助手气泡，与本文 6.2「界面状态不落盘、重放得到同一张界面」矛盾。
+    UserMessage { blocks: Vec<ContentBlock> },
     ToolCall { call: ToolCallView, risk: Risk },
     PermissionRequest { id: String, call: ToolCallView, risk: Risk },
     PermissionResolved { id: String, decision: Decision },
@@ -409,18 +413,28 @@ reduce(events: AgentEvent[], state: UiState): UiState
 |---|---|
 | `turn_start` | 新建 assistant turn |
 | `text_delta` | 追加/合并到该 turn 末尾的 text block |
+| `user_message` | push 一条 user turn —— **只有重放路径会喂这一支**，live 时那句话由前端乐观插入（见 4.3） |
 | `tool_call` | push `status: running` 的工具卡片 |
 | `permission_request` | push 权限卡片（pending），按 `id` 入索引 |
 | `permission_resolved` | 按 `id` 更新卡片为 已允许/已拒绝 |
 | `tool_result` | 按 `call_id` 找回工具卡片，填 `preview`、耗时、错误标记 |
 | `usage` | 更新状态栏 token 计数 |
 | `context_compacted` | push 分隔提示「已压缩早期对话」 |
-| `error` | `fatal` → 顶部红条；否则 → turn 内警示条 |
-| `done` | `streaming = false`，恢复输入 |
+| `error` | `fatal` → `UiState.fatal`（顶部红条）；否则 → 追加进 `UiState.notices` |
+| `done` | `streaming = false`，恢复输入；`interrupted` / `max_turns` 各追加一条 `notices` |
 
 **关键决定：界面状态不落盘，持久化的 messages 才是唯一真相源。** 重启后把 messages 映射成等价事件序列，重放同一 reducer 得到界面。收益：没有两套渲染路径、无需为 UI 状态设计存储格式、reducer 的测试天然就是「喂事件、断言状态」。代价：`usage`、压缩提示等瞬时事件重开即消失——可接受，它们本就不该假装是历史。
 
 `tool_result` 与 `permission_resolved` 需按 id 回找先前 block，故 state 内维护 `Map<string, index>`。这是该 reducer 唯一的状态复杂度。
+
+**提示的落点（落地时补，T14 评审 F5）**：`notices` 是**只增不减**的一支 —— 归位失败、非致命 `error`、
+`done{interrupted|max_turns}`、`context_compacted` 都往同一个列表里追加。重放一整段历史能追加出上百条，
+所以界面不许逐条平铺：`MessageList` 把**相邻的同一句话**折成一行带计数（`×N`）渲染，非相邻的重复不折。
+上限数字住在 Rust 的 `SessionConfig`，事件里不带，前端也不许复述（R116）。
+另有一条与 reducer 无关的通道：`App` 自己把 IPC reject 的原文收在 `appNotices` 里（同一句话上屏，
+不解读、不分类，R195）。**它没有任何清除路径** —— 既不在发送成功时清，也不在切换会话时清
+（`UiState` 那一支会随 `setUi(initialState())` 归零，`appNotices` 是另一个 `useState`，没人归零），
+记为已知债而不是需求 —— 它的可观测症状要等真机跑过一轮才能定性（§见 findings 的 T17 手顺）。
 
 ### 6.3 流式渲染性能
 
