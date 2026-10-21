@@ -3,6 +3,8 @@ import type {
   BlockLocation,
   ContentBlock,
   Decision,
+  PermCard,
+  ToolCard,
   Turn,
   TurnRole,
   UiBlock,
@@ -20,6 +22,9 @@ import type {
  *    `toolIndex`/`permIndex` 存 `Turn.id`；任何地方都不拿 `e.turn` 当键或数组下标。
  * 3. 不用 `Date.now()`、不用 `Math.random()`、不修改入参 —— `replay` 同输入同输出，
  *    T17 的端到端断言靠它复现。
+ *    这一条以前只是愿望（评审 F2 实测：往 `notice()` 里插 `Date.now()` 时全测试集 28 条全绿，
+ *    因为两次 replay 落在同一毫秒）。现在有两道机器判据：`reducer.test.ts` 里
+ *    一条剥注释后的静态扫描 + 一条自己推时钟的复现用例。
  */
 
 /** 归位失败时交给界面的那句话。留调用方（notices）而不是抛错：前端不许因为一条陌生事件崩。 */
@@ -83,6 +88,12 @@ function pushBlock(t: Turn, block: UiBlock): Turn {
 
 /**
  * 按 `BlockLocation` 交出那条气泡的下标；找不到返回 -1（R113：定位认 turnId，不认 `e.turn`）。
+ *
+ * 为什么必须 `findIndex` 而不是 `return turnId - 1`（评审 F10）：今天 reducer 从不裁剪 `turns`，
+ * 所以 `Turn.id === 下标 + 1` 恒成立，两种写法是**等价变异** —— 实现者在 `task-14-report.md` §4 M5
+ * 自报过这一点，评审复现确认「换成下标写法后 28 条全绿」。正因为它分辨不出来，才要把理由写在这里：
+ * 一旦 T16 给历史做虚拟化/裁剪，下标写法会**静默把结果归到别的气泡上**，而测试不会红。
+ * `findIndex` 今天不多做事，将来不塌方 —— 它不是冗余。
  */
 function locate(s: UiState, turnId: number): number {
   return s.turns.findIndex((t) => t.id === turnId);
@@ -104,6 +115,16 @@ function userBlocks(blocks: ContentBlock[]): UiBlock[] {
       case "tool_call":
       case "tool_result":
         break;
+
+      default: {
+        // 编译期穷尽守卫（评审 F1②）：理由和 reduce 那张 switch 完全同构，但这条更硬 ——
+        // db.rs:388 把 `m.blocks.clone()` **原样**上交，Rust 给 `ContentBlock` 加第 5 支时
+        // 它会自动流到这里，而 `out` 不 push 就等于静默丢数据。
+        // 于是「ContentBlock 多了一支而这里没跟上」直接是 TS2322，不许靠 T17 手测发现。
+        const _exhaustive: never = b;
+        void _exhaustive; // 本仓库 noUnusedLocals=true：用 void 消费掉才不报 TS6133
+        break; // 运行期行为与今天一致：未知 tag 不崩、也不渲染
+      }
     }
   }
   return out;
@@ -134,20 +155,26 @@ function placeCard(state: UiState, block: UiBlock): { next: UiState; loc: BlockL
   return { next, loc: { turnId: next.turns[index].id, block: at } };
 }
 
-function openToolCard(state: UiState, block: UiBlock, callId: string): UiState {
+function openToolCard(state: UiState, block: ToolCard, callId: string): UiState {
   const { next, loc } = placeCard(state, block);
   return { ...next, streaming: true, toolIndex: { ...next.toolIndex, [callId]: loc } };
 }
 
-function openPermCard(state: UiState, block: UiBlock, id: string): UiState {
+function openPermCard(state: UiState, block: PermCard, id: string): UiState {
   const { next, loc } = placeCard(state, block);
   // 不动 `streaming`：R112 把置真的事件写死为 turn_start/text_delta/tool_call 三支，
   // 权限请求在直播里一定发生在已流式的回合内，这里再置一次是多余的第二次真相。
+  //
+  // 这条前提的真机依据（评审 F8）：权限门只在 `session.rs:119` 的
+  // `for turn in 1..=self.cfg.max_turns` 循环体**内部**被调用，而 `:124` 每轮开头就发了
+  // `TurnStart{turn}` ⇒ 恒有前置 `turn_start`，`placeCard` 里的 `ensureTurn` 只会复用那一格。
+  // 将来若有人把权限门挪到 `run()` 之前做预检，这条就不成立了：界面会出现
+  // 「有待决权限卡 + 输入框可用」。挪 gate 的人请回来看这一行。
   return { ...next, permIndex: { ...next.permIndex, [id]: loc } };
 }
 
 /** 把决定写进 perm 卡。`allow` 是布尔真相（R98），不靠「哪个键存在」猜变体。 */
-function resolvedCard(block: UiBlock, decision: Decision): UiBlock | undefined {
+function resolvedCard(block: UiBlock, decision: Decision): PermCard | undefined {
   if (block.kind !== "perm") return undefined;
   return decision.allow
     ? { ...block, state: "allowed", scope: decision.scope, reason: undefined }
@@ -204,7 +231,7 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
         // 归位不了就承认归位不了：不猜卡、不静默丢（brief:337 说的歧义由这条守卫兜住）。
         return notice(state, `工具结果无法归位：${e.call_id}`);
       }
-      const updated: UiBlock = {
+      const updated: ToolCard = {
         ...block,
         status: e.is_error ? "error" : "ok",
         preview: e.preview,
@@ -256,11 +283,17 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
       return { ...state, streaming: false, notices: notes };
     }
 
-    default:
-      // 前向兼容：Rust 侧新增事件时前端不许崩（brief:339）。
-      // 但它**不许**兜住任何已经存在于线格式的变体 —— `types.ts` 的 union 与
-      // `reducer.test.ts` 的 11 标签表驱动用例一起守这条线（R111/R118）。
+    default: {
+      // 前向兼容：Rust 侧新增事件时前端不许崩（brief:339）——运行期仍然原样返回。
+      //
+      // 但这一支**不许**兜住任何已经存在于线格式的变体（R111 漏 `user_message` 就是活例子），
+      // 所以把它做成编译期穷尽守卫（评审 F1①）：`AgentEvent` 加了第 12 支而这里没写臂，
+      // `e` 在 default 上就不再是 `never`，`tsc` 直接 TS2322 —— 「镜像有臂、reducer 没写」
+      // 从「只靠测试」升级成「编译不过」。
+      const _exhaustive: never = e;
+      void _exhaustive; // 本仓库 noUnusedLocals=true：用 void 消费掉才不报 TS6133
       return state;
+    }
   }
 }
 

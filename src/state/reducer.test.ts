@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AGENT_CHANNEL } from "../types";
 import {
   appendUserTurn,
@@ -11,8 +11,10 @@ import type {
   AgentEvent,
   AgentPayload,
   ContentBlock,
+  PermCard,
   Risk,
   ToolCallView,
+  ToolCard,
   UiBlock,
   UiState,
 } from "../types";
@@ -46,11 +48,12 @@ const permRequest = (id: string, risk: Risk = "write"): AgentEvent => ({
   risk,
   call: call(id, risk),
 });
-const tool = (b: UiBlock | undefined): Extract<UiBlock, { kind: "tool" }> => {
+// 收窄断言用 `types.ts` 的具名别名，不再在本文件重抄 `Extract<UiBlock, ...>`（评审 F3）。
+const tool = (b: UiBlock | undefined): ToolCard => {
   if (!b || b.kind !== "tool") throw new Error("期望一个 tool 卡片");
   return b;
 };
-const perm = (b: UiBlock | undefined): Extract<UiBlock, { kind: "perm" }> => {
+const perm = (b: UiBlock | undefined): PermCard => {
   if (!b || b.kind !== "perm") throw new Error("期望一个 perm 卡片");
   return b;
 };
@@ -63,21 +66,106 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-// 逐字抄自 src-tauri/src/agent/events.rs:400-412
-// （every_agent_event_variant_serializes_its_t_tag，R118）。
-const WIRE_TAGS = [
-  "turn_start",
-  "text_delta",
-  "user_message",
-  "tool_call",
-  "permission_request",
-  "permission_resolved",
-  "tool_result",
-  "usage",
-  "context_compacted",
-  "error",
-  "done",
-] as const;
+/**
+ * 读仓库源码用的最小 `node:fs` 具名。本仓库**没有** `@types/node`，也不许安装，
+ * 于是静态 `import { readFileSync } from "node:fs"` 会报 TS2591 并打断 `npm run build`（实测）。
+ * 把说明符宽化成 `string` 让 tsc 不去解析它（结果是 `Promise<any>`），再在本地把用到的
+ * 那一个函数标注出来 —— 类型仍然在本文件里闭环，运行期由 node 正常解析 `node:fs`。
+ */
+async function readSource(relative: string): Promise<string> {
+  const fs = (await import("node:fs" as string)) as {
+    readFileSync(path: URL, encoding: "utf8"): string;
+  };
+  // 相对起点是本文件 src/state/reducer.test.ts ⇒ 仓库根是 **../../**，不是 ../../../。
+  return fs.readFileSync(new URL(relative, import.meta.url), "utf8");
+}
+
+/**
+ * 剥掉注释、只留正文（评审 F2② 的坑）：`reducer.ts` 的纪律注释里就**明写**着
+ * 「不用 Date.now()、不用 Math.random()」，naive 的 `not.toContain` 会在干净代码上直接红。
+ * 逐字符走一遍，行注释丢到行尾（换行保留，免得把两行并成一行造出假 token）、
+ * 块注释整段丢掉，字符串与模板字面量原样保留。
+ */
+function stripComments(src: string): string {
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    const n = src[i + 1];
+    if (c === "/" && n === "/") {
+      while (i < src.length && src[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && n === "*") {
+      i += 2;
+      while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      out += c;
+      i++;
+      while (i < src.length) {
+        const s = src[i];
+        if (s === "\\") {
+          out += s + (src[i + 1] ?? "");
+          i += 2;
+          continue;
+        }
+        out += s;
+        i++;
+        if (s === c) break;
+      }
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+/**
+ * 表驱动用例的输入：`AgentEvent` 的每一支至少给一条能推进状态的事件。
+ *
+ * 类型写成 `Record<AgentEvent["t"], AgentEvent>` 是这套守卫的核心（评审 F1③）：
+ * 名单**不再手抄**，而是 `Object.keys(probe)` 从镜像自己推出来。于是
+ * `types.ts` 的 union 多了一支而这里忘了补键 ⇒ 缺键直接 TS2741，`tsc` 红。
+ * 键的插入顺序按 events.rs:400-412 排，`Object.keys` 保序，所以下面那条跨语言用例
+ * 拿到的就是「按 Rust 名单顺序的镜像标签表」。
+ */
+const probe: Record<AgentEvent["t"], AgentEvent> = {
+  turn_start: start(3),
+  text_delta: d("继续"),
+  user_message: { t: "user_message", blocks: [{ type: "text", text: "说一句" }] },
+  tool_call: toolCall("c2"),
+  permission_request: permRequest("p2"),
+  permission_resolved: { t: "permission_resolved", id: "p1", decision: { allow: true, scope: "once" } },
+  tool_result: toolResult("c1", "结果"),
+  usage: { t: "usage", input_tokens: 1, output_tokens: 2 },
+  context_compacted: { t: "context_compacted", dropped: 4, summary_chars: 120 },
+  error: { t: "error", where: "loop", message: "循环了", fatal: false },
+  done: done(),
+};
+
+/** 由联合类型派生的标签名单（不是抄来的字面量）；与 `events.rs` 的一致性由机器检查保证。 */
+const WIRE_TAGS = Object.keys(probe) as AgentEvent["t"][];
+
+/**
+ * `ContentBlock` 同法（评审 F1②/F1③ 的姊妹手法）：四支由 `ContentBlock["type"]` 派生，
+ * `types.rs` 加第 5 支时这里缺键就 TS2741，而 `reducer.ts` 的 `userBlocks` 守卫同时 TS2322。
+ */
+const contentProbe: Record<ContentBlock["type"], ContentBlock> = {
+  text: { type: "text", text: "甲" },
+  image: { type: "image", data: "AA", mime: "png" },
+  tool_call: { type: "tool_call", id: "c1", name: "fs.read", input: {} },
+  tool_result: {
+    type: "tool_result",
+    call_id: "c1",
+    is_error: false,
+    output: { kind: "text", text: "乙" },
+  },
+};
+const CONTENT_TAGS = Object.keys(contentProbe) as ContentBlock["type"][];
 
 describe("reducer", () => {
   // ==== brief Step 1 的 11 条 ====
@@ -331,23 +419,42 @@ describe("reducer", () => {
   // ==== R118：11 个标签表驱动 ====
 
   it("handles every one of the 11 wire t tags without falling through to default", () => {
-    expect(WIRE_TAGS).toHaveLength(11);
+    // 名单来自 `Object.keys(probe)`，probe 的类型是 `Record<AgentEvent["t"], AgentEvent>`：
+    // 镜像有第 12 支而 probe 没补 → tsc 红；probe 补了而 reducer 没写臂 → reducer 的
+    // never 守卫红（tsc）+ 这里的 swallowed 断言红。三层都在（评审 F1③）。
+    expect(WIRE_TAGS).toHaveLength(11); // 这个数字锚在 events.rs:358 那条 (11, 11) 断言上
     const base = replay([start(1), d("在写正文"), toolCall("c1"), permRequest("p1")]);
-    const probe: Record<(typeof WIRE_TAGS)[number], AgentEvent> = {
-      turn_start: start(3),
-      text_delta: d("继续"),
-      user_message: { t: "user_message", blocks: [{ type: "text", text: "说一句" }] },
-      tool_call: toolCall("c2"),
-      permission_request: permRequest("p2"),
-      permission_resolved: { t: "permission_resolved", id: "p1", decision: { allow: true, scope: "once" } },
-      tool_result: toolResult("c1", "结果"),
-      usage: { t: "usage", input_tokens: 1, output_tokens: 2 },
-      context_compacted: { t: "context_compacted", dropped: 4, summary_chars: 120 },
-      error: { t: "error", where: "loop", message: "循环了", fatal: false },
-      done: done(),
-    };
     const swallowed = WIRE_TAGS.filter((tag) => reduce(base, probe[tag]) === base);
     expect(swallowed).toEqual([]);
+  });
+
+  it("still mirrors the tag list that events.rs actually serializes", async () => {
+    // 评审 F1④：这条才是「Rust 加第 12 支而前端镜像没跟上」的唯一机器判据。
+    // 之前 WIRE_TAGS 是手抄字面量，全仓库没有任何一条测试把它和 events.rs 连起来 ——
+    // Rust 加一支、镜像不动 ⇒ 测试与 tsc 双双全绿，那条事件在 reduce 的 default 里被静默吞掉。
+    const src = await readSource("../../src-tauri/src/agent/events.rs");
+    const anchor = "every_agent_event_variant_serializes_its_t_tag";
+    // 锚点在文件里必须唯一，否则切片起点就是在赌其中哪一个。
+    expect(src.split(anchor).length - 1).toBe(1);
+
+    // 切片**必须有界**：只取 `let tags = [` 到**下一个** `];` 之间的那一段。
+    // 从锚点一路切到文件末尾会把后续计划里新增的测试字符串一起吞进来，
+    // 于是这条用例会越来越宽，最后谁都读不出它到底在钉什么。
+    const openMarker = "let tags = [";
+    const open = src.indexOf(openMarker);
+    expect(open, "events.rs 里找不到 `let tags = [` —— 名单的锚点被改名了").toBeGreaterThanOrEqual(0);
+    const bodyStart = open + openMarker.length;
+    const close = src.indexOf("];", bodyStart);
+    expect(close, "`let tags = [` 之后找不到 `];` —— 切片没有收口").toBeGreaterThan(bodyStart);
+
+    const slice = src.slice(bodyStart, close);
+    const rust = [...slice.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
+    // 两条都要：只比集合的话，切片一旦被收紧成空列表就会「两边都缺同一支」地悄悄通过。
+    expect(rust).toHaveLength(11); // 这个数字锚在 events.rs:358 的 (11, 11) 断言上
+    expect(WIRE_TAGS).toHaveLength(11);
+    // 集合相等，**不**比顺序：Rust 那边把 tags 数组重新排序不影响线格式，
+    // 断言顺序只会造出一个假红。
+    expect(new Set(rust)).toEqual(new Set(WIRE_TAGS));
   });
 
   // ==== R114/R115/R116：不许替线格式发明真相 ====
@@ -406,6 +513,13 @@ describe("reducer", () => {
   it("lets turn_start, text_delta and tool_call own streaming, but not user_message", () => {
     expect(reduce(initialState(), { t: "user_message", blocks: [] }).streaming).toBe(false);
     expect(reduce(initialState(), start(1)).streaming).toBe(true);
+    // 下面两条钉的是 **R112 那句枚举的字面推论**（置真只有三支、done 置假），不是业务规则。
+    // 真机出口产不出「`done` 之后的迟到 text_delta / tool_call」这种帧：
+    // `ipc.rs:133-138` 的 `other => { flush(); send(other) }` 臂保证任何非 TextDelta 事件之前
+    // 先落帧（`Done` 也走这一臂），`session.rs:263-267` 的 `finish()` 是**唯一出口**、
+    // 致命错误之后必定跟着一条 `Done` 收尾。⇒ 这两行断言的是不可达分支上的 reducer 语义。
+    // 如果 T16 要做「回合结束后不许再锁输入框」的加固，改的是渲染层怎么解读 `streaming`，
+    // 别把这个断言当成「产品期望输入框二次锁死」（评审 F6）。
     expect(reduce(replay([done()]), d("迟到的一帧")).streaming).toBe(true);
     expect(reduce(replay([done()]), toolCall("late")).streaming).toBe(true);
   });
@@ -435,7 +549,7 @@ describe("reducer", () => {
     }
   });
 
-  it("replays the same events to the same state, so E2E can reproduce", () => {
+  it("replays the same events to the same state even across a clock jump, so E2E can reproduce", () => {
     const events: AgentEvent[] = [
       { t: "user_message", blocks: [{ type: "text", text: "第一轮" }] },
       start(1),
@@ -451,24 +565,61 @@ describe("reducer", () => {
       { t: "context_compacted", dropped: 9, summary_chars: 30 },
       done("max_turns"),
     ];
-    const a = replay(events);
-    const b = replay(events);
-    expect(a).toEqual(b);
-    expect(JSON.stringify(a)).toBe(JSON.stringify(b)); // 连键序都稳定
+    // 评审 F2①：这条以前是 R119「同输入同输出」的唯一守卫，而两次 replay 落在**同一毫秒**里
+    // —— 往 notice() 插一个 `Date.now()` 实测仍然 28 条全绿。现在自己把时钟推开。
+    // `vi` 从 "vitest" 显式导入：R121 的坑是不导入会让 `tsc && vite build` 编译不过。
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      // 先自证时钟真的被推开了。桩哪天失效时这条会喊，而不是悄悄退回「两次同一毫秒」那个假绿样子。
+      expect(Date.now()).toBe(0);
+      const a = replay(events);
+      vi.setSystemTime(5_000);
+      expect(Date.now()).toBe(5_000);
+      const b = replay(events);
+      expect(b).toEqual(a);
+      expect(JSON.stringify(b)).toBe(JSON.stringify(a)); // 连键序都稳定
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  // ==== ipc.rs 的 payload 镜像 ====
+  it("keeps reducer.ts itself free of clock, randomness and global reads", async () => {
+    // 评审 F2②：上一条用「推开时钟」抓时钟读取，这一条从**源码**层面把 R119 那句
+    // 「请保持纯函数」钉成机器判据。两者互补：事件级断言受攻击面选择影响
+    // （notice() 只是可达位置之一，把时钟当单调 id 塞进 Turn.id 同样能骗过事件级比较），
+    // 静态扫描不看可达性，正文里出现一次就红。
+    //
+    // 坑（必须剥注释）：`reducer.ts` 的纪律注释里**明写**着「不用 Date.now()、不用 Math.random()」，
+    // 所以拿原文做 `not.toContain` 会在干净代码上直接红。
+    const code = stripComments(await readSource("./reducer.ts"));
+    for (const read of ["Date.now(", "Math.random(", "new Date(", "performance.now(", "globalThis"]) {
+      expect(code, `reducer.ts 的正文里出现了 ${read} —— replay 不再可复现（R119）`).not.toContain(read);
+    }
+    // 剥注释不许把正文一起剥没：扫描范围必须仍然看得见真实代码，
+    // 否则 stripComments 一旦退化成返回空串，上面那五条就全成了空断言。
+    expect(code).toContain("export function replay");
+    expect(code.length).toBeGreaterThan(1_000);
+  });
 
-  it("mirrors the wire keys and the { sessionId, event } payload on the agent channel", () => {
-    const e: AgentEvent = { t: "tool_result", call_id: "c", is_error: false, ms: 0, preview: "" };
-    expect(Object.keys(e)).toEqual(["t", "call_id", "is_error", "ms", "preview"]);
-    const b: ContentBlock = { type: "image", data: "AA", mime: "png" };
-    expect(Object.keys(b)).toEqual(["type", "data", "mime"]);
-    const p: AgentPayload = { sessionId: "s1", event: e };
+  // ==== ipc.rs 的信封与通道名 ====
+
+  it("keeps the { sessionId, event } payload envelope and the channel name mirrored", () => {
+    // 改名说明（评审 F4）：旧名字「mirrors the wire keys ...」承诺过头 —— 它 `Object.keys` 的是
+    // 本用例自己手写的字面量，Rust 把 `ms` 改名成 `elapsed_ms` 时它照样绿。
+    // 线格式的真判据不在这儿：键名由 `probe`/`contentProbe` 上的 `AgentEvent`、`ContentBlock`
+    // 标注（tsc）+ 上面那条跨语言用例（读 events.rs 的 tags 表）承担。
+    // 本用例只留下**有独立价值**的两件事：信封形状（ipc.rs:24-32 那唯一一层 camelCase）
+    // 和通道名（ipc.rs:146）。键序断言全部改指镜像产物 `probe`/`contentProbe`。
+    const p: AgentPayload = { sessionId: "s1", event: probe.tool_result };
     expect(Object.keys(p).sort()).toEqual(["event", "sessionId"]); // camelCase 只在这一层
     expect(AGENT_CHANNEL).toBe("agent");
     expect(p.event.t).toBe("tool_result"); // 信封换键，事件内部仍是 snake_case
-    expect(Object.keys(p.event)).toEqual(["t", "call_id", "is_error", "ms", "preview"]);
+    expect(Object.keys(probe.tool_result)).toEqual(["t", "call_id", "is_error", "ms", "preview"]);
+    expect(Object.keys(probe.usage)).toEqual(["t", "input_tokens", "output_tokens"]);
+    expect(Object.keys(probe.error)).toEqual(["t", "where", "message", "fatal"]);
+    expect(Object.keys(contentProbe.image)).toEqual(["type", "data", "mime"]);
+    expect(CONTENT_TAGS).toHaveLength(4); // 对齐 types.rs:4-24 的四支
   });
 });
 
