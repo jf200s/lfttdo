@@ -113,7 +113,13 @@ describe("App 图片接线", () => {
       ]),
     );
     // 乐观插入那支气泡里也必须有图：`appendUserTurn` 收到的是同一份 blocks。
-    expect(await screen.findByTestId("bubble-user")).toHaveTextContent("图里是什么");
+    // 修复轮 F3 —— 原先这里只断文字，于是「把 text 那一支交给 appendUserTurn、图只发给
+    // sendMessage」这种错实现照样绿，症状是用户重开这条会话才发现自己的图没进历史。
+    const bubble = await screen.findByTestId("bubble-user");
+    expect(bubble).toHaveTextContent("图里是什么");
+    const thumb = bubble.querySelector("img.thumb");
+    expect(thumb).not.toBeNull();
+    expect(thumb).toHaveAttribute("src", "data:image/png;base64,AAAA");
     // 发成功之后待发图清空（Step 2 第 8 条的上半场，在 App 这一层同样成立）。
     await waitFor(() => expect(screen.queryByTestId("thumb-0")).toBeNull());
   });

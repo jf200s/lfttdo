@@ -155,7 +155,11 @@ function BlockView({
       return (
         <img
           className="thumb"
-          src={`data:${block.mime};base64,${block.data}`}
+          // 线上的 `mime` 是裸子类型（`"png"` / `"jpeg"`，见 ImageMime 的小写 serde 表示），
+          // 不是完整 MIME。少写这个 `image/` 前缀产出的 `data:png;base64,…` 是非法 data URL，
+          // 浏览器直接画不出来：症状是「发图那一条气泡里只有文字、重开也还是没图」，
+          // 而待发缩略图（Composer 那份拼对了）一切正常，所以极易被误判成后端没存图。
+          src={`data:image/${block.mime};base64,${block.data}`}
           alt="图片"
         />
       );
