@@ -19,7 +19,8 @@ const MAX_INPUT_BYTES: usize = 40_000_000;
 /// R183：解码缓冲的分配预算，取值照 `image::Limits::default()` 的 `max_alloc`，
 /// 也就是 `ImageReader::decode()` 里那道 `limits.reserve(total_bytes)` 的等价物。
 const MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
-/// 首发质量：PNG 与 JPEG 各只编这一次，超线才进阶梯。
+/// jpeg 首发质量。png 首发不吃它（png 编码器没有质量旋钮，走 `encode_png`，F6-N1）；
+/// 两支各自只编这一次，超线才进阶梯。
 const FIRST_JPEG_QUALITY: u8 = 90;
 /// PNG 超限回落成 JPEG 时的第一级（PNG 自己没有质量旋钮）。
 const PNG_FALLBACK_JPEG_QUALITY: u8 = 85;
@@ -35,6 +36,11 @@ pub enum ImageError {
     TooLargeAfterCompression { actual: usize },
     #[error("不支持的图片格式，仅接受 png / jpeg / webp / gif")]
     Unsupported,
+    /// F5（R185）：解码已经成功、**编码器**自己拒收（边长超上限、颜色型不支持等）。
+    /// 这一支从前被 `map_err` 折成 [`Self::Unreadable`]，等于对着用户说「你的文件认不出来」，
+    /// 而它的文件当然认得出来 —— 顶替原因就是 R185 不许的那件事。
+    #[error("图片转码失败（已读出像素，是编码器拒收，不是文件认不出来）")]
+    EncodeFailed,
     #[error("图片太大（当前 {actual} 字节），请先裁剪或缩小后再发送")]
     InputTooLarge { actual: usize },
 }
@@ -116,19 +122,27 @@ pub fn normalize_with(
     } else {
         ImageMime::Jpeg
     };
-    let mut encoded = encode(&img, format_of(&mime), FIRST_JPEG_QUALITY)?;
+    // F6-N1（行为一字未变）：png 首发从前也接着 `FIRST_JPEG_QUALITY` 这个参数，而 png 编码器
+    // 根本没有质量旋钮 —— 那个值进去就是个被忽略的摆设，名字却把它挂在 png 的调用上。
+    // 现在拆成两个函数，png 这条路在**签名上**就没有质量参数可吃。
+    // mime 与编码器仍由同一个 `keep_png` 决定 ⇒ R137 的「声明与字节同源」没有变两份真相。
+    let mut encoded = if keep_png {
+        encode_png(&img)?
+    } else {
+        encode_jpeg(&img, FIRST_JPEG_QUALITY)?
+    };
 
     if base64_len(encoded.len()) > max_base64_bytes {
         if keep_png {
             // PNG 没有质量旋钮：只能换成 JPEG 再来 —— 换的那一刻 mime 必须跟着变（R137）。
             mime = ImageMime::Jpeg;
-            encoded = encode(&img, ImageFormat::Jpeg, PNG_FALLBACK_JPEG_QUALITY)?;
+            encoded = encode_jpeg(&img, PNG_FALLBACK_JPEG_QUALITY)?;
         }
         for q in QUALITY_LADDER {
             if base64_len(encoded.len()) <= max_base64_bytes {
                 break;
             }
-            encoded = encode(&img, ImageFormat::Jpeg, q)?;
+            encoded = encode_jpeg(&img, q)?;
         }
     }
 
@@ -142,42 +156,33 @@ pub fn normalize_with(
     })
 }
 
-/// mime 到编码格式的映射只有一份真相，回落分支改 mime 时不可能漏掉这一半。
-/// `ImageMime` 没有 `Copy`（types.rs 不在本任务的可改范围），所以这里借过去。
-fn format_of(mime: &ImageMime) -> ImageFormat {
-    match mime {
-        ImageMime::Png => ImageFormat::Png,
-        ImageMime::Jpeg => ImageFormat::Jpeg,
-    }
+/// jpeg 编码。质量旋钮只在这一支存在，所以它是唯一收 `quality` 的函数（F6-N1）。
+///
+/// R136（原写法编译不过）：内存编码只有 `write_with_encoder`，`Vec<u8>` 实现 `Write`
+/// 但不实现 `Seek`，所以必须 `Cursor` 包一层再 `into_inner()`。
+fn encode_jpeg(img: &DynamicImage, quality: u8) -> Result<Vec<u8>, ImageError> {
+    // 显式 encoder，质量阶梯要用 `new_with_quality`（实测 codecs/jpeg/encoder.rs:398）。
+    // `write_with_encoder` 的约束 `P: PixelWithColorType` 对 `Rgb<u8>` 成立（buffer.rs:1125）。
+    let mut buf = Vec::new();
+    img.to_rgb8()
+        .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+            &mut buf, quality,
+        ))
+        // F5：编码器拒收（边长/颜色型）不是输入问题，不许顶替成 Unreadable。
+        .map_err(|_| ImageError::EncodeFailed)?;
+    Ok(buf)
 }
 
-fn encode(img: &DynamicImage, fmt: ImageFormat, quality: u8) -> Result<Vec<u8>, ImageError> {
-    match fmt {
-        // JPEG：显式 encoder，质量阶梯要用 `new_with_quality`（实测 codecs/jpeg/encoder.rs:398）。
-        // `write_with_encoder` 的约束 `P: PixelWithColorType` 对 `Rgb<u8>` 成立（buffer.rs:1125）。
-        ImageFormat::Jpeg => {
-            let mut buf = Vec::new();
-            img.to_rgb8()
-                .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
-                    &mut buf, quality,
-                ))
-                .map_err(|_| ImageError::Unreadable)?;
-            Ok(buf)
-        }
-        // R136（原写法编译不过）：`save_with_format` 收的是**路径**（dynimage.rs:1409，
-        // `Q: AsRef<Path>`），`&mut Vec<u8>` 不满足。内存编码只有 `write_to`，而它的约束是
-        // `W: Write + Seek`（dynimage.rs:1371）—— `Vec<u8>` 实现 Write 但**不实现 Seek**，
-        // 所以必须 `Cursor<Vec<u8>>` 包一层再 `into_inner()`。
-        // PNG 必须留在这条路上、不许 `to_rgb8()`：否则带 alpha 的截图会被抹成黑底。
-        ImageFormat::Png => {
-            let mut cur = Cursor::new(Vec::new());
-            img.write_to(&mut cur, ImageFormat::Png)
-                .map_err(|_| ImageError::Unreadable)?;
-            Ok(cur.into_inner())
-        }
-        // 其余格式在 `normalize_with` 入口就被 Unsupported 拦掉了；这个臂只为 match 穷尽性存在。
-        _ => Err(ImageError::Unsupported),
-    }
+/// png 编码：签名里没有质量参数可吃（F6-N1）。
+///
+/// PNG 必须留在这条路上、不许 `to_rgb8()`：否则带 alpha 的截图会被抹成黑底。
+/// 与 jpeg 那一支同理由用 `Cursor<Vec<u8>>` —— `write_to` 要求 `W: Write + Seek`
+/// （dynimage.rs:1371）。
+fn encode_png(img: &DynamicImage) -> Result<Vec<u8>, ImageError> {
+    let mut cur = Cursor::new(Vec::new());
+    img.write_to(&mut cur, ImageFormat::Png)
+        .map_err(|_| ImageError::EncodeFailed)?;
+    Ok(cur.into_inner())
 }
 
 /// R183 那道闸的判定本身。取值照 `image::Limits::default().max_alloc`（limits.rs:49-56），
@@ -425,8 +430,11 @@ mod tests {
     }
 
     #[test]
-    fn reports_unsupported_for_non_image_bytes_not_panic() {
+    fn reports_unreadable_for_bytes_that_carry_no_image_magic() {
         // R185 之后这一支只管「连魔数都认不出来」：`with_guessed_format` 给 None ⇒ Unreadable。
+        // 测试名原样承自 brief 的 `..._unsupported_...`（F6-N3）：真 `Unsupported` 另有专测
+        // （上面 `reports_unsupported_for_a_real_but_unaccepted_format`），这里断言的一直是
+        // `Unreadable`，所以改的是名字，不是断言。
         let err = normalize_image(b"this is definitely not an image").unwrap_err();
         assert!(matches!(err, ImageError::Unreadable), "得到 {err:?}");
         assert!(err.to_string().contains("无法识别为图片"));
@@ -444,6 +452,25 @@ mod tests {
             "bmp 该说不支持，得到 {err:?}"
         );
         assert!(err.to_string().contains("不支持的图片格式"));
+    }
+
+    /// F5（R185 的第四支）：**编码器**拒收不许被说成「无法识别为图片」。
+    /// 构造法：JPEG 的边长上限是 65535（实测 image-0.25.10 `codecs/jpeg/encoder.rs:357`
+    /// 「width and height must be >= 1 and <= 65535」），把一张 65536×1 的图直接交给
+    /// `encode` —— 能走到这一步说明解码早就成功了，失败只能是编码器自己拒的。
+    #[test]
+    fn an_encoder_rejection_is_not_blamed_on_the_input() {
+        let img = image::DynamicImage::new_rgb8(65536, 1);
+        let err = encode_jpeg(&img, FIRST_JPEG_QUALITY)
+            .expect_err("夹具前提：超过 JPEG 边长上限，编码器必须报错");
+        assert!(
+            matches!(err, ImageError::EncodeFailed),
+            "这一支必须是「编码器拒收」，得到 {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("无法识别"),
+            "编码器故障被说成「输入不是图片」：{err}"
+        );
     }
 
     /// R185 的第一支：40MB 那道前置闸管的是**入流字节数**，格式完全受支持也一样拦。

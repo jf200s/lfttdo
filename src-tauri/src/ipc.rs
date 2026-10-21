@@ -37,7 +37,8 @@ pub trait Publish: Send + Sync {
     fn publish(&self, payload: AgentPayload);
 }
 
-/// `TextDelta` 的合帧缓冲。30ms 或累计 512 字符任一命中就交出一帧。
+/// `TextDelta` 的合帧缓冲。两个上限（30ms / 累计 512 字符）**都只在下一个 delta 到达时**
+/// 由 `push` 检查一次 ⇒ 这里没有定时器，谁也别指望「时间到了自己会发一帧」。
 /// 只负责「什么时候可以交出去」，交出之后发哪儿去归 `Publish`。
 struct Coalescer {
     buf: Mutex<String>,
@@ -45,7 +46,11 @@ struct Coalescer {
 }
 
 impl Coalescer {
-    /// 距上次 flush 的上限。超过它就发一帧，保证前端不觉得卡住。
+    /// 距上次 flush 的时间上限（30ms）。**它自己不会发帧**：`push` 在下一次被调用时拿
+    /// `elapsed()` 与它比，比过了才当场交出整帧（实测由
+    /// `the_30ms_threshold_releases_the_frame_on_the_next_delta` 钉住）。
+    /// 所以「保证前端不觉得卡住」这句话的真相是：流还在动的时候最迟下一个 delta 就落地；
+    /// 流的最后一帧没有下一个 delta，靠收尾的 `flush()` 兜底。
     const MAX_WAIT: Duration = Duration::from_millis(30);
     /// 累计字符上限：命中即发，不等 30ms。长段回复时这是 IPC 次数的主要来源。
     const MAX_CHARS: usize = 512;
@@ -53,7 +58,10 @@ impl Coalescer {
     fn new() -> Self {
         Self {
             buf: Mutex::new(String::new()),
-            // 构造即视为「刚刚 flush 过」：第一帧因此最多等 30ms 也能主动出去。
+            // 构造即把 `last_flush` 拨到「现在」，计时从这一刻起算。诚实的说法：
+            // 30ms 之内到达的第一个 delta **不会**因为时间命中而出帧（`elapsed() < MAX_WAIT`），
+            // 它要么攒够 `MAX_CHARS`，要么等之后的某个 delta，要么由收尾的 `flush()` 带走。
+            // 这里没有定时器，所以不存在「最多等 30ms 也能主动出去」那件事（F3/m3 改的就是这句）。
             last_flush: Mutex::new(Instant::now()),
         }
     }
@@ -568,11 +576,20 @@ fn take_raw_body(body: &InvokeBody) -> Result<Vec<u8>, String> {
 
 /// Task 18 Step 4：三入口拿到的字节 → `ContentBlock::Image`。
 ///
-/// T3 的两条硬约束（实测，非推测）：
+/// T3 的两条硬约束（brief:394，实测，非推测）是下面 1、2 两条 —— 它们都是「前端怎么写、
+/// 命令体就怎么收，谁也察觉不到谁」的那种，所以只能写在 doc 里让 T19 读得到。
+/// 第 3 条不是硬约束，是平台面。
 /// 1. **raw 与 JSON 字段互斥** —— 这条命令一旦加第二个具名参数，前端就没法再把它整体当
 ///    raw body 发。所以 max-edge / mime 这类旋钮只能内置（`image_prep::MAX_EDGE_PX`），
 ///    或另开一条 JSON 命令。
-/// 2. `Request` 的文档注释写明 raw body 「on all platforms except Android」。本项目只发
+/// 2. **永远不要把 `subarray` 切出来的那段视图的 `.buffer` 交出去**（brief:394 T3 第 2 条，
+///    实测；T19 的前端就靠这一条活着）：若 `bytes` 是一个切过的视图，`bytes.buffer` 带回的是
+///    底层**整个** ArrayBuffer 而不是那一段 ⇒ 字节照发、长度照报，命令体这边**察觉不到多收**
+///    —— `take_raw_body` 只做「把收到的字节原样克隆出去」（`a_raw_body_is_handed_over_byte_for_byte`
+///    钉的就是这个），它没有任何办法知道「前端其实只想发中间那 3KB」。
+///    前端要传切片就得把它重建成独立缓冲（`view.slice(0)`，或 `new Uint8Array(view)`），
+///    不许 `view.buffer`。
+/// 3. `Request` 的文档注释写明 raw body 「on all platforms except Android」。本项目只发
 ///    Windows，但这是**已知降级面**：真要跨端，兜底是走 JSON 传 base64。
 ///
 /// 归一化是 CPU 活（解码 + 缩放 + 降质循环），而且 R139 之后 `image` 的 `rayon` 是关的，
@@ -705,6 +722,15 @@ pub fn run() {
             normalize_image,
             runtime_summary,
         ])
+        // R108 / T18 m2 —— `tauri.conf.json` 里那句 `"label": "main"` 的理由（R108 要求每处
+        // conf 改动写清理由，而这份 conf 里放不下理由，原因写在下面）：
+        // 默认 label 本来就是 `main`，这行显式改动**冗余无害**，留着它的价值在于
+        // `capabilities/default.json` 的 `"windows": ["main"]` 是按 **label** 指名窗口的 ——
+        // label 写死在 conf 里，「主窗口叫什么」就只有一份答案，不用去赌某个依赖版本的默认值。
+        // 为什么理由落在 Rust 里而不是 conf 里（实测两次 `cargo check` 均 rc=101）：这份 conf 由
+        // `tauri-build` 的 build script 在编译期解析，`//` 注释得到 `key must be a string at
+        // line 15 column 9`，自由字段 `"_comment"` 得到 `unknown field _comment` —— JSON 里没有
+        // 任何合法的注释位。红线：交出去的 conf 必须能被解析（`cargo check` rc=0 为准）。
         .run(tauri::generate_context!())
         .expect("error while running qwen-do");
 }
@@ -987,6 +1013,24 @@ mod tests {
             .collect()
     }
 
+    /// 事件的 serde 标签名，只用来让行序断言失败时能一眼看出「谁排在了谁前面」
+    /// （直接比 `Vec<AgentEvent>` 的话，失败信息是两大屏结构体字段）。
+    fn event_tag(e: &AgentEvent) -> &'static str {
+        match e {
+            AgentEvent::TurnStart { .. } => "turn_start",
+            AgentEvent::TextDelta { .. } => "text_delta",
+            AgentEvent::UserMessage { .. } => "user_message",
+            AgentEvent::ToolCall { .. } => "tool_call",
+            AgentEvent::PermissionRequest { .. } => "permission_request",
+            AgentEvent::PermissionResolved { .. } => "permission_resolved",
+            AgentEvent::ToolResult { .. } => "tool_result",
+            AgentEvent::Usage { .. } => "usage",
+            AgentEvent::ContextCompacted { .. } => "context_compacted",
+            AgentEvent::Error { .. } => "error",
+            AgentEvent::Done { .. } => "done",
+        }
+    }
+
     /// R103：落库只能有一个所有者。`run()` 自己会把这条用户轮次 push 进 history，
     /// 所以一轮 = 两行（一问一答），**不许**再按块补写、也不许把整段历史重放一遍。
     /// brief:152-160 的写法在这里会测出 8 行（2 + 2 + 4）而不是 4 行。
@@ -1057,6 +1101,45 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, AgentEvent::UserMessage { .. }))
             .count();
+
+        // F1（T13 m1）：**行序**。上面与下面这几条断言全都是「按角色筛一遍再比」或
+        // 「数个数」，所以一轮内部整段倒序在它们眼里看不出来 —— 评审变异 M6 实证过：
+        // `append_rows` 的迭代一旦改成反向，230 条测试全绿，而 `messages()` 是
+        // `ORDER BY id`（写入顺序，db.rs:202），落库顺序就是重放顺序 ⇒ 助手回复会排在
+        // 用户提问之前。这里按**落库行的原始顺序**逐行断言角色与文本，谁把追加顺序弄倒
+        // 就必须在这里红。
+        assert_eq!(
+            msgs.iter()
+                .map(|m| (m.role.clone(), m.text_of()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Role::User, "第一句".to_string()),
+                (Role::Assistant, "回复一".to_string()),
+                (Role::User, "第二句".to_string()),
+                (Role::Assistant, "回复二".to_string()),
+            ],
+            "落库行序必须是「一问一答」交替；T20 的重放直接吃这个顺序"
+        );
+        // 重放侧同样要按行序交替：剔除 `usage` 与 `done` 两支后的**全事件序列**。
+        // `turn_start` 排在 `user_message` 之后不是笔误 —— `events_from_messages`
+        // 是在助手行才发它（db.rs:395），顺序本身就是行序的镜像。
+        let replay_tags: Vec<&str> = replay
+            .iter()
+            .filter(|e| !matches!(e, AgentEvent::Usage { .. } | AgentEvent::Done { .. }))
+            .map(event_tag)
+            .collect();
+        assert_eq!(
+            replay_tags,
+            vec![
+                "user_message",
+                "turn_start",
+                "text_delta",
+                "user_message",
+                "turn_start",
+                "text_delta",
+            ],
+            "重放的事件顺序就是行序：user_message 必须排在它那条回复之前"
+        );
 
         assert_eq!(replay_text, live_text, "重放的文字与直播不一致");
         assert_eq!(
@@ -1193,9 +1276,17 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("]").next())
             .expect("找不到 generate_handler 的登记表");
+        // F6-N4：原来写的是 `list.contains("normalize_image,")` —— 它硬依赖尾逗号，
+        // 登记项哪天被挪成末项（末项无逗号）就**假红**。按分隔符拆开、逐项 trim 再比，
+        // 对空白与尾逗号都不敏感；少登记仍然是红（拆出来的集合里根本没有这一项）。
+        let registered: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
         assert!(
-            list.contains("normalize_image,"),
-            "命令写了但没登记，前端调用只会拿到 not found：{list}"
+            registered.contains(&"normalize_image"),
+            "命令写了但没登记，前端调用只会拿到 not found：{registered:?}"
         );
     }
 }
