@@ -36,6 +36,7 @@ Task 1（脚手架 + 双测试器接线）只负责建立基线与记录待人�
 - `qwen-do.exe`（debug）：**12,822,528 字节 ≈ 12.23 MB**。
 - 旁边还有 115 MB 的 `qwen_do.pdb`（调试符号，不计入分发体积）。
 - **debug 体积不能用于验收**：<15MB 的判定对象是 `tauri build` 的发布产物（且发布配置已开启 `lto`、`codegen-units=1`、`strip=true`、`panic=abort`）。此处只是确认 MSVC 链接器能产出可执行文件。
+- **勘误（2026-10-22，T46）**：上面 12,822,528 字节是 10-19 那次的 debug 产物，同日今天的 debug 已涨到 30,007,808 字节——数字会随手增长，不能当基线读。真正的验收数值以 [`plan-c-delivery-baseline.md`](plan-c-delivery-baseline.md) 的发布安装包实测为准（4,111,344 字节 ≈ 3.92 MiB）。
 
 ## Task 1：双测试器与 dev 启动的实测结果（程序化验证）
 
