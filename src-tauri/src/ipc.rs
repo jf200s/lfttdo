@@ -8,7 +8,7 @@ use crate::agent::context::{ContextBuilder, ContextConfig};
 use crate::agent::events::{AgentEvent, Decision, EventSink, StopReason};
 use crate::agent::session::{AgentSession, SessionDeps};
 use crate::agent::types::{ContentBlock, Message};
-use crate::model::openai_compat::OpenAiCompat;
+use crate::model::openai_compat::{OpenAiCompat, is_loopback_endpoint};
 use crate::model::provider::ModelProvider;
 use crate::permission::gate::PermissionGate;
 use crate::settings::{Settings, SettingsStore};
@@ -358,6 +358,24 @@ fn auto_title(db: &Db, session_id: &str) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// 装配层的 key 闸门：`None` 时究竟是拒绝还是放行，判据只有一个 —— 端点是不是回环。
+///
+/// 为什么这道闸住在装配层而不是 provider 里：`OpenAiCompat::new` 早就接受空 `api_key`
+/// （`new_rejects_blank_base_url_but_not_blank_api_key` 钉着），拦住本机模型的一直是
+/// 这里那句 `ok_or_else`。反过来，provider 也不该拥有「要不要凭据」这个决定 —— 它只是
+/// 把 key 塞进 header，配不配是设置与端点的事。
+///
+/// 判据**只能窄到回环**：放错的代价是把一个无凭据的推理端点交给任意网络（SSRF 同一条
+/// 红线）。非回环分支保持与抽函数之前逐字一致，包括「`Some("")` 也照样放行」这一条 ——
+/// 那是既有行为，收紧它是另一件事，不在本轮范围。
+fn resolve_api_key(api_key: Option<String>, base_url: &str) -> Result<String, String> {
+    match api_key {
+        Some(key) => Ok(key),
+        None if is_loopback_endpoint(base_url) => Ok(String::new()),
+        None => Err("尚未配置 API key，请在设置中填写".to_string()),
+    }
+}
+
 #[tauri::command]
 pub async fn send_message(
     state: State<'_, AppState>,
@@ -376,9 +394,10 @@ pub async fn send_message(
     }
     // 先查地址再读凭据：端点没配时压根不该去碰凭据管理器（少一次无关的失败）。
     let key_store = state.settings.clone();
-    let api_key = blocking(move || key_store.api_key().map_err(|e| e.to_string()))
-        .await?
-        .ok_or_else(|| "尚未配置 API key，请在设置中填写".to_string())?;
+    let api_key = resolve_api_key(
+        blocking(move || key_store.api_key().map_err(|e| e.to_string())).await?,
+        &settings.base_url,
+    )?;
 
     // 明文 key 只在这一行进 `ModelConfig`：不打日志、不进事件、不回前端（spec:473）。
     let model =
@@ -1393,5 +1412,59 @@ mod tests {
             registered.contains(&"normalize_image"),
             "命令写了但没登记，前端调用只会拿到 not found：{registered:?}"
         );
+    }
+
+    // ---- resolve_api_key：本机模型免 key 的唯一闸门 ----
+    //
+    // 这三条断言是一组「放宽不许越界」的锁：第一条是新行为，后两条是既有行为，
+    // 谁哪天把分支写成 `if base_url.contains("localhost")` 之类，后两条之一必红。
+
+    #[test]
+    fn a_loopback_endpoint_needs_no_stored_key() {
+        // ollama / LM Studio 的默认形态。空串而不是 None 是刻意的：provider 侧
+        // 只认「有 key 就带 header」，空串正好等于不带。
+        assert_eq!(
+            resolve_api_key(None, "http://127.0.0.1:11434/v1"),
+            Ok(String::new())
+        );
+        assert_eq!(
+            resolve_api_key(None, "http://localhost:11434/v1"),
+            Ok(String::new())
+        );
+    }
+
+    #[test]
+    fn a_remote_endpoint_still_rejects_a_missing_key() {
+        for base_url in [
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "https://api.openai.com/v1",
+            // 前缀骗人：字符串看像 127.，实际是 DNS 名。
+            "http://127.0.0.1.evil.test/v1",
+            // 0.0.0.0 语义是「所有网卡」，不算本机。
+            "http://0.0.0.0:11434/v1",
+        ] {
+            let err = resolve_api_key(None, base_url)
+                .expect_err("非回环端点没有 key 必须停在这里，不能带着空 header 发出去");
+            assert_eq!(
+                err, "尚未配置 API key，请在设置中填写",
+                "报文是前端直接展示的文案，不许漂"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_key_passes_through_byte_identical_on_both_paths() {
+        for base_url in ["http://127.0.0.1:11434/v1", "https://remote.test/v1"] {
+            assert_eq!(
+                resolve_api_key(Some("sk-secret".into()), base_url),
+                Ok("sk-secret".into())
+            );
+            // 抽函数之前 `Some("")` 就是能过的。这里维持原样：本轮只做「None 且回环」
+            // 这一件事，顺手收紧空串会让非回环路径的行为不再是「逐字不变」。
+            assert_eq!(
+                resolve_api_key(Some(String::new()), base_url),
+                Ok(String::new())
+            );
+        }
     }
 }

@@ -123,6 +123,51 @@ pub fn normalize_base_url(raw: &str) -> String {
     s
 }
 
+/// 判据：这个 `base_url` 是不是**只可能**打到本机自己的回环接口。
+/// 装配层用它决定「凭据管理器里没有 key」是否可以放行（见 `ipc.rs` 的 `send_message`）。
+///
+/// 判假的代价是「还得填一次 key」，判真的代价是一个**无凭据的推理端点被当成安全**。
+/// 所以整条链每一段都朝「假」收：认不出的形态一律 false，不用 `url` crate（本仓纪律是不加
+/// 依赖，T46b 同因），scheme 只认 http/https（`socks5://127.0.0.1` 是把流量转出去的代理，
+/// 不是本机），host 用 `std::net` 的 `is_loopback()` 判定（127/8 与 ::1 的语义交给系统，
+/// 不自己比字符串 —— `127.0.0.1.evil.test` 就是给 `starts_with("127.")` 那种写法准备的）。
+pub fn is_loopback_endpoint(raw: &str) -> bool {
+    let s = raw.trim();
+    // 1. scheme：只认 http/https，大小写不敏感。没有 `://` 的（裸 `localhost`、`not a url`）在这里就假。
+    let (scheme, rest) = match s.split_once("://") {
+        Some(pair) => pair,
+        None => return false,
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    // 2. authority：`/`、`?`、`#` 之前的那一段。路径/查询里再出现别的 URL 不参与判定。
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // 3. 凭据：host 是**最后一个** `@` 之后的部分（RFC 3986 允许 userinfo 里有 `@`）。
+    //    这一步同时挡掉 `http://localhost@evil.test/` —— 真去的不是本机。
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // 4. 端口：带方括号的是 IPv6 字面量，取 `]` 之前；不带括号却出现第二个 `:` 是非法形态，假。
+    let host = if let Some(bracketed) = hostport.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or("")
+    } else if let Some((h, port)) = hostport.split_once(':') {
+        if port.contains(':') {
+            return false;
+        }
+        h
+    } else {
+        hostport
+    };
+    if host.is_empty() {
+        return false;
+    }
+    // 5. `localhost` 这个名字只有回环这一个含义（RFC 6761），可以直接认；其余一律要求它
+    //    真的能解析成 IP，并且那个 IP 自己说是回环。
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// 一次模型调用的配置。
 /// **没有 `#[derive(Debug)]`**：derive 出来的 Debug 会把明文 `api_key` 打进任何 `{:?}`、
 /// `dbg!` 或 panic 回溯，违反 Plan A 约束「api_key 不进导出、不写日志」。
@@ -741,6 +786,64 @@ mod tests {
             normalize_base_url("http://localhost:11434/v1"),
             "http://localhost:11434/v1"
         );
+    }
+
+    // ---- is_loopback_endpoint（本机端点免 key 的唯一判据）----
+    //
+    // 背景：`OpenAiCompat::new` 从来就允许空 `api_key`（上面那条测试就是为它写的），
+    // 真正拦着本机模型的是装配层那句「尚未配置 API key」。所以这里要的不是「放宽 key 要求」，
+    // 而是**一条只能窄到回环的判据** —— 判错的后果是把一个无凭据的推理端点暴露给任意网络，
+    // 因此下面每一支「假」都比「真」更重要。
+    // 为什么不用 `url` crate：本仓的纪律是不加依赖（T46b 同因），而这里只需要 scheme +
+    // authority + host，`std::net` 的 `is_loopback()` 已经把 127/8 与 ::1 的判定权给了系统。
+
+    #[test]
+    fn accepts_every_loopback_shape_of_a_local_endpoint() {
+        assert!(is_loopback_endpoint("http://127.0.0.1:11434/v1"));
+        // 整段 127/8 都是回环，不只是 .0.1（systemd-resolved 那类会绑 127.0.0.53）。
+        assert!(is_loopback_endpoint("http://127.0.0.53:11434/v1"));
+        assert!(is_loopback_endpoint("http://localhost:11434/v1"));
+        assert!(is_loopback_endpoint("http://[::1]:11434/v1"));
+        // scheme 与 host 的大小写不敏感（用户从配置里粘出来的形态不止一种）。
+        assert!(is_loopback_endpoint("HTTP://LOCALHOST:11434/v1"));
+        // 没有显式端口、没有 /v1 尾巴，也还是本机。
+        assert!(is_loopback_endpoint("http://127.0.0.1"));
+        // 带凭据的本机端点（LM Studio 一类可以设密码）：凭据在 `@` 左边，不是 host。
+        assert!(is_loopback_endpoint("http://user:pw@localhost:1234/v1"));
+    }
+
+    #[test]
+    fn rejects_every_non_loopback_host() {
+        assert!(!is_loopback_endpoint(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        ));
+        // 前缀像回环，其实是 DNS 名 —— 字符串 `starts_with("127.")` 会放它过。
+        assert!(!is_loopback_endpoint("http://127.0.0.1.evil.test/v1"));
+        assert!(!is_loopback_endpoint("http://localhost.evil.test/v1"));
+        assert!(!is_loopback_endpoint("http://notlocalhost/v1"));
+        // `0.0.0.0` 在 Windows 上连出去确实落到本机，但它的语义是「所有网卡」：
+        // 认它等于给「把无凭据端点绑到局域网」的配置背书，所以判假。
+        assert!(!is_loopback_endpoint("http://0.0.0.0:11434/v1"));
+        assert!(!is_loopback_endpoint("http://192.168.1.10:11434/v1"));
+        // 回环地址写在别的 host 后面：真去的不是本机。
+        assert!(!is_loopback_endpoint("http://evil.test/@127.0.0.1:11434"));
+    }
+
+    #[test]
+    fn rejects_unparseable_and_non_http_inputs_as_not_loopback() {
+        // 判假的代价是「还要填 key」，判真的代价是无凭据端点出网 —— 所以默认值必须是假。
+        assert!(!is_loopback_endpoint(""));
+        assert!(!is_loopback_endpoint("   "));
+        assert!(!is_loopback_endpoint("localhost"));
+        assert!(!is_loopback_endpoint("not a url"));
+        assert!(!is_loopback_endpoint("http://:11434/v1"));
+        assert!(!is_loopback_endpoint("http:///v1"));
+        assert!(!is_loopback_endpoint("socks5://127.0.0.1:1080"));
+        assert!(!is_loopback_endpoint("file:///C:/Users/x/model.gguf"));
+        // 查询串里藏一个回环 URL 不算回环端点。
+        assert!(!is_loopback_endpoint(
+            "http://evil.test/?next=http://127.0.0.1:11434"
+        ));
     }
 
     /// brief 未定义的输入：按契约「没有 origin 就谈不上 `<origin><path>/v1`」定为原样空串；
