@@ -7,8 +7,9 @@
 //   src-tauri/src/agent/types.rs:4-38     `ContentBlock`（tag 字段 `type`）/`ImageMime`/`ToolOutput`（tag 字段 `kind`）
 //   src-tauri/src/agent/types.rs:158-173  `ToolCallView`/`Risk`
 //   src-tauri/src/ipc.rs:24-32,146        `AgentPayload`（唯一 camelCase 的一层）+ 通道名 `"agent"`
-//   src-tauri/src/ipc.rs:488-500          `SettingsView`（`#[serde(flatten)]` ⇒ 线上拍平一层）
-//   src-tauri/src/settings.rs:231-250     `Mode`（`rename_all = "lowercase"`）/`Settings` 的 8 个键
+//   src-tauri/src/ipc.rs:630-641          `SettingsView`（`#[serde(flatten)]` ⇒ 线上拍平一层）
+//   src-tauri/src/settings.rs:251-255     `Mode`（`rename_all = "lowercase"`）
+//   src-tauri/src/settings.rs:261-284     `Settings` 的 12 个键（T43 起含 `accent`）
 //   src-tauri/src/store/db.rs:239-246     `SessionRow`（无 `rename_all` ⇒ snake_case，R128）
 //
 // 本文件除类型外**只导出一个运行期值**：通道名 `AGENT_CHANNEL`（:115）。
@@ -100,7 +101,7 @@ export interface SessionRow {
 }
 
 /**
- * `Settings`（settings.rs:261-278）：11 个键，`serde` 无 `rename_all` ⇒ 全 snake_case；
+ * `Settings`（settings.rs:261-284）：12 个键，`serde` 无 `rename_all` ⇒ 全 snake_case；
  * `mode` 是 `rename_all = "lowercase"` 的 `"light"|"dark"`（settings.rs:250-253），
  * 和 `applyTheme` 收的那个 `Mode` 是同一支，所以这里**引用**它而不是再抄一份字面量。
  * 数值一律 `number`：Rust 侧是 `u32`/`usize`/`f32`，钳位只有 `settings.rs` 的
@@ -126,15 +127,23 @@ export interface Settings {
   compact_threshold: number;
   /** T39：压缩时保留原文的最近轮数 K，Rust 侧夹 `1..=50`。 */
   keep_turns: number;
+  /**
+   * T43：用户自选的强调色，`""` = **跟随预设**。Rust 侧只有 `normalize_accent()` 一处白名单
+   * （`#rgb`/`#rrggbb` ⇒ 小写 6 位，其余回落 `""`），读写两侧各过一次 ⇒ 到这里的一定是
+   * `""` 或 `#rrggbb`，TS 侧不校验第二遍（同 `font_size` 的 R123 规矩：两处边界会漂移）。
+   * 消费者是 T44 的 `applyTheme`；本切片**没有**控件，所以它也绝不会由界面产生。
+   */
+  accent: string;
 }
 
 /**
  * `settings_get` 真正的返回形状（第 3 条裁定）：**不是** `Settings`。
- * `ipc.rs:488-500` 是 `struct SettingsView { #[serde(flatten)] settings, api_key_masked, corrupt_backup }`
- * ⇒ `#[serde(flatten)]` 把内层 8 个键**摊平到同一层**，线上是一层扁平对象，外加两个可空键：
+ * `ipc.rs:630-641` 是 `struct SettingsView { #[serde(flatten)] settings, api_key_masked, corrupt_backup }`
+ * ⇒ `#[serde(flatten)]` 把内层 12 个键**摊平到同一层**，线上是一层扁平对象，外加两个可空键：
  * - `api_key_masked: Option<String>` —— `null` 表示未配置（R99：读不到走 `Err`，不在这个键里编故事）
  * - `corrupt_backup: Option<PathBuf>` —— 字符串路径或 `null`（R102：紧跟那次 `load()` 取走）
- * `setSettings` 反过来只收 `Settings` 那 8 个键，不许把整个 view 原样送回去。
+ * `setSettings` 反过来只收 `Settings` 那 12 个键，不许把整个 view 原样送回去。
+ * T43 的 `accent` 因此**不需要动 `ipc.rs`**：它在 `Settings` 里，flatten 自动把它带上出口、也带上入口。
  */
 export interface SettingsView extends Settings {
   api_key_masked: string | null;

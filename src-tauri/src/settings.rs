@@ -6,7 +6,7 @@
 // key「不写 settings 表、不进导出、不写日志」，三条里最容易失守的是第一条，而靠纪律
 // （「记得别写」）守的规矩一定会被下一次加字段破掉；字段不存在才是结构性防线：
 // serde 写不出一个不存在的字段，`{:?}` 打不出它，导出也就无从带上它。
-// `serialized_field_names_are_exactly_the_eleven_settings_fields` 那条测试钉的正是这件事，
+// `serialized_field_names_are_exactly_the_twelve_settings_fields` 那条测试钉的正是这件事，
 // 它同时也是 R89 的防线：加字段必须先给出它的消费者，否则 Plan A 里多一个没人读的键。
 //
 // 「不写日志」那一条还有第二道闸，而且不在结构体上：`SettingsError` 的 `Debug` 是**手写**的
@@ -133,7 +133,7 @@ pub enum SettingsError {
 /// 打成十进制转储 —— spec :473 说的「不写日志」在这种形态下守不住，而且 spec :543 计划的
 /// 「全文搜索 key 字符串」根本查不到十进制转储。Display 侧本来就安全（那两个变体的 Display
 /// 只说 "Password data is not valid UTF-8"），所以这里每一支都借 Display 落地。
-/// `serialized_field_names_are_exactly_the_eleven_settings_fields` 同族的
+/// `serialized_field_names_are_exactly_the_twelve_settings_fields` 同族的
 /// `credential_debug_never_prints_the_secret_bytes` 钉住它。
 impl std::fmt::Debug for SettingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -275,6 +275,12 @@ pub struct Settings {
     pub compact_threshold: f32,
     /// 压缩时保留原文的最近轮数 K。夹 `1..=50`；K=0 会让刚说完的那轮也被摘要掉。
     pub keep_turns: u32,
+    /// Plan C T43：用户自选的强调色，`""` = **跟随预设**（不覆盖主题自己的 accent）。
+    /// 消费方是 T44 的 `applyTheme` 三件套：这个值会被原样写进 CSS 变量，所以它是本结构里
+    /// 唯一一个**字符串形状的注入面** —— 因此它也是唯一一个走白名单而不是走钳位的字符串
+    /// （`base_url` 归一形态、`model` 由端点报错兜底，都挡不住「把 `tomato` 写进 `--accent`」）。
+    /// 校验只有 `normalize_accent` 一处定义，读写两侧各过一次（R86 同规）。
+    pub accent: String,
 }
 
 impl Default for Settings {
@@ -293,6 +299,9 @@ impl Default for Settings {
             temperature: DEFAULT_TEMPERATURE,
             compact_threshold: DEFAULT_COMPACT_THRESHOLD,
             keep_turns: DEFAULT_KEEP_TURNS,
+            // `""` 是「跟随预设」而不是「没配好」：T44 的 `applyTheme` 据此决定要不要覆盖
+            // 主题自带的 accent，所以这里不能给一个具体颜色当默认。
+            accent: String::new(),
         }
     }
 }
@@ -310,6 +319,36 @@ fn clamp_finite(value: f32, fallback: f32, min: f32, max: f32) -> f32 {
     } else {
         fallback
     }
+}
+
+/// T43：强调色的**唯一**白名单。只放行 CSS 的两种 hex 形状 —— `#rgb` 与 `#rrggbb`，
+/// 输出统一成小写 6 位（`#0aF` → `#00aaff`）：CSS 自己会展开 3 位，但 T44 要按亮度决定
+/// 前景色，两份形状不同的值就会各判各的。其余一律返回 `""`（= 跟随预设）。
+///
+/// 为什么是白名单而不是钳位/转义：这个字符串的去处是 CSS 自定义属性的**值**
+/// （`applyTheme` 把它写成 `--accent`），而 `settings.json` 是用户可手改的文件。
+/// `"tomato"`、`"red; --x: `、`url(...)` 在「非空就用」的写法下都会原样进到行内样式里 ——
+/// 数值字段可以夹进区间，颜色不能「夹」进形状，所以这里做的是形状判定而不是纠正。
+/// 认不出来时回落预设比替用户编一个颜色好：界面上看得见的还是主题原本的那支 accent。
+///
+/// 幂等（`normalize` 在读写两侧各跑一次，见 `load`/`save`）：展开后的小写 6 位
+/// 本身就在白名单里，第二遍判定的结果和第一遍相同。
+pub fn normalize_accent(s: &str) -> String {
+    let t = s.trim();
+    let Some(hex) = t.strip_prefix('#') else {
+        return String::new();
+    };
+    let is_hex = |c: char| c.is_ascii_hexdigit();
+    let expanded: String = match hex.len() {
+        // `#rgb` → `#rrggbb`：CSS 的 3 位缩写按「每位重复一次」展开。
+        3 => hex.chars().flat_map(|c| [c, c]).collect(),
+        6 => hex.to_string(),
+        _ => return String::new(),
+    };
+    if !expanded.chars().all(is_hex) {
+        return String::new();
+    }
+    format!("#{}", expanded.to_lowercase())
 }
 
 impl Settings {
@@ -351,6 +390,10 @@ impl Settings {
             MIN_TEMPERATURE,
             MAX_TEMPERATURE,
         );
+        // T43：`accent` 是唯一「形状不合法就整支作废」的字段 —— 数值越界能夹回区间，
+        // 一个不是颜色的字符串没法夹成颜色，于是回落 `""`（跟随预设）。
+        // 放在这里而不是只放在 `save` 前：`load()` 也走 `normalize`，磁盘上的脏值出不了读侧。
+        self.accent = normalize_accent(&self.accent);
     }
 
     /// 归一后的副本。派生方法用它，省掉「调用者忘了先 normalize」这条静默错误路径。
@@ -1218,6 +1261,35 @@ mod tests {
     }
 
     #[test]
+    fn accent_accepts_only_the_two_hex_forms_and_lowercases_them() {
+        // T43：`accent` 是要进 CSS 变量的字符串，而 `settings.json` 是用户可手改的文件。
+        // 只放行两种 hex 形状，其余一律回落 `""`（= 跟随预设），**绝不原样带出去**。
+        assert_eq!(
+            normalize_accent("#0aF"),
+            "#00aaff",
+            "3 位必须展开成 6 位：CSS 自己会展开，但前端要做亮度判定，得拿同一个形状"
+        );
+        assert_eq!(normalize_accent("#AA00FF"), "#aa00ff");
+        for bad in ["", "red", "#ff00", "not-a-color", "#aaaaaaa", "aa00ff"] {
+            assert_eq!(
+                normalize_accent(bad),
+                "",
+                "{bad} 不是可信的强调色 ⇒ 回落预设，而不是原样写进 CSS 变量"
+            );
+        }
+        // 粘贴带首尾空白是常规路径（同 R95 的 key）：trim 之后才判定，别让一个尾随 `\n`
+        // 把合法颜色判成脏、静默丢掉用户的设置。
+        assert_eq!(normalize_accent("  #00AaFf \n"), "#00aaff");
+        // 幂等：`normalize` 读写两侧各跑一次（load / save 经 `normalized()`），
+        // 第二遍不许把第一遍的输出判成脏 —— 不幂等就是「存一次盘设置自己变空」。
+        assert_eq!(
+            normalize_accent(&normalize_accent("#AB12CD")),
+            "#ab12cd",
+            "规范化必须幂等"
+        );
+    }
+
+    #[test]
     fn absurd_compaction_settings_are_clamped_not_obeyed() {
         // 1.5 的阈值意味着「永不压缩」，0 的阈值意味着「每轮都压」。两者都不该照原样进内核，
         // 也不该报错 —— 钳位是 normalize 的职责（`font_size` 12..=24 是同一道闸的兄弟字段）。
@@ -1460,7 +1532,7 @@ mod tests {
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_eleven_settings_fields() {
+    fn serialized_field_names_are_exactly_the_twelve_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -1472,6 +1544,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "accent",
                 "base_url",
                 "budget_tokens",
                 "compact_threshold",
@@ -1487,9 +1560,10 @@ mod tests {
         );
         // T39 起 `temperature`/`compact_threshold`/`keep_turns` 都是**认识的**键，
         // 再放进这个名单就会自我矛盾（它测的是「这个键压根不存在」，不是「它没被序列化」）。
+        // T43 起 `accent` 同样认识了，所以它进的是上面的**键名数组**而不是这里 ——
+        // brief §3 明说这一步「删 `accent`」是空转：T39 落地时这个列表就只剩 `api_key` 了。
         // 剩下唯一永远不该出现的键只有 `api_key`：它住凭据管理器，不住 settings.json（R89/spec :473）。
-        // T43 新加的 `accent`/`mcp`/`roots` 落进 `Settings` 后同样要从这里挪走 ——
-        // 这条名单只该收缩，谁加字段谁负责，别把它当成「五个永远不会出现的键」的原样清单。
+        // 后面的切片再落 `roots`/MCP 时同样要从这里**确认它不在**、而不是删东西。
         let raw = serde_json::to_string(&Settings::default()).unwrap();
         for banned in ["api_key"] {
             assert!(
@@ -1525,6 +1599,35 @@ mod tests {
         assert!(
             corrupt_backups(d.path()).is_empty(),
             "缺字段是可读的，不该按损坏处理（R84 与 R91 的边界）"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_accent_on_disk_falls_back_without_marking_the_file_corrupt() {
+        // `settings.json` 是用户可手改的文件。写坏了 `accent` 不该让整份设置被 rename 成
+        // `settings.json.corrupt-<ms>` 并回落默认（那会连带抹掉用户别的设置），
+        // 也不该置起「文件损坏」的通知 —— 单个字段可修 ≠ 文件损坏（R84/R91 边界的延伸）。
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        std::fs::write(store.path(), r#"{"model":"qwen-turbo","accent":"tomato"}"#).unwrap();
+        let got = store.load().unwrap();
+        assert_eq!(got.model, "qwen-turbo", "其余设置照原样保住");
+        assert_eq!(got.accent, "", "认不出的 accent 回落『跟随预设』");
+        assert!(
+            corrupt_backups(d.path()).is_empty(),
+            "单个可修字段不是文件损坏，不许留备份"
+        );
+        assert!(
+            store.take_corrupt_backup().is_none(),
+            "脏 accent 不该被当成损坏事故通知界面（R93 的那条线只在真损坏时亮）"
+        );
+        // 同一道闸的另一半：读侧规范化不是「见脏就清」，合法值要能带着形状出去。
+        // 若 `load()` 不过 `normalize`（brief §4.1 问的就是这个），这一支会原样吐出 `"#0AF"`。
+        std::fs::write(store.path(), r##"{"model":"qwen-turbo","accent":"#0AF"}"##).unwrap();
+        assert_eq!(
+            store.load().unwrap().accent,
+            "#00aaff",
+            "读侧就把 3 位展开成 6 位：脏值不许带出门，合法值也不该等到保存那次才被规范"
         );
     }
 

@@ -55,6 +55,7 @@ const view = (): SettingsView => ({
   temperature: 0.7,
   compact_threshold: 0.85,
   keep_turns: 10,
+  accent: "",
   api_key_masked: "…abcd",
   corrupt_backup: null,
 });

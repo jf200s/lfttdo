@@ -23,6 +23,9 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   temperature: 0.3,
   compact_threshold: 0.5,
   keep_turns: 3,
+  // T43 的 `accent` 同一条理由（Rust 默认是 `""` = 跟随预设）：面板不渲染它，
+  // 所以这里也得是一支**看得见差别**的颜色，而不是那个「漏带和带错长得一样」的空串。
+  accent: "#aa00ff",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -69,15 +72,16 @@ describe("SettingsPanel", () => {
       temperature: 0.3,
       compact_threshold: 0.5,
       keep_turns: 3,
+      accent: "#aa00ff",
     });
   });
 
   it("carries the fields it does not render through a save", async () => {
     // T39 给 Rust 的 `Settings` 加了 `temperature`/`compact_threshold`/`keep_turns`，
-    // 面板**不渲染**它们（渲染一个存不进去的输入框才是 bug，见下面那条），于是逐字段列名单的
-    // `settingsOf` 会少带三键。少带不报错：`settings.rs:260` 的结构体级 `#[serde(default)]`
-    // 把它们抹回 Rust 默认值 ⇒ **一次普通的点保存，就把用户手改进 settings.json 的
-    // 温度、压缩阈值和 K 全数清零**。这条测试存在的理由就是这个静默路径。
+    // T43 又加了 `accent`：面板**不渲染**这四键（渲染一个存不进去的输入框才是 bug，见下面那条），
+    // 于是逐字段列名单的 `settingsOf` 会少带它们。少带不报错：`settings.rs:260` 的结构体级
+    // `#[serde(default)]` 会把它们抹回 Rust 默认值 ⇒ **一次普通的点保存，就把用户手改进
+    // settings.json 的温度、压缩阈值、K 和强调色全数清零**。这条测试存在的理由就是这个静默路径。
     const p = setup();
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
     await waitFor(() => expect(p.onSave).toHaveBeenCalled());
@@ -85,6 +89,9 @@ describe("SettingsPanel", () => {
     expect(sent.temperature).toBe(0.3);
     expect(sent.compact_threshold).toBe(0.5);
     expect(sent.keep_turns).toBe(3);
+    // T43：`accent` 是第四只「面板不渲染但必须带走」的键。夹具里它不等于 Rust 默认值 `""`，
+    // 所以「漏带」和「带成默认」在这里是两种都看得出来的错。
+    expect(sent.accent).toBe("#aa00ff");
     // 同一次展开不许把 `SettingsView` 那两只只读键一起带进 body：
     // `settings_set` 收的是 `Settings`，把掩码当设置存盘是另一件事（上面那条 toEqual 也守着）。
     expect(sent).not.toHaveProperty("api_key_masked");
@@ -170,12 +177,13 @@ describe("SettingsPanel", () => {
   });
 
   it("renders no control that this slice has no design for", async () => {
-    // 断言没变，**理由变了**（别把这条当成还在测「存不存得进去」）：T39 之后
+    // 断言没变，**理由又变了一次**（别把这条当成还在测「存不存得进去」）：T39 之后
     // `temperature`/`compact_threshold`/`keep_turns` 是存得进去的（spec 5.3 的三个内部参数，
-    // 默认值就够用），`accent` 要等 T43、`roots`/MCP 要等 Plan B。
-    // 现在钉的是「不许半拉子地先加一个没有校验、没有说明的输入框」——真要开这块 UI 是
-    // 一个带设计的任务，不是顺手加一行 `<input>`。上面那条 carry-through 测试保证
-    // 「不渲染」不等于「不带上」：这三键照样得原样回到 `settings_set`。
+    // 默认值就够用）；T43 之后 `accent` **也存得进去了**（后端字段 + 校验已落地），
+    // `roots`/MCP 要等 Plan B。所以这里钉的从来不是「存不存得进」，而是
+    // 「不许半拉子地先加一个没有校验、没有说明的输入框」——真要开取色器是一个带设计的任务
+    // （T44 的三件套 + 面板控件），不是顺手加一行 `<input>`。上面那条 carry-through 测试保证
+    // 「不渲染」不等于「不带上」：这四键照样得原样回到 `settings_set`。
     for (const label of [/温度/, /temperature/i, /压缩|阈值|keep_turns/i, /强调色/, /accent/i, /目录|roots/i, /MCP/i]) {
       expect(screen.queryByLabelText(label)).toBeNull();
     }
