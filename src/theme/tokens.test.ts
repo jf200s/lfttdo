@@ -189,7 +189,12 @@ describe("theme tokens", () => {
   // `THEME_TOKENS` 里摘走一项（本任务自己就在 R124 下摘走过一项）会让漏项闸当场少守一个
   // token 而全绿。这三条把名单自己钉住：数量、内容、两份不相交。
   it("keeps the token lists themselves complete", () => {
-    expect(THEME_TOKENS.length).toBe(15);
+    // T50 质感轮新增两项：`--radius-sm`（圆角只有一档时，72px 缩略图与整块面板共用同一个
+    // 10px，是「没调过」最显眼的痕迹）与 `--font-code`（全仓当时没有任何等宽声明，
+    // 工具调用 JSON 与 markdown 代码块都排在界面字体上，paper 下等于用 Georgia 排代码）。
+    expect(THEME_TOKENS.length).toBe(17);
+    expect(THEME_TOKENS).toContain("--radius-sm");
+    expect(THEME_TOKENS).toContain("--font-code");
     expect(USER_TOKENS).toEqual(["--font-size"]);
     expect(THEME_TOKENS.filter((t) => USER_TOKENS.includes(t))).toEqual([]);
     expect(new Set(THEME_TOKENS).size).toBe(THEME_TOKENS.length);
@@ -396,6 +401,28 @@ describe("theme tokens", () => {
       }
     }
     expect(offenders, offenders.join("\n")).toEqual([]);
+  });
+
+  // T50 质感轮新增的两项必须有人读它。R201 的教训是「token 被六块声明得整整齐齐，
+  // 但没有一条闸问过它值对不对得起名字」——加进 `THEME_TOKENS` 只是付了六块 × 一行的税，
+  // 判据在消费侧。这里不套对比度那种性质断言（圆角和字体族没有可比的大小关系），
+  // 只闸最便宜的一条：组件样式里出现 `var(--…)`。
+  // 变异：删掉 styles.css 里全部 `font-family: var(--font-code)` ⇒ 本用例红，
+  //       而六块覆盖、名单长度、双向集合那几道闸一道都不响。
+  it("keeps the new texture tokens consumed by the component stylesheet", () => {
+    const css = stripComments(readFileSync(pathOf("../styles.css"), "utf8"));
+    for (const token of ["--radius-sm", "--font-code"]) {
+      expect(
+        css,
+        `styles.css 不再消费 ${token} —— 预设里那六行等于装饰：` +
+          `${token} 进了名单却没有任何样式读它（R201 的「有名单没消费者」）`,
+      ).toMatch(new RegExp(`var\\(${token}\\)`));
+    }
+    // 等宽不是「代码块排得好看」：改之前全仓没有任何等宽声明，工具卡的 JSON（`.io`）
+    // 和 markdown 代码块都排在界面字体上，paper 下等于用 Georgia 排代码。
+    expect(css, "markdown 代码语境必须走 --font-code，等宽名单只有预设里那一份").toMatch(
+      /\.md pre,\s*\.md code\s*\{[^}]*font-family:\s*var\(--font-code\)/,
+    );
   });
 
   // R181：按下态必须比静止态**暗**，六块全过。

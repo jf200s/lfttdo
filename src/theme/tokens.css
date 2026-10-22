@@ -10,9 +10,11 @@
   --border: #2c313a;
   --danger: #ff6b6b;
   --code-bg: #101317;
-  --radius: 10px;
+  --radius: 12px;
+  --radius-sm: 6px;
   --shadow: rgb(0 0 0 / 45%);
   --font-size: 15px;
   --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --bubble-max-w: 72ch;
 }

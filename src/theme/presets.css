@@ -1,4 +1,4 @@
-/* 每个预设 × 每个明暗档各一块，块内写全 15 个 THEME_TOKENS，一个不漏（tokens.test.ts 钉这条，
+/* 每个预设 × 每个明暗档各一块，块内写全 17 个 THEME_TOKENS，一个不漏（tokens.test.ts 钉这条，
    并且是双向的：块集合必须恰好等于 THEME_NAMES × {dark, light}，漏一项、多一项、多一块、少一块
    都会红）。
    --font-size 刻意不进这些块：预设块的特异度高于 :root，而 applyTheme 写的是 <html> 的
@@ -8,20 +8,22 @@
    阴影的深浅/色相跟着这套预设的底色走，所以六块各写各的。 */
 
 [data-theme="noir"][data-mode="dark"] {
-  --bg-surface: #14161a;
-  --bg-raised: #1c1f26;
-  --bg-input: #22262e;
-  --text-primary: #e6e8ec;
-  --text-muted: #9aa1ad;
-  --accent: #6aa6ff;
-  --accent-hover: #8fbcff;
-  --accent-text: #0b0d10;
-  --border: #2c313a;
-  --danger: #ff6b6b;
-  --code-bg: #101317;
-  --radius: 10px;
+  --bg-surface: #151517;
+  --bg-raised: #1d1d21;
+  --bg-input: #232329;
+  --text-primary: #e8e6e3;
+  --text-muted: #9a968f;
+  --accent: #d0a95f;
+  --accent-hover: #e2bd78;
+  --accent-text: #1a1a1c;
+  --border: #303037;
+  --danger: #e0776a;
+  --code-bg: #111113;
+  --radius: 12px;
+  --radius-sm: 6px;
   --shadow: rgb(0 0 0 / 45%);
   --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --bubble-max-w: 72ch;
 }
 
@@ -37,9 +39,11 @@
   --border: #d8dce3;
   --danger: #c0392b;
   --code-bg: #f0f2f5;
-  --radius: 10px;
+  --radius: 12px;
+  --radius-sm: 6px;
   --shadow: rgb(0 0 0 / 20%);
   --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --bubble-max-w: 72ch;
 }
 
@@ -56,8 +60,10 @@
   --danger: #a83c22;
   --code-bg: #ece5d8;
   --radius: 6px;
+  --radius-sm: 4px;
   --shadow: rgb(74 58 32 / 18%);
   --font-family: Georgia, "Times New Roman", "Microsoft YaHei", serif;
+  --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --bubble-max-w: 68ch;
 }
 
@@ -74,8 +80,10 @@
   --danger: #e07a5a;
   --code-bg: #17140f;
   --radius: 6px;
+  --radius-sm: 4px;
   --shadow: rgb(23 20 15 / 55%);
   --font-family: Georgia, "Times New Roman", "Microsoft YaHei", serif;
+  --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --bubble-max-w: 68ch;
 }
 
@@ -92,8 +100,10 @@
   --danger: #b03a2e;
   --code-bg: #e3edf4;
   --radius: 12px;
+  --radius-sm: 6px;
   --shadow: rgb(20 60 84 / 22%);
   --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --bubble-max-w: 76ch;
 }
 
@@ -110,7 +120,9 @@
   --danger: #ff7a66;
   --code-bg: #0a1620;
   --radius: 12px;
+  --radius-sm: 6px;
   --shadow: rgb(3 12 18 / 60%);
   --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --bubble-max-w: 76ch;
 }

@@ -4,6 +4,11 @@
       就开始讲先后，而那条先后今天只由 `main.tsx` 的 import 顺序和一个读取它的测试守着。
    ② 一律 `var(--token)`，无一处 hex、也无 rgb()/hsl()（`color-no-hex` 与 `npm test`
       里那道 hex 闸都只盯 hex，`rgb()` 是已知盲区 —— R170）。
+   ③ 尺寸这一层走刻度：间距只用 4 的阶（2 / 4 / 8 / 12 / 16），圆角只分两档 ——
+      `--radius` 给成块的表面（气泡、控件、面板、卡片），`--radius-sm` 给贴边的小元素
+      （徽章、缩略图、代码块、会话行）。改之前这些数是逐条 ad-hoc 的（同一列里躺着
+      `6px 10px`、`10px 12px`、`8px 10px`），而「没调过」最显眼的痕迹就是这个。
+      刻度不进门禁：为五个常量付「六块 × 一行」的重复不值得，代价是改样式的人得自己守。
    import 顺序在 `main.tsx`：tokens → presets → 本文件。 */
 
 /* `font-size: var(--font-size)` 是全仓 `--font-size` 的唯一消费者（T15 评审 F11）：
@@ -43,11 +48,11 @@ input,
 textarea {
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 6px 10px;
+  padding: 6px 12px;
   font: inherit;
   color: var(--text-primary);
   background-color: var(--bg-raised);
-  box-shadow: 0 2px 2px var(--shadow);
+  box-shadow: 0 1px 2px var(--shadow);
 }
 
 button {
@@ -112,8 +117,8 @@ a:hover {
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 4px;
-  padding: 4px;
-  border-radius: var(--radius);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
   border: 1px solid transparent;
 }
 
@@ -123,16 +128,42 @@ a:hover {
 }
 
 .session-title {
+  min-width: 0;
+  padding: 2px 0;
+  border-color: transparent;
+  background-color: transparent;
+  box-shadow: none;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: left;
 }
 
+/* 行尾那两个动作：静止态不描边、不给底、字号降一档，悬停/按下时才由基座那两条
+   `button:hover` / `button:active` 长出边界。原来三个控件全都带边框+阴影，
+   一行看过去是三个并排的盒子，读不出「左边那个是会话名，右边这两个是动作」。 */
+.session-rename,
+.session-delete {
+  padding: 2px 8px;
+  border-color: transparent;
+  background-color: transparent;
+  box-shadow: none;
+  color: var(--text-muted);
+  font-size: 0.8em;
+}
+
 .rename-form {
   grid-column: 1 / -1;
   display: flex;
   gap: 4px;
+}
+
+/* 原生 `input` 的 `min-width: auto` 会卡在约 20 个字符的固有宽度上，而侧栏只有 240px：
+   不写这两行，重命名那一横排（输入框 + 「提交重命名」）比整条侧栏还宽，向右溢出到主面板底下。
+   `.panel-row input` 早就写了同样的 `min-width: 0`，这里是补上侧栏那一支。 */
+.rename-form input {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 /* ==== 主面板 ==== */
@@ -154,13 +185,24 @@ a:hover {
   gap: 12px;
 }
 
+/* `.turns` 这一层是 `MessageList.tsx:94` 建的，但 T16 起就没给过它任何样式：
+   它是普通块盒，于是里面的 `.bubble` 按块级铺满整行宽，气泡上那两条
+   `align-self: flex-end` / `flex-start` 一直是死代码（不是 flex item 就无从对齐），
+   「你好」两个字也要占满一整个窗口的宽。补成 flex 列之后对齐才真的生效，
+   `max-width: var(--bubble-max-w)` 也从「永远够不着」变成行宽上限。 */
+.turns {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 /* ==== 横幅与提示 ==== */
 
 .fatal {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 10px 12px;
+  padding: 12px 16px;
   border: 1px solid var(--danger);
   border-radius: var(--radius);
   background-color: var(--bg-raised);
@@ -179,7 +221,7 @@ a:hover {
 
 .app-notice,
 .notice {
-  padding: 6px 10px;
+  padding: 8px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background-color: var(--bg-raised);
@@ -197,25 +239,33 @@ a:hover {
 
 /* ==== 气泡 ==== */
 
+/* 正文行距比全站基线（`:root` 的 1.5）松一档：气泡是这份界面里唯一成段读人话的地方，
+   1.5 排在 15px 上，中文换行时上下两行的笔画几乎贴着。 */
 .bubble {
   max-width: var(--bubble-max-w);
-  padding: 10px 12px;
+  padding: 12px 16px;
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background-color: var(--bg-raised);
   display: flex;
   flex-direction: column;
   gap: 8px;
+  line-height: 1.6;
   overflow-wrap: anywhere;
 }
 
+/* 四角同圆角时，一列气泡看着像一列同规格的盒子；把靠近说话人那一侧的下/上角收到
+   1/3 档，两条各往自己那边走，方向感就出来了。取 `calc(var(--radius) / 3)` 而不是
+   `--radius-sm`：这是一个**比例**（跟随各主题自己的圆角档），不是新的绝对档位。 */
 .bubble-user {
   align-self: flex-end;
   background-color: var(--bg-input);
+  border-bottom-right-radius: calc(var(--radius) / 3);
 }
 
 .bubble-assistant {
   align-self: flex-start;
+  border-top-left-radius: calc(var(--radius) / 3);
 }
 
 /* 流式进行中的那一块：纯文本，保留换行，不解析半截 Markdown（要求 2）。 */
@@ -244,20 +294,24 @@ a:hover {
 /* 链接的静止/悬停态只有「通用控件」那一节的 `a` / `a:hover` 两条：
    再写一条 `.md a` 就是同一个属性两个来源，而且会撞 `no-descending-specificity`。 */
 
+/* 等宽这一档是全仓第一次出现：改之前 markdown 代码块、行内 code、工具卡的 JSON 都排在
+   界面字体上（paper 下等于用 Georgia 排代码）。名单只有预设里那一份 `--font-code`。 */
 .md pre,
 .md code {
   background-color: var(--code-bg);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-code);
+  font-size: 0.9em;
 }
 
 .md pre {
-  padding: 8px 10px;
+  padding: 12px 16px;
   overflow-x: auto;
 }
 
 .md blockquote {
   margin: 0;
-  padding-left: 10px;
+  padding-left: 12px;
   border-left: 2px solid var(--border);
   color: var(--text-muted);
 }
@@ -269,7 +323,7 @@ a:hover {
 .md td,
 .md th {
   border: 1px solid var(--border);
-  padding: 4px 6px;
+  padding: 4px 8px;
 }
 
 /* ==== 工具卡 / 权限卡 ==== */
@@ -277,8 +331,8 @@ a:hover {
 .card {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px 10px;
+  gap: 8px;
+  padding: 12px 16px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background-color: var(--bg-input);
@@ -288,13 +342,13 @@ a:hover {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
 .badge {
-  padding: 1px 6px;
+  padding: 2px 8px;
   border: 1px solid var(--border);
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   color: var(--text-muted);
   font-size: 0.85em;
 }
@@ -322,12 +376,13 @@ a:hover {
 
 .io {
   margin: 0;
-  padding: 6px 8px;
+  padding: 8px 12px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   background-color: var(--code-bg);
   color: var(--text-primary);
+  font-family: var(--font-code);
   font-size: 0.9em;
 }
 
@@ -336,7 +391,7 @@ a:hover {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
 .deny-reason input {
@@ -348,7 +403,7 @@ a:hover {
 .composer {
   display: flex;
   gap: 8px;
-  padding: 12px;
+  padding: 12px 16px;
   border-top: 1px solid var(--border);
   background-color: var(--bg-raised);
 }
@@ -356,7 +411,7 @@ a:hover {
 .composer-input {
   flex: 1 1 auto;
   resize: vertical;
-  padding: 8px;
+  padding: 8px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   color: var(--text-primary);
@@ -365,20 +420,28 @@ a:hover {
 }
 
 .statusbar {
-  padding: 4px 12px 8px;
+  padding: 4px 16px 8px;
   color: var(--text-muted);
   font-size: 0.85em;
 }
 
 /* 卡片和气泡不是控件，基座那一节管不到，阴影在这里补上。
-   控件（含 `.composer-input`）的阴影已在基座里，重复写一遍等于同一个属性两个来源。 */
+   控件（含 `.composer-input`）的阴影已在基座里，重复写一遍等于同一个属性两个来源。
+   两块 surface 走两层而不是单层 `0 2px 2px`：第一层贴着边收住轮廓（1px，几乎只是让
+   `--border` 那根线在浅色预设里不至于消失），第二层给出高度。单层 2px 的阴影撑不起
+   「这块浮在那块上面」，四张卡片排一列时尤其平。 */
 .card,
 .bubble {
-  box-shadow: 0 2px 2px var(--shadow);
+  box-shadow:
+    0 1px 2px var(--shadow),
+    0 4px 12px var(--shadow);
 }
 
+/* `outline-offset` 是把焦点环从控件自己的 1px 边框上挪开，否则 2px 的 accent 直接压在
+   `--border` 上，两套颜色糊成一根脏线 —— 键盘走到「重命名」这种小按钮时最难看清。 */
 :focus-visible {
   outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* ==== 输入区 ==== */
@@ -395,21 +458,24 @@ a:hover {
   min-width: 0;
 }
 
+/* `align-items: flex-end`：不写的话 flex 默认 stretch，「发送」会被拉成和输入框
+   一样高的一块大按钮（textarea 默认 3 行）。贴在底边才像输入区的动作键。 */
 .composer-row {
   display: flex;
+  align-items: flex-end;
   gap: 8px;
 }
 
 .image-strip {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .image-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
   margin: 0;
   padding: 0;
   list-style: none;
@@ -418,20 +484,21 @@ a:hover {
 .image-item {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding: 4px;
+  gap: 4px;
+  padding: 4px 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background-color: var(--bg-input);
 }
 
 /* 缩略图按固定方块裁切（`object-fit` 而不是 `max-width`）：四张比例各不相同的截图
-   排在一条里时，不裁的话整条高度随图抖动。气泡里那张仍用 `.thumb`（整图，不裁）。 */
+   排在一条里时，不裁的话整条高度随图抖动。气泡里那张仍用 `.thumb`（整图，不裁）。
+   72px 的方块上 12px 圆角要吃掉近五分之一的边，看着像被啃过 —— 这一档走 `--radius-sm`。 */
 .image-thumb {
   width: 72px;
   height: 72px;
   object-fit: cover;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
 }
 
 .image-name {
@@ -444,7 +511,8 @@ a:hover {
 }
 
 .image-remove {
-  padding: 2px 6px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
 }
 
 .image-errors {
@@ -461,7 +529,7 @@ a:hover {
 .image-note,
 .image-error {
   margin: 0;
-  padding: 4px 8px;
+  padding: 8px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background-color: var(--bg-raised);
@@ -475,12 +543,28 @@ a:hover {
 }
 
 /* 原生 file 控件的边框/阴影由基座那一节管（它是控件），这里只把它收进条里的宽度预算，
-   免得四张图排一行时长文件名把整条撑破。 */
+   免得四张图排一行时长文件名把整条撑破。
+   `width: fit-content`：不写的话它作为 `.image-strip`（flex 列）的子项被拉满整行宽，
+   「选择文件 未选择文件」十个字左边那一小块内容，右边拖着一条空到底的底色带。 */
 .image-file-input {
+  width: fit-content;
   max-width: 100%;
   padding: 4px 8px;
   color: var(--text-muted);
   background-color: var(--bg-input);
+}
+
+/* 原生 file 控件里那枚「选择文件」是 UA 自己画的（浅色底、自己的圆角与字号），
+   noir 下就是一块贴上去的白标签。`::file-selector-button` 是唯一能改它的入口，
+   颜色一律走 token，字号随基座（`font: inherit`）。 */
+.image-file-input::file-selector-button {
+  margin-right: 8px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  background-color: var(--bg-raised);
+  font: inherit;
 }
 
 /* ==== 设置面板（T45） ==== */
@@ -498,8 +582,9 @@ a:hover {
   background-color: var(--shadow);
 }
 
-/* 面板要浮在遮罩之上，靠的就是那一层 24px 的阴影：light 预设里 `--shadow` 只有 18% 透明度，
-   而 `--bg-raised` 与页面底色只差一档亮度，控件级的 2px 阴影分不出「这是另一层」。 */
+/* 面板要浮在遮罩之上，靠的是第二层那 32px 的扩散：light 预设里 `--shadow` 只有 18% 透明度，
+   而 `--bg-raised` 与页面底色只差一档亮度，控件级的阴影分不出「这是另一层」。
+   第一层 2px 是贴着边的收口，去掉它面板会像一块糊在遮罩上的同色纸。 */
 .panel {
   display: flex;
   flex-direction: column;
@@ -513,7 +598,9 @@ a:hover {
   border-radius: var(--radius);
   background-color: var(--bg-raised);
   color: var(--text-primary);
-  box-shadow: 0 8px 24px var(--shadow);
+  box-shadow:
+    0 2px 4px var(--shadow),
+    0 12px 32px var(--shadow);
   outline: none;
 }
 
@@ -527,7 +614,7 @@ a:hover {
   flex-direction: column;
   gap: 8px;
   margin: 0;
-  padding: 8px;
+  padding: 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
@@ -558,9 +645,13 @@ a:hover {
 }
 
 .panel-readonly code {
+  padding: 2px 4px;
   overflow-wrap: anywhere;
+  border-radius: var(--radius-sm);
   color: var(--text-muted);
   background-color: var(--code-bg);
+  font-family: var(--font-code);
+  font-size: 0.9em;
 }
 
 .panel-hint,
@@ -572,7 +663,7 @@ a:hover {
 }
 
 .panel-note {
-  padding: 6px 10px;
+  padding: 8px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
@@ -581,7 +672,7 @@ a:hover {
    原文必须整条换行显示（前端不解释文案，R195），长地址、长堆栈都不许截断。 */
 .panel-error {
   margin: 0;
-  padding: 6px 10px;
+  padding: 8px 12px;
   border: 1px solid var(--danger);
   border-radius: var(--radius);
   color: var(--text-primary);
@@ -601,7 +692,7 @@ a:hover {
 .panel > .panel-actions {
   position: sticky;
   bottom: 0;
-  padding-top: 6px;
+  padding-top: 8px;
   background-color: var(--bg-raised);
 }
 
@@ -622,5 +713,28 @@ a:hover {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-  padding: 0 12px 10px;
+  padding: 0 16px 12px;
+}
+
+/* ==== 滚动条 ==== */
+
+/* 四个滚动容器各留一根 15px 宽的默认条，是「默认模板」第二显眼的痕迹（第一是没调过的间距）。
+   走标准属性而不是 `::-webkit-scrollbar`：stylelint-config-standard 的 `selector-no-vendor-prefix`
+   会红，而且 Chromium 一旦看到 `scrollbar-color` 就忽略 `-webkit-` 那套伪元素 —— 两套并存
+   等于同一件事两个来源。颜色只有 `--border`（静止）与 `--text-muted`（悬停），
+   轨道和页底色之间不画第三层。 */
+.sidebar,
+.message-list,
+.md pre,
+.panel,
+.composer-input {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.sidebar:hover,
+.message-list:hover,
+.panel:hover,
+.composer-input:hover {
+  scrollbar-color: var(--text-muted) transparent;
 }

@@ -2,13 +2,18 @@ export const THEME_NAMES = ["noir", "paper", "ocean"] as const;
 export type ThemeName = (typeof THEME_NAMES)[number];
 export type Mode = "light" | "dark";
 
-/** 预设块负责拥有的 token。`tokens.test.ts` 逐块断言「每个预设覆盖这 15 个、一个不漏」，
+/** 预设块负责拥有的 token。`tokens.test.ts` 逐块断言「每个预设覆盖这 17 个、一个不漏」，
  *  所以这里少列一个就等于漏项测试少守一个（R124）。
  *  `--accent-hover`（R168）与 `--shadow`（R170）是 T15 修复轮补进来的两项：前者是因为
  *  `a:hover` 曾经退回 `--text-primary`，让链接悬停比静止时**更不显眼**；后者是因为
  *  `styles.css` 的 `box-shadow` 曾经直接写死一条 `rgb(0 0 0 / 20%)`，两道 hex 闸都看不见它，
  *  而 minifier 会把它写回成 `#0003` 塞进产物 —— 所以它现在只能取 `var(--shadow)`，
- *  值由 `tokens.css` 给基座默认、`presets.css` 的六个预设块（三套 × 明/暗）各自覆盖。 */
+ *  值由 `tokens.css` 给基座默认、`presets.css` 的六个预设块（三套 × 明/暗）各自覆盖。
+ *  `--radius-sm` 与 `--font-code`（T50 质感轮）：前者是因为圆角只有一档时 72px 缩略图与整块
+ *  面板共用同一个值；后者是因为全仓当时没有任何等宽声明，工具调用 JSON 与代码块都排在
+ *  界面字体上。`--font-code` 进名单而不是落进 `styles.css`，是被文件头那条纪律逼的：
+ *  组件样式表里**不许声明 `--*`**（R133，且有测试守着），而间距那一类永不变化的量走字面值，
+ *  不该为五个常量付六块 × 一行的重复。 */
 export const THEME_TOKENS = [
   "--bg-surface",
   "--bg-raised",
@@ -22,8 +27,10 @@ export const THEME_TOKENS = [
   "--danger",
   "--code-bg",
   "--radius",
+  "--radius-sm",
   "--shadow",
   "--font-family",
+  "--font-code",
   "--bubble-max-w",
 ];
 
