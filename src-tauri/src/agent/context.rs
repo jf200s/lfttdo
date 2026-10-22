@@ -25,6 +25,13 @@ pub struct ContextConfig {
     pub budget_tokens: u32,
     /// 滑窗兜底：最多保留多少条非 system 消息（spec 5.3 默认 40 轮）
     pub window_messages: usize,
+    /// 压缩触发线：**占预算的比例**（spec 5.3 默认 0.85）。留给 15% 余量是为了
+    /// 让压缩发生在两次对话之间、而不是把请求顶到 400 之后再补救。
+    /// 消费者在 T41；本任务只负责把它送进内核，`build()` 今天不读它。
+    pub compact_threshold: f32,
+    /// 压缩时保留原文的最近轮数 K（spec 5.3 默认 10）。K=0 意味着连刚说完的那轮
+    /// 都被摘要掉 ⇒ 当场失忆，所以 `Settings::normalize` 夹 `1..=50`。
+    pub keep_turns: usize,
 }
 
 impl Default for ContextConfig {
@@ -33,6 +40,8 @@ impl Default for ContextConfig {
             reserve_output: 4096,
             budget_tokens: 32_000,
             window_messages: 40,
+            compact_threshold: 0.85,
+            keep_turns: 10,
         }
     }
 }
@@ -302,6 +311,25 @@ mod tests {
         None
     }
 
+    // ---- 压缩预算的三个参数（Plan C T39）----
+
+    #[test]
+    fn compaction_defaults_match_the_spec_table() {
+        // 三条都钉成字面量而不是从 `Default` 推：这一条的全部作用就是给 `Default`
+        // 一个独立锚点，`compact_threshold`/`keep_turns` 还没有消费者（T41 才用），
+        // 漏进 `Default` 是静默的 —— 所有 `..Default::default()` 夹具会拿到 0。
+        let cfg = ContextConfig::default();
+        assert_eq!(
+            (cfg.reserve_output, cfg.budget_tokens, cfg.window_messages),
+            (4096, 32_000, 40)
+        );
+        assert_eq!(
+            cfg.compact_threshold, 0.85,
+            "spec 5.3：预算的 85% 触发，留余量别卡线"
+        );
+        assert_eq!(cfg.keep_turns, 10, "spec 5.3：压缩时最近 10 轮留原文");
+    }
+
     // ---- 估算口径 ----
 
     #[test]
@@ -506,6 +534,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 100_000,
             window_messages: 1,
+            ..Default::default()
         };
         let built = ContextBuilder::new(cfg).build(&hist);
         assert_eq!(dangling_tool_result(&built.messages), None);
@@ -527,6 +556,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 100_000,
             window_messages: 3,
+            ..Default::default()
         };
         let built = ContextBuilder::new(cfg).build(&hist);
         assert_eq!(dangling_tool_result(&built.messages), None);
@@ -550,6 +580,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 40,
             window_messages: 40,
+            ..Default::default()
         };
         let built = ContextBuilder::new(cfg).build(&hist);
         assert_eq!(dangling_tool_result(&built.messages), None);
@@ -570,6 +601,7 @@ mod tests {
                 reserve_output: 0,
                 budget_tokens: 100_000,
                 window_messages: window,
+                ..Default::default()
             };
             let built = ContextBuilder::new(cfg).build(&hist);
             assert_eq!(
@@ -589,6 +621,7 @@ mod tests {
             reserve_output: 4096,
             budget_tokens: 20_000,
             window_messages: 40,
+            ..Default::default()
         };
         let hist: Vec<Message> = (0..40)
             .map(|i| u(&("测".repeat(4000) + &format!(" {i}"))))
@@ -620,6 +653,7 @@ mod tests {
             reserve_output: 100,
             budget_tokens: 1_000,
             window_messages: 40,
+            ..Default::default()
         };
         let mut hist = vec![
             Message::system_note(&"历史里的摘要备注，它同样占预算。".repeat(4)),
@@ -661,6 +695,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 0,
             window_messages: 40,
+            ..Default::default()
         };
         let built = ContextBuilder::new(zero).build(&[]);
         assert_eq!(built.messages.len(), 1);
@@ -673,6 +708,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 0,
             window_messages: 40,
+            ..Default::default()
         };
         let built = ContextBuilder::new(cfg).build(&[u(&"测".repeat(10))]);
         assert_eq!(built.messages[0].role, Role::System);
@@ -683,6 +719,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 0,
             window_messages: 0,
+            ..Default::default()
         };
         let built = ContextBuilder::new(zero_window).build(&[u("一"), u("二"), u("三")]);
         assert_eq!(built.messages.len(), 1);
@@ -731,6 +768,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 1000,
             window_messages: 40,
+            ..Default::default()
         };
         let hist: Vec<Message> = (0..4).map(|_| u(&"测".repeat(300))).collect();
 
@@ -761,6 +799,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 1000,
             window_messages: 40,
+            ..Default::default()
         };
         let hist: Vec<Message> = (0..4).map(|_| u(&"测".repeat(300))).collect();
 
@@ -786,6 +825,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 1000,
             window_messages: 40,
+            ..Default::default()
         };
         let hist: Vec<Message> = (0..4).map(|_| u(&"测".repeat(300))).collect();
         let bad = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
@@ -820,6 +860,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 1000,
             window_messages: 40,
+            ..Default::default()
         };
         let hist: Vec<Message> = (0..4).map(|_| u(&"测".repeat(300))).collect();
 

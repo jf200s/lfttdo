@@ -178,6 +178,9 @@ pub struct ModelConfig {
     pub model: String,
     pub api_key: String,
     pub max_output_tokens: u32,
+    /// 端点级别的采样温度。`None` = 不写进请求体，由端点自己定；`Some(t)` 由
+    /// `ChatRequest.temperature` 带上（谁给它赋值见 `agent/session.rs` 的 `request()`）。
+    pub temperature: Option<f32>,
 }
 
 impl std::fmt::Debug for ModelConfig {
@@ -194,6 +197,7 @@ impl std::fmt::Debug for ModelConfig {
                 },
             )
             .field("max_output_tokens", &self.max_output_tokens)
+            .field("temperature", &self.temperature)
             .finish()
     }
 }
@@ -619,6 +623,9 @@ mod tests {
             model: "qwen-test".into(),
             api_key: FAKE_API_KEY.into(),
             max_output_tokens: 512,
+            // 端点级温度默认不带：温度进请求体那一条线由 `ChatRequest.temperature`
+            // 测（`request_declares_tools_and_temperature`），夹具这里保持中性。
+            temperature: None,
         }
     }
 
@@ -1697,6 +1704,7 @@ mod tests {
             model,
             api_key: key,
             max_output_tokens: 512,
+            temperature: None,
         })
         .unwrap();
         println!("RESOLVED_BASE={}", provider.base_url_resolved());

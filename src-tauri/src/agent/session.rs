@@ -46,6 +46,10 @@ pub struct SessionDeps {
     pub gate: Arc<PermissionGate>,
     pub sink: Arc<dyn EventSink>,
     pub context: ContextBuilder,
+    /// 端点级别的采样温度，来自 `Settings::to_model_config`（装配点给，见 `ipc.rs`）。
+    /// `None` = 请求体里不带这个键，由端点自己定。**不在这里读 `Settings`**：
+    /// 那会造出第二份配置真相，Settings 的读取归装配点（Plan A 约束）。
+    pub temperature: Option<f32>,
 }
 
 /// 一轮对话的编排者。一次 `run` 只跑一轮（`&mut self`），历史留在结构体里，
@@ -317,7 +321,9 @@ impl AgentSession {
             // R66：`defs()` 已经是 `Vec<model::provider::ToolDef>`（registry.rs:143），
             // 这里没有跨层转换要做，逐字段搬运只会让人以为 risk 能在这里被加工。
             tools: self.deps.registry.defs(),
-            temperature: None,
+            // T39：Plan A 这里硬写 `None`，于是设置里的温度到 `ModelConfig` 就断了线
+            // （`openai_compat.rs` 的发送侧一直在等这个 `Some`）。
+            temperature: self.deps.temperature,
         }
     }
 }
@@ -615,7 +621,7 @@ mod tests {
             recorder: Recorder,
             extra_tools: Vec<Arc<dyn Tool>>,
         ) -> Rig {
-            let (session, sink, gate) = parts(model, context, extra_tools);
+            let (session, sink, gate) = parts(model, context, None, extra_tools);
             Rig {
                 session,
                 sink,
@@ -664,9 +670,12 @@ mod tests {
         }
     }
 
+    /// 温度作为第 3 个入参而不是藏在夹具默认里：`the_session_temperature_reaches_the_chat_request`
+    /// 要能换着值喂它，而其它测试要的「不带温度」= 生产上端点自己定那个状态，写明白比默认好。
     fn parts(
         model: Arc<dyn ModelProvider>,
         context: ContextConfig,
+        temperature: Option<f32>,
         extra_tools: Vec<Arc<dyn Tool>>,
     ) -> (AgentSession, Arc<VecSink>, Arc<PermissionGate>) {
         let sink = Arc::new(VecSink::default());
@@ -683,6 +692,7 @@ mod tests {
             gate: gate.clone(),
             sink: sink.clone(),
             context: ContextBuilder::new(context),
+            temperature,
         });
         (session, sink, gate)
     }
@@ -1589,6 +1599,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 100_000,
             window_messages: 4,
+            ..Default::default()
         };
         let mut rig = Rig::with_context(
             cfg,
@@ -1648,6 +1659,7 @@ mod tests {
             reserve_output: 0,
             budget_tokens: 100_000,
             window_messages: 3,
+            ..Default::default()
         };
         let mut rig = Rig::with_context(cfg, vec![deltas(&["只看了最近三条"])]);
         let carried: Vec<Message> = (0..20)
@@ -1671,6 +1683,29 @@ mod tests {
             22,
             "20 条恢复的 + 这一轮的 user + assistant：history 不被窗口裁"
         );
+    }
+
+    // ---- T39：请求构造的最后一段线 ----
+
+    /// 前置事实 3 说温度那条管线早就通了，缺的只有本文件那句 `temperature: None`。
+    /// `openai_compat.rs` 的 `request_declares_tools_and_temperature` 钉的是「`Some(t)` 会上线」，
+    /// 这里钉的是**我们真的把设置里那个数交出去**。三个取值一起跑（含 `None`），
+    /// 所以「在 `request()` 里硬写一个常数」这种实现会当场红。
+    #[test]
+    fn the_session_temperature_reaches_the_chat_request() {
+        for want in [None, Some(0.3), Some(1.25)] {
+            let (mut session, _sink, _gate) = parts(
+                ScriptedModel::new(vec![]),
+                ContextConfig::default(),
+                want,
+                vec![],
+            );
+            assert_eq!(
+                session.request().temperature,
+                want,
+                "{want:?} 必须原样进请求"
+            );
+        }
     }
 
     // ---- 预览：一次大输出不许压垮 IPC 与前端 ----

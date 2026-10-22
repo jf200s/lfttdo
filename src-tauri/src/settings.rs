@@ -6,7 +6,7 @@
 // key「不写 settings 表、不进导出、不写日志」，三条里最容易失守的是第一条，而靠纪律
 // （「记得别写」）守的规矩一定会被下一次加字段破掉；字段不存在才是结构性防线：
 // serde 写不出一个不存在的字段，`{:?}` 打不出它，导出也就无从带上它。
-// `serialized_field_names_are_exactly_the_eight_settings_fields` 那条测试钉的正是这件事，
+// `serialized_field_names_are_exactly_the_eleven_settings_fields` 那条测试钉的正是这件事，
 // 它同时也是 R89 的防线：加字段必须先给出它的消费者，否则 Plan A 里多一个没人读的键。
 //
 // 「不写日志」那一条还有第二道闸，而且不在结构体上：`SettingsError` 的 `Debug` 是**手写**的
@@ -81,6 +81,24 @@ const _: () = assert!(MAX_RESERVE_OUTPUT >= 1);
 const MIN_FONT_SIZE: u32 = 12;
 const MAX_FONT_SIZE: u32 = 24;
 
+/// 压缩与采样三个参数的默认值与可接受区间（Plan C T39，spec 5.3 的表）。
+/// `DEFAULT_*` 与 `MIN_*`/`MAX_*` 分成两组常量而不是只写边界，是因为非有限值
+/// （NaN、±inf，手改 `settings.json` 或前端漏了 `isFinite`）必须**回落默认**而不是钳到边界：
+/// `f32::clamp` 对 NaN 返回 NaN，而 NaN 阈值让「该不该压」的判定永远为假且静默
+/// （`set_calibration` 在 `context.rs:73-77` 为同样的事立过先例）。
+const DEFAULT_TEMPERATURE: f32 = 0.7;
+const MIN_TEMPERATURE: f32 = 0.0;
+const MAX_TEMPERATURE: f32 = 2.0;
+const DEFAULT_COMPACT_THRESHOLD: f32 = 0.85;
+const MIN_COMPACT_THRESHOLD: f32 = 0.05;
+/// 上界 0.95 = 至少留 5% 余量：阈值 1.0 意味着「永不压缩」，而压缩是两次对话之间的
+/// 存储动作（前置事实 2），卡在 100% 上等于是把 400 留给用户去撞。
+const MAX_COMPACT_THRESHOLD: f32 = 0.95;
+const DEFAULT_KEEP_TURNS: u32 = 10;
+/// 下限 1：K=0 会把最近一轮也压掉 ⇒ 当场失忆。
+const MIN_KEEP_TURNS: u32 = 1;
+const MAX_KEEP_TURNS: u32 = 50;
+
 /// 设置与凭据的失败面（R82）。仓库约定是每模块一个枚举，不用 `Result<_, String>`：
 /// T13 要能区分「没有条目」（显示「未配置」）与「读不到」（显示原因），
 /// 后者被降级成前者会让用户重设 key、覆盖掉其实还在库里的那一条（R83/R71 同病）。
@@ -115,7 +133,7 @@ pub enum SettingsError {
 /// 打成十进制转储 —— spec :473 说的「不写日志」在这种形态下守不住，而且 spec :543 计划的
 /// 「全文搜索 key 字符串」根本查不到十进制转储。Display 侧本来就安全（那两个变体的 Display
 /// 只说 "Password data is not valid UTF-8"），所以这里每一支都借 Display 落地。
-/// `serialized_field_names_are_exactly_the_eight_settings_fields` 同族的
+/// `serialized_field_names_are_exactly_the_eleven_settings_fields` 同族的
 /// `credential_debug_never_prints_the_secret_bytes` 钉住它。
 impl std::fmt::Debug for SettingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -250,6 +268,13 @@ pub struct Settings {
     pub theme: String,
     pub mode: Mode,
     pub font_size: u32,
+    /// 采样温度，进 `ChatRequest.temperature`（`openai_compat.rs` 的 build_request 早已
+    /// 把它写进请求体，缺的只是这个键）。夹 `0.0..=2.0`：兼容端点对 >2 普遍报错。
+    pub temperature: f32,
+    /// 压缩触发线，**占预算的比例**（消费者在 T41）。夹 `0.05..=0.95`。
+    pub compact_threshold: f32,
+    /// 压缩时保留原文的最近轮数 K。夹 `1..=50`；K=0 会让刚说完的那轮也被摘要掉。
+    pub keep_turns: u32,
 }
 
 impl Default for Settings {
@@ -265,7 +290,25 @@ impl Default for Settings {
             theme: "noir".into(),
             mode: Mode::Dark,
             font_size: 15,
+            temperature: DEFAULT_TEMPERATURE,
+            compact_threshold: DEFAULT_COMPACT_THRESHOLD,
+            keep_turns: DEFAULT_KEEP_TURNS,
         }
+    }
+}
+
+/// f32 设置项的钳位：**非有限值（NaN、±inf）回落默认，而不是钳到边界**。
+/// `f32::clamp` 对 NaN 返回 NaN（min/max 都被跳过），于是 NaN 阈值会一路活到
+/// T41 那个「该不该压缩」的判定上 —— 任何与 NaN 的比较都是 false，于是压缩静默地
+/// 永不发生，正是 `compact_threshold` 最坏的失效形态。`±inf` 也一样：手改的
+/// `settings.json` 里写 `1e40` 解出来就是 inf，钳到 0.95 与回落默认哪个更能用？
+/// 后者 —— 一个从默认值出发的阈值至少还是个说得清的数。
+/// 先例同 `ContextBuilder::set_calibration`（`agent/context.rs` 的 `is_finite` 那道闸）。
+fn clamp_finite(value: f32, fallback: f32, min: f32, max: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        fallback
     }
 }
 
@@ -289,6 +332,25 @@ impl Settings {
         // R123（边界由 T15 定，这里是唯一钳位处）：`applyTheme` 原样把它写成 inline `--font-size`，
         // 0 → 看不见字、`u32::MAX` → 一行一个字，都不报错。TS 侧不再钳第二遍，免得两处边界漂移。
         self.font_size = self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        // Plan C T39：压缩与采样的三个参数走**同一道闸**，而且和上面那些同样只调不报错。
+        // `compact_threshold` 的两端都比字面上更危险：1.5 是「永不压缩」（长对话必然失忆，
+        // 而这正是本计划要修的东西），0 以下是「每轮都压」。
+        // `keep_turns` 的下界是 1 而不是 0：K=0 连刚说完的那轮都被摘要掉。
+        // `temperature` 的上界 2.0 是替用户挡端点的 400 —— 兼容实现对 >2 普遍报错，
+        // 而报错的是用户的锅、不是设置界面的。
+        self.compact_threshold = clamp_finite(
+            self.compact_threshold,
+            DEFAULT_COMPACT_THRESHOLD,
+            MIN_COMPACT_THRESHOLD,
+            MAX_COMPACT_THRESHOLD,
+        );
+        self.keep_turns = self.keep_turns.clamp(MIN_KEEP_TURNS, MAX_KEEP_TURNS);
+        self.temperature = clamp_finite(
+            self.temperature,
+            DEFAULT_TEMPERATURE,
+            MIN_TEMPERATURE,
+            MAX_TEMPERATURE,
+        );
     }
 
     /// 归一后的副本。派生方法用它，省掉「调用者忘了先 normalize」这条静默错误路径。
@@ -308,6 +370,10 @@ impl Settings {
             reserve_output: c.reserve_output,
             budget_tokens: c.budget_tokens,
             window_messages: c.window_messages,
+            // T39：压缩的两个参数也必须经这里，否则 `settings.json` 里的键就成了
+            // 只有界面能看见的装饰品（T41 读的是 `ContextConfig`，不是 `Settings`）。
+            compact_threshold: c.compact_threshold,
+            keep_turns: c.keep_turns as usize,
         }
     }
 
@@ -319,6 +385,10 @@ impl Settings {
             model: c.model,
             api_key: api_key.to_string(),
             max_output_tokens: c.reserve_output,
+            // `Settings.temperature` 是 f32（有默认值、已被钳进 0..=2），`ModelConfig` 里
+            // 却是 `Option<f32>`：`None` 在协议上意味着「这个字段不上线，由端点自己定」，
+            // 而设置面板给出的永远是一个具体的数。见 `ChatRequest.temperature` 那一条线。
+            temperature: Some(c.temperature),
         }
     }
 }
@@ -667,6 +737,11 @@ mod tests {
         assert_eq!(s.budget_tokens, 32_000);
         assert_eq!(s.window_messages, 40);
         assert_eq!(s.mode, Mode::Dark);
+        // T39 的三个新键同样得在这里钉住：它们没有别的默认值锚点，
+        // 而漏进 `Default` 的字段会被所有 `..Default::default()` 夹具静默读成 0。
+        assert_eq!(s.temperature, 0.7);
+        assert_eq!(s.compact_threshold, 0.85);
+        assert_eq!(s.keep_turns, 10);
     }
 
     #[test]
@@ -1143,6 +1218,102 @@ mod tests {
     }
 
     #[test]
+    fn absurd_compaction_settings_are_clamped_not_obeyed() {
+        // 1.5 的阈值意味着「永不压缩」，0 的阈值意味着「每轮都压」。两者都不该照原样进内核，
+        // 也不该报错 —— 钳位是 normalize 的职责（`font_size` 12..=24 是同一道闸的兄弟字段）。
+        let s = Settings {
+            compact_threshold: 1.5,
+            keep_turns: 0,
+            temperature: 9.0,
+            ..Default::default()
+        };
+        let n = s.normalized();
+        assert!(n.compact_threshold <= 0.95, "阈值上界：留至少 5% 余量");
+        assert!(n.keep_turns >= 1, "K=0 会让压缩把最近一轮也压掉 ⇒ 当场失忆");
+        assert!(
+            (0.0..=2.0).contains(&n.temperature),
+            "兼容端点对 >2 普遍报错，别把用户的锅变成 400"
+        );
+    }
+
+    #[test]
+    fn non_finite_numbers_fall_back_to_the_default_instead_of_to_nan() {
+        // `f32::clamp` 对 NaN 返回 NaN（min/max 都被跳过），而 NaN 与任何数的比较都是 false：
+        // 一个 NaN 的 `compact_threshold` 会让「该不该压缩」永远判假，且一句日志都不留。
+        // 所以这里回落默认而不是钳位 —— 先例是 `set_calibration`（`agent/context.rs`）。
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let n = Settings {
+                compact_threshold: bad,
+                temperature: bad,
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(
+                n.compact_threshold, DEFAULT_COMPACT_THRESHOLD,
+                "非有限阈值必须回落默认，实际 {n:?}"
+            );
+            assert_eq!(n.temperature, DEFAULT_TEMPERATURE, "非有限温度必须回落默认");
+            assert!(n.compact_threshold.is_finite() && n.temperature.is_finite());
+        }
+    }
+
+    #[test]
+    fn compaction_bounds_are_the_clamped_values_on_both_ends() {
+        // 上面那条只管「不许照原样进内核」，这一条把**两个方向**的边界都钉成精确数字，
+        // 否则把 `0.05` 写成 `0.0`（阈值 0 = 每轮都压）不会有任何测试变红。
+        for (input, want) in [
+            (-1.0f32, MIN_COMPACT_THRESHOLD),
+            (0.0, MIN_COMPACT_THRESHOLD),
+            (0.05, MIN_COMPACT_THRESHOLD),
+            (0.85, 0.85),
+            (0.95, MAX_COMPACT_THRESHOLD),
+            (1.0, MAX_COMPACT_THRESHOLD),
+            (1.5, MAX_COMPACT_THRESHOLD),
+        ] {
+            let mut s = Settings {
+                compact_threshold: input,
+                ..Default::default()
+            };
+            s.normalize();
+            assert_eq!(
+                s.compact_threshold, want,
+                "compact_threshold={input} 应钳到 {want}"
+            );
+        }
+        for (input, want) in [
+            (-1.0f32, MIN_TEMPERATURE),
+            (0.0, MIN_TEMPERATURE),
+            (0.7, 0.7),
+            (2.0, MAX_TEMPERATURE),
+            (2.5, MAX_TEMPERATURE),
+            (9.0, MAX_TEMPERATURE),
+        ] {
+            let mut s = Settings {
+                temperature: input,
+                ..Default::default()
+            };
+            s.normalize();
+            assert_eq!(s.temperature, want, "temperature={input} 应钳到 {want}");
+        }
+        // `keep_turns` 是 u32，非有限值压根造不出来，只需要边界。
+        for (input, want) in [
+            (0u32, MIN_KEEP_TURNS),
+            (1, MIN_KEEP_TURNS),
+            (10, 10),
+            (50, MAX_KEEP_TURNS),
+            (51, MAX_KEEP_TURNS),
+            (u32::MAX, MAX_KEEP_TURNS),
+        ] {
+            let mut s = Settings {
+                keep_turns: input,
+                ..Default::default()
+            };
+            s.normalize();
+            assert_eq!(s.keep_turns, want, "keep_turns={input} 应钳到 {want}");
+        }
+    }
+
+    #[test]
     fn font_size_is_the_clamped_value_after_a_save_and_load_round_trip() {
         // 边界只在 `normalize()` 里定义一次，所以「读回来」「落盘的字节」两处都得是钳过的值，
         // 而不是靠前端再钳一遍（那会造出第二份真相，T16 就无法确定自己拿到的是哪个数）。
@@ -1205,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn to_context_config_maps_the_three_context_fields_and_clamps_them() {
+    fn to_context_config_maps_every_context_field_and_clamps_them() {
         let cc = Settings {
             reserve_output: 2_000,
             budget_tokens: 1_000,
@@ -1222,6 +1393,38 @@ mod tests {
             (4096, 32_000, 40),
             "派生出来的默认值必须和 context.rs 的默认值逐字相同（spec 5.3）"
         );
+        assert_eq!(
+            (d.compact_threshold, d.keep_turns),
+            (0.85, 10),
+            "压缩那两个键也一样：两边默认值一旦分叉，T41 读到的就不是设置里的那个"
+        );
+    }
+
+    #[test]
+    fn settings_reach_the_context_builder_end_to_end() {
+        // 这条钉的是「映射」而不是「钳位」：钳位由上面那条管。谁把 to_context_config
+        // 里这两行漏掉，T41 的压缩就会永远看到 0.85/10 —— 用户改了设置、什么都没发生。
+        let s = Settings {
+            compact_threshold: 0.5,
+            keep_turns: 3,
+            ..Default::default()
+        };
+        let c = s.to_context_config();
+        assert_eq!(c.compact_threshold, 0.5);
+        assert_eq!(c.keep_turns, 3);
+    }
+
+    #[test]
+    fn settings_temperature_reaches_the_request_body() {
+        // 前置事实 3：管线早就通了（openai_compat.rs 的 build_request 且 :1025 那条钉着），
+        // 缺的只有 `Settings` 这个键和 session.rs 那句 `temperature: None`。
+        // 这条测试钉的是**最后一段线**，不是重测 openai_compat。
+        let s = Settings {
+            temperature: 0.3,
+            ..Default::default()
+        };
+        let mc = s.to_model_config("k");
+        assert_eq!(mc.temperature, Some(0.3));
     }
 
     #[test]
@@ -1257,7 +1460,7 @@ mod tests {
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_eight_settings_fields() {
+    fn serialized_field_names_are_exactly_the_eleven_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -1271,19 +1474,27 @@ mod tests {
             [
                 "base_url",
                 "budget_tokens",
+                "compact_threshold",
                 "font_size",
+                "keep_turns",
                 "mode",
                 "model",
                 "reserve_output",
+                "temperature",
                 "theme",
                 "window_messages"
             ]
         );
+        // T39 起 `temperature`/`compact_threshold`/`keep_turns` 都是**认识的**键，
+        // 再放进这个名单就会自我矛盾（它测的是「这个键压根不存在」，不是「它没被序列化」）。
+        // 剩下唯一永远不该出现的键只有 `api_key`：它住凭据管理器，不住 settings.json（R89/spec :473）。
+        // T43 新加的 `accent`/`mcp`/`roots` 落进 `Settings` 后同样要从这里挪走 ——
+        // 这条名单只该收缩，谁加字段谁负责，别把它当成「五个永远不会出现的键」的原样清单。
         let raw = serde_json::to_string(&Settings::default()).unwrap();
-        for banned in ["api_key", "temperature", "accent", "mcp", "roots"] {
+        for banned in ["api_key"] {
             assert!(
                 !raw.contains(banned),
-                "{banned} 不该出现在 Plan A 的 settings.json 里"
+                "{banned} 不该出现在 settings.json 里"
             );
         }
     }
@@ -1321,9 +1532,12 @@ mod tests {
     fn unknown_fields_are_ignored_and_the_file_is_not_backed_up() {
         let d = tempfile::tempdir().unwrap();
         let store = SettingsStore::new(d.path());
+        // 夹具必须用**永远不会被认识**的键。原来这里写的是 `"temperature":0.7,"accent":"#ffffff"`，
+        // 而 T39 把 `temperature` 变成了 `Settings` 的真字段 —— 测试照绿，但它声称的
+        // 「不认识的字段被忽略」从此没人测了（前置事实 4 的第二半，那才是真正的坑）。
         std::fs::write(
             store.path(),
-            r##"{"model":"qwen-turbo","temperature":0.7,"accent":"#ffffff","mcp":{"n":1}}"##,
+            r##"{"model":"qwen-turbo","quantum_mode":true,"legacy_engine":"x"}"##,
         )
         .unwrap();
         let got = store.load().unwrap();

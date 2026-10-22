@@ -256,6 +256,9 @@ pub struct TurnDeps {
     pub sink: Arc<dyn EventSink>,
     /// 由 `Settings::to_context_config()` 给（R100）：钳位与预算只有一处定义。
     pub context: ContextConfig,
+    /// 由 `Settings::to_model_config()` 给（T39）：`None` = 请求体不带 `temperature`，
+    /// 端点自己定。和 `context` 同样理由 —— 会话不许自己去读 `Settings`。
+    pub temperature: Option<f32>,
     pub cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
@@ -289,6 +292,7 @@ pub async fn run_turn(
         model,
         sink,
         context,
+        temperature,
         cancel,
     } = deps;
     let sid = session_id.to_string();
@@ -308,6 +312,7 @@ pub async fn run_turn(
         gate,
         sink,
         context: ContextBuilder::new(context),
+        temperature,
     });
     let token = TurnToken { slot: cancel };
     token.install(session.cancel_handle());
@@ -400,8 +405,11 @@ pub async fn send_message(
     )?;
 
     // 明文 key 只在这一行进 `ModelConfig`：不打日志、不进事件、不回前端（spec:473）。
-    let model =
-        Arc::new(OpenAiCompat::new(settings.to_model_config(&api_key)).map_err(|e| e.to_string())?);
+    // T39：温度从**同一个** `ModelConfig` 里取出来交给会话 —— 这里读一次 `Settings`，
+    // `AgentSession` 只收现成的值，配置真相仍然只有一份。
+    let model_cfg = settings.to_model_config(&api_key);
+    let temperature = model_cfg.temperature;
+    let model = Arc::new(OpenAiCompat::new(model_cfg).map_err(|e| e.to_string())?);
     drop(api_key);
 
     let emitter = Arc::new(TauriEmitter::new(
@@ -417,6 +425,8 @@ pub async fn send_message(
             sink: emitter.clone(),
             // R100：钳位与预算只有一处定义，手搭 `ContextConfig{..}` 等于绕过 `normalize()`。
             context: settings.to_context_config(),
+            // T39：同上，温度的唯一来源是上面那个 `ModelConfig`（同一个 `normalize()` 出来的）。
+            temperature,
             cancel: state.cancel.clone(),
         },
         &session_id,
@@ -1111,6 +1121,10 @@ mod tests {
                     model,
                     sink: sink.clone(),
                     context: ContextConfig::default(),
+                    // 夹具不带温度 = 请求体里不带这个键，与 T39 之前的行为逐字相同
+                    // （`run_turn` 侧的那条线由 `session.rs` 的
+                    // `the_session_temperature_reaches_the_chat_request` 钉）。
+                    temperature: None,
                     cancel: self.cancel.clone(),
                 },
                 sid,
