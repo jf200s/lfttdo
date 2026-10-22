@@ -18,8 +18,8 @@
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
 
-use rmcp::transport::TokioChildProcess;
 use rmcp::ServiceExt;
+use rmcp::transport::TokioChildProcess;
 use tokio::process::Command as TokioCommand;
 
 /// 协议自带的 stdio 测试服务器（官方、无需密钥）。`stdio` 是它选择传输的命令行参数。
@@ -91,20 +91,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     hb.args(["/C", "npx", "-y", PKG, "stdio"]);
     candidates.push(("B-cmd-C", Some(hb)));
 
-    candidates.push(("C-resolved", chosen.map(|p| {
-        let mut hc = TokioCommand::new(p);
-        hc.args(["-y", PKG, "stdio"]);
-        hc
-    })));
+    candidates.push((
+        "C-resolved",
+        chosen.map(|p| {
+            let mut hc = TokioCommand::new(p);
+            hc.args(["-y", PKG, "stdio"]);
+            hc
+        }),
+    ));
 
     // 默认顺序 A,B,C（首个成功即停）。可用 MCP_PROBE_ORDER=C-resolved,B-cmd-C 把某种
     // 策略提前，让“每种策略各自的真实结果”都能被单独量到，而不是被 A/B 短路掉
     // （取值必须是下面 push 的完整 label，写 C/B 这种短名不会命中、会静默退回默认序）。
     if let Ok(spec) = std::env::var("MCP_PROBE_ORDER") {
         let want: Vec<String> = spec.split(',').map(|t| t.trim().to_string()).collect();
-        candidates.sort_by_key(|(label, _)| {
-            want.iter().position(|w| w == label).unwrap_or(usize::MAX)
-        });
+        candidates
+            .sort_by_key(|(label, _)| want.iter().position(|w| w == label).unwrap_or(usize::MAX));
     }
     let mut winner: Option<&str> = None;
     let mut winner_pid: Option<u32> = None;
@@ -118,7 +120,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let tc = match TokioChildProcess::new(cmd) {
             Ok(tc) => tc,
             Err(e) => {
-                println!("handshake {label}: spawn ERR kind={:?} os={:?} {e}", e.kind(), e.raw_os_error());
+                println!(
+                    "handshake {label}: spawn ERR kind={:?} os={:?} {e}",
+                    e.kind(),
+                    e.raw_os_error()
+                );
                 continue;
             }
         };
@@ -139,15 +145,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match list_res {
             Ok(res) => {
                 let n = res.tools.len();
-                let first3: Vec<String> =
-                    res.tools.iter().take(3).map(|t| t.name.to_string()).collect();
+                let first3: Vec<String> = res
+                    .tools
+                    .iter()
+                    .take(3)
+                    .map(|t| t.name.to_string())
+                    .collect();
                 println!("handshake {label}: tools={n} first3={first3:?}");
                 winner = Some(label);
                 winner_pid = pid;
                 // 只靠 rmcp 关闭：cancel() -> RunningService::close() -> transport.close()
                 // -> TokioChildProcess::graceful_shutdown()（关 stdin，等 3s，超时才 kill）。
                 match service.cancel().await {
-                    Ok(reason) => println!("handshake {label}: cancelled via rmcp, quit={reason:?}"),
+                    Ok(reason) => {
+                        println!("handshake {label}: cancelled via rmcp, quit={reason:?}")
+                    }
                     Err(e) => println!("handshake {label}: cancel JOIN_ERR {e:?}"),
                 }
                 break;
@@ -170,11 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn describe(r: &Result<tokio::process::Child, std::io::Error>) -> String {
     match r {
         Ok(c) => format!("ok pid={:?}", c.id()),
-        Err(e) => format!(
-            "ERR kind={:?} os={:?} {e}",
-            e.kind(),
-            e.raw_os_error()
-        ),
+        Err(e) => format!("ERR kind={:?} os={:?} {e}", e.kind(), e.raw_os_error()),
     }
 }
 
