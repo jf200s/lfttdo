@@ -7,6 +7,7 @@
 // 本模块与 Tauri 无关（Plan A 约束：只有 `ipc.rs` 允许 `use tauri`）：数据库路径由
 // 调用方给，不碰 tauri 的 path API 去找 app data 目录。
 
+use crate::agent::context::CompactionPlan;
 use crate::agent::events::{AgentEvent, StopReason};
 use crate::agent::types::{ContentBlock, Message, Risk, Role, ToolCallView};
 use rusqlite::types::Type;
@@ -91,11 +92,17 @@ impl Db {
     }
 
     /// 锁中毒后继续服务，而不是 panic 把整个应用永久锁死（R76）。
-    /// 这个取舍成立的前提是本模块的写全部是**单语句 autocommit**：没有跨锁持有的事务，
-    /// 也没有 panic 时留在连接上的未回滚事务。将来谁把两条语句包成一个事务，
-    /// 这里必须改成显式回滚，吞掉 poison 就不再安全了。
+    /// 这个取舍成立的前提是**这里的写不会在 panic 中留下未回滚的事务**：
+    /// 单语句写（`append_message` 等）本来就没有跨锁事务；T41 的 `compact_session` 确实
+    /// 跨锁持有一个事务，但它靠 `rusqlite::Transaction` 的 **RAII 回滚**兑现同一个前提 ——
+    /// 事务对象被 drop（正常返回 `Err`、`?` 提前退出、或 panic 展开）时自动 ROLLBACK，
+    /// 所以中毒时连接上不会挂着半条事务。将来谁在 `compact_session` 里 `std::mem::forget`
+    /// 那个事务、或把 `Transaction` 换成 `unchecked_transaction` + 手动提交，这里必须重新讨论。
+    /// 另外 `compact_session` 的越界分支刻意**报错而不是 slice panic**：panic 会把锁打成
+    /// 中毒态，症状是「此后每条命令都打不开」（见那方法的文档注释）。
     /// 这层 `Mutex` 不可重入：`Db` 的方法都是「先取锁再碰连接」，将来谁在持锁期间
     /// 再调一个 `Db` 方法，就是自己等自己 —— 表现是界面卡死而不是报错，所以别试。
+    /// （`compact_session` 全程只取一次锁、内部只调自由函数 `insert_message_row`，不碰 `&self`。）
     fn lock(&self) -> MutexGuard<'_, Connection> {
         crate::lock::guard(&self.conn)
     }
@@ -181,22 +188,62 @@ impl Db {
 
     /// 追加一行，返回 rowid。刻意不包事务：这里碰两行（messages 与 sessions.updated_at），
     /// 撕裂的代价只是排序键旧了一格；包成事务会让上面的「中毒即恢复」承担回滚语义。
+    /// SQL 与 `blocks_json` 的编码都在 [`insert_message_row`]（T41 要求：落一行消息的写法
+    /// 只有一处真相，压缩备注必须走同一条路）。
     pub fn append_message(&self, session_id: &str, m: &Message) -> Result<i64, rusqlite::Error> {
-        // blocks_json 只装 blocks 数组，role 有自己的列（可被 SQL 过滤，且是 R71 的显式 match）。
-        let json = serde_json::to_string(&m.blocks)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        let t = Self::now_ms();
         let c = self.lock();
-        c.execute(
-            "INSERT INTO messages(session_id,role,blocks_json,created_at) VALUES(?1,?2,?3,?4)",
-            params![session_id, role_code(&m.role), json, t],
-        )?;
-        let rowid = c.last_insert_rowid();
-        c.execute(
-            "UPDATE sessions SET updated_at=?2 WHERE id=?1",
-            params![session_id, t],
-        )?;
-        Ok(rowid)
+        insert_message_row(&c, session_id, m)
+    }
+
+    /// 把 [`CompactionPlan`](crate::agent::context::CompactionPlan) 圈定的最老一段对话行删掉，
+    /// 并在**同一个事务**里落一条 `Role::System` 摘要备注。
+    ///
+    /// **一个事务 = 删除与插入要么都成、要么都不做**（计划 Step 5）。两条失败路径各有各的
+    /// 覆盖：取消发生在「模型还在写摘要」时，压根不会走到这里（`ipc.rs` 的
+    /// `compact_before_turn` 先收完摘要再调本方法，所以库自然一字未改）；而**事务中途失败**
+    /// 由 `a_failed_note_insert_rolls_the_deletes_back_too` 用触发器实测 —— 把这里拆成两次
+    /// 非事务调用，那条会留下「原文已删、备注没落」的半条状态。
+    ///
+    /// **下标口径**：`plan.drop_from`/`drop_to` 数的是**对话消息**（去掉 `role = 'system'`
+    /// 之后按 `ORDER BY id` 的序列）里的位置，与 `compaction_plan` 的 `conv` 同一个口径；
+    /// 映射见 [`conversation_ids`]，那里写明了为什么不能用 `LIMIT/OFFSET`。
+    ///
+    /// **备注落在物理尾部**（前置事实 3）：`id INTEGER PRIMARY KEY AUTOINCREMENT` 让新插入的
+    /// 一行拿到最大 id，`messages()` 读回来就在最后 —— 「插在最前」物理上做不到，也不需要：
+    /// `ContextBuilder::build()` 把 `Role::System` 整行摘出来当 `notes` 拼在 head 之后，
+    /// `events_from_messages` 的 `Role::System => {}` 又让它对用户不可见。这条不变量由
+    /// 测试里的 `build()` 断言钉住，而不是钉在一条写不出来的 SQL 上。
+    pub fn compact_session(
+        &self,
+        session_id: &str,
+        plan: &CompactionPlan,
+        note_text: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let mut c = self.lock();
+        let tx = c.transaction()?;
+        let ids = conversation_ids(&tx, session_id)?;
+        // 越界意味着 plan 与库已经分叉（单轮闸门之外的写入、或将来有人把读历史与压缩拆开）。
+        // 这里必须**报错**而不是 `ids[from..to]` 当场 slice panic：panic 会把 `Mutex` 打成
+        // 中毒态，症状是「此后每条命令都打不开」。
+        if plan.drop_from > plan.drop_to || plan.drop_to > ids.len() {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_RANGE),
+                Some(format!(
+                    "压缩区间 [{}, {}) 越界：会话 {session_id} 现在只有 {} 条对话消息（超出计划要删的行数）",
+                    plan.drop_from,
+                    plan.drop_to,
+                    ids.len()
+                )),
+            ));
+        }
+        for id in &ids[plan.drop_from..plan.drop_to] {
+            tx.execute("DELETE FROM messages WHERE id=?1", params![id])?;
+        }
+        // 同一条 append 路径：备注是一行普通消息，role 由 `Message::system_note` 决定，
+        // 这里不新写 INSERT（`blocks_json` 的编码必须只有一个来源）。
+        insert_message_row(&tx, session_id, &Message::system_note(note_text))?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// 读回一个会话的全部消息，顺序 == 写入顺序（`ORDER BY id`，不是时间戳：
@@ -248,6 +295,54 @@ pub struct SessionRow {
 fn pragma_i64(c: &Connection, name: &str) -> Result<i64, rusqlite::Error> {
     // `name` 只来自本文件里的字面量，没有拼接外部输入的路径。
     c.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+}
+
+/// 落一行消息的**唯一** SQL 与**唯一**的 `blocks_json` 编码点（T41 Step 5：
+/// 「插入走已有 `append_message` 的 SQL，不新写一条 INSERT」—— 两条 INSERT 语句就是两份
+/// 「一行消息长什么样」的真相，早晚和 `role_code` 分叉）。
+///
+/// 收 `&Connection` 而不是 `&mut Connection`：`rusqlite::Transaction` 实现了
+/// `Deref<Target = Connection>`（rusqlite 0.40.2 `transaction.rs:233`），所以
+/// `compact_session` 在事务里直接把 `&tx` 递进来，两处共用同一条语句。
+/// `session_id` 不存在时由外键报错（`a_row_for_an_unknown_session_is_rejected_by_the_foreign_key`），
+/// 这里不另做一次存在性检查 —— 那是第二份真相。
+fn insert_message_row(
+    c: &Connection,
+    session_id: &str,
+    m: &Message,
+) -> Result<i64, rusqlite::Error> {
+    // blocks_json 只装 blocks 数组，role 有自己的列（可被 SQL 过滤，且是 R71 的显式 match）。
+    let json = serde_json::to_string(&m.blocks)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let t = Db::now_ms();
+    c.execute(
+        "INSERT INTO messages(session_id,role,blocks_json,created_at) VALUES(?1,?2,?3,?4)",
+        params![session_id, role_code(&m.role), json, t],
+    )?;
+    let rowid = c.last_insert_rowid();
+    c.execute(
+        "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+        params![session_id, t],
+    )?;
+    Ok(rowid)
+}
+
+/// `CompactionPlan` 的**对话下标**到 `messages.id` 的映射，即「第几条对话消息」对应哪一行。
+/// 顺序与 `Db::messages()` 逐字相同（同一条 `ORDER BY id`）—— 那是这条映射的唯一根据。
+/// **刻意不用 `LIMIT`/`OFFSET`**：SQLite 的 OFFSET 数的是过滤前的行序，在 role 过滤下与
+/// `messages()` 的切片不对齐，切错了就是删错用户的原话。
+/// `'system'` 那个字面量来自 [`role_code`]（口径只有一处）：把 `role<>'system'` 改成硬编码
+/// 字符串，将来 `role_code` 换名就会让备注被当成对话消息删掉
+/// （`the_second_compaction_does_not_count_the_note_as_a_conversation_row` 盯这一点）。
+fn conversation_ids(c: &Connection, session_id: &str) -> Result<Vec<i64>, rusqlite::Error> {
+    let mut st =
+        c.prepare("SELECT id FROM messages WHERE session_id=?1 AND role<>?2 ORDER BY id")?;
+    let ids = st
+        .query_map(params![session_id, role_code(&Role::System)], |r| {
+            r.get::<_, i64>(0)
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(ids)
 }
 
 /// 一行损坏的库内容。`Display` 里带上原始报错，T13 把它 `to_string()` 给前端时
@@ -1041,6 +1136,186 @@ mod tests {
         assert!(
             db.messages(&s).is_err(),
             "兜底成 User 会把库里的一行损坏伪装成「用户说过话」"
+        );
+    }
+
+    // ---------- Db 的可托管性与锁语义（R76） ----------
+
+    // ---------- Task 41：`compact_session`（一个事务里删一段 + 落一条备注）----------
+
+    // `CompactionPlan` 由文件顶部的 `use` 带进来（生产签名要用它），这里不重复 import。
+    use crate::agent::context::{ContextBuilder, ContextConfig, SYSTEM_PROMPT};
+
+    /// 种 `rounds` 轮真实形状的历史：一条 user + 一条 assistant，文本带轮号。
+    /// 行序就是 `messages()` 读回来的顺序（`ORDER BY id`），所以下面的区间断言可以直接对撞。
+    fn seed_rounds(db: &Db, s: &str, rounds: usize) -> Vec<Message> {
+        let mut all = Vec::new();
+        for k in 0..rounds {
+            all.push(user_text(&format!("轮 {k}")));
+            all.push(assistant(vec![text_block(&format!("答 {k}"))]));
+        }
+        for m in &all {
+            db.append_message(s, m).unwrap();
+        }
+        all
+    }
+
+    /// 本层只吃 `drop_from`/`drop_to` 这两个下标（`source` 是调用方送去摘要的那些消息，
+    /// 落库用不上）。手搭而不是调 `compaction_plan`：这里测的是「按下标删行 + 落备注」，
+    /// 决策那半归 `context.rs` 的 `mod compaction_planning`。
+    fn range(from: usize, to: usize) -> CompactionPlan {
+        CompactionPlan {
+            drop_from: from,
+            drop_to: to,
+            dropped: to - from,
+            source: vec![],
+        }
+    }
+
+    /// 备注文本的期望值（前缀由 `summary_note` 负责，这里直接写落库后的样子）。
+    const NOTE_A: &str = "早期对话摘要：轮 0 到轮 3 谈的是天气";
+    const NOTE_B: &str = "早期对话摘要：又压了一段";
+
+    #[test]
+    fn compact_session_removes_the_planned_rows_and_appends_exactly_one_note() {
+        let (_d, db) = tmpdb();
+        let s = db.create_session("压缩前").unwrap();
+        let all = seed_rounds(&db, &s, 20); // 40 行
+
+        db.compact_session(&s, &range(0, 8), NOTE_A).unwrap();
+        let after = db.messages(&s).unwrap();
+
+        // 删 8 行、落 1 行 ⇒ 33。写两条备注就是「同一段历史被摘要了两遍」。
+        assert_eq!(after.len(), 40 - 8 + 1, "实际留下 {} 行", after.len());
+        let notes: Vec<&Message> = after.iter().filter(|m| m.role == Role::System).collect();
+        assert_eq!(notes.len(), 1, "每次压缩恰好一条备注");
+        assert_eq!(notes[0].text_of(), NOTE_A, "备注正文原样进库");
+
+        // 被删的必须是**区间内那 8 行**，其余原样、原序（`ORDER BY id` 就是写入序）。
+        let conv: Vec<&Message> = after.iter().filter(|m| m.role != Role::System).collect();
+        assert_eq!(conv, all[8..].iter().collect::<Vec<_>>().as_slice());
+
+        // 前置事实 3：新插入的备注拿到**最大 id**、读回来排在**最后**。
+        // 「插在最前」物理上做不到（`id INTEGER PRIMARY KEY AUTOINCREMENT`），
+        // 而它没必要 —— 下面那条 `build()` 断言才是这条不变量的真身。
+        assert_eq!(
+            after.last().unwrap().role,
+            Role::System,
+            "备注行的物理位置在尾部：这条断言钉的是事实，不是愿望"
+        );
+
+        // 但模型看到的顺序仍然对：`build()` 把 System 行整行摘出来当 notes、拼在 head 之后。
+        let built = ContextBuilder::new(ContextConfig::default()).build(&after);
+        assert_eq!(built.messages[0].text_of(), SYSTEM_PROMPT);
+        assert_eq!(built.messages[1].text_of(), NOTE_A);
+        assert_eq!(
+            built.messages.last().unwrap().text_of(),
+            all.last().unwrap().text_of(),
+            "尾部那行必须是历史里最后一条，备注不许插进中间把它挤掉"
+        );
+        assert!(
+            built
+                .messages
+                .iter()
+                .filter(|m| m.text_of() == NOTE_A)
+                .count()
+                == 1,
+            "双重前缀 / 备注进了一次以上：`build()` 原样带上 notes，那里不该再拼前缀"
+        );
+    }
+
+    #[test]
+    fn the_second_compaction_does_not_count_the_note_as_a_conversation_row() {
+        // 下标口径的唯一根据是「role<>'system' 之后的序列」，与 `messages()` 里
+        // 非 system 行的相对顺序一致。把 `SELECT id` 那条查询的 role 过滤摘掉，
+        // 第二条备注就会被当成「第 33 条对话消息」参与删除 —— 那是要吃掉用户原话的。
+        let (_d, db) = tmpdb();
+        let s = db.create_session("两次压缩").unwrap();
+        let all = seed_rounds(&db, &s, 20); // 40 行
+
+        db.compact_session(&s, &range(0, 8), NOTE_A).unwrap();
+        db.compact_session(&s, &range(2, 10), NOTE_B).unwrap();
+        let after = db.messages(&s).unwrap();
+
+        let notes: Vec<String> = after
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .map(|m| m.text_of())
+            .collect();
+        assert_eq!(
+            notes,
+            [NOTE_A, NOTE_B],
+            "两次压缩各留一条备注，且第一条不许被第二次当成对话消息删掉"
+        );
+        let conv: Vec<&Message> = after.iter().filter(|m| m.role != Role::System).collect();
+        // 第一次留下 all[8..40]；第二次吃掉其中下标 2..10 ⇒ 剩 all[8..10] + all[18..40]。
+        let mut want: Vec<&Message> = all[8..10].iter().collect();
+        want.extend(all[18..40].iter());
+        assert_eq!(conv, want, "第二次的区间必须相对**当下**的对话序列数");
+        // 40 - 8 + 1 - 8 + 1 = 26：两次各删 8 行、各落 1 条备注。
+        assert_eq!(after.len(), 24 + 2, "留下 24 条对话 + 2 条备注");
+
+        // 这条测试真正的牙在这里：越界判据数的必须是**对话行数**，不是**总行数**。
+        // 此刻库里 24 条对话 + 2 条备注 = 26 行。把 `conversation_ids` 里 `role<>?2` 那道
+        // 过滤摘掉，两条备注就成了「第 25、26 条对话消息」，下面这个区间于是合法，
+        // 会把用户仅剩的原话连同两条摘要一起吃掉 —— 而它现在是**越界拒绝**。
+        let err = db
+            .compact_session(&s, &range(0, want.len() + 1), NOTE_B)
+            .expect_err("区间越过对话行数就该拒绝，即使总行数够（备注不是对话消息）");
+        assert!(
+            err.to_string().contains("越界") || err.to_string().contains("超出"),
+            "错误文本要说得出是哪件事：{err}"
+        );
+        assert_eq!(
+            db.messages(&s).unwrap(),
+            after,
+            "拒绝之后库里一个字都没动，两条备注都还在"
+        );
+    }
+
+    #[test]
+    fn a_plan_beyond_the_stored_rows_is_refused_and_writes_nothing() {
+        // `run_turn` 拿的是刚读出来的历史，正常不会越界；越界意味着 plan 与库已经分叉
+        // （单轮并发闸门之外的写入、或将来有人把这两步拆开）。
+        // 这里要的是**报错**，不是 slice panic —— panic 会把 `Mutex` 打成中毒态，
+        // 症状是「此后每条命令都打不开」（`lock()` 的文档注释就是为这一刻写的）。
+        let (_d, db) = tmpdb();
+        let s = db.create_session("越界").unwrap();
+        let all = seed_rounds(&db, &s, 4); // 8 行
+        let err = db
+            .compact_session(&s, &range(0, 99), NOTE_A)
+            .expect_err("越界的区间必须报错，不许静默少删");
+        assert!(
+            err.to_string().contains("越界") || err.to_string().contains("超出"),
+            "错误文本要说得出是哪件事：{err}"
+        );
+        assert_eq!(db.messages(&s).unwrap(), all, "拒绝之后库里一个字都没动");
+    }
+
+    /// 这条就是「一个事务」四个字的牙齿。把删除与插入拆成两次非事务调用（计划 Step 8
+    /// 判据 (c) 的变异），这里会留下「原文已删、备注没落」的半条状态 —— 用户的历史
+    /// 凭空少 8 行而界面上没有任何摘要，而且下一轮连重压的机会都没有（备注才是线索）。
+    /// 夹具用触发器让**事务里的第二条语句**失败：取消测试测不到这一侧，因为取消发生在
+    /// 事务开始之前，拆不拆事务它都照样绿。
+    #[test]
+    fn a_failed_note_insert_rolls_the_deletes_back_too() {
+        let (_d, db) = tmpdb();
+        let s = db.create_session("半条事务").unwrap();
+        let all = seed_rounds(&db, &s, 10); // 20 行
+        {
+            let c = db.lock();
+            c.execute_batch(
+                "CREATE TRIGGER no_message_insert BEFORE INSERT ON messages \
+                 BEGIN SELECT RAISE(ABORT, '夹具：这一条插入必须失败'); END",
+            )
+            .unwrap();
+        }
+        db.compact_session(&s, &range(0, 8), NOTE_A)
+            .expect_err("插入被触发器挡下，compact_session 必须报错");
+        assert_eq!(
+            db.messages(&s).unwrap(),
+            all,
+            "备注没落地 ⇒ 同一事务里的删除必须一起回滚"
         );
     }
 

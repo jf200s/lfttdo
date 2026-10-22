@@ -7,6 +7,7 @@
 use crate::agent::context::{ContextBuilder, ContextConfig};
 use crate::agent::events::{AgentEvent, Decision, EventSink, StopReason};
 use crate::agent::session::{AgentSession, SessionDeps};
+use crate::agent::summarize::{SUMMARY_OMITTED, collect_summary, summary_note, summary_request};
 use crate::agent::types::{ContentBlock, Message};
 use crate::model::openai_compat::{OpenAiCompat, is_loopback_endpoint};
 use crate::model::provider::ModelProvider;
@@ -274,12 +275,92 @@ where
         .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
-/// 一轮对话的完整生产路径：恢复历史 → `AgentSession::run` → **只写新增的行** → 条件自动改名。
+/// 两次发送之间的摘要压缩（T41）。
+///
+/// 为什么它是一段**独立**的 `pub(crate)` 函数、而不是 `run_turn` 里的一串行：
+/// `#[tauri::command]` 在单测里调不动（Plan A T13 实测），而 `run_turn` 要凑齐 `TurnDeps`
+/// 那八项才谈得上一次调用。把压缩的真相收进一个不碰 `State` 的签名，Step 1–4 的测试直接调
+/// 它（brief §5），`run_turn` 剩下的只有「按顺序装配」。
+///
+/// 三步，全部在「越了线」这个判定里面（`an_under_threshold_history_costs_no_model_call…`
+/// 守的就是这条 —— 把 IO 挪到判定外，用户每次发消息都要白烧一次摘要调用）：
+/// 1) 问构建器要不要压、压哪一段：纯决策，不调模型不做 IO（T40）；
+/// 2) 用被丢掉的那一段换一句摘要。摘要调用报错就降级成 `SUMMARY_OMITTED` 并**照压**
+///    （spec:365：降级只换正文，不换事务）；用户在摘要还挂着的时候按了停止是另一件事 ——
+///    事务压根还没开始，一个字节都不写，原样交回；
+/// 3) 一次事务删旧行 + 落一条 `Role::System` 备注（`db.rs` 的 `compact_session`），
+///    然后把库**重读**回来。
+///
+/// 交回的是重读后的历史：调用方必须在这份历史之上才取 `prior`（brief §4 的第一个陷阱）。
+/// 交回的事件只带两个数（`dropped` / `summary_chars`），摘要文本一个字都不在其中 ——
+/// 它唯一的去处是库里那条 `Role::System` 备注，而那条备注在模型侧可见、用户侧不可见（R69）。
+pub(crate) async fn compact_before_turn(
+    db: &Arc<Db>,
+    session_id: &str,
+    model: &dyn ModelProvider,
+    builder: &ContextBuilder,
+    history: Vec<Message>,
+    cancel: &CancellationToken,
+) -> Result<(Vec<Message>, Option<AgentEvent>), String> {
+    let Some(plan) = builder.compaction_plan(&history) else {
+        return Ok((history, None));
+    };
+
+    let body = match collect_summary(model, summary_request(&plan.source), cancel).await {
+        Ok(text) => text,
+        // 取消优先于报错。`collect_summary` 的 `Err` 在这一臂既可能是「用户按了停止」也可能
+        // 是端点报错，所以判据看令牌、不看错误文本（错误文本里那句「已取消」是它的兜底说法，
+        // 不是事实来源）。没压成，也就没什么可宣布的。
+        Err(_) if cancel.is_cancelled() => return Ok((history, None)),
+        // 降级。原因只进日志、不进事件：`ContextCompacted` 的载荷是两个数，前端那句
+        // 「已压缩 N 轮」不该被一条端点文案污染；日志才是它该去的地方（R107，GUI 没有控制台）。
+        Err(reason) => {
+            tracing::warn!("会话 {session_id} 的摘要调用失败，本轮改为省略占位：{reason}");
+            SUMMARY_OMITTED.to_string()
+        }
+    };
+
+    let note = summary_note(&body);
+    let dropped = plan.dropped;
+    // 字数按字符算不是按字节：中文备注用 `len()` 会显示成 3 倍（brief §4 的第三条陷阱）。
+    let summary_chars = note.chars().count();
+    let writer = db.clone();
+    let write_sid = session_id.to_string();
+    blocking(move || {
+        writer
+            .compact_session(&write_sid, &plan, &note)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+
+    // 重读，不在内存里自己拼那份「删了若干行 + 加了一条备注」的结果：
+    // 库里是什么样就以库为准，`run_turn` 之后的 `restore`/`append_rows` 才有同一个基准。
+    let reader = db.clone();
+    let read_sid = session_id.to_string();
+    let reread = blocking(move || reader.messages(&read_sid).map_err(|e| e.to_string())).await?;
+    Ok((
+        reread,
+        Some(AgentEvent::ContextCompacted {
+            dropped,
+            summary_chars,
+        }),
+    ))
+}
+
+/// 一轮对话的完整生产路径：读历史 →（越线就）摘要压缩 → `AgentSession::run` →
+/// **只写新增的行** → 条件自动改名。
 ///
 /// R103 的落库所有权就落在 `prior` 这一个下标上：`session.rs:110` 的 `run()` 自己会
 /// `history.push(Message::user(blocks))`（一条用户轮次 = 一行），而 `restore()` 装回来的
 /// 历史本来就在库里。所以发送前一行都不写、跑完只写 `history[prior..]`。
 /// brief:152-160 的写法（按块补写 + 整段重放）会把一轮的两行写成四行。
+///
+/// T41 加的那一段就插在 `prior` 之前，顺序是硬性的（brief §4 的三条陷阱）：
+/// ① `prior` 取在压缩段**重读之后**那份历史之上 —— 取在压缩前就是 `history()[40..]` 越界；
+/// ② 构建器只造一次，压缩段借 `&builder`，同一个 `builder` 随后 move 进 `SessionDeps`
+///    （造两次就是两份阈值、两份校准，压缩判定和装配判定从此可以分叉）；
+/// ③ `ContextCompacted` 在写本轮新行**之前**emit（顺序在用户那边是「先说压缩、再答这句」），
+///    也在 `sink` move 进 `SessionDeps` 之前用借用发。
 pub async fn run_turn(
     deps: TurnDeps,
     session_id: &str,
@@ -301,6 +382,24 @@ pub async fn run_turn(
     let reader = db.clone();
     let read_sid = sid.clone();
     let history = blocking(move || reader.messages(&read_sid).map_err(|e| e.to_string())).await?;
+
+    // 构建器只在这里造一次（②），压缩段与本轮用的是同一个。
+    let builder = ContextBuilder::new(context);
+
+    // 摘要调用挂在流上的那几秒也必须能被「停止」打到，所以先把**这一只**令牌装进槽位。
+    // `AgentSession::new` 自己造令牌（`session.rs:74`）且不接受外来的，只能先装这只、
+    // 装配完再换成会话那只，并把已经按下的停止传染过去。
+    let compaction = CancellationToken::new();
+    let token = TurnToken { slot: cancel };
+    token.install(compaction.clone());
+
+    let (history, compacted) =
+        compact_before_turn(&db, &sid, &*model, &builder, history, &compaction).await?;
+    // ③：先宣布，再答这句。此刻本轮的一行都还没写。
+    if let Some(event) = compacted {
+        sink.emit(event);
+    }
+    // ①：这一行必须在压缩段之后，量的才是「restore 回来的那份历史」。
     let prior = history.len();
 
     // R105：装配期没有 session_id，所以 gate 的出口每轮换一次内核（`gate.rs:77`）。
@@ -311,11 +410,17 @@ pub async fn run_turn(
         registry,
         gate,
         sink,
-        context: ContextBuilder::new(context),
+        context: builder,
         temperature,
     });
-    let token = TurnToken { slot: cancel };
-    token.install(session.cancel_handle());
+    let session_cancel = session.cancel_handle();
+    token.install(session_cancel.clone());
+    if compaction.is_cancelled() {
+        // 停止是按在摘要上的：会话带着同一个事实早退（`session.rs:114` 直接收尾成
+        // `Interrupted`，连 user 行都不 push），而不是在这里另发明一套「按了停止还跑不跑」。
+        // `fresh` 因此是空的，本轮一个字都不写 —— 库里那一刻还是压缩前的完整历史。
+        session_cancel.cancel();
+    }
     session.restore(history);
 
     let reason = session.run(blocks).await;
@@ -1339,6 +1444,530 @@ mod tests {
             f.cancel.lock().unwrap().is_none(),
             "一轮跑完不许把令牌留在槽里"
         );
+    }
+
+    // ==== Task 41：两次发送之间的摘要压缩 ====
+    //
+    // 本组的形状由 brief §5 定死：`#[tauri::command]` 在单测里调不动（Plan A T13 实测过），
+    // 所以压缩段的全部真相住在**不依赖 `State`** 的 `compact_before_turn` 里，Step 1–4 的
+    // 测试一律直接调它、一处都不碰 `run_turn`。唯一例外是
+    // `prior_is_recounted_after_compaction`：`prior` 那一行下标只存在于 `run_turn` 内部，
+    // 判据 (a)「把 prior 放回压缩前」要红的就是它，理由写在那条测试的注释里。
+    //
+    // 假模型本地写：`session.rs` 的 `VecSink`/`ScriptedModel`/`HangingModel` 是那个私有测试
+    // 模块的（:356/:467/:523），跨不过模块边界，也**不许**为了让它们跨过来改成 `pub`。
+
+    use crate::agent::summarize::{
+        SUMMARY_INSTRUCTION, SUMMARY_OMITTED, SUMMARY_PREFIX, summary_note,
+    };
+    use async_stream::stream;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 摘要调用与本轮回答共用**同一只**模型 —— 生产就是这样（`TurnDeps.model` 只有一个
+    /// `Arc`，`compact_before_turn` 与 `AgentSession` 拿的是它），所以这个替身按请求头部分流：
+    /// 头一条是 `SUMMARY_INSTRUCTION` 就走摘要那一支，否则走回答那一支。
+    /// `calls` 逐次记账（R57：「模型实际看到了什么」只能从模型这一侧取证）。
+    struct FakeModel {
+        /// 摘要调用吐出的分片（失败那一支里它是「报错之前已经到的半句」）
+        summary_parts: Vec<String>,
+        /// `true` = 摘要调用先吐 `summary_parts` 再回一个 `Api` 错误（429 那一类）
+        summary_fails: bool,
+        /// `true` = 摘要调用吐完分片后**挂住不回**，等测试按停止
+        summary_stalls: bool,
+        /// 本轮回答的队列（只有走 `run_turn` 的那条测试用得到）
+        replies: Mutex<VecDeque<String>>,
+        calls: Mutex<Vec<ChatRequest>>,
+        /// 挂住夹具的同步点：置位 = 最后一个分片已经抵达消费者。不靠 sleep 猜时间。
+        stalled: Arc<AtomicBool>,
+    }
+
+    impl FakeModel {
+        fn build(parts: &[&str], answers: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                summary_parts: parts.iter().map(|s| s.to_string()).collect(),
+                summary_fails: false,
+                summary_stalls: false,
+                replies: Mutex::new(answers.iter().map(|s| s.to_string()).collect()),
+                calls: Mutex::new(vec![]),
+                stalled: Arc::new(AtomicBool::new(false)),
+            })
+        }
+        fn summarizing(parts: &[&str]) -> Arc<Self> {
+            Self::build(parts, &[])
+        }
+        /// 报错之前先吐出 `parts` 那半句：半截摘要不是摘要。
+        fn failing(parts: &[&str]) -> Arc<Self> {
+            let mut raw = Self::build(parts, &[]);
+            // 构造期改一次：`Arc` 之后不再可变，所以这里用 `get_mut`（唯一持有者）。
+            Arc::get_mut(&mut raw).unwrap().summary_fails = true;
+            raw
+        }
+        /// 吐完 `parts` 之后永久挂住：测试在 `stalled` 置位的那一刻按停止。
+        fn stalling(parts: &[&str]) -> Arc<Self> {
+            let mut raw = Self::build(parts, &[]);
+            Arc::get_mut(&mut raw).unwrap().summary_stalls = true;
+            raw
+        }
+        /// 走完整 `run_turn` 时用：摘要与回答都要能答。
+        fn summarizing_and_replying(parts: &[&str], answers: &[&str]) -> Arc<Self> {
+            Self::build(parts, answers)
+        }
+        fn calls(&self) -> Vec<ChatRequest> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for FakeModel {
+        fn stream<'a>(
+            &'a self,
+            req: ChatRequest,
+        ) -> std::pin::Pin<Box<dyn Stream<Item = Result<ModelDelta, ModelError>> + Send + 'a>>
+        {
+            self.calls.lock().unwrap().push(req.clone());
+            let is_summary = req
+                .messages
+                .first()
+                .is_some_and(|m| m.role == Role::System && m.text_of() == SUMMARY_INSTRUCTION);
+            if !is_summary {
+                // 回答那一支：取完了就是夹具写错（轮数不够），不许安静地回一条空消息把测试做绿。
+                let reply = self
+                    .replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("夹具的回答轮数不够");
+                return Box::pin(futures::stream::iter(
+                    vec![ModelDelta::Text(reply)].into_iter().map(Ok),
+                ));
+            }
+            if self.summary_fails {
+                let head = self.summary_parts.clone();
+                return Box::pin(futures::stream::iter(
+                    head.into_iter()
+                        .map(|t| Ok(ModelDelta::Text(t)))
+                        .chain(std::iter::once(Err(ModelError::Api(
+                            "429 rate limited".to_string(),
+                        )))),
+                ));
+            }
+            if self.summary_stalls {
+                let head: Vec<ModelDelta> = self
+                    .summary_parts
+                    .iter()
+                    .cloned()
+                    .map(ModelDelta::Text)
+                    .collect();
+                let ready = self.stalled.clone();
+                return Box::pin(stream! {
+                    for d in head {
+                        yield Ok(d);
+                    }
+                    ready.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                });
+            }
+            Box::pin(futures::stream::iter(
+                self.summary_parts
+                    .iter()
+                    .cloned()
+                    .map(ModelDelta::Text)
+                    .map(Ok)
+                    .collect::<Vec<_>>(),
+            ))
+        }
+    }
+
+    /// 40 条 user/assistant 交替 = **20 轮**，每条**恰好 800 个 ASCII 字符** ⇒ 单条
+    /// `4 + 800/4 = 204 token`，与 `context.rs` 的 `mod compaction_planning` 同一个夹具口径。
+    /// 内容带行号（`000…012`），所以「哪一段被丢、哪一段留下」能逐字对撞，而不是靠数条数。
+    fn long_history() -> Vec<Message> {
+        (0..40)
+            .map(|i| Message {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                blocks: vec![ContentBlock::Text {
+                    text: format!("{i:0>800}"),
+                }],
+            })
+            .collect()
+    }
+
+    /// 上面那份夹具在这组参数下**必然**越线，且 `compaction_plan` 恰好压掉最老的 10 轮 = 20 条
+    /// （`40/2 = 20`、`keep_turns: 10` ⇒ 刀口 `starts[10] = 20`）。算术本身归 `context.rs` 测，
+    /// 这里要的只是「压缩一定会发生」这个前提。
+    fn compacting_cfg() -> ContextConfig {
+        ContextConfig {
+            budget_tokens: 1_024,
+            reserve_output: 0,
+            keep_turns: 10,
+            ..Default::default()
+        }
+    }
+
+    fn seed(db: &Db, session_id: &str, msgs: &[Message]) {
+        for m in msgs {
+            db.append_message(session_id, m).unwrap();
+        }
+    }
+
+    /// Step 1–4 共用的一次压缩。`ContextBuilder` 与生产同一处造出来（造一次、然后 move 进
+    /// `SessionDeps`），所以这里也是 `new(cfg)` 之后再借 `&builder`（§2a 的形状）。
+    async fn compact_once(
+        f: &Fixture,
+        model: &Arc<FakeModel>,
+        sid: &str,
+        history: Vec<Message>,
+        cfg: ContextConfig,
+        cancel: &CancellationToken,
+    ) -> (Vec<Message>, Option<AgentEvent>) {
+        compact_before_turn(
+            &f.db,
+            sid,
+            &**model,
+            &ContextBuilder::new(cfg),
+            history,
+            cancel,
+        )
+        .await
+        .expect("压缩段本身不许报错（摘要失败的降级由另一条测试管）")
+    }
+
+    /// 摘要文本**绝不进用户可见的事件流**（brief §1 的那句话）。
+    /// 用户可见的出口只有两处，这里两处都查：① `compact_before_turn` 交回、由 `run_turn`
+    /// emit 的那一条事件；② 重放投影 `events_from_messages`（前端重开会话走的那条路）。
+    /// 摘要调用压根拿不到 sink —— 它只在模型的返回流里存在过一次。
+    #[tokio::test]
+    async fn the_summary_call_never_leaks_into_the_event_stream() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let all = long_history();
+        seed(&f.db, &sid, &all);
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::summarizing(&["早期要点：用户叫林，", "卡号尾 4021"]);
+        let (_, event) = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        // 压了就要说，而且只说这一件事（两个数：dropped / summary_chars）。
+        let event = event.expect("越线的历史必须交回一条 ContextCompacted");
+        assert!(matches!(event, AgentEvent::ContextCompacted { .. }));
+        let wire = serde_json::to_string(&event).unwrap();
+        assert!(
+            !wire.contains("早期要点"),
+            "摘要文本混进了 emit 的事件里：{wire}"
+        );
+
+        // 落库那条是 `Role::System` ⇒ 重放里压根没有它（R69 那一臂；判据 (b) 打的就是这里）。
+        let replay =
+            events_from_messages(&f.db.messages(&sid).unwrap(), &|n| f.registry.risk_of(n));
+        let visible = serde_json::to_string(&replay).unwrap();
+        assert!(
+            !visible.contains("早期要点"),
+            "摘要进了重放事件流 ⇒ 用户会看到一句莫名其妙的小结"
+        );
+        assert!(
+            !replay
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ContextCompacted { .. })),
+            "压缩事件是直播时发的一条通知，不是历史（库里没有这一列，重放也不该编造它）"
+        );
+        assert_eq!(model.calls().len(), 1, "一次压缩恰好一次摘要调用");
+    }
+
+    /// §9「存在一条覆盖被丢弃区间的摘要消息」的可测形式，加上「不重复」。
+    /// 覆盖范围从**模型那一侧**取证（R57）：摘要调用的输入必须逐字等于被删掉的那一段 ——
+    /// 只断言「库里有一条备注」是不够的，输入对不上就等于覆盖范围没兜住。
+    #[tokio::test]
+    async fn the_summary_row_is_written_once_and_covers_the_dropped_range() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let all = long_history();
+        seed(&f.db, &sid, &all);
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::summarizing(&["早期要点：", "用户叫林，卡号尾 4021"]);
+        let (history, _) = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let after = f.db.messages(&sid).unwrap();
+        let notes: Vec<&Message> = after.iter().filter(|m| m.role == Role::System).collect();
+        assert_eq!(
+            notes.len(),
+            1,
+            "每次压缩一条备注；两条备注意味着同一段历史被摘要了两遍"
+        );
+        assert_eq!(
+            notes[0].text_of(),
+            summary_note("早期要点：用户叫林，卡号尾 4021"),
+            "备注 = 前缀 + 摘要正文（分片拼接后的原文）"
+        );
+        assert!(
+            notes[0].text_of().starts_with(SUMMARY_PREFIX),
+            "前缀必须有，而且只加一次：`build()` 把 System 行当 notes 原样带上"
+        );
+        assert!(
+            after.len() < all.len(),
+            "被压掉的行必须真的没了，否则下一轮还是全量读"
+        );
+        assert_eq!(after.len(), 21, "40 删 20 加 1 条备注");
+
+        let req = model.calls().remove(0);
+        assert_eq!(
+            req.messages.len(),
+            1 + 20,
+            "摘要输入 = 被丢掉的那 20 条，一条不多一条不少"
+        );
+        assert_eq!(
+            &req.messages[1..],
+            &all[..20],
+            "摘要输入必须逐字是被丢的那一段（最老 10 轮）"
+        );
+        let conv: Vec<&Message> = after.iter().filter(|m| m.role != Role::System).collect();
+        assert_eq!(
+            conv,
+            all[20..].iter().collect::<Vec<_>>(),
+            "留下的必须是刀口之后那 20 条，原样原序"
+        );
+        assert_eq!(history, after, "交回给调用方的历史必须就是重读回来的那份");
+    }
+
+    /// spec :365 的降级：摘要调用报错（429、断流）时**照压**，正文换成 `[早期对话已省略]`。
+    /// 关键词是「照压」—— 不许有第二条「丢弃」路径，落库走的还是同一条 `compact_session`，
+    /// 该删的行照删（否则下一轮照样超预算，而这次连摘要都没了）。
+    #[tokio::test]
+    async fn a_failing_summary_still_frees_space_and_says_so() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let all = long_history();
+        seed(&f.db, &sid, &all);
+        let before = f.db.messages(&sid).unwrap();
+        // 报错之前先到了半句：那半句**不是**摘要，也不许落进备注。
+        let model = FakeModel::failing(&["早期要点：用户叫"]);
+        let (history, event) = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let after = f.db.messages(&sid).unwrap();
+        let notes: Vec<&Message> = after.iter().filter(|m| m.role == Role::System).collect();
+        assert_eq!(notes.len(), 1, "降级也只落一条备注");
+        assert_eq!(
+            notes[0].text_of(),
+            summary_note(SUMMARY_OMITTED),
+            "降级只换正文，不换事务"
+        );
+        assert!(
+            !notes[0].text_of().contains("早期要点"),
+            "半截摘要被当成了摘要落库：{}",
+            notes[0].text_of()
+        );
+        let conv: Vec<&Message> = after.iter().filter(|m| m.role != Role::System).collect();
+        assert_eq!(
+            conv,
+            all[20..].iter().collect::<Vec<_>>(),
+            "摘要失败也不能把该删的留着撑爆下一轮"
+        );
+        assert_eq!(after.len(), 21);
+
+        // 「压了」这件事照样要说，而且说的就是删掉的行数与备注的字数。
+        match event.expect("降级路径同样必须 emit") {
+            AgentEvent::ContextCompacted {
+                dropped,
+                summary_chars,
+            } => {
+                assert_eq!(dropped, 20);
+                assert_eq!(
+                    summary_chars,
+                    summary_note(SUMMARY_OMITTED).chars().count(),
+                    "字数是 chars().count() 不是 len()：前端文案「摘要 {{n}} 字」，\
+                     用字节数中文会显示成 3 倍"
+                );
+            }
+            other => panic!("降级也要说清楚压了多少，拿到的是 {other:?}"),
+        }
+        assert_eq!(history, after);
+    }
+
+    /// 取消发生在「模型还在写摘要」时：事务压根还没开始，所以库必须**一字未改**（原子性）。
+    /// 半截摘要同样不许当成成功（那条合同在 `summarize.rs` 的
+    /// `cancelling_a_summary_returns_an_error_and_keeps_nothing_back`）。
+    #[tokio::test]
+    async fn cancelling_mid_compaction_leaves_a_consistent_store() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let all = long_history();
+        seed(&f.db, &sid, &all);
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::stalling(&["早期要点：用户叫林，"]);
+        let cancel = CancellationToken::new();
+        let ready = model.stalled.clone();
+        let builder = ContextBuilder::new(compacting_cfg());
+        // 同步点而非 sleep：`ready` 置位时分片已经抵达消费者，摘要此刻确实还挂在流上。
+        let (got, _) = tokio::join!(
+            compact_before_turn(&f.db, &sid, &*model, &builder, before.clone(), &cancel),
+            async {
+                while !ready.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                cancel.cancel();
+            }
+        );
+        let (history, event) = got.expect("取消不是失败：压缩段必须正常返回");
+        assert!(event.is_none(), "没压成就别说压了：{event:?}");
+        assert_eq!(
+            history, before,
+            "交回的历史必须是原样那份，否则调用方的 `prior` 会跟着错"
+        );
+        assert_eq!(
+            f.db.messages(&sid).unwrap(),
+            before,
+            "取消不许留下半条摘要、也不许留下已经删掉的行"
+        );
+        assert_eq!(
+            model.calls().len(),
+            1,
+            "夹具前提：摘要调用确实发起过并被取消"
+        );
+    }
+
+    /// 没越线 ⇒ 一次模型调用都不发起、一个字节都不写。
+    /// 这条看着像废话，但它守着的是「压缩段的 IO 全部在 `if let Some(plan)` 里面」：
+    /// 把 `collect_summary` 挪到判定之外，用户每次发消息都要白烧一次摘要调用（花钱、且慢）。
+    #[tokio::test]
+    async fn an_under_threshold_history_costs_no_model_call_and_writes_nothing() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let short = vec![
+            Message::user(vec![ContentBlock::Text { text: "一".into() }]),
+            Message {
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::Text { text: "二".into() }],
+            },
+        ];
+        seed(&f.db, &sid, &short);
+        let model = FakeModel::summarizing(&["不该被调用的摘要"]);
+        let (history, event) = compact_once(
+            &f,
+            &model,
+            &sid,
+            short.clone(),
+            ContextConfig::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(event.is_none(), "没压就不许 emit：{event:?}");
+        assert_eq!(history, short, "不压时交回的就是进来的那份");
+        assert_eq!(
+            model.calls().len(),
+            0,
+            "没越线一次都不该调模型：摘要调用要花钱"
+        );
+        assert_eq!(
+            f.db.messages(&sid).unwrap(),
+            short,
+            "不压时库里一个字都不动"
+        );
+    }
+
+    /// Step 6.3 的判据，也是本组**唯一**走 `run_turn` 的一条。
+    /// 为什么只能走它：`prior` 这一行下标住在 `run_turn` 里（原 :304 / :323），
+    /// brief §4 点名的失败模式（`prior` 停在压缩前的 40，而压缩后的历史只有 21 行
+    /// ⇒ `session.history()[prior..]` 当场越界）发生在装配层的 move/重读**顺序**上，
+    /// 抽出来的 `compact_before_turn` 里压根没有这个下标 —— 判据 (a)「把 prior 放回压缩前」
+    /// 要红的就是这条测试。
+    #[tokio::test]
+    async fn prior_is_recounted_after_compaction() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let all = long_history();
+        seed(&f.db, &sid, &all);
+        let model = FakeModel::summarizing_and_replying(&["早期要点：用户叫林"], &["本轮的回复"]);
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        let reason = run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: model.clone(),
+                sink: sink.clone(),
+                context: compacting_cfg(),
+                temperature: None,
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "本轮的提问".into(),
+            }],
+        )
+        .await
+        .expect("压缩 + 一轮发送必须整体成功");
+        sink.flush();
+        assert_eq!(reason, StopReason::EndTurn);
+
+        let after = f.db.messages(&sid).unwrap();
+        // 压缩后 21 行 + 本轮 2 行 = 23。`prior` 停在压缩前的 40 时，
+        // `session.history()[40..]` 在 23 行上直接 panic（测试表现为失败），
+        // 而「少附」的写法会把本轮那两行整轮丢掉 —— 两种退化都过不了下面三条。
+        assert_eq!(
+            after.len(),
+            21 + 2,
+            "总行数 = 压缩后行数 + 本轮新增两行；实际 {}",
+            after.len()
+        );
+        assert_eq!(
+            after[after.len() - 2].text_of(),
+            "本轮的提问",
+            "倒数第二行必须是本轮的用户行"
+        );
+        assert_eq!(
+            after[after.len() - 1].text_of(),
+            "本轮的回复",
+            "最后一行必须是本轮的助手行"
+        );
+        assert!(
+            after[..21]
+                .iter()
+                .all(|m| m.role != Role::User || m.blocks.len() == 1),
+            "留下那 21 行的形状不许被本轮污染"
+        );
+
+        // 事件顺序（Step 6.5 / brief §4）：`context_compacted` 在写新行之前发，
+        // 也就是排在本轮的回答之前；且摘要文本不在任何一帧里。
+        let tags: Vec<&str> = rec.frames().iter().map(event_tag).collect();
+        assert_eq!(
+            tags.first().copied(),
+            Some("context_compacted"),
+            "压缩通知必须排在整轮回答之前，实际顺序 {tags:?}"
+        );
+        let wire = serde_json::to_string(&rec.frames()).unwrap();
+        assert!(
+            !wire.contains("早期要点"),
+            "摘要文本进了用户可见的事件流：{wire}"
+        );
+        assert_eq!(model.calls().len(), 2, "一次摘要 + 一次回答");
     }
 
     /// 单轮并发闸门：任何一轮都在跑的时候都不许起第二轮 —— 同会话也不行，
