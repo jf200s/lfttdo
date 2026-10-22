@@ -57,6 +57,8 @@ pub struct AgentSession {
     cancel: CancellationToken,
     http: reqwest::Client,
     roots: Vec<PathBuf>,
+    /// 发出**当前这次请求**时 `build()` 报的粗估输入 token（切片 5 的校准分母）。
+    last_est_input: u32,
 }
 
 impl AgentSession {
@@ -71,6 +73,7 @@ impl AgentSession {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             roots: Vec::new(),
+            last_est_input: 0,
         }
     }
 
@@ -124,7 +127,10 @@ impl AgentSession {
             self.deps.sink.emit(AgentEvent::TurnStart { turn });
 
             let mut acc = AssistantAcc::default();
-            let mut deltas = self.deps.model.stream(self.request());
+            // `request()` 要 `&mut self`（记下校准分母），而 `stream` 的接收者是
+            // `&self.deps.model`：分两步取，请求先落地，流再借模型。
+            let req = self.request();
+            let mut deltas = self.deps.model.stream(req);
             let mut stream_done = false;
             let mut interrupted = false;
             let mut model_error: Option<String> = None;
@@ -150,6 +156,17 @@ impl AgentSession {
                         Some(Ok(ModelDelta::Usage { input_tokens, output_tokens })) => {
                             // R60：`AssistantAcc::apply` 会**静默丢掉** Usage 里的 token
                             // （assistant_acc.rs:37-39），必须在交给它之前自己取走。
+                            // 切片 5：这里同时是 `set_calibration` 的第一个调用方（前置事实 1）。
+                            // 分母用**发出这次请求时**的 est，不是现在的：一轮里可能有多次
+                            // request（工具循环），每次的 usage 只能和它自己那次 build 对齐。
+                            // 两道零闸留在 session 侧：`set_calibration` 只挡非有限值，
+                            // 而 0.0 是**有限**的、会被 clamp 成 0.2 —— 一次「端点报了 0 token」
+                            // 不该把估算压到地板（`a_zero_or_absurd_usage_...` 钉这条）。
+                            if input_tokens > 0 && self.last_est_input > 0 {
+                                self.deps.context.set_calibration(
+                                    input_tokens as f64 / self.last_est_input as f64,
+                                );
+                            }
                             self.deps.sink.emit(AgentEvent::Usage { input_tokens, output_tokens });
                         }
                         Some(Ok(d)) => {
@@ -289,10 +306,12 @@ impl AgentSession {
     }
 
     /// 交给模型的请求：滑窗组装出来的消息 + 注册表的工具声明。
-    fn request(&self) -> ChatRequest {
+    /// `&mut self` 只为记下这次请求的粗估（校准的分母）；`run()` 是它唯一的调用方。
+    fn request(&mut self) -> ChatRequest {
         let built = self.deps.context.build(&self.history);
-        // `built.dropped` 与 `est_input_tokens` 在 Plan A 没有消费者：`ContextCompacted`
-        // 属切片 5，`context.rs:44` 明确要求 Task 10 不为它造事件。
+        self.last_est_input = built.est_input_tokens;
+        // `built.dropped` 在 Plan A 没有消费者：`ContextCompacted` 属切片 5，
+        // `context.rs:44` 明确要求 Task 10 不为它造事件。
         ChatRequest {
             messages: built.messages,
             // R66：`defs()` 已经是 `Vec<model::provider::ToolDef>`（registry.rs:143），
@@ -1141,6 +1160,84 @@ mod tests {
             "usage 事件只能来自流里的那个 Usage delta"
         );
         assert_paired("用量请求", &rig.reqs()[0]);
+    }
+
+    // ---- 路径 5b：usage → 校准（切片 5 的第一根线） ----
+
+    #[tokio::test]
+    async fn real_usage_calibrates_the_estimator_in_the_right_direction() {
+        // 端点真实回报 = 粗估的一半 ⇒ 系数必须是 真实 ÷ 粗估 = 0.5（context.rs:65 的语义）。
+        // 接反成 粗估 ÷ 真实 = 2.0 不会报错，但估算会一直朝危险方向偏 —— 这条测试存在的唯一理由。
+        // 分母不许由测试自己造（R110：不给 ContextBuilder 加测试专用 setter），
+        // 而是用真 `ContextConfig` + 真历史，把 `built.est_input_tokens` **读出来**当分母。
+        let hist = vec![Message::user(user("hi"))];
+        let est = ContextBuilder::new(ContextConfig::default())
+            .build(&hist)
+            .est_input_tokens;
+        assert!(
+            est > 1,
+            "夹具前提：粗估必须非零，否则除不出 0.5（est={est}）"
+        );
+        let mut rig = Rig::new(vec![vec![
+            ModelDelta::Text("好".into()),
+            ModelDelta::Usage {
+                input_tokens: est / 2,
+                output_tokens: 7,
+            },
+        ]]);
+        // `run()` 在 build 之前 push 的正是这条 `user("hi")` ⇒ 请求那一刻的历史就是 `hist`，
+        // 所以 `request()` 当时看到的 est 就是上面这个 `est`。
+        assert_eq!(rig.session.deps.context.build(&hist).est_input_tokens, est);
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        // 校准只能从 ContextBuilder 侧观测：给它**同一份**历史再 build 一次，看 est 落下来了。
+        let again = rig.session.deps.context.build(&hist).est_input_tokens;
+        assert!(
+            again < est,
+            "真实比粗估省 ⇒ 之后的估算必须跟着降：{again} vs {est}"
+        );
+        assert_eq!(again, est / 2, "系数必须是真实÷粗估（接反成 2.0 时这条红）");
+    }
+
+    #[tokio::test]
+    async fn a_zero_or_absurd_usage_leaves_the_budget_gate_functioning() {
+        // 两种坏法都要守：(a) input_tokens=0、(b) input_tokens=u32::MAX。
+        // 可观测面只有 `build()` 的返回（裁定：**不新增** `calibration_for_test`），
+        // 所以断言一律写成行为式。判据一句话：**坏 usage 之后预算闸还在工作**。
+        let hist = vec![Message::user(user("hi"))];
+        let before = ContextBuilder::new(ContextConfig::default())
+            .build(&hist)
+            .est_input_tokens;
+        assert!(before > 0);
+        for actual in [0u32, u32::MAX] {
+            let mut rig = Rig::new(vec![vec![
+                ModelDelta::Text("好".into()),
+                ModelDelta::Usage {
+                    input_tokens: actual,
+                    output_tokens: 3,
+                },
+            ]]);
+            assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+            let after = rig.session.deps.context.build(&hist).est_input_tokens;
+            assert!(
+                after > 0,
+                "估算被清零 ⇒ 预算永不生效，正是 context.rs:69 禁止的后果"
+            );
+            assert!(
+                after <= before * 3 && after >= before / 5 || after == before,
+                "系数必须落在 0.2..=3.0（actual={actual}：{after} vs {before}）"
+            );
+            // 带内断言单独**抓不到**「session 侧那道闸被删」：0.0 是有限因子，
+            // `set_calibration` 会把它 clamp 成 floor 0.2，数值仍贴着 0.2 的下界。
+            // 所以这里各自钉死精确值：0 报告整个被忽略，爆表报告被 clamp 到天花板。
+            if actual == 0 {
+                assert_eq!(
+                    after, before,
+                    "input_tokens=0 不许动系数（actual={actual}）"
+                );
+            } else {
+                assert_eq!(after, before * 3, "u32::MAX 必须被 clamp 到 3.0 天花板");
+            }
+        }
     }
 
     #[tokio::test]
