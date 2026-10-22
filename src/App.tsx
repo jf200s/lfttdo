@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Composer } from "./components/Composer";
 import { MessageList } from "./components/MessageList";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { Sidebar } from "./components/Sidebar";
 import * as api from "./ipc/commands";
 import { useTextBuffer } from "./ipc/batching";
@@ -10,6 +11,8 @@ import type {
   Decision,
   SendBlock,
   SessionRow,
+  Settings,
+  SettingsView,
   UiState,
 } from "./types";
 
@@ -26,6 +29,12 @@ export default function App() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [ui, setUi] = useState<UiState>(initialState);
   const [appNotices, setAppNotices] = useState<string[]>([]);
+  /**
+   * 面板打开时手里那份 `SettingsView`；`null` 就是「面板没开」。
+   * 用「数据」而不是「布尔开关」表达可见性：布尔 + 另一份 view 状态会有两个真相
+   * （开着但拿的是上次那份），而这里要的恰恰是**打开那一次读到的**那份。
+   */
+  const [settingsView, setSettingsView] = useState<SettingsView | null>(null);
   /**
    * 当前会话的**同步**影子。事件回调是 tauri 那边推进来的，读 `activeId` 这个 state
    * 会拿到旧值；这一支只有一处写（`openSession` / 启动那次），所以它是可审的。
@@ -78,9 +87,28 @@ export default function App() {
 
 
   /**
+   * 把设置里那三项落到 `documentElement` 上。**启动与保存共用这一份**（R117 的口径：
+   * 一份实现、两个入口）—— 写两遍的话「保存后界面没跟着变」这种 bug 只会出现在没被
+   * 抄到的那一边。回落必须出声：静默回落等于「设置没生效但界面说生效了」。
+   */
+  const applySettingsTheme = useCallback(
+    (v: Pick<Settings, "theme" | "mode" | "font_size">) => {
+      const { theme, fellBack } = resolveTheme(v.theme);
+      try {
+        applyTheme(document.documentElement, theme, v.mode, v.font_size);
+      } catch (e) {
+        notice(`主题未能应用：${String(e)}`);
+        return;
+      }
+      if (fellBack) notice(`未知主题「${v.theme}」，已回落到 noir`);
+    },
+    [notice],
+  );
+
+  /**
    * 第 12 条 / 要求 10：主题由真实 `settings_get` 驱动（R169 因此才能删掉 `main.tsx`
-   * 那行硬编码）。`resolveTheme` 只兜主题名；`mode` 那一支的运行时防线在 `applyTheme` 里
-   * （T16 是它唯一的调用方，R167），所以 try/catch 在这里是**必需的**而不是装饰 ——
+   * 那行硬编码）。`applySettingsTheme` 只兜主题名；`mode` 那一支的运行时防线在 `applyTheme` 里
+   * （T16 是它唯一的调用方，R167），所以 try/catch 在那一处是**必需的**而不是装饰 ——
    * 磁盘上躺着未来版本写的值时，界面不许白屏。
    */
   useEffect(() => {
@@ -89,21 +117,13 @@ export default function App() {
       .getSettings()
       .then((v) => {
         if (!alive) return;
-        const { theme, fellBack } = resolveTheme(v.theme);
-        try {
-          applyTheme(document.documentElement, theme, v.mode, v.font_size);
-        } catch (e) {
-          notice(`主题未能应用：${String(e)}`);
-          return;
-        }
-        // 静默回落等于「设置没生效但界面说生效了」—— 必须让用户看见。
-        if (fellBack) notice(`未知主题「${v.theme}」，已回落到 noir`);
+        applySettingsTheme(v);
       })
       .catch((e) => notice(`读取设置失败：${String(e)}`));
     return () => {
       alive = false;
     };
-  }, [notice]);
+  }, [notice, applySettingsTheme]);
 
   /** 切会话：先打断正在跑的那一轮，再用 `replaySession` 重建界面（要求 5）。 */
   const openSession = useCallback(
@@ -226,6 +246,46 @@ export default function App() {
     [],
   );
 
+  /**
+   * T45：面板是 `settings_set` / `settings_set_api_key` 的第一个消费者。
+   * 打开时**重新读一次**而不是复用启动那一份 —— `settings_get` 每次都读磁盘
+   * （`ipc.rs:370` → `settings.rs:432`），用户在外面改了 `settings.json`，
+   * 面板复用旧值就等于让他对着一个已经过期的模型名编辑。
+   */
+  const openSettings = useCallback(() => {
+    api
+      .getSettings()
+      .then((v) => setSettingsView(v))
+      .catch((e) => notice(`读取设置失败：${String(e)}`));
+  }, [notice]);
+
+  const closeSettings = useCallback(() => setSettingsView(null), []);
+
+  /**
+   * 这里**不许**把 rejection 吞成 resolved：`SettingsPanel` 靠它决定「面板关不关、
+   * 错误原文显不显示」。理由与 `send` 那句 `throw e` 完全同构（`AppImages.test.tsx`
+   * 的变异判据 c），判据在 `AppSettings.test.tsx` 那条「keeps the panel open …」。
+   * 主题只在写盘成功之后应用一次 —— 失败的保存顺手改界面，是「没生效但看着生效了」。
+   */
+  const saveSettings = useCallback(
+    async (s: Settings) => {
+      await api.setSettings(s);
+      applySettingsTheme(s);
+    },
+    [applySettingsTheme],
+  );
+
+  // 明文只许走 `settings_set_api_key` 这一条命令；空串是命令侧「清除」的唯一编码（R88），
+  // 所以清除在 App 这一层也是一次 `setApiKey`，不另造删除路径。两处都不 catch：
+  // 原文要交给面板显示。`async` + `await` 是为了把 `invoke` 的 `Promise<unknown>` 收成
+  // 面板签名要的那个 `Promise<void>`（同 `commands.ts:31` 的 `send_message` 那一支）。
+  const saveKey = useCallback(async (k: string) => {
+    await api.setApiKey(k);
+  }, []);
+  const clearKey = useCallback(async () => {
+    await api.setApiKey("");
+  }, []);
+
   const usageText =
     ui.usage === null
       ? "本轮 token：尚未回报"
@@ -304,7 +364,24 @@ export default function App() {
         <div className="statusbar" data-testid="usage">
           {usageText}
         </div>
+        <div className="pane-actions">
+          <button type="button" onClick={openSettings}>
+            设置
+          </button>
+        </div>
       </main>
+      {/* 面板是**视图**，不是另一份状态：它开着的时候 `ui`、订阅、会话列表全都照旧跑
+          （判据在 `AppSettings.test.tsx` 那条「keeps rendering the live turn …」）。
+          `backdrop` 是 fixed 全屏，所以挂在 `.app` 这个 grid 的最后一个子位上不影响布局。 */}
+      {settingsView !== null ? (
+        <SettingsPanel
+          initial={settingsView}
+          onSave={saveSettings}
+          onSaveKey={saveKey}
+          onClearKey={clearKey}
+          onClose={closeSettings}
+        />
+      ) : null}
     </div>
   );
 }

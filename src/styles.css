@@ -482,3 +482,145 @@ a:hover {
   color: var(--text-muted);
   background-color: var(--bg-input);
 }
+
+/* ==== 设置面板（T45） ==== */
+
+/* 遮罩是 `fixed` 且铺满：面板开着的时候背后的界面不许还能点得到，否则一次误点
+   就把没保存的草稿丢在背后。底色取 `--shadow`（预设里那支半透明阴影色），面板自己
+   落 `--bg-raised`，两层之间靠 `--border` 分界 —— 全程只有 `var(--…)`（R207）。 */
+.panel-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background-color: var(--shadow);
+}
+
+/* 面板要浮在遮罩之上，靠的就是那一层 24px 的阴影：light 预设里 `--shadow` 只有 18% 透明度，
+   而 `--bg-raised` 与页面底色只差一档亮度，控件级的 2px 阴影分不出「这是另一层」。 */
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 460px;
+  max-width: 100%;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background-color: var(--bg-raised);
+  color: var(--text-primary);
+  box-shadow: 0 8px 24px var(--shadow);
+  outline: none;
+}
+
+.panel-title {
+  margin: 0;
+  font-size: 1.1em;
+}
+
+.panel-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.panel-group > legend {
+  padding: 0 4px;
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+/* 一行一项：标签在左、控件在右。控件宽度写死一个而不是 `auto`，是因为
+   `budget_tokens` 那种六位数的框会比标签长，整组会跟着左右跳。 */
+.panel-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 160px;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-row input,
+.panel-row select {
+  min-width: 0;
+  background-color: var(--bg-input);
+}
+
+.panel-readonly {
+  margin: 0;
+}
+
+.panel-readonly code {
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+  background-color: var(--code-bg);
+}
+
+.panel-hint,
+.panel-note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8em;
+  overflow-wrap: anywhere;
+}
+
+.panel-note {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* 错误行与 `.image-error` / `.app-notice` 是同一语义：静止态不描边，异常才描 `--danger`。
+   原文必须整条换行显示（前端不解释文案，R195），长地址、长堆栈都不许截断。 */
+.panel-error {
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 窗口默认 800×600（`tauri.conf.json:17-18`），而这份表单比它高：动作行得留在视野里。
+   「保存」躺在折叠线下，找不到的设置在交互上等于没有设置。
+   只给 `.panel` 的直接子元素这一支上 sticky —— API key 组里那一排（清除）不该跟着钉住。 */
+.panel > .panel-actions {
+  position: sticky;
+  bottom: 0;
+  padding-top: 6px;
+  background-color: var(--bg-raised);
+}
+
+.panel-save {
+  border-color: var(--accent);
+  color: var(--accent-text);
+  background-color: var(--accent);
+}
+
+.panel-save:hover:not(:disabled) {
+  border-color: var(--accent-hover);
+  background-color: var(--accent-hover);
+}
+
+/* App 底部那一行只有一个入口，靠右、不抢状态行的字。
+   它放在 `main.pane` 里而不是侧栏：侧栏的合同是会话，这条是应用级。 */
+.pane-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 12px 10px;
+}
