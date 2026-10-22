@@ -505,6 +505,70 @@ describe("theme tokens", () => {
     }
   });
 
+  // R235：真窗口里量出来的两条，jsdom 一条都守不住（它没有布局引擎，也没有配色判据）。
+  // ① 消息列表的 `overflow-y: auto` 从 T16 起就是**死代码**：`.pane` 与 `.message-list`
+  //    都是 flex/grid 子项，而子项的 `min-height` 初始值是 `auto`（自动最小尺寸），
+  //    含义是「不许缩到内容高度以下」。于是长对话把 `.message-list` 顶到 1045px、
+  //    `.pane` 顶到 1279px，`.app` 那 100vh 被撑破，滚动条跑到**文档**上，
+  //    输入框落到 y=1188（视口 638）——读长回复时看不见输入框。
+  //    和 R233 那条 `.turns` 是同一类：样式声明了意图，布局把它吃掉。
+  it("keeps the shell's scroll containers able to shrink below their content", () => {
+    const css = readFileSync(pathOf("../styles.css"), "utf8");
+    const bodyOf = (selector: string): string => {
+      const hits = rules(css).filter(([s]) => s.trim() === selector);
+      expect(
+        hits,
+        `styles.css 里恰好一条 \`${selector}\` 单选择器规则没了 —— 这条闸的锚点变了，` +
+          `先确认外壳是不是重新排过版（合并/改名都会命中这里），**不许**把选择器从名单里摘掉`,
+      ).toHaveLength(1);
+      return hits[0][1];
+    };
+    // 意图锚点：外壳锁在一屏高上，滚动的是消息列表而不是整份文档。
+    // 这两条一旦变，下面那圈 `min-height: 0` 就成了无的放矢，必须跟着改这条闸而不是改样式。
+    expect(bodyOf(".app"), ".app 不再声明 height: 100vh —— 外壳高度的来源变了").toMatch(
+      /height:\s*100vh/,
+    );
+    expect(
+      bodyOf(".message-list"),
+      ".message-list 不再声明 overflow-y: auto —— 滚动容器换人了",
+    ).toMatch(/overflow-y:\s*auto/);
+
+    for (const selector of [".pane", ".message-list", ".sidebar"]) {
+      expect(
+        bodyOf(selector),
+        `${selector} 是 100vh 外壳里的 flex/grid 子项，缺 \`min-height: 0\` 就退到内容高度，` +
+          `外壳被撑破、滚动条跑到文档上，输入框会被推到视口之外（R235 实测）`,
+      ).toMatch(/min-height:\s*0/);
+    }
+  });
+
+  // ② `--text-muted` 落在四支底色上（页面、抬起层、输入框、代码底）都要过 WCAG AA 的 4.5:1。
+  //    质感轮之后 muted 的用处变多了（状态栏、待发图的文件名、错误提示、等宽卡片的说明行），
+  //    而六块里 ocean/light 一直差着一档：对 --bg-input 只有 4.00。
+  //    上面那条 --accent-hover 的闸（R201）立过同样的规矩：token 被六块声明得整整齐齐，
+  //    不等于它的值对得起它的名字。
+  it("keeps --text-muted readable on every surface it is painted on", () => {
+    const blocks = [
+      ...stripComments(presets).matchAll(
+        /^\[data-theme="([a-z-]+)"\]\[data-mode="(light|dark)"\]\s*\{([^}]*)\}/gm,
+      ),
+    ];
+    expect(blocks, "预设块不是 6 块 —— 这条判据的覆盖面会跟着少一块").toHaveLength(6);
+    for (const m of blocks) {
+      const key = `${m[1]}/${m[2]}`;
+      const values = presetTokenValues(m[3]);
+      for (const bg of ["--bg-surface", "--bg-raised", "--bg-input", "--code-bg"]) {
+        const ratio = contrast(values["--text-muted"], values[bg]);
+        expect(
+          ratio,
+          `${key}：--text-muted 对 ${bg} 只有 ${ratio.toFixed(2)}:1，低于 AA 的 4.5:1 —— ` +
+            `muted 那支要同时读得清这四支底色（页面/抬起层/输入框/代码底），` +
+            `改 --text-muted 或改底色都行，但别把它调成和 --text-primary 分不开`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
 
   // R126 ②：仓库没有 CI，`npm run lint:css` 只有「有人记得跑」才会跑，而 `npm test` 一定跑。
   // 两道闸各保一层：这条守住「hex 与函数记号形式的硬编码颜色不许进组件样式」（记号范围见

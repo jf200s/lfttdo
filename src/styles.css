@@ -100,6 +100,10 @@ a:hover {
   padding: 12px;
   border-right: 1px solid var(--border);
   background-color: var(--bg-surface);
+
+  /* 网格子项的 `min-height` 初始值是 `auto`＝「不许缩到内容高度以下」，于是会话一多就把
+     这一格顶破 100vh、滚动条跑到文档上。缺这一行，下面那句 `overflow-y: auto` 是死代码。 */
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -172,12 +176,17 @@ a:hover {
   display: flex;
   flex-direction: column;
   min-width: 0;
+
+  /* 同 `.sidebar`：`.pane` 是 `.app` 那一格的第二个子项，自动最小尺寸会让长对话把它撑到
+     1279px（实测），100% 白写。这一行和 `.message-list` 那一行是一对，缺一个都收不住。 */
+  min-height: 0;
   height: 100%;
   background-color: var(--bg-surface);
 }
 
 .message-list {
   flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   padding: 16px;
   display: flex;

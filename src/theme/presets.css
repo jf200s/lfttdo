@@ -92,7 +92,11 @@
   --bg-raised: #ffffff;
   --bg-input: #dfeaf2;
   --text-primary: #142633;
-  --text-muted: #5b7488;
+  /* R235：原来是 #5b7488，对同块 --bg-input 只有 4.00:1（tokens.test.ts 那条 muted 闸
+     当场红）。muted 要同时读得清四支底色，最差那支是 --bg-input，所以按它配；
+     #4f6877 把最差档抬到 4.80，和另外五块（4.73–5.42）排在同一区间，
+     对 --text-primary 仍差 2.64 档，不会和正文分不开。 */
+  --text-muted: #4f6877;
   --accent: #1c6ea3;
   --accent-hover: #0f5585;
   --accent-text: #ffffff;
