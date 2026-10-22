@@ -100,11 +100,16 @@ export interface SessionRow {
 }
 
 /**
- * `Settings`（settings.rs:239-250）：8 个键，`serde` 无 `rename_all` ⇒ 全 snake_case；
- * `mode` 是 `rename_all = "lowercase"` 的 `"light"|"dark"`（settings.rs:231-236），
+ * `Settings`（settings.rs:261-278）：11 个键，`serde` 无 `rename_all` ⇒ 全 snake_case；
+ * `mode` 是 `rename_all = "lowercase"` 的 `"light"|"dark"`（settings.rs:250-253），
  * 和 `applyTheme` 收的那个 `Mode` 是同一支，所以这里**引用**它而不是再抄一份字面量。
- * 数值一律 `number`：Rust 侧是 `u32`/`usize`，`font_size` 的 12..=24 钳位只有
- * `settings.rs` 的 `normalize()` 那一处定义（R123），TS 侧不钳第二遍。
+ * 数值一律 `number`：Rust 侧是 `u32`/`usize`/`f32`，钳位只有 `settings.rs` 的
+ * `normalize()` 那一处定义（R123），TS 侧不钳第二遍。
+ *
+ * **加字段的人请注意**：结构体级 `#[serde(default)]`（settings.rs:260）意味着前端**少送一个键
+ * 不会报错**，只会静默把那一键抹回 Rust 默认值。`SettingsPanel` 的 `settingsOf` 因此不许再
+ * 逐字段列名单——`SettingsPanel.test.tsx` 里 `carries the fields it does not render through a
+ * save` 那条钉的就是这件事。
  */
 export interface Settings {
   base_url: string;
@@ -115,6 +120,12 @@ export interface Settings {
   theme: string;
   mode: Mode;
   font_size: number;
+  /** T39：采样温度，Rust 侧夹 `0.0..=2.0`，进 `ChatRequest.temperature`。 */
+  temperature: number;
+  /** T39：**占预算的比例**（不是 token 数），Rust 侧夹 `0.05..=0.95`；消费者在 T41。 */
+  compact_threshold: number;
+  /** T39：压缩时保留原文的最近轮数 K，Rust 侧夹 `1..=50`。 */
+  keep_turns: number;
 }
 
 /**

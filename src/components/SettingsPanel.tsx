@@ -10,19 +10,14 @@ interface SettingsPanelProps {
   onClose: () => void;
 }
 
-/** 面板只渲染这 8 个键 —— 它们就是 `Settings` 今天的全部（`settings.rs:245-252` / `types.ts:109-118`）。
- *  `api_key_masked` 与 `corrupt_backup` 是 `SettingsView` 多出来的两只**只读**键，
- *  写回 `settings_set` 等于把掩码和备份路径当设置存盘（`commands.ts:62` 的注释就写着这件事）。 */
-const settingsOf = (v: SettingsView): Settings => ({
-  base_url: v.base_url,
-  model: v.model,
-  reserve_output: v.reserve_output,
-  budget_tokens: v.budget_tokens,
-  window_messages: v.window_messages,
-  theme: v.theme,
-  mode: v.mode,
-  font_size: v.font_size,
-});
+/** 从 `SettingsView` 里剥掉那两只**只读**键，剩下的就是 `Settings` 全部。
+ *  `api_key_masked` 与 `corrupt_backup` 不许写回 `settings_set`（把掩码当设置存盘是另一件事，
+ *  `commands.ts:62` 的注释就写着）。
+ *  这里**故意不逐字段列名单**：`settings.rs:260` 的结构体级 `#[serde(default)]` 让「少带一键」
+ *  不报错、只把它抹回 Rust 默认值 ⇒ 面板每保存一次，就把手改进 `settings.json` 的
+ *  `temperature`/`compact_threshold`/`keep_turns` 清零一遍。T39 之后 Rust 还会继续加键
+ *  （T43 的 `accent`），列一次名单就是埋一次这样的雷。 */
+const settingsOf = ({ api_key_masked, corrupt_backup, ...rest }: SettingsView): Settings => rest;
 
 /** 数值项的名称表：`NaN` 必须在提交前被拦下并**报出是哪一项**。
  *  serde 收到 NaN 会直接拒收，症状是「点了保存什么也没发生」，而用户看不出是哪个框。 */

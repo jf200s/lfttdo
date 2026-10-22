@@ -53,9 +53,11 @@ const row = (id: string, updated_at: number): SessionRow => ({
   updated_at,
 });
 
-// 夹具写满 10 个键（`SettingsView` 是 flatten 后拍平一层的形状）：App 若把 view 降级成
-// 只剩 8 个可写键再传进面板，`api_key_masked` / `corrupt_backup` 那两块界面会**静默消失**，
-// 少写一项 TS 当场报错 —— 这是这份夹具唯一有用的报错方式。
+// 夹具写满 13 个键（`SettingsView` 是 flatten 后拍平一层的形状，11 个可写 + 2 只读）：
+// App 若把 view 降级成只剩面板渲染的那几键再传进面板，`api_key_masked` / `corrupt_backup`
+// 那两块界面会**静默消失**，少写一项 TS 当场报错 —— 这是这份夹具唯一有用的报错方式。
+// T39 那三键（`temperature`/`compact_threshold`/`keep_turns`）面板不渲染但必须一路带到保存，
+// 所以它们在这里也得不漏 —— 漏了就是 `SettingsPanel.test.tsx` 那条 carry-through 测试的现场。
 const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   base_url: "https://example.invalid/v1",
   model: "qwen-plus",
@@ -65,6 +67,9 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   theme: "noir",
   mode: "dark",
   font_size: 15,
+  temperature: 0.7,
+  compact_threshold: 0.85,
+  keep_turns: 10,
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -135,7 +140,9 @@ describe("App 设置接线", () => {
       target: { value: "17" },
     });
     fireEvent.click(within(dialog).getByRole("button", { name: /保存/ }));
-    // 载荷是**整表 8 键**：App 这一层不许重新拼一份「只发送编辑过的字段」。
+    // 载荷是**整表 11 键**：App 这一层不许重新拼一份「只发送编辑过的字段」，
+    // 也不许在把 view 交给面板的路上把 `temperature`/`compact_threshold`/`keep_turns`
+    // 这三只面板不渲染的键丢掉（丢了不报错，`serde(default)` 会替用户把它们抹回默认值）。
     await waitFor(() =>
       expect(h.setSettings).toHaveBeenCalledWith({
         base_url: "https://example.invalid/v1",
@@ -146,6 +153,9 @@ describe("App 设置接线", () => {
         theme: "paper",
         mode: "dark",
         font_size: 17,
+        temperature: 0.7,
+        compact_threshold: 0.85,
+        keep_turns: 10,
       }),
     );
     // 保存成功才改界面：这三项是 `applyTheme` 唯一的三个可见后果。

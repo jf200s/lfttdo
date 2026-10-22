@@ -52,6 +52,9 @@ const view = (): SettingsView => ({
   theme: "noir",
   mode: "dark",
   font_size: 15,
+  temperature: 0.7,
+  compact_threshold: 0.85,
+  keep_turns: 10,
   api_key_masked: "…abcd",
   corrupt_backup: null,
 });

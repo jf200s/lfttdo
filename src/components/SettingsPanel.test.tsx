@@ -1,4 +1,4 @@
-// T45 的组件层判据。为什么单独一个文件、以及为什么这份夹具**必须写满 10 个键**：
+// T45 的组件层判据。为什么单独一个文件、以及为什么这份夹具**必须写满 13 个键**：
 // `SettingsView` 是 `#[serde(flatten)]` 拍平一层的形状（types.ts:128-131），面板少读一个键
 // 的话，写成 `as SettingsView` 的断言转换会照样绿 —— 这里用完整字面量，缺项由 TS 拦。
 // `waitFor` 用 `@testing-library/react` 那一个，不用 `vi.waitFor`：只有它包在 `act` 里，
@@ -17,6 +17,12 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   theme: "noir",
   mode: "dark",
   font_size: 15,
+  // T39 那三键故意取**与 Rust 默认值不同**的数（默认 0.7 / 0.85 / 10）：
+  // 面板不渲染它们，一旦 `settingsOf` 漏带，落盘的就是默认值，而默认值恰好是
+  // 「看不出来」的那种错——用 0.3/0.5/3 才测得出来。
+  temperature: 0.3,
+  compact_threshold: 0.5,
+  keep_turns: 3,
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -60,7 +66,29 @@ describe("SettingsPanel", () => {
       theme: "noir",
       mode: "dark",
       font_size: 15,
+      temperature: 0.3,
+      compact_threshold: 0.5,
+      keep_turns: 3,
     });
+  });
+
+  it("carries the fields it does not render through a save", async () => {
+    // T39 给 Rust 的 `Settings` 加了 `temperature`/`compact_threshold`/`keep_turns`，
+    // 面板**不渲染**它们（渲染一个存不进去的输入框才是 bug，见下面那条），于是逐字段列名单的
+    // `settingsOf` 会少带三键。少带不报错：`settings.rs:260` 的结构体级 `#[serde(default)]`
+    // 把它们抹回 Rust 默认值 ⇒ **一次普通的点保存，就把用户手改进 settings.json 的
+    // 温度、压缩阈值和 K 全数清零**。这条测试存在的理由就是这个静默路径。
+    const p = setup();
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    const sent = p.onSave.mock.calls[0][0];
+    expect(sent.temperature).toBe(0.3);
+    expect(sent.compact_threshold).toBe(0.5);
+    expect(sent.keep_turns).toBe(3);
+    // 同一次展开不许把 `SettingsView` 那两只只读键一起带进 body：
+    // `settings_set` 收的是 `Settings`，把掩码当设置存盘是另一件事（上面那条 toEqual 也守着）。
+    expect(sent).not.toHaveProperty("api_key_masked");
+    expect(sent).not.toHaveProperty("corrupt_backup");
   });
 
   it("never puts the key into the settings payload", async () => {
@@ -141,11 +169,14 @@ describe("SettingsPanel", () => {
     expect(screen.getByText(/settings\.json\.corrupt-1700000000000/)).toBeInTheDocument();
   });
 
-  it("renders no field the store cannot save today", () => {
-    // Step 0 的 grep 结果：`Settings` 恰好 8 个键（settings.rs:245-252 / types.ts:109-118）。
-    // 渲染一个存不进去的输入框会造出「改了但没生效」的用户可见 bug，比缺一个组更糟。
-    // T39/T43/Plan B 落了 `temperature`/`accent`/`roots` 之后这条要跟着改，不许悄悄删。
-    for (const label of [/温度/, /temperature/i, /强调色/, /accent/i, /目录|roots/i, /MCP/i]) {
+  it("renders no control that this slice has no design for", async () => {
+    // 断言没变，**理由变了**（别把这条当成还在测「存不存得进去」）：T39 之后
+    // `temperature`/`compact_threshold`/`keep_turns` 是存得进去的（spec 5.3 的三个内部参数，
+    // 默认值就够用），`accent` 要等 T43、`roots`/MCP 要等 Plan B。
+    // 现在钉的是「不许半拉子地先加一个没有校验、没有说明的输入框」——真要开这块 UI 是
+    // 一个带设计的任务，不是顺手加一行 `<input>`。上面那条 carry-through 测试保证
+    // 「不渲染」不等于「不带上」：这三键照样得原样回到 `settings_set`。
+    for (const label of [/温度/, /temperature/i, /压缩|阈值|keep_turns/i, /强调色/, /accent/i, /目录|roots/i, /MCP/i]) {
       expect(screen.queryByLabelText(label)).toBeNull();
     }
   });
