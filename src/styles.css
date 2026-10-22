@@ -565,29 +565,43 @@ a:hover {
   color: var(--text-primary);
 }
 
-/* 原生 file 控件的边框/阴影由基座那一节管（它是控件），这里只把它收进条里的宽度预算，
-   免得四张图排一行时长文件名把整条撑破。
-   `width: fit-content`：不写的话它作为 `.image-strip`（flex 列）的子项被拉满整行宽，
-   「选择文件 未选择文件」十个字左边那一小块内容，右边拖着一条空到底的底色带。 */
+/* 这个控件在基座那一节里是按「控件」待遇画的（边框、底色、阴影）。整条规则现在把这些
+   一层层撤掉，落到最后一行只剩那枚 UA 按钮 —— 因为 UA 按钮自己就是可见控件，外面那层壳
+   是多余的一圈。宽度预算仍在：不写 `width: fit-content`，它作为 `.image-strip`（flex 列）
+   的子项会被拉满整行宽，按钮右边拖着一条空到底的底色带。
+   `font-size: 0`：UA 除了那枚按钮还自己画一行「未选择文件」，那**不是 DOM 节点**，
+   没有任何选择器点得着它 —— 唯一的入口是让承载它的控件字号归零。同一处选完文件后会换成
+   文件名，也一起没了；不心疼：`.image-name`（ImageStrip.tsx:71）本来就逐张把名字渲染成 DOM
+   文本，比 UA 那一行更完整（多张图各有一行，UA 只留最后一次选择的那个）。
+   外壳那圈边框/底色/阴影跟着一起撤：文案没了以后，那层壳就是「一个套着按钮的空盒子」。 */
 .image-file-input {
   width: fit-content;
   max-width: 100%;
-  padding: 4px 8px;
-  color: var(--text-muted);
-  background-color: var(--bg-input);
+  padding: 0;
+  border: 0;
+  font-size: 0;
+  background-color: transparent;
+  box-shadow: none;
 }
 
-/* 原生 file 控件里那枚「选择文件」是 UA 自己画的（浅色底、自己的圆角与字号），
-   noir 下就是一块贴上去的白标签。`::file-selector-button` 是唯一能改它的入口，
-   颜色一律走 token，字号随基座（`font: inherit`）。 */
+/* 那枚按钮是 UA 画的，`::file-selector-button` 是唯一入口：颜色一律走 token（R207）。
+   字号**必须自己写**：`font: inherit` 会把上面那个 0 继承进来，症状是按钮缩成零尺寸、
+   附件的第三个入口点不着 —— 这两条声明是成对的，`tokens.test.ts` 那条闸钉的就是这个对。
+   单位取 `rem` 不取 `em`：父级字号是 0，`em` 会跟着塌成 0。
+   **文案改不掉**（2026-10-22 在发布产物里实测）：`::file-selector-button { content: "添加图片" }`
+   在 `getComputedStyle` 里拿得到那串字，但引擎不拿它当按钮文案用，界面上仍是「选择文件」；
+   写进 `::-webkit-file-upload-button` 更直接被打回 `content: normal`。⇒ 不许再加 `content`
+   装样子，想换文案只能换成「看得见的 `<label>` + 隐藏 input」那一类 DOM 改动。 */
 .image-file-input::file-selector-button {
-  margin-right: 8px;
-  padding: 2px 8px;
+  padding: 4px 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   background-color: var(--bg-raised);
-  font: inherit;
+  font-family: inherit;
+  font-size: 1rem;
+  box-shadow: 0 1px 2px var(--shadow);
+  cursor: pointer;
 }
 
 /* ==== 设置面板（T45） ==== */
