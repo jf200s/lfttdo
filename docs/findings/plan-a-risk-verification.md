@@ -65,27 +65,29 @@ dev 日志中唯一的额外信息行是 `[vite] dependency optimized: vitest` �
 
 探针：`src-tauri/examples/stream_probe.rs`（`cargo build --example stream_probe` 通过，`cargo run --example stream_probe` 可执行）。审查后已修正探针：请求现在**真的声明了 `get_time` 工具**并附带 user 轮「现在几点」（详见下方「探针设计缺口」一节）；流式遍历逻辑本身未动，仍是 `create_stream`。
 
-**本节状态：探针就绪，四个判定问题均未实测。** 本机环境 `QWEN_API_KEY` 为空，无法向真端点发请求；为避免把「预期结果」写成「实测结果」，所有实测项统一标注 `未实测`，等补跑后回填。已实测的只有本机三件事：探针能编译、探针在无 key 时按契约 panic、`cargo test` 基线未退化（原文输出见本节末「本机实测原文输出」）。
+**本节状态（2026-10-22 更新）：补跑打出去了，第 1–3 问仍未实测，第 4 问拿到半程答案。** 六次真请求的原文见下方「2026-10-22 补跑原文」。拦路的是端点回的 `401 invalid_api_key`：凭据管理器里那条 key 形态正确（`key_shape=bailian_hex`，即 `sk-`+32 位小写 hex），北京站和国际站两个端点都用**与明知无效的假 key 完全相同**的报文拒绝它，所以「HTTP 通路/请求组装/报文解码」这条链是通的，不通的是凭据本身——这一条只能由用户处理，探针无法自助（R81 禁止任何自动化写凭据，也不许打印值）。第 4 问原本要判「哪种形态可用」，`Ok` 汇总行一次都没拿到，因此**不能**写成「`…/v1` 可用」；能写的是「只有 `…/v1` 能把请求送到 chat API 并换回可解析的 API 报文，其余三种形态换回空正文」。已实测的本机三件事仍是：探针能编译、`cargo test` 基线未退化（原文见本节末「本机实测原文输出」）；「无 key 时按契约 panic」那条已被新的凭据管理器回退路径取代，见「补跑命令」。
 
 ### 必答四问
 
 | # | 问题 | 结论 | 补跑后需附的原始输出行 |
 | --- | --- | --- | --- |
-| 1 | 首块延迟实测值（spec 风险 #4） | **未实测（缺 QWEN_API_KEY，待补跑）** | `chunks=… first_chunk_in=…` 中的 `first_chunk_in` 原值 |
-| 2 | chunk 是否真的多块（spec 风险 #4） | **未实测（缺 QWEN_API_KEY，待补跑）** | 同一行的 `chunks=N`（判据 `N > 1`） |
-| 3 | tool_call 分片是否带 index（spec 风险 #3，决定 Task 7 归组策略） | **未实测（缺 QWEN_API_KEY，待补跑）** | 全部 `TOOLCALL idx=… id=… name=… args=…` 行，一条不删 |
-| 4 | base_url 四种组合哪种可用（spec 风险 #5） | **未实测（缺 QWEN_API_KEY，待补跑）** | 每种组合一行：最终 URL → `Ok` 或 `Err` 原文 |
+| 1 | 首块延迟实测值（spec 风险 #4） | **仍未实测。** 六次请求全部死在 `create_stream` 的 `await` 上（401 / 空正文），SSE 响应头都没到手，`first_chunk_in` 这个数在结构上无法产生 | `chunks=… first_chunk_in=…` 中的 `first_chunk_in` 原值 |
+| 2 | chunk 是否真的多块（spec 风险 #4） | **仍未实测，同上。** 六次运行的汇总行一律是 `Err`，没有一次进入 `while let Some(chunk)` 循环 | 同一行的 `chunks=N`（判据 `N > 1`） |
+| 3 | tool_call 分片是否带 index（spec 风险 #3，决定 Task 7 归组策略） | **仍未实测。** `TOOLCALL` 行 0 条，但这**不能**读成「端点不触发工具调用」——请求根本没被授权。「若补上 tools 后 TOOLCALL 仍为 0 行」那条分支的前置条件（请求成功）没有满足 | 全部 `TOOLCALL idx=… id=… name=… args=…` 行，一条不删 |
+| 4 | base_url 四种组合哪种可用（spec 风险 #5） | **拿到半程答案：四只有一只到得了 API 层。** `…/compatible-mode/v1` 回的是**可解析的** `ApiError(401 invalid_api_key)`，另外三种形态（尾斜杠 / 少 `/v1` / 只剩主机名）一律回 `JSONDeserialize("EOF while parsing a value", 空正文)`。「可用」的判据是 `Ok` 汇总行，本轮一次都没拿到，所以**不能写「`…/v1` 可用」**，只能写「只有它能走到 API 层」 | 每种组合一行：最终 URL → `Ok` 或 `Err` 原文（见下「2026-10-22 补跑原文」，已逐字贴全） |
 
 第 4 问待填的表格（四种组合即 brief Step 4 列出的三种变换加「原样」；`<你的端点>` 指补跑时实际使用的那个 base，dashscope 默认值一并给出做参照）：
 
 | 组合 | `QWEN_BASE_URL` 取值 | 结果 |
 | --- | --- | --- |
-| 原样（探针内置默认） | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 未实测（缺 QWEN_API_KEY，待补跑） |
-| 去掉尾部 `/` | `<你的端点>` 去掉末尾斜杠（默认值本就不带，故与「原样」同） | 未实测（缺 QWEN_API_KEY，待补跑） |
-| 补 `/v1` | 在没有 `/v1` 的 base 后面补上，例 `https://dashscope.aliyuncs.com/compatible-mode` + `/v1`（结果即第一行） | 未实测（缺 QWEN_API_KEY，待补跑） |
-| 去掉 `/v1` | 例 `https://dashscope.aliyuncs.com/compatible-mode` | 未实测（缺 QWEN_API_KEY，待补跑） |
+| 原样（探针内置默认） | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `Err`：`ApiError(ApiErrorResponse { status_code: 401, … code: Some("invalid_api_key") … })`——**走到 API 层了**，被凭据挡下 |
+| 去掉尾部 `/` | 与「原样」同一只 URL（默认值本就不带斜杠），另按「多加一只斜杠」实测 `…/compatible-mode/v1/` | `Err`：`JSONDeserialize(Error("EOF while parsing a value", line: 1, column: 0), "")`——**空正文** |
+| 补 `/v1` | `https://dashscope.aliyuncs.com/compatible-mode` + `/v1`（结果即第一行） | 同上（第一行那只 URL），未单独重跑 |
+| 去掉 `/v1` | 例 `https://dashscope.aliyuncs.com/compatible-mode` | `Err`：`JSONDeserialize("EOF while parsing a value", "")`；再退一步只填 `https://dashscope.aliyuncs.com` 也是同一支 |
 
 注：以 dashscope 默认 base 为输入时，这四行只有 2 个不同的 URL（`…/v1` 与 `…/compatible-mode`）；「四种组合」真正有意义的前提是补跑者用的是自己的端点。请如实记录你实际打过的每个 URL，包括命中 404/连接失败的那些，别只记成功的一个。
+
+**2026-10-22 补跑把这张表打满了六只 URL**（四形态 + 国际站 + 假 key 对照组），原文见下「2026-10-22 补跑原文」。上表「补 `/v1`」那一格没有独立一行原文，是因为它按定义就是第一行那只 URL——**这一格是定义，不是实测**，别把它读成重复验证过两次。
 
 ### 判据说明（补跑时避免误读）
 
@@ -151,6 +153,8 @@ error: process didn't exit successfully: `target\debug\examples\stream_probe.exe
 EXIT=101
 ```
 
+**这段已经过期（2026-10-22）**：`expect("set QWEN_API_KEY")` 那一行已被凭据管理器回退取代，panic 路径**不存在了**——这半句是源码判读。而「环境变量没设、库里也没有条目」那一支**未实测**：本机凭据条目是存在的，为了造出那个场景必须删掉用户的真条目，R81 不许。原文留着是因为它记录的是**当时**那次实测，本节的原则是「运行结果按运行时的代码记」，不去改写历史。
+
 Task 1 基线未退化检查，`cargo test` 原文（三处 `0 passed; 0 failed`，退出码 0，无 warning）：
 
 ```
@@ -178,8 +182,18 @@ EXIT=0
 
 ## 补跑命令
 
+**下面这行原文照录，但已作废**——它把真 key 放到命令行上：
+
 ```bash
-cd src-tauri && QWEN_API_KEY=<真 key> cargo run --example stream_probe
+cd src-tauri && QWEN_API_KEY=<真 key> cargo run --example stream_probe   # 作废：见下
+```
+
+作废理由（2026-10-22 补跑前发现的，不是跑完才回想起来的）：命令行参数在 Windows 上对同机其他用户态进程可读（`wmic process`/任务管理器的命令行列都能翻出来），而本节的交付要求是「stdout/stderr **原样**贴进文档」，终端缓冲和 findings 文档于是构成第二条泄漏路径。R164 的判据是「findings 里不许有真 key」，这条命令却把 key 先放到进程列表里——照它执行就把 R156 的「读取接口返回掩码值」在唯一一处绕开了。
+
+现在的形态是探针自己走凭据管理器（`stream_probe.rs` 的 `api_key()`，非 Windows 平台才退回环境变量）：
+
+```bash
+cd src-tauri && cargo run --example stream_probe            # key 来自 api_key.qwen-do，全程不落盘、不打印
 ```
 
 **成本说明：这条命令一次只回答第 1–3 问；第 4 问的四组合表需要共四次运行。** 探针在启动时只读一次 `QWEN_BASE_URL`，且**故意没有**内置 URL 循环（四种形态各跑一次比在探针里做循环更接近 Task 6 的真实用法，也更简单）。每种形态单独跑一次、各自往四组合表里添一行「最终 URL → `Ok` 汇总行原文 或 `Err`/`STREAM_ERROR` 原文」：
@@ -192,6 +206,72 @@ QWEN_BASE_URL=https://<你的端点>/compatible-mode   cargo run --example strea
 ```
 
 即完整补跑 ≈ 1 次主跑 + 4 次 base_url 形态跑（用默认 dashscope base 时其中两两 URL 相同，见四组合表下的注；用自建端点时四个都该打）。失败的那几次同样要记录原文，别只留成功的。stdout/stderr 原样贴进四问表格，不转述、不修剪 `TOOLCALL` 行。
+
+### 2026-10-22 补跑原文（六次运行，逐字照贴，含失败）
+
+命令都在仓库根执行；`cargo run -q` 只是去掉 `Finished/Running` 两行噪音，探针输出未作任何修剪。**每段第一行是探针自己打印的来源行**，其中 `key_len`/`key_shape` 各是一个长度和一个字符类判定，**不含值的任何片段**（R164）。
+
+一，主跑（默认 base，凭据管理器里的 key）：
+
+```
+$ cargo run -q --manifest-path src-tauri/Cargo.toml --example stream_probe
+key_source=keyring key_len=35 key_shape=bailian_hex base=https://dashscope.aliyuncs.com/compatible-mode/v1 model=qwen-plus
+Error: ApiError(ApiErrorResponse { status_code: 401, api_error: ApiError { message: "Incorrect API key provided. For details, see: https://help.aliyun.com/zh/model-studio/error-code#apikey-error", type: Some("invalid_request_error"), param: None, code: Some("invalid_api_key"), misalignment: None } })
+probe rc=1
+```
+
+二/三/四，其余三种 base_url 形态（同一只 key）：
+
+```
+======== run: QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/ ========
+key_source=keyring key_len=35 key_shape=bailian_hex base=https://dashscope.aliyuncs.com/compatible-mode/v1/ model=qwen-plus
+Error: JSONDeserialize(Error("EOF while parsing a value", line: 1, column: 0), "")
+rc=1
+======== run: QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode ========
+key_source=keyring key_len=35 key_shape=bailian_hex base=https://dashscope.aliyuncs.com/compatible-mode model=qwen-plus
+Error: JSONDeserialize(Error("EOF while parsing a value", line: 1, column: 0), "")
+rc=1
+======== run: QWEN_BASE_URL=https://dashscope.aliyuncs.com ========
+key_source=keyring key_len=35 key_shape=bailian_hex base=https://dashscope.aliyuncs.com model=qwen-plus
+Error: JSONDeserialize(Error("EOF while parsing a value", line: 1, column: 0), "")
+rc=1
+```
+
+五，国际站端点（怀疑 key 是新加坡区建的、打到北京站自然 401）：
+
+```
+key_source=keyring key_len=35 key_shape=bailian_hex base=https://dashscope-intl.aliyuncs.com/compatible-mode/v1 model=qwen-plus
+Error: ApiError(ApiErrorResponse { status_code: 401, api_error: ApiError { message: "Incorrect API key provided. For details, see: https://www.alibabacloud.com/help/en/model-studio/error-code#apikey-error", type: Some("invalid_request_error"), param: None, code: Some("invalid_api_key"), misalignment: None } })
+probe rc=1
+```
+
+六，**对照组**：明知无效的假 key 走环境变量（`key_source=env`，32 字符，`key_shape=other`）。这一只是把「我们的请求组装错了」和「服务器不认这把 key」分开的那一次运行：
+
+```
+key_source=env key_len=32 key_shape=other base=https://dashscope.aliyuncs.com/compatible-mode/v1 model=qwen-plus
+Error: ApiError(ApiErrorResponse { status_code: 401, api_error: ApiError { message: "Incorrect API key provided. For details, see: https://help.aliyun.com/zh/model-studio/error-code#apikey-error", type: Some("invalid_request_error"), param: None, code: Some("invalid_api_key"), misalignment: None } })
+probe rc=1
+```
+
+#### 这六段原文能证明什么、不能证明什么
+
+- **能证明**：DNS、TLS、请求构造、Bearer 头、报文解码这一整条链是通的——对照组拿到的是一句**结构完整的** `ApiError(401)`，而且北京站与国际站各自的帮助链接不同（`help.aliyun.com` vs `www.alibabacloud.com`），说明请求确实落到了那两只主机上。库里那条 key 得到的是**逐字相同**的 401 报文，所以服务端把它和一把假 key 视为同类：**问题在凭据本身，不在本仓代码**。
+- **能证明**：`key_shape=bailian_hex`（`sk-`+32 位小写 hex）——这排除了「粘成了魔搭/OpenAI 的 key」这一种成因（那两家的字符集不是纯小写 hex，长度也不同）。剩下的是「未开通/已吊销/过期/属于另一个账号」，这四者探针分不开，只能回控制台看。
+- **不能证明**：任何 base_url 形态「可用」。判据是 `Ok` 汇总行（`chunks=N first_chunk_in=…`），六次运行一次都没出现。第 1–3 问的格子仍是 `未实测`，Task 7 累加器的 index 归组策略**仍未被真端点背书**。
+- **成因推断的边界**：`key_shape` 是启发式（百炼 key 的常见形态是本仓此前见过的样子，未查厂商文档、未对多把真 key 实测），所以 `bailian_hex` 只说「像」，不说「是」；判据权在 HTTP 状态码，不在这里。
+
+#### 顺带从这次补跑里落地的一个缺陷（已修，有测试）
+
+形态二/三/四那三次 `JSONDeserialize("EOF while parsing a value", 空正文)` **不是探针才会遇到的形态**：用户把控制台的整行端点连主机名一起粘进设置页时（例如只填 `https://dashscope.aliyuncs.com`），`normalize_base_url` 只会补 `/v1`、补不出 `/compatible-mode`（`openai_compat.rs:120-122`），生产路径同样会撞上空正文。而 `classify_openai_error` 的 `Decode` 那一支当时打印的是：
+
+```
+协议数据转换失败: 响应体无法解析: EOF while parsing a value at line 1 column 0｜响应正文:
+```
+
+（这是变异测试期间实测打印出来的原文。）正文为空 ⇒ 后半句什么都没有，整条错误里**没有任何字指向「设置页」或「哪个地址」**，而 provider.rs:50-58 那张表对本层的承诺恰恰是「一眼分得开去查设置还是去查网络」。修法是这一支带上请求地址（`｜请求地址: …`，用 `text::truncate_display(_, 120)` 夹长度，因为 base_url 是用户粘贴的自由文本，不夹就等于把「错误文本长度受控」那条不变量交到用户手里）。
+
+测试：`an_empty_response_body_still_names_the_url_it_came_from`（先跑红：`正文为空时，请求地址是唯一的线索：协议数据转换失败: …｜响应正文: `；改好后 `model::openai_compat` 组 48 只全绿，全套 266 passed / 0 failed / 1 ignored）。**牙齿实测过**：把 `classify_openai_error` 改回不带地址的写法，新测试当场红、旧的正文片段那条仍然绿（`1 passed; 1 failed`），说明新判据咬的是新行为；改回后 `cmp` 与备份逐字节相同，`rustfmt --edition 2024 --check` rc=0。
+
 
 ## 风险 2：Tauri 二进制 IPC
 
