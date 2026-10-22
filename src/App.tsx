@@ -6,6 +6,7 @@ import { Sidebar } from "./components/Sidebar";
 import * as api from "./ipc/commands";
 import { useTextBuffer } from "./ipc/batching";
 import { appendUserTurn, initialState, reduce, replay } from "./state/reducer";
+import { writeThemeCache } from "./theme/cache";
 import { applyTheme, resolveTheme } from "./theme/theme";
 import type {
   Decision,
@@ -87,19 +88,28 @@ export default function App() {
 
 
   /**
-   * 把设置里那三项落到 `documentElement` 上。**启动与保存共用这一份**（R117 的口径：
+   * 把设置里那四项落到 `documentElement` 上。**启动与保存共用这一份**（R117 的口径：
    * 一份实现、两个入口）—— 写两遍的话「保存后界面没跟着变」这种 bug 只会出现在没被
    * 抄到的那一边。回落必须出声：静默回落等于「设置没生效但界面说生效了」。
+   * T44：`accent` 进必填第 5 参；成功后写主题缓存（冷启动播种的唯一数据源，
+   * `main.tsx` + `theme/cache.ts`）。写缓存的时机判据与「成功后才应用」同一条：
+   * 失败的保存不许把没生效的颜色/字号种进下一份启动（`AppSettings.test.tsx` 钉着）。
    */
   const applySettingsTheme = useCallback(
-    (v: Pick<Settings, "theme" | "mode" | "font_size">) => {
+    (v: Pick<Settings, "theme" | "mode" | "font_size" | "accent">) => {
       const { theme, fellBack } = resolveTheme(v.theme);
       try {
-        applyTheme(document.documentElement, theme, v.mode, v.font_size);
+        applyTheme(document.documentElement, theme, v.mode, v.font_size, v.accent);
       } catch (e) {
         notice(`主题未能应用：${String(e)}`);
         return;
       }
+      writeThemeCache({
+        theme,
+        mode: v.mode,
+        fontSize: v.font_size,
+        accent: v.accent,
+      });
       if (fellBack) notice(`未知主题「${v.theme}」，已回落到 noir`);
     },
     [notice],
@@ -107,8 +117,9 @@ export default function App() {
 
   /**
    * 第 12 条 / 要求 10：主题由真实 `settings_get` 驱动（R169 因此才能删掉 `main.tsx`
-   * 那行硬编码）。`applySettingsTheme` 只兜主题名；`mode` 那一支的运行时防线在 `applyTheme` 里
-   * （T16 是它唯一的调用方，R167），所以 try/catch 在那一处是**必需的**而不是装饰 ——
+   * 那行硬编码；T44 之后 `main.tsx` 只从**缓存**播种，权威仍是这里 → `AppSettings` 保存）。
+   * `applySettingsTheme` 兜主题名回落；`mode` 那一支的运行时防线在 `applyTheme` 里
+   * （`cache.ts` 的播种路径共用同一份防线，R167），所以 try/catch 在那一处是**必需的**而不是装饰 ——
    * 磁盘上躺着未来版本写的值时，界面不许白屏。
    */
   useEffect(() => {

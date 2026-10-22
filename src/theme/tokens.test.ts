@@ -10,6 +10,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  ACCENT_TOKENS,
   THEME_NAMES,
   THEME_TOKENS,
   USER_TOKENS,
@@ -50,14 +51,18 @@ function declaredCustomProperties(body: string): string[] {
   return [...body.matchAll(/(--[a-z][a-z0-9-]*)\s*:/g)].map((m) => m[1]);
 }
 
-/** applyTheme 的自证桩：把两次写入分别收进数组，`toEqual` 钉的是**顺序与内容**（R121）。 */
+/** applyTheme 的自证桩：把写入与清除分别收进数组，`toEqual` 钉的是**顺序与内容**（R121）。
+ *  T44 之后 `style` 上多了一个被消费的方法 `removeProperty`（accent 为空时清除 inline 三件套），
+ *  桩不实现它，测试会 TypeError 在一片红里淹掉真正的原因。 */
 function makeSpyElement(): {
   el: HTMLElement;
   attrs: [string, string][];
   vars: [string, string][];
+  removed: string[];
 } {
   const attrs: [string, string][] = [];
   const vars: [string, string][] = [];
+  const removed: string[] = [];
   const el = {
     setAttribute: (k: string, v: string): void => {
       attrs.push([k, v]);
@@ -66,9 +71,12 @@ function makeSpyElement(): {
       setProperty: (k: string, v: string): void => {
         vars.push([k, v]);
       },
+      removeProperty: (k: string): void => {
+        removed.push(k);
+      },
     },
   } as unknown as HTMLElement;
-  return { el, attrs, vars };
+  return { el, attrs, vars, removed };
 }
 
 /**
@@ -200,6 +208,15 @@ describe("theme tokens", () => {
     expect(new Set(THEME_TOKENS).size).toBe(THEME_TOKENS.length);
     // F16：spec 443 明写「预设主题 3 套」，块数期望值就是从这个数字推出来的，所以它自己也得有牙。
     expect(THEME_NAMES.length * 2).toBe(6);
+    // T44 裁定 1：`--accent*` 走**新名单** `ACCENT_TOKENS`，不进 `USER_TOKENS`（上面那条
+    // `toEqual(["--font-size"])` 与不相交、双向相等三条钉的是旧语义，照计划把它们塞进
+    // `USER_TOKENS` 会同时撞红三条在跑的闸）。这条子集关系**就是**「清掉 inline 能回到预设」
+    // 的结构保证：预设块定义了它们，inline 移除后层叠自然回落到那一份。少了它，回落的正确性
+    // 只存在于口头。两个名单的语义差别写在 `theme.ts` 的注释里。
+    expect(ACCENT_TOKENS).toEqual(["--accent", "--accent-hover", "--accent-text"]);
+    for (const t of ACCENT_TOKENS) {
+      expect(THEME_TOKENS, `${t} 必须同时由预设块定义`).toContain(t);
+    }
   });
 
   // F2 + F5：双向集合相等，且**只在 :root 这一条规则里取**。
@@ -263,7 +280,7 @@ describe("theme tokens", () => {
 
   it("writes attributes onto the element rather than swapping stylesheets", () => {
     const probe = makeSpyElement();
-    applyTheme(probe.el, "noir", "dark", 17);
+    applyTheme(probe.el, "noir", "dark", 17, "");
     expect(probe.attrs).toEqual([
       ["data-theme", "noir"],
       ["data-mode", "dark"],
@@ -271,37 +288,66 @@ describe("theme tokens", () => {
     expect(probe.vars).toEqual([["--font-size", "17px"]]);
   });
 
-  // F3 / R122：`--accent` 只由 presets.css 拥有。评审 M16 把 R122 明令删掉的
-  // `accent?: string` 参数与 `if (accent) el.style.setProperty("--accent", accent)` 原样加回
-  // `theme.ts`，实测 vitest / tsc / lint:css 三道闸一道都不响 —— R122 是 R120-R127 里
-  // 唯一「完全靠它自己不在」的裁定。下面两条是新绊线：
-  //   ① arity：applyTheme 今天声明 4 个形参，加回第 5 个（哪怕可选）就变 5；
-  //   ② 效果：多传一个颜色串，只要它真被写进 CSS 自定义属性，vars 就多一项。
-  // 评审 §4.10 自己声明过修复片段没实跑，这里实跑了一遍：它给的
-  // `applyTheme(el, "noir", "dark", 17, "#ff0000" as never)` 实测是
-  // `error TS2554: Expected 4 arguments, but got 5`（`as never` 只放宽类型、不管实参个数），
-  // 而本任务的判据要求 `npx tsc --noEmit` rc=0，所以改成通过放宽签名的引用传这个多余实参。
-  it("has no hook for writing --accent inline", () => {
+  // F3 / R122 的翻面（T44，计划 Step 0 预告的冲突之一）：R122 当年明令 `--accent` 只由
+  // presets.css 拥有、`applyTheme` 不许有写它的钩子；Plan C 把语义改成「预设 + 用户覆盖」，
+  // inline 三件套由 `applyTheme` 的第 5 个**必填**入参驱动。旧绊线的两条判据因此必须跟着翻面
+  // （同 R169 守卫的处理口径 —— 不许留一条描述已死不变式的闸）：
+  //   ① arity：形参数现在是 5。做成可选也会被这条红掉（默认值不计入 Function.length），
+  //      而可选意味着漏传合法、漏传的症状正是「强调色设了没反应」（计划 :734 的裁定）；
+  //   ② 效果：第 5 参真的写进 CSS 自定义属性。
+  // R122 的另一半**仍然成立**：`USER_TOKENS` 一字未动（见上面名单完整性那条与裁定 1）。
+  it("owns the accent triplet through a required fifth argument", () => {
     expect(
       applyTheme.length,
-      "applyTheme 的形参数量不再是 4 —— R122 明令删掉的第 5 个 `accent` 参数被加回来了" +
-        "（哪怕声明成可选，arity 也会先红在这里）",
-    ).toBe(4);
+      "applyTheme 的形参数量不再是 5 —— 第 5 个 `accent` 入参被摘掉或做成了可选" +
+        "（T44：漏传合法的症状是『强调色设了没反应』，所以必填）",
+    ).toBe(5);
 
     const probe = makeSpyElement();
-    const callWithExtraAccent = applyTheme as unknown as (
-      ...args: unknown[]
-    ) => void;
-    callWithExtraAccent(probe.el, "noir", "dark", 17, "#ff0000");
+    applyTheme(probe.el, "noir", "dark", 17, "#ff0000");
     expect(
       probe.vars,
-      "applyTheme 把多余实参写进了 CSS 自定义属性（R122：--accent 不许走 inline）",
-    ).toEqual([["--font-size", "17px"]]);
+      "第 5 参没有写进 CSS 自定义属性（三件套的唯一出口被绕过，用户改色没反应）",
+    ).toEqual([
+      ["--font-size", "17px"],
+      ["--accent", "#ff0000"],
+      ["--accent-hover", expect.any(String)],
+      ["--accent-text", expect.any(String)],
+    ]);
+    expect(probe.removed, "非空 accent 不该顺手清除 inline").toEqual([]);
+  });
+
+  // 计划 Step 2：写三件套 + 清除回预设。断言只能打在 `el.style.getPropertyValue` 上 ——
+  // jsdom 的 CSSOM 不会把 `:root`/预设块与 inline 合成出最终值（简报 §4.4），
+  // 「inline 优先于 [data-theme] 块」是浏览器行为，本片不许用单元测试声称验证过层叠。
+  it("writes the triplet inline and removes all three when the setting is empty", () => {
+    const el = document.createElement("div");
+    applyTheme(el, "noir", "dark", 15, "#aa00ff");
+    expect(el.style.getPropertyValue("--accent")).toBe("#aa00ff");
+    expect(el.style.getPropertyValue("--accent-hover")).toBeTruthy();
+    expect(el.style.getPropertyValue("--accent-text")).toBe("#ffffff");
+    applyTheme(el, "noir", "dark", 15, "");
+    for (const t of ACCENT_TOKENS) {
+      expect(
+        el.style.getPropertyValue(t),
+        `${t} 必须被 removeProperty：残留会让「跟随预设」变成「沿用上次挑的色」`,
+      ).toBe("");
+    }
+  });
+
+  // 裁定 4 末条：形状不认识的 accent（用户手改 settings.json 塞进来的 `"tomato"`，
+  // Rust 侧 `normalize_accent` 已规范成 `""`，正常到不了这里；直接调用方兜住它）
+  // = 清除 inline、**不抛错**。一处校验的边界有两个入口就会漂移（R123 同一条）。
+  it("treats an unparseable accent as follow-the-preset instead of throwing", () => {
+    const el = document.createElement("div");
+    applyTheme(el, "noir", "dark", 15, "#aabbcc");
+    expect(() => applyTheme(el, "noir", "dark", 15, "tomato")).not.toThrow();
+    expect(el.style.getPropertyValue("--accent"), "认不出的形状必须清除 inline").toBe("");
   });
 
   it("rejects unknown theme names instead of silently falling back", () => {
     expect(() =>
-      applyTheme(document.documentElement, "bogus", "dark", 15),
+      applyTheme(document.documentElement, "bogus", "dark", 15, ""),
     ).toThrow();
   });
 
@@ -311,7 +357,7 @@ describe("theme tokens", () => {
   // 评审 M14 实测：整支删掉后 6 passed + tsc rc=0（零覆盖）。
   it("rejects an unknown mode instead of writing an unusable attribute", () => {
     expect(() =>
-      applyTheme(document.documentElement, "noir", "sepia" as Mode, 15),
+      applyTheme(document.documentElement, "noir", "sepia" as Mode, 15, ""),
     ).toThrow();
   });
 
@@ -369,13 +415,29 @@ describe("theme tokens", () => {
     }
   });
 
-  // R169 的另一半：硬编码那一行**必须不在**。注释里提到 applyTheme 不算调用，所以先剥注释。
-  it("leaves settings as the only source of the applied theme", () => {
+  // R169 + T44 裁定 2：这条闸的语义在 T44 被翻了面 —— `main.tsx` 现在**要**在首帧前接线，
+  // 但接的是**缓存**（用户上一次的真值），不是 `Settings::default()` 的第 N 份硬编码拷贝。
+  // 旧标题「settings as the only source」描述的是 T44 之前的世界，留着它就是一条与现实相反的
+  // 绿闸（R201 的「有闸无牙」）。现在的判据四选一：
+  //   ① ② 仍然不许直接调 `applyTheme`/`resolveTheme` —— 那是把写盘逻辑第二次实现；
+  //   ③ **必须**接线 `seedFromCache` —— 否则 `theme/cache.ts` 成了有名单没消费者的死码（R201 同族）；
+  //   ④ 不许出现任何**字面主题名** —— 这才是 R169 真正在守的东西（默认值的拷贝会随 Rust 漂移）。
+  // 缓存缺失/坏掉时 `seedFromCache` 什么都不做：第一帧仍是 `tokens.css` 的 `:root` 兜底。
+  it("seeds only from the cache and never from a hardcoded default", () => {
     const code = stripCodeComments(readFileSync(pathOf("../main.tsx"), "utf8"));
     expect(code, "main.tsx 又出现了启动期硬编码的 applyTheme 调用").not.toMatch(
       /applyTheme\s*\(/,
     );
     expect(code).not.toMatch(/resolveTheme\s*\(/);
+    expect(
+      code,
+      "main.tsx 不再接线 seedFromCache —— theme/cache.ts 成了没人消费的第二份名单（R201），" +
+        "而「冷启动不再闪」整个交付就没人执行了",
+    ).toMatch(/seedFromCache\s*\(/);
+    expect(
+      code,
+      "main.tsx 出现了字面主题名 —— R169 的病根：默认值的拷贝会随 Rust 侧漂移，四处相等时全绿",
+    ).not.toMatch(/"(noir|paper|ocean)"/);
     // 但第一帧仍然要有兜底字号：设置回来之前不许退回浏览器的 16px。
     // 这条不再钉死 15 —— 钉死数字就是再造一份默认值（R169 的根因）。
     expect(stripComments(tokens)).toMatch(/--font-size:\s*\d+px;/);

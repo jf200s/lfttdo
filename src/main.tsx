@@ -7,18 +7,20 @@ import "./styles.css";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { seedFromCache } from "./theme/cache";
 
-// R169：这里**不再有**启动期的 `applyTheme` 调用。以前那一行
-// `applyTheme(document.documentElement, "noir", "dark", 15)` 是 `Settings::default()`
-// （`settings.rs:265-267`）的第三份拷贝，`tokens.css` 的 `--font-size: 15px` 是第四份。
-// 四处今天逐字相等 —— 这正是危险：Rust 侧把默认字号改成 14，第一帧照旧闪成 15px，
-// 而 cargo test / vitest / tsc 全绿。主题现在只有**一个**来源：`App` 里那次 `settings_get`。
-//
-// 第一帧（HTML 已上屏、设置还没读回来）的底色由 `tokens.css` 的 `:root` 兜着 —— 那就是
-// noir/dark 那一套值。没有把它「修掉」：往 `index.html` 写 `data-theme=noir` 不会改变
-// 任何一个计算值（`:root` 与 noir/dark 那块逐字相同），只会多出第五份硬编码默认值。
-// 残余风险：设置里存的是别的预设时，首帧到设置返回之间可能有一次配色跳变（肉眼可见与否
-// 属未实测项 —— 见 T16 报告的 未实测 清单，`tauri dev` 不归本任务）。
+// T44（裁定 2 重写此段；旧版断言「主题只有一个来源」从这一刻起不再成立）：
+// 首帧前同步读一次主题**缓存**。R169 当年删掉的是
+// `applyTheme(document.documentElement, "noir", "dark", 15)` —— `Settings::default()`
+// 的第 N 份硬编码拷贝；这里装的不是默认值，是**用户上一次会话的真值**。两者的区别就是
+// 这条线存在的理由：拷贝会随 Rust 侧漂移而全绿，缓存不会说谎。
+// 失败模式（裁定 2/缓存注释）：缓存缺失、坏 JSON、名单外的主题名、不可用的 mode ——
+// `seedFromCache` 全部什么都不做，第一帧回到今天的老行为：`tokens.css` 的 `:root` 兜底
+// （noir/dark 那一套值）。播种只走 `resolveTheme` + `applyTheme`（一份实现、两个入口），
+// 所以这里不出现 `applyTheme(` 本身 —— `tokens.test.ts` 那条翻面后的 R169 守卫钉着这两点。
+// 权威仍是 `App` 里那次 `settings_get`：它回来后**无条件覆盖**缓存与界面，
+// 磁盘上的设置永远赢过首帧播种的那一份。
+seedFromCache(document.documentElement);
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>

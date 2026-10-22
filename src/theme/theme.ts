@@ -1,3 +1,5 @@
+import { accentTriplet, normalizeHex } from "./accent";
+
 export const THEME_NAMES = ["noir", "paper", "ocean"] as const;
 export type ThemeName = (typeof THEME_NAMES)[number];
 export type Mode = "light" | "dark";
@@ -38,11 +40,27 @@ export const THEME_TOKENS = [
  *  它只在 `tokens.css` 的 `:root` 留一份「applyTheme 还没跑时」的兜底，绝不进预设块（R124）。 */
 export const USER_TOKENS = ["--font-size"];
 
+/** T44 裁定 1：`--accent` 三件套是 inline **临时覆盖**，真相仍在预设 —— 与 `USER_TOKENS`
+ *  的「inline **独占**、预设不许有」是两种语义，所以它们进 `ACCENT_TOKENS` 而不是
+ *  `USER_TOKENS`（后者撞红的三条在跑的闸见 `tokens.test.ts` 名单完整性那条）。
+ *  `ACCENT_TOKENS ⊆ THEME_TOKENS` 由那条测试钉住：预设块定义了它们，inline 被清除后
+ *  层叠自然回落到那一份 —— 这就是「跟随预设」的结构保证。 */
+export const ACCENT_TOKENS = ["--accent", "--accent-hover", "--accent-text"] as const;
+
+/**
+ * `accent` 是 T44 加的**必填**第 5 入参：可选意味着漏传合法，而漏传的症状是「强调色设了
+ * 没反应」（计划 :734）。`""` 与认不出的形状都走「清除 inline、跟随预设」—— 不抛错、
+ * 不出声：校验边界只有 Rust 一处（R123 同一条纪律），用户手改 `settings.json` 写进
+ * `"tomato"` 时 `load()` 已经把它规范成 `""`，这里的宽容只是兜住直接调用方。
+ * 这里翻面了 R122 的旧语义（「--accent 只由 presets.css 拥有」）：Plan C 之后真相是
+ * 「预设 + 用户覆盖」，覆盖只能走这一个出口。
+ */
 export function applyTheme(
   el: HTMLElement,
   theme: string,
   mode: Mode,
   fontSize: number,
+  accent: string,
 ): void {
   if (!THEME_NAMES.includes(theme as ThemeName)) {
     throw new Error(`未知主题 "${theme}"，可选：${THEME_NAMES.join(", ")}`);
@@ -53,6 +71,15 @@ export function applyTheme(
   el.setAttribute("data-theme", theme);
   el.setAttribute("data-mode", mode);
   el.style.setProperty("--font-size", `${fontSize}px`);
+  const hex = normalizeHex(accent);
+  if (hex === null || hex === "") {
+    for (const t of ACCENT_TOKENS) el.style.removeProperty(t);
+    return;
+  }
+  const triplet = accentTriplet(hex, mode);
+  el.style.setProperty(ACCENT_TOKENS[0], triplet.accent);
+  el.style.setProperty(ACCENT_TOKENS[1], triplet.hover);
+  el.style.setProperty(ACCENT_TOKENS[2], triplet.text);
 }
 
 /** 面向设置的适配器（R125）。`Settings.theme` 是自由字符串（`settings.rs:243`，serde 不校验），

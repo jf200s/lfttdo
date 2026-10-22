@@ -87,6 +87,12 @@ beforeEach(() => {
   document.documentElement.removeAttribute("data-theme");
   document.documentElement.removeAttribute("data-mode");
   document.documentElement.style.removeProperty("--font-size");
+  // T44：`applyTheme` 现在会写 `<html>` 的 inline 三件套，不清会把上一用例的颜色串给下一条。
+  for (const t of ["--accent", "--accent-hover", "--accent-text"]) {
+    document.documentElement.style.removeProperty(t);
+  }
+  // App 成功应用后会写主题缓存（jsdom 的 localStorage 同文件内共享），每条用例从冷启动开始。
+  localStorage.clear();
 
   h.sendMessage.mockReset().mockResolvedValue(undefined);
   h.interrupt.mockReset().mockResolvedValue(undefined);
@@ -260,5 +266,58 @@ describe("App 设置接线", () => {
     expect(
       within(dialog).getByText(/settings\.json\.corrupt-1700000000000/),
     ).toBeInTheDocument();
+  });
+
+  // T44：accent 进 `applySettingsTheme`（必填第 5 参）+ 成功应用后写缓存，判据在 App 接线层。
+  // 面板**没有**取色器控件（任务 #64 另片），所以走「load 带 accent → 原样 carry-through →
+  // 保存成功」这条路 —— `accent` 正是面板不渲染、必须带过的键之一（上面整表断言的同一支）。
+  it("paints the accent triplet inline and caches it after a successful save", async () => {
+    h.getSettings.mockResolvedValue(view({ accent: "#aa00ff" }));
+    render(<App />);
+    await settled();
+    const dialog = await openPanel();
+    fireEvent.click(within(dialog).getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    // inline 三件套真的上了 `documentElement`（判据只能打在 `el.style`，jsdom 不合成层叠）。
+    const style = document.documentElement.style;
+    expect(style.getPropertyValue("--accent")).toBe("#aa00ff");
+    expect(style.getPropertyValue("--accent-hover"), "hover 与静止同色 = R168 的病").not.toBe(
+      "#aa00ff",
+    );
+    expect(style.getPropertyValue("--accent-text")).toBe("#ffffff");
+    // 成功应用后才写缓存，且只写白名单四键：key/base_url/模型名绝不许出现在里面。
+    const cached = localStorage.getItem("qwen-do.theme");
+    expect(cached, "applyTheme 成功后必须 writeThemeCache（冷启动播种的唯一数据源）").not.toBeNull();
+    expect(JSON.parse(cached as string)).toEqual({
+      theme: "noir",
+      mode: "dark",
+      fontSize: 15,
+      accent: "#aa00ff",
+    });
+    expect(cached).not.toMatch(/sk-|api_key|base_url|example\.invalid|qwen-plus/);
+  });
+
+  // 失败路径的对应物（「保存成功才应用」的另一半延伸到 accent + 缓存）：写盘失败时
+  // 三件套不许上屏、缓存里也不许出现这次的颜色 —— 否则「没生效但看着生效了」换了个入口复发。
+  it("does not paint the accent or touch the cache when the write failed", async () => {
+    h.setSettings.mockRejectedValue("写入设置失败：磁盘只读");
+    h.getSettings.mockResolvedValue(view({ accent: "#aa00ff" }));
+    render(<App />);
+    await settled();
+    // 启动那次 applySettingsTheme 是成功的（settings_get 回来了），所以此刻 inline 有颜色、
+    // 缓存有四键 —— 这正是要钉住的起点：之后写盘失败，界面与缓存都不许跟着假保存走。
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#aa00ff");
+    const dialog = await openPanel();
+    fireEvent.change(within(dialog).getByLabelText(/字号/), { target: { value: "18" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: /保存/ }));
+    await within(dialog).findByRole("alert");
+    expect(
+      document.documentElement.style.getPropertyValue("--font-size"),
+      "写盘失败不许把 18px 假应用上去",
+    ).toBe("15px");
+    expect(
+      JSON.parse(localStorage.getItem("qwen-do.theme") as string).fontSize,
+      "缓存也不许被失败的保存改写",
+    ).toBe(15);
   });
 });
