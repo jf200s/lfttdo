@@ -278,6 +278,30 @@ describe("App", () => {
     );
   });
 
+  // ---- 真窗口实测（R234）：自动改名的标题回不到侧栏 ----
+  // 改名发生在 Rust 侧（`ipc.rs` 的 `auto_title`），而侧栏的 `rows` 只在
+  // 新建/删除/重命名时重新 `sessions()`。症状：发完第一句话，那一行仍然写着
+  // 「新对话」，直到用户再建一条会话才更新 —— 功能在库里成了、在界面上没成。
+  it("re-reads the session list after a turn so the auto-renamed title shows up", async () => {
+    render(<App />);
+    await settled();
+    const before = h.sessions.mock.calls.length;
+    // 下一轮 `sessions()` 才给出改名后的标题，等价于 Rust 侧刚写完 `sessions.title`。
+    h.sessions.mockResolvedValue([{ ...row("B", 2), title: "你好" }]);
+
+    const box = await screen.findByRole("textbox", { name: /输入/ });
+    fireEvent.change(box, { target: { value: "你好" } });
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled());
+
+    await waitFor(() =>
+      expect(h.sessions.mock.calls.length).toBeGreaterThan(before),
+    );
+    expect(
+      await screen.findByRole("button", { name: "你好" }),
+    ).toBeInTheDocument();
+  });
+
   // ---- 硬性要求 6：停止按钮不做乐观恢复 ----
   it("switches the composer to a self-disabling stop button until done arrives", async () => {
     render(<App />);

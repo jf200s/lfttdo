@@ -210,8 +210,14 @@ export default function App() {
         notice(`发送失败：${String(e)}`);
         throw e;
       }
+      // R234：自动改名住在 Rust 侧（`auto_title`），而它不发事件 —— 不重新拉一次列表，
+      // 侧栏那一行会一直写着「新对话」，直到用户下次新建/删除/重命名才更新。
+      // 放在 `await` 之后是必须的：命令返回时那一轮的写入已经落库。不 `await` 它：
+      // 草稿清空挂在 `onSend` 的 resolve 上，不该为一次列表刷新多等一个来回。
+      // `refresh` 自己吞错并 `notice`，所以这里不存在悬空 rejection。
+      void refresh();
     },
-    [notice],
+    [notice, refresh],
   );
 
   /**

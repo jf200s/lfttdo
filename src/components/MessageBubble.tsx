@@ -182,11 +182,15 @@ export function MessageBubble({
   onRespond: (id: string, d: Decision) => void;
 }) {
   const lastIndexOf = turn.blocks.length - 1;
+  // R234：空的助手气泡有两种来路 —— 等首字（该留着并看得出在等）与这一轮已结束
+  // （401、中断，该收起）。样式分不出「空且还在跑」和「空且已经死」，所以在这里打标。
+  const inFlight = streaming && isLastTurn && turn.role === "assistant";
   return (
     <article
       className={`bubble bubble-${turn.role}`}
       data-testid={`bubble-${turn.role}`}
       data-role={turn.role}
+      {...(inFlight ? { "data-streaming": "true" } : {})}
     >
       {turn.blocks.map((b, i) => (
         <BlockView

@@ -425,6 +425,26 @@ describe("theme tokens", () => {
     );
   });
 
+  // 真窗口实测（R234）：质感层给 `.bubble` 加了内边距与投影之后，一个**空的**助手气泡
+  // 变成屏幕左侧一枚没有含义的小胶囊。空气泡有两种来路 —— 正在等首字（该留，且要看得出
+  // 在等）和这一轮已经死了（401、中断，该消失）。区分它们的标记由 `MessageBubble` 打
+  // （`data-streaming`，`MessageList.test.tsx` 钉着），这里钉样式的另一半。
+  it("keeps the in-flight empty bubble and hides the dead-empty one", () => {
+    const css = stripComments(readFileSync(pathOf("../styles.css"), "utf8"));
+    expect(
+      css,
+      "已结束的轮次不许留下一枚空气泡：`.bubble-assistant:not([data-streaming]):empty` 必须收起",
+    ).toMatch(
+      /\.bubble-assistant:not\(\[data-streaming\]\):empty\s*\{[^}]*display:\s*none/,
+    );
+    expect(
+      css,
+      "等首字的那几秒必须看得见 —— 空气泡上要有一个占位字符，而不是一个空壳",
+    ).toMatch(
+      /\.bubble-assistant\[data-streaming\]:empty::after\s*\{[^}]*content:/,
+    );
+  });
+
   // R181：按下态必须比静止态**暗**，六块全过。
   // 为什么做成性质检查而不是钉死某个值：`--bg-input` 的明暗方向本身随 mode 翻转
   // （三个 dark 块更亮、三个 light 块更暗），所以「这里用 --bg-input」在 light 三块看着对、

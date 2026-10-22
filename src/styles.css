@@ -268,6 +268,20 @@ a:hover {
   border-top-left-radius: calc(var(--radius) / 3);
 }
 
+/* R234：真窗口实测出来的两种「空气泡」。质感层给 `.bubble` 加了内边距与投影之后，
+   空元素从「看不见」变成「左侧浮一枚没有含义的小胶囊」，而它有两种来路：
+   这一轮已经结束（401、中断）—— 该收起；还在等首字 —— 该留着，并且要看得出在等
+   （本机模型冷启动实测 5~10 秒没有任何字符，是这条占位撑住那段时间）。
+   区分两者的 `data-streaming` 由 `MessageBubble` 打，`MessageList.test.tsx` 钉着。 */
+.bubble-assistant:not([data-streaming]):empty {
+  display: none;
+}
+
+.bubble-assistant[data-streaming]:empty::after {
+  content: "…";
+  color: var(--text-muted);
+}
+
 /* 流式进行中的那一块：纯文本，保留换行，不解析半截 Markdown（要求 2）。 */
 .plain {
   margin: 0;

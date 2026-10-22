@@ -18,6 +18,32 @@ function state(partial: Partial<UiState>): UiState {
 }
 
 describe("MessageList", () => {
+  // 真窗口实测（R234）：发一条消息后 `.bubble-assistant` 立刻存在而且是空的，
+  // 质感层给它加了内边距与投影，于是屏幕左侧浮出一个没有任何含义的小胶囊。
+  // 同一个空元素在「正在生成」和「这一轮已经死了（401/中断）」两种状态下长得一模一样，
+  // CSS 分不开，所以由这里打一个标记，样式才有依据只留前者、藏后者。
+  it("marks the in-flight empty assistant bubble as streaming", () => {
+    const s = state({
+      streaming: true,
+      turns: [{ id: 1, role: "assistant", blocks: [] }],
+    });
+    render(<MessageList state={s} onRespond={() => {}} />);
+    const bubble = screen.getByTestId("bubble-assistant");
+    expect(bubble.textContent).toBe("");
+    expect(bubble).toHaveAttribute("data-streaming", "true");
+  });
+
+  it("drops the streaming mark when the turn is no longer running", () => {
+    const s = state({
+      streaming: false,
+      turns: [{ id: 1, role: "assistant", blocks: [] }],
+    });
+    render(<MessageList state={s} onRespond={() => {}} />);
+    expect(screen.getByTestId("bubble-assistant")).not.toHaveAttribute(
+      "data-streaming",
+    );
+  });
+
   it("renders streaming text without markdown-parsing the in-flight block", () => {
     const s = state({
       streaming: true,
