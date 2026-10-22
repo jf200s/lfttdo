@@ -42,10 +42,14 @@ export function SettingsPanel({
   const [error, setError] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   // 强调色控件的三态（任务 #64，计划 :942）：`null` = 跟随预设（复选框勾着、取色器不渲染），
-  // `""` = 「刚取消勾选、还没选过色」，其余才是用户真选过的 `#rrggbb`。
+  // `""` = 回到自选但**这一轮还没有值**（只有载入的 accent 本身是空串时才停在这里），
+  // 其余才是用户真选过的 `#rrggbb`。
   // `""` 那一态不是多余的谨慎：`<input type="color">` 的 DOM 值**永远**是合法 hex（空白态被
   // 规范化成黑），载荷一旦取自 DOM，「我想看看自选长什么样」这一点击的必然结果就是存进一支
   // 用户从没选过的黑色 —— 症状是界面突然变黑底，而用户完全看不出为什么。
+  // 反过来，取消勾选时把**载入的那支存色**恢复成待定值（种子来自设置本身，不是硬编码 hex）：
+  // 否则「有存色 → 勾选跟随预设 → 再取消勾选」这条路上取色器显示 `#aa00ff` 而载荷发 `""`，
+  // 同一个病的反面 —— 显示与载荷必须同源。
   // 这里**不校验形状**：`accent` 的合法值名单只有 Rust 的 `normalize_accent` 那一份（R123 的
   // 两处边界会漂移）；载入值已经过那一处归一，所以「非空即自选色」是可信的。
   const [customHex, setCustomHex] = useState<string | null>(() =>
@@ -250,7 +254,7 @@ export function SettingsPanel({
                 <input
                   type="checkbox"
                   checked={customHex === null}
-                  onChange={() => setCustomHex(customHex === null ? "" : null)}
+                  onChange={() => setCustomHex(customHex === null ? form.accent : null)}
                 />
                 <span>跟随预设</span>
               </label>

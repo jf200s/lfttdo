@@ -230,6 +230,30 @@ describe("SettingsPanel", () => {
     expect(screen.getByTestId("accent-swatch")).toBeInTheDocument();
   });
 
+  it("restores the loaded colour when custom mode is turned back on", async () => {
+    // 审查抓到的形状不一致（简报 §3 裁定 2 的第四条路）：`defaultValue` 取的是载入值 `form.accent`，
+    // 而载荷判据在 `customHex === ""` 时发空串。于是「存着 `#aa00ff` → 勾选跟随预设 → 再取消勾选」
+    // 这一条路上，取色器**显示** `#aa00ff` 而保存的是 `""` —— 与 headline 那条（显示黑、存进去黑）
+    // 同一个病的反面：显示与载荷分叉。修法是让取消勾选把用户自己的存色恢复成待定值，
+    // 种子来自设置本身而不是硬编码 hex，于是两条路都同源。
+    const p = setup({ accent: "#aa00ff" });
+    const follow = screen.getByLabelText(/跟随预设/) as HTMLInputElement;
+    fireEvent.click(follow);
+    expect(follow.checked, "第一次点击 = 跟随预设").toBe(true);
+    fireEvent.click(follow);
+    expect(follow.checked, "第二次点击 = 回到自选，取色器重新出现").toBe(false);
+    expect(
+      (screen.getByLabelText(/强调色/) as HTMLInputElement).value,
+      "取色器重新出现时显示的是用户存着的那支色",
+    ).toBe("#aa00ff");
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(
+      p.onSave.mock.calls[0][0].accent,
+      "显示 #aa00ff 却保存成空串：用户在取色器里看见的颜色与他存进去的颜色不是一份",
+    ).toBe("#aa00ff");
+  });
+
   it("saves the colour the user actually picked", async () => {
     const p = setup({ accent: "" });
     fireEvent.click(screen.getByLabelText(/跟随预设/));
