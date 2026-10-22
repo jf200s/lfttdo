@@ -41,6 +41,16 @@ export function SettingsPanel({
   const [keyDraft, setKeyDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  // 强调色控件的三态（任务 #64，计划 :942）：`null` = 跟随预设（复选框勾着、取色器不渲染），
+  // `""` = 「刚取消勾选、还没选过色」，其余才是用户真选过的 `#rrggbb`。
+  // `""` 那一态不是多余的谨慎：`<input type="color">` 的 DOM 值**永远**是合法 hex（空白态被
+  // 规范化成黑），载荷一旦取自 DOM，「我想看看自选长什么样」这一点击的必然结果就是存进一支
+  // 用户从没选过的黑色 —— 症状是界面突然变黑底，而用户完全看不出为什么。
+  // 这里**不校验形状**：`accent` 的合法值名单只有 Rust 的 `normalize_accent` 那一份（R123 的
+  // 两处边界会漂移）；载入值已经过那一处归一，所以「非空即自选色」是可信的。
+  const [customHex, setCustomHex] = useState<string | null>(() =>
+    initial.accent === "" ? null : initial.accent,
+  );
   const boxRef = useRef<HTMLDivElement>(null);
 
   // 打开即把焦点收进对话框：`aria-modal` 承诺了「这是当前唯一的操作面」，
@@ -61,8 +71,15 @@ export function SettingsPanel({
       }
     }
     const typedKey = keyDraft.trim();
+    // `accent` 的唯一判据（见上面 `customHex` 那段）：`null`（勾选跟随预设）和 `""`（取消勾选
+    // 但没选过色）都发空串回 Rust 默认，只有真选过色才发那支 hex。其余十一键**照原样带过**，
+    // 不重新拼名单 —— `settingsOf` 的减法形状守的就是这件事（上面那条 carry-through 测试）。
+    const payload: Settings = {
+      ...form,
+      accent: customHex === null || customHex === "" ? "" : customHex,
+    };
     try {
-      await onSave(form);
+      await onSave(payload);
     } catch (e) {
       // 原文照贴，前端不解释文案（R195 口径）：解释一次就多一处与上游分叉的真相。
       setError(String(e));
@@ -216,6 +233,42 @@ export function SettingsPanel({
               <option value="dark">深色</option>
             </select>
           </label>
+          {/* 这一行**不用**上面那几行的「`<label className="panel-row">` 套 span + 控件」写法：
+              一行里有两个控件，而一个 `<label>` 只指向它第一个 labelable 后代。所以复选框自己带
+              一支 `<label>`（可及名「跟随预设」），取色器用 `aria-label` 取同一个可见文案当名字。
+              取色器是**非受控**的 `defaultValue`（裁定 2）：受控写法要么得写一支硬编码黑（R169 的
+              病根 + 硬编码色闸），要么在第一次 onChange 时把控件从非受控翻成受控（控制台那条
+              warning 本仓没有闸，会安静地留在产物里）。面板每次打开都是全新挂载，所以
+              `defaultValue` 不需要「props 变了要重新同步」这件事。
+              chip 恒定渲染且色值只写在 `styles.css` 里（`background-color: var(--accent)`）：
+              它显示的就是界面当前**真的**在用的那支色（预设档来自预设块、自选档来自 inline 三件套），
+              不需要 TS 知道它的值 —— 于是也没有第三份真相。 */}
+          <div className="panel-row">
+            <span>强调色</span>
+            <span className="panel-accent">
+              <label className="panel-follow">
+                <input
+                  type="checkbox"
+                  checked={customHex === null}
+                  onChange={() => setCustomHex(customHex === null ? "" : null)}
+                />
+                <span>跟随预设</span>
+              </label>
+              {customHex === null ? null : (
+                <input
+                  type="color"
+                  aria-label="强调色"
+                  defaultValue={form.accent}
+                  onChange={(e) => setCustomHex(e.target.value)}
+                />
+              )}
+              <span
+                className="panel-swatch"
+                data-testid="accent-swatch"
+                aria-hidden="true"
+              />
+            </span>
+          </div>
         </fieldset>
 
         {error !== null ? (

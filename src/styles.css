@@ -677,6 +677,44 @@ a:hover {
   background-color: var(--bg-input);
 }
 
+/* 强调色那一行（任务 #64）：复选框 + 取色器 + 色块 chip 挤在同一格（160px）里，整组横向排、
+   放不下就换行。复选框必须**退出**上面那条底色规则 —— 原生 checkbox 被填上不透明底色以后，
+   勾在浅色预设里几乎看不见（`.image-file-input` 为同一个理由撤过外壳那层底色）。
+   `color` + `font-size` 那两行是给「跟随预设」这串说明文字的：它跟 legend 同级，是行内的次要说明，
+   不该抢「强调色」那个行名。 */
+.panel-accent {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.panel-follow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: 0.85em;
+  cursor: pointer;
+}
+
+.panel-row input[type="checkbox"] {
+  width: auto;
+  background-color: transparent;
+}
+
+/* chip 显示的必须是界面**真的**在用的那支 accent，所以色值只有这一份、写在 CSS 里取
+   `var(--accent)`：预设档下来自预设块，自选档下来自 `applyTheme` 写的 inline 三件套
+   （`--accent` 在 `:root` 有兜底值，所以这一格永远有颜色）。TS 递一支色进来就是第三份真相，
+   而且它递不出「当前生效的那支」——只有层叠知道。描边是为了近白的 accent 在浅色面板上不消失。 */
+.panel-swatch {
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background-color: var(--accent);
+}
+
 .panel-readonly {
   margin: 0;
 }

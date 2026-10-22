@@ -3,10 +3,21 @@
 // 的话，写成 `as SettingsView` 的断言转换会照样绿 —— 这里用完整字面量，缺项由 TS 拦。
 // `waitFor` 用 `@testing-library/react` 那一个，不用 `vi.waitFor`：只有它包在 `act` 里，
 // 否则保存这类 await 之后的 setState 会留下一堆 act 警告，把真正的失败淹在 stderr 里。
+// 不用 Vite 的 `?raw`（Vitest 默认不处理 CSS，`import x from "./styles.css?raw"` 在测试里拿到空串，
+// 断言会假绿），也不把 `new URL(...)` 直接交给 fs：jsdom 环境里全局 `URL` 是 whatwg 实现，
+// Node 的 fs 认不出它，会抛 `The URL must be of scheme file`。口径照抄 tokens.test.ts:22-23。
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { SettingsPanel } from "./SettingsPanel";
 import type { SettingsView } from "../types";
+
+const pathOf = (relative: string): string =>
+  fileURLToPath(new URL(relative, import.meta.url).href);
+
+/** 剥块注释后再做正则匹配：注释里的色值不参与渲染，拿它充当「这条声明存在」的证据就是假绿。 */
+const stripComments = (css: string): string => css.replace(/\/\*[\s\S]*?\*\//g, "");
 
 const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   base_url: "https://example.invalid/v1",
@@ -176,15 +187,84 @@ describe("SettingsPanel", () => {
     expect(screen.getByText(/settings\.json\.corrupt-1700000000000/)).toBeInTheDocument();
   });
 
+  // ==== 任务 #64：强调色那一行（计划 :942 的「`<input type="color">` + 跟随预设复选框」） ====
+  // 四条用例的分工是**三态**，不重复：`null`（勾选跟随预设）/ `""`（取消勾选但没选过色）/
+  // 合法 hex（真选过）。判据只有载荷那一条 —— 控件本身的形状随设计走，`accent` 的字符串形状
+  // 由 Rust 认（`normalize_accent`），TS 侧不许再校验第二遍（R123：两处边界会漂移）。
+
+  it("keeps following the preset when the picker was shown but never used", async () => {
+    // 本片的 headline。`<input type="color">` 的 DOM 值**永远**是合法 6 位 hex：空白态在 DOM 里
+    // 被规范化成黑（jsdom 与 Chromium 同一算法，下面第二条断言钉的就是这件事）。
+    // 于是「打开面板 → 取消勾选 → 什么也没选 → 保存」这条最自然的探索路径，只要载荷取自 DOM
+    // 就会存进一支用户从没选过的黑色，症状是界面突然变黑底，而用户完全看不出为什么。
+    const p = setup({ accent: "" });
+    fireEvent.click(screen.getByLabelText(/跟随预设/));
+    const picker = screen.getByLabelText(/强调色/) as HTMLInputElement;
+    expect(picker.value, "DOM 的空白态就是黑 —— 所以载荷绝不许读 input.value").toBe("#000000");
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].accent).toBe("");
+  });
+
+  it("submits the empty accent while following the preset, even over a loaded colour", async () => {
+    // 复选框真的能**压掉**已有值：夹具里躺着一支 `#aa00ff`，勾选之后载荷必须是 `""`，
+    // 否则「跟随预设」只是个装饰文字，回到预设档要点两次保存。
+    const p = setup();
+    const follow = screen.getByLabelText(/跟随预设/) as HTMLInputElement;
+    expect(follow.checked, "载入自选色时复选框不该是勾上的").toBe(false);
+    fireEvent.click(follow);
+    expect(screen.queryByLabelText(/强调色/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].accent).toBe("");
+  });
+
+  it("loads a stored custom accent into an unchecked box and a picker showing that colour", () => {
+    // 「面板每次打开都是全新挂载」（App.tsx 按 settingsView !== null 条件渲染），所以
+    // defaultValue 只在挂载时读一次就够 —— 这条钉的就是那一次：已存的色必须看得见。
+    setup();
+    expect(screen.getByLabelText(/跟随预设/)).not.toBeChecked();
+    const picker = screen.getByLabelText(/强调色/) as HTMLInputElement;
+    expect(picker.type).toBe("color");
+    expect(picker.value).toBe("#aa00ff");
+    expect(screen.getByTestId("accent-swatch")).toBeInTheDocument();
+  });
+
+  it("saves the colour the user actually picked", async () => {
+    const p = setup({ accent: "" });
+    fireEvent.click(screen.getByLabelText(/跟随预设/));
+    fireEvent.change(screen.getByLabelText(/强调色/), { target: { value: "#336699" } });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].accent).toBe("#336699");
+  });
+
+  it("paints the swatch chip from the accent token, not from a value in script", () => {
+    // 裁定 2 的另一半 + R201 的「有名单没消费者」同族：chip 显示的必须是界面**真的**在用的
+    // 那支色（预设档来自预设块、自选档来自 `applyTheme` 的 inline 三件套），所以色值只能写在
+    // CSS 里取 `var(--accent)`，不许 TS 递一支进 `style`。jsdom 读不到层叠，判据就落在源码上
+    // （R235 立的口径，与 tokens.test.ts 那几条 CSS 闸同一族）。
+    const css = stripComments(readFileSync(pathOf("../styles.css"), "utf8"));
+    const swatch = /\.panel-swatch\s*\{([^}]*)\}/.exec(css);
+    expect(swatch, ".panel-swatch 没有声明 —— chip 是个死元素").not.toBeNull();
+    // `?? ""` 不参与判定：上一条 expect 在 null 时当场抛，走不到这里。写它只为让 TS 认识
+    // 到这条已经 narrowed（`not.toBeNull()` 不窄化类型，`swatch[1]` 报 TS18047）。
+    expect(
+      swatch?.[1] ?? "",
+      "chip 不许自带色值：它必须显示界面真的在用的那支 accent",
+    ).toMatch(/background(-color)?:\s*var\(--accent\)/);
+  });
+
   it("renders no control that this slice has no design for", async () => {
-    // 断言没变，**理由又变了一次**（别把这条当成还在测「存不存得进去」）：T39 之后
-    // `temperature`/`compact_threshold`/`keep_turns` 是存得进去的（spec 5.3 的三个内部参数，
-    // 默认值就够用）；T43 之后 `accent` **也存得进去了**（后端字段 + 校验已落地），
-    // `roots`/MCP 要等 Plan B。所以这里钉的从来不是「存不存得进」，而是
-    // 「不许半拉子地先加一个没有校验、没有说明的输入框」——真要开取色器是一个带设计的任务
-    // （T44 的三件套 + 面板控件），不是顺手加一行 `<input>`。上面那条 carry-through 测试保证
-    // 「不渲染」不等于「不带上」：这四键照样得原样回到 `settings_set`。
-    for (const label of [/温度/, /temperature/i, /压缩|阈值|keep_turns/i, /强调色/, /accent/i, /目录|roots/i, /MCP/i]) {
+    // 禁名单的历史（一路变了三次，别把这条当成还在测「存不存得进去」）：
+    // T39 之后 `temperature`/`compact_threshold`/`keep_turns` 是存得进去的（spec 5.3 的三个内部
+    // 参数，默认值就够用）；T43 之后 `accent` 也存得进去、但**还没有控件**，于是当时给它加了
+    // `/强调色/` `/accent/i` 两项预告；任务 #64（计划 :942）把控件补上了 ⇒ **这两项今天删掉**，
+    // 面板从此渲染强调色那一行（上面那四条取色器用例就是它的判据）。
+    // 剩下四项继续禁：它们的后端字段存在、面板**有意**不渲染，那是「有意的不渲染」不是遗漏。
+    // 这里钉的从来不是「存不存得进」，而是「不许半拉子地先加一个没有校验、没有说明的输入框」——
+    // 上面那条 carry-through 测试保证「不渲染」不等于「不带上」：那四键照样得原样回到 `settings_set`。
+    for (const label of [/温度/, /temperature/i, /压缩|阈值|keep_turns/i, /目录|roots/i, /MCP/i]) {
       expect(screen.queryByLabelText(label)).toBeNull();
     }
   });
