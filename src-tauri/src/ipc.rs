@@ -731,7 +731,12 @@ fn persist_window_geometry(window: &tauri::Window) {
     };
     // `Destroyed` 这一臂很可能已经取不到几何了，那是「不写」而不是「写 (0,0,0,0)」：
     // 写一份 zeros 进存档会把一次正常的关闭变成下一次启动要靠 `sane` 兜底的脏数据。
-    let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+    // 位置取 **outer**、尺寸取 **inner**，这个不对称是被真窗口逼出来的：恢复侧的
+    // `set_position` 与 `set_size` 分别按 outer 位置、inner 尺寸生效（tao 的 `resize`
+    // 改的是客户区）。两边都用 `outer_size` 时，存档的 1000×800 会被当成客户区尺寸重放，
+    // 实测每次启动净增一圈边框 —— 在这台 2560×1600 的屏上是 +22 宽 / +56 高，连开三个
+    // 窗口依次 1000×800 → 1022×856 → 1044×912，一路涨到被 `sane` 夹满工作区为止。
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.inner_size()) else {
         return;
     };
     // 最小化状态下关窗，Windows 报的是 (-32000, -32000) 一类的哨兵位置。这里**不加特例**：
