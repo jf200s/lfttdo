@@ -1,10 +1,12 @@
-# Plan C 交付基线：安装包体积与三条配置缺口
+# Plan C 交付基线：体积、冷启动、常驻内存与 §9 十二条判定表
 
-本轮（T46）只做一件事：**把「安装包 <15MB」这条验收线第一次真的量出来**。
+T46 那一轮只做一件事：**把「安装包 <15MB」这条验收线第一次真的量出来**。
 在此之前这个项目里所有出现过的体积数字都是 `target/debug/qwen-do.exe`，
 而 debug 产物从来不参与验收（`plan-a-risk-verification.md` 自己在 :38 就写了这句话）。
+T47 接手了 §3（冷启动、常驻内存）与 §6（§9 十二条的判定表）。
 
-**测量对象**：`npx tauri build` 的 NSIS 产物文件本身。不是 exe、不是 `dist/`、不是安装后占用。
+**测量对象**：`npx tauri build` 的产物 —— 安装包文件本身，以及它吐出来的那只 exe。
+不是 `cargo build --release` 的 exe（那只不能参与任何验收，原因见 §3.0）、不是 `dist/`、不是安装后占用。
 
 ---
 
@@ -140,11 +142,230 @@ Plan B 的 `htmd` / `url` / `ipnet`（`fetch_url` 那条链）、`rmcp`（**dev-
 
 ---
 
-## 3. 冷启动与常驻内存 —— 本轮没有数字
+## 3. 冷启动与常驻内存（T47，2026-10-22 实测）
 
-`§9` 的另两条线（冷启动、常驻内存）由 **T47** 填进本文件，测量脚本走
-`docs/findings/scripts/cold-start.ps1`。本节故意留空：
-上一轮已经吃过一次「把没跑的写成跑过」的账，宁可留一个空节标题。
+### 3.0 先记一条会让「release 产物」这四个字失去含义的事实
+
+今天**第一次**测出来的那批数字全部作废，原因不在测量方法，在被测对象：
+`cargo build --release` 产出的 `target/release/qwen-do.exe` 是一个**离了 dev server 就打不开界面**的
+二进制。把 vite 关掉再启动它，页面是 `chrome-error://chromewebdata/`、`document.title` 是
+`localhost`（CDP 读 `location.href` 原文，2026-10-22 15:07）。机制读源码钉死，不是猜：
+
+| 事实 | 出处 |
+| --- | --- |
+| `dev: cfg!(not(feature = "custom-protocol"))` | `tauri-macros-2.7.3/src/context.rs:155` |
+| `#[cfg(dev)]` 下 `get_app_url()` 返回 `build.dev_url`，否则返回 `tauri://localhost` | `tauri-2.12.4/src/manager/mod.rs:345-358` |
+| 本仓库 `src-tauri/Cargo.toml` **没有 `[features]` 段** ⇒ `custom-protocol` 只能由外部注入 | `grep -n '^\[features\]' src-tauri/Cargo.toml` 零命中 |
+| 注入者就是 CLI：`"cargo" build --bins --features tauri/custom-protocol --release` | `Get-CimInstance Win32_Process` 抓到的命令行原文（15:15 那次构建） |
+
+⇒ **只有 `npx tauri build` 的产物才是发布产物**，`cargo build --release` 那只不参与任何验收。
+这条顺带对上了 §5.7 那个一直没解释的数：同一份代码，cargo 版 exe 11,125,760 B，CLI 版
+11,287,040 B，差的 **161,280 B** 与「内嵌 `dist/` 582,295 B 经 brotli 压完」的量级一致。
+
+本节所有数字都在 15:15 那次 `npx tauri build` 之后重取，取之前用 CDP 读过
+`location.href == "http://tauri.localhost/"` 作为产物质地证明（连同 `min-height: 0`、
+`docScroll: false` 一起读，见 3.5）。
+
+### 3.1 冷启动（判据 <1.5 s）
+
+**测法**：`docs/findings/scripts/cold-start.ps1`（窗口句柄 / `Responding` 两档，5 次取中位数）
++ 一段一次性 CDP 探针（`%TEMP%\qwd_coldkey.mjs`，**不进仓库**）量第三档
+「输入框真的吃到一次按键」。每轮之前都确认机器上没有第二个 `qwen-do` 实例 ——
+脚本自己会 abort（`ABORT: N qwen-do process(es) already running`），CDP 那一档靠手工核对。
+
+```
+$ powershell -NoProfile -ExecutionPolicy Bypass -File docs/findings/scripts/cold-start.ps1 -Runs 5
+exe: D:\qwen do 1\src-tauri\target\release\qwen-do.exe
+run 1: window-handle 127 ms, responding 147 ms
+run 2: window-handle 120 ms, responding 138 ms
+run 3: window-handle 110 ms, responding 132 ms
+run 4: window-handle 111 ms, responding 127 ms
+run 5: window-handle 110 ms, responding 127 ms
+median window-handle: 111 ms   median responding: 132 ms   bar: 1500 ms
+```
+
+「按键可达」那档，同样 5 次（每次都是全新进程，端口用完即随进程消失）：
+
+```
+run 1: composer 551 | keystroke 584 | replayed 585
+run 2: composer 563 | keystroke 587 | replayed 588
+run 3: composer 518 | keystroke 524 | replayed 525
+run 4: composer 582 | keystroke 610 | replayed 610
+run 5: composer 511 | keystroke 523 | replayed 524
+```
+
+| 档位 | 5 次原始值（ms） | 中位数 | 对 1.5 s |
+| --- | --- | --- | --- |
+| 主窗口句柄出现 | 127 / 120 / 110 / 111 / 110 | **111 ms** | ✅ |
+| 且 `Responding` 为真 | 147 / 138 / 132 / 127 / 127 | **132 ms** | ✅ |
+| **输入框吃到一次按键**（spec :534 那句的口径） | 584 / 587 / 524 / 610 / 523 | **584 ms** | ✅，用掉 39% |
+| 会话历史已重放上屏 | 585 / 588 / 525 / 610 / 524 | 585 ms | 顺带 |
+
+四条测法边界，按对结果的影响方向写清：
+
+1. 起点是 `Start-Process` / `spawn`，**不是真的双击图标** —— 少算 explorer 那一下，方向是**低估**，
+   量级几十毫秒。584 ms 对 1500 ms 有 2.6 倍余量，这个方向的偏差改不了结论。
+2. 终点是 CDP `Input.insertText` 走浏览器输入路径后 `textarea.value` 变化，**不是物理键盘**，
+   也不含「焦点是否真的在输入框上」的无障碍判定（探针另外断言过 `document.activeElement === ta`）。
+3. 轮询粒度 20 ms ⇒ 所有数字都是**上界 + 20 ms 的量化误差**。
+4. **冷文件系统缓存的首次启动：未实测。** 上面 10 次全是 warm。要真做冷只有两条路：
+   Sysinternals `EmptyStandbyList`（本机没有，且不装第三方可执行）或重启。
+   「`Copy-Item` 一份新副本再测」这条路我试过思路后**放弃**：写入本身就经缓存管理器，
+   副本的页在 `Copy` 完就已经热了，那样报出来的「冷」是假的。
+
+### 3.2 空闲常驻内存（判据 <150 MB）—— ❌
+
+**测法**（计划 T47 Step 2 点名的坑，照做）：以 `qwen-do` 的 PID 为根，按 `ParentProcessId`
+**递归**收整棵树再 `WorkingSet64` 求和；**不按进程名过滤** ——
+`msedgewebview2.exe` 是全机 WebView2 应用共享的镜像名，按名字求和会把别人的内核进程记到我们账上。
+脚本 `%TEMP%\qwd_mem.ps1`（一次性，不落仓库），窗口打开 **60 秒**、无对话，取 3 次。
+
+```
+root pid 45592, up 60 s
+sample 1: 7 processes, WorkingSet sum 394.3 MB, PrivateBytes sum 211.2 MB
+sample 2: 7 processes, WorkingSet sum 394.4 MB, PrivateBytes sum 210.4 MB
+sample 3: 7 processes, WorkingSet sum 394.5 MB, PrivateBytes sum 210.4 MB
+```
+
+| 角色（命令行 `--type=` 判的） | PID | WorkingSet | PrivateBytes |
+| --- | --- | --- | --- |
+| **我们的进程**（browser-root，无 `--type`） | 45592 | **29.0 MB** | **6.5 MB** |
+| WebView2 browser-root | 26560 | 136.4 | 40.8 |
+| gpu-process | 45760 | 76.7 | **107.6** |
+| renderer | 42184 | 74.2 | 32.4 |
+| utility ×2（网络服务 / 其它） | 29780 / 44440 | 41.6 / 20.9 | 11.7 / 7.5 |
+| crashpad-handler | 37016 | 15.1 | 3.4 |
+| **合计** | 7 个进程 | **394.4 MB** | **210.4 MB** |
+
+**判定：❌ 超标 2.6 倍**，而且这不是「我们再优化一下」能收的差距：
+
+- 树里 **93%（365 MB）是 WebView2 运行时自己的进程**，我们写的那部分只有 29 MB 工作集 /
+  6.5 MB 私有字节。Plan A 风险清单第 8 条当时写的预估是「Rust core + WebView2 实测 60–120 MB」，
+  **那个预估错了**，错在把 WebView2 当成一个进程。
+- 两个口径都试过：`WorkingSet64` 求和会**重复计共享页**（虚高），所以同时报了 `PrivateBytes`
+  求和 = 210.4 MB —— 这是更保守、更接近任务管理器「内存」列的口径，**仍然超**。
+- 唯一有希望的那个开关试了：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--disable-gpu`
+  同样跑 60 s 空闲 ⇒ **380.2 MB WS / 119.9 MB Private**（省 14.2 MB WS / 90.5 MB Private），
+  但 gpu-process **并没有消失**（仍占 53.9 MB WS），只是从硬件合成退回软件合成。
+  也就是说：**没有任何一个运行时旋钮能把 394 MB 拉到 150 MB**，能省的那 14 MB 是 3.5%。
+  代价是渲染走 CPU，界面滚动/长回答上屏会明显变糙 —— 拿这条去换 14 MB 不值。
+- 测量状态如实记：侧栏 10 个会话，打开时自动恢复的是上一轮测试留下的那一屏内容
+  （含 markdown 列表）。**没有**测「空数据库首启动」那一档，那一档只会低不会高，
+  低多少未实测。
+
+⇒ 这一条**必须由用户重述**，三个方向（我不替用户选）：
+(a) 把判据改成「我们自己的进程 <30 MB + 安装包 <15 MB」，即「轻」定义在**我们可控的部分**；
+(b) 保留 150 MB 但明确它当前不达标、写进已知限制；
+(c) 换掉 WebView2（QtWebEngine / 自绘 / Flutter）—— 那是换技术栈，不在任何计划里。
+
+### 3.3 流式不掉帧 + 中断 1 s（Step 3）
+
+计划 Step 3 允许两条路：临时打开 `withGlobalTauri`，或改用「T16 的 rAF 合帧测试 + 一次真流式的
+主线程帧间隔」。**走了第二条** ⇒ `tauri.conf.json` 一行未改，那条「临时改动未提交」的尾巴不存在。
+DevTools Performance 面板那条路本来也走不通：release 无 devtools（§2 第 3 条）。
+
+测法：CDP 连进 15:15 那只产物 exe，点「新建对话」→ 发一条要求 150 条列表的长 prompt →
+等真实文本开始上屏（`.message-list` 的 `MutationObserver` 批次 ≥40）→ 在**真渲染窗口**内
+跑 rAF 采样环 → 点「停止」。跑了两轮（第二轮把点击后的观测窗从 200 ms 拉长到 2 s）。
+
+| 判据 | 实测 | 判定 |
+| --- | --- | --- |
+| 主线程单帧 <16 ms | rAF 间隔：963 / 1055 个样本，median **3.3 ms**、p95 **3.4 ms**、max **3.5 / 10.0 ms**，**>16 ms 的帧 0 个** | ✅（口径警告见下） |
+| React 渲染频率 ≤10 次/秒 | DOM 提交批次 **26.0 / 27.3 次每秒** | **❌ 未达字面阈值**，见 3.3.1 |
+| 中断在 1 s 内生效 | 点击 → 最后一次 DOM 提交 **+4.3 / +5.5 ms**；点击 → 「停止」按钮卸载 **+8 / +15.3 ms**；其后 **2 s 内 `.message-list` 零提交**（`commitsAfterClick = 1`，就是那一下） | ✅ |
+
+**口径警告（必须连着读上面那行才不算自欺）**：rAF 间隔**不等于** DevTools 的「主线程单帧耗时」，
+它是「两次回调之间的墙钟」。本机 rAF 稳定跑在 **300 Hz**（median 3.3 ms）—— 要么这是一块
+300 Hz 屏，要么这个窗口没被垂直同步封顶。无论哪种，「≤16 ms」在这台机器上是一条**天然宽松**的线，
+所以我连绝对分布一起贴出来，而不只贴一个 ✅。反过来它也是**强**证据的那一面：整段真流式渲染里
+最长的一帧只有 10 ms，说明主线程从没被一次 React 提交卡住过一帧以上。
+
+#### 3.3.1 26 次/秒 vs spec 的 ≤10 次/秒：一次口径分叉，不是回归
+
+`src/ipc/batching.ts` 的合帧边界选在**一帧一次**（文件头注释自己写着「使 React 渲染频率 ≤ 帧率」），
+而 spec :539 写的是「≤10 次/秒」。Rust 侧 `ipc.rs` 的 `Coalescer::MAX_WAIT = 30 ms` 已经把
+50–100 次/秒的 `text_delta` 压到 ~33 次/秒，前端再按帧合并 ⇒ 实测 26–27 次/秒正好落在那条上限之下。
+**症状上这条已经赢了**（不掉帧、上屏跟手），但阈值字面没满足。收口只有两种：
+给合帧加一个 100 ms 的时间下限（改实现、字面达标、代价是最长 100 ms 的上屏延迟），
+或者把 spec :539 那句改成「≤ 帧率且实测无 >16 ms 帧」（改标准）。**这是用户的判据，我不自己选。**
+
+#### 3.3.2 「停止中…」这个中间态实测不可见
+
+两轮都记到 `stopBecameDisabledMs = null`：`Composer.tsx:136` 确实把 `stopRequested` 置真、
+按钮也确实带 `disabled`，但从点击到 `.stop` 卸载只有 8–15 ms，**没有任何一帧**能被观测成
+「灰着的『停止中…』」。spec :475 那句「点击后立即禁用并显示停止中…」在用户眼里其实是
+「按钮立刻变回发送」。不是缺陷（反馈更快、且已生成的文本原样保留，截图核过），
+但那是 spec 的一句话没有对应可观测行为的一条，记在这里免得下一轮又当成 bug 去「修」。
+
+### 3.4 本轮数字对应哪一份代码
+
+| 事实 | 值 |
+| --- | --- |
+| 来源 commit | `0107e03`（工作树除 `docs/findings/scripts/` 外干净） |
+| 构建命令 | `npx tauri build`，rc=0，15:15 |
+| `target/release/qwen-do.exe` | 11,287,040 B |
+| `bundle/nsis/qwen-do_0.1.0_x64-setup.exe` | **4,118,863 B（3.93 MiB）**，比 §5.7 那次 +2,991 B |
+| `dist/` | 582,295 B（+2,022 B，就是 `0107e03` 的三行 `min-height: 0` 与一处色值） |
+
+⇒ **§1 那条 15 MB 的线在新代码上重测仍然大幅达标**，判定不变（3.93 MiB / 15 MB，用掉 26%）。
+
+### 3.5 顺带：R235 那两处修复在**产物**里成立
+
+字节级 grep 这条路是错的（内嵌资产是 brotli 压缩的，产物里搜不到 `min-height:0` 也搜不到色值），
+所以判据只能是行为。在 15:15 那只产物 exe 里用 CDP 读计算样式：
+
+```
+href "http://tauri.localhost/"  minHeightMessageList "0px"  overflowMessageList "auto"  docScroll false
+```
+
+⇒ 外壳滚动容器真的能缩了、文档不再跟着滚。这条证据从「dev 实例 + vite」换成了「发布产物」，
+之前那条只是同一件事的弱证据。
+
+---
+
+## 6. spec §9 十二条判定表（T47 Step 4；#29 与 T48 的唯一输入）
+
+一条一格，**不合并、不省略未做的**。判定只有四种：`✅` / `❌` / `未实测` / `不适用`，
+需要人坐在那台机器前面的，在判定后再加一个 `待人工`。
+
+| # | 判据（spec :531-563 原文） | 测法 | 实测值 | 判定 |
+| --- | --- | --- | --- | --- |
+| 1 | 安装包 <15MB | NSIS 产物文件字节数 | 4,118,863 B = **3.93 MiB**（§3.4，`0107e03` 之后重打） | ✅ |
+| 2 | 冷启动 <1.5s | 进程启动 → 输入框吃到一次按键，5 次中位数（§3.1） | **584 ms**（另两档：句柄 111 ms / `Responding` 132 ms） | ✅；**冷文件系统缓存的首次启动 未实测** |
+| 3 | 空闲常驻内存 <150MB | 递归 `ParentProcessId` 取整棵进程树求和，空闲 60 s，3 次（§3.2） | **394.4 MB** WorkingSet / 210.4 MB PrivateBytes；其中我们自己的进程 29 MB | ❌ 超标 2.6 倍，且 `--disable-gpu` 只省 14 MB ⇒ **判据本身要用户重述** |
+| 4 | 流式输出不掉帧 | 真流式窗口内 rAF 帧间隔 + T16 合帧单测（§3.3） | >16 ms 的帧 **0 个**（max 3.5 / 10.0 ms）；但渲染频率 **26–27 次/秒** | 帧间隔 ✅ / 「≤10 次/秒」❌ ⇒ 口径分叉，见 §3.3.1 |
+| 5 | 中断在 1s 内生效 | 点「停止」→ 前端最后一次文本 DOM 提交；其后 2 s 观测窗（§3.3） | **+4.3 / +5.5 ms**，2 s 内**零**新增提交 | ✅ |
+| 6 | 长对话不失忆、不 400 | 连续 100 轮：存在覆盖被丢弃区间的摘要消息，且第 100 轮 input tokens ≤ 预算 | 摘要压缩**未实现** —— `plan_compaction` 在 `src-tauri/` 零命中，`ContextCompacted` 只有事件变体与映射、**没有生产者**（`context.rs:45`、`session.rs:294` 自己写着「Plan A 无消费者，属切片 5」）；今天只有滑窗丢弃 + 图片降级 | ❌ 未实现（Plan C **T40–T42** 未开工）；人工那一半 `待人工` |
+| 7 | 全程零弹窗 | 100 轮 + 若干次联网下 `permission_request` 计数 = 0 | Plan A 结构性为 0（生产 registry 不注册工具，权限门不触发）；前端 `grep "confirm(\|alert(\|prompt("` **零命中** ⇒ 连 `window.confirm` 这类逃逸都没有。**但从未在真 key 全流程下数过一次** | 未实测 `待人工`（T48） |
+| 8 | 看图可用 | 一次贴 4 张图，模型答对图中内容；单张超限时 UI 指名是哪张、为什么 | 归一化 / 三入口 / 历史降级 的自动化测试在（T18–T20）；**真模型看图从未跑过** —— 本机 Ollama 只有 `qwen3-abliterated:8b` 这一个文本模型，没有 VL 模型 | 未实测 `待人工`（且 #28 阻塞在「要不要拉一个 VL 模型」这个决定上） |
+| 9 | MCP 可用 | 接一个真实搜索 server，模型调用其工具并引用来源 | Plan B 未开工；`rmcp` 仍在 `[dev-dependencies]`（只有 `examples/mcp_probe.rs` 用），**不进产物、也没有生产用户** | 不适用（Plan B） |
+| 10 | 无孤儿子进程 | 连 ≥1 个 stdio MCP server 后关窗，进程树无残留 npx/node | 同上 —— 没有 stdio 连接可关 | 不适用（Plan B） |
+| 11 | 主题生效 | 3 套预设 × 亮暗 × 强调色 × 字号，切换后即时生效且无需重启 | 预设 × 亮暗 = **6 块**真窗口截图逐块核过（#49 / R235）；字号 = `--font-size`，`USER_TOKENS` 里唯一的用户 token，设置面板可改、即时生效；**强调色取色器不存在** —— `theme.ts:39` 是 `USER_TOKENS = ["--font-size"]`，`--accent` 只由 `presets.css` 六块钉值 | 部分：预设 / 亮暗 / 字号 ✅；强调色 ❌ 未实现（Plan C **T43–T44** 未开工） |
+| 12 | api_key 不落明文 | key 在 Windows 凭据管理器；对配置目录与日志**全文搜索该 key 字符串，0 命中** | 结构性证据在：T12 只写 keyring、IPC 出口返回掩码、`settings.rs` 有一条断言序列化结果**不含** `api_key` 的钉子。**「全文搜索 0 命中」这一步从未跑过**（且当前存的那把 key 被两个 region 都 401 拒、曾被贴进对话 ⇒ 欠轮换，轮换前跑它没有意义） | 未实测 `待人工`（T48，前置是轮换） |
+
+**合计**：✅ 3 条（1、2、5）· 部分 ✅ 2 条（4、11）· ❌ 2 条（3 超标、6 未实现）·
+不适用 2 条（9、10，Plan B）· 未实测/待人工 3 条（7、8、12）。
+
+### 6.1 为了让这张表好看，本轮**没有**做的四件事
+
+1. **没有**把 `--disable-gpu` 写进 `tauri.conf.json` 或任何启动参数去换那 14 MB —— 它改变渲染路径，
+   拿界面手感换一个仍然不达标的数字是亏的。
+2. **没有**把第 3 条的判据改小或改口径（比如「只数我们自己的进程 ⇒ 29 MB ✅」）。
+   那 29 MB 我写在括号里，不写在判定列。
+3. **没有**把第 4 条整格判成 ✅。帧间隔那半边是真的，「≤10 次/秒」那半边实测 26 次/秒，
+   两半分开报。
+4. **没有**用「Plan A 结构性为 0」充当第 7 条的证据。结构性推理我写在实测值那一格里，
+   判定列是 `未实测`。
+
+### 6.2 这张表往下怎么走
+
+- 第 3、4 两条**需要用户判**：一个是要不要重述 150 MB，一个是要不要给合帧加 100 ms 时间下限
+  （或改 spec 那句阈值）。这两条都不是我能替用户收的。
+- 第 6、11 两条各有明确的未开工任务（T40–T42 / T43–T44），要动就是**开 Plan C 的那两片**，
+  不是在本轮顺手补。
+- 第 7、8、12 三条是 **T48 的正文**，且第 12 条前置在 key 轮换、第 8 条前置在一个 VL 模型。
+- 第 9、10 两条属于 Plan B，与「MCP 客户端目前不在这个产品里」是同一个事实的两种写法。
+
 
 ---
 
