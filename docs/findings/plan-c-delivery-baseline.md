@@ -571,3 +571,116 @@ Tauri 自己打印的那行也一致：`Finished 1 bundle at: …(3.93 MiB)`。
 所以**无消费者权限是 0 条，不是 3 条**。本任务的恢复全在 Rust 侧（Rust 不受 capabilities 约束），
 `capabilities/default.json` 一行未动。
 
+## 7. 第一次真的装上、真的跑起来（2026-10-22 22:35–22:57，HEAD `4ad7010`）
+
+### 7.0 为什么这一节之前不存在
+
+ledger :2218 那条原话是「**没有真的运行过那个 setup.exe**」。§1 到 §3.6 量的都是文件字节数 ——
+装没装上、装完能不能跑、跑起来长什么样，一条都没验过。本轮得到许可（「先把qwen-do关了再重装」）
+才第一次走完 打包 → 静默安装 → 启动 → 真窗口取数。
+
+### 7.1 体积线（T43/T44/#64 三片落地后的复测）
+
+| 量法 | 字节 | 对比 |
+| --- | --- | --- |
+| `bundle/nsis/qwen-do_0.1.0_x64-setup.exe` | **4,127,228 B（3.94 MiB）** | 比 §3.6 的 4,118,009 多 **+9,219 B**；比 §1.1 的 T46 基线 4,111,344 多 +15,884 B |
+
+15 MB 的线用掉 26%。**引用体积以本节为准**，§5.7 那句「以本节为准」的有效期到此结束。
+
+### 7.2 安装（这台机器上的第一次）
+
+| 项 | 值 |
+| --- | --- |
+| 命令 | `powershell -NoProfile -Command "Start-Process -FilePath '…\qwen-do_0.1.0_x64-setup.exe' -ArgumentList '/S' -Wait"` → rc=0 |
+| 为什么不是 `cmd /c start //wait … /S` | MSYS 不重写引号串里的 `//`，`start` 把 `/S` 当成自己的开关，报「无效开关 - "/"」，rc=1 |
+| 安装目录 | `%LOCALAPPDATA%\qwen-do\`：`qwen-do.exe` 11,311,616 B、`uninstall.exe` 79,242 B |
+| 卸载登记 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\qwen-do` |
+
+### 7.3 装进去的那只 exe 与 build 出来的那只差 3 个字节
+
+| 文件 | 字节数 | md5 |
+| --- | --- | --- |
+| `%LOCALAPPDATA%\qwen-do\qwen-do.exe` | 11,311,616 | `9e02efe7…` |
+| `target/release/qwen-do.exe` | 11,311,616 | `d7aaafa2…` |
+
+同尺寸、不同哈希，看着像「装的不是新代码」。逐字节比对的结论是：**只有 3 个字节不同，
+且全落在偏移 10,081,375–10,081,377 这一段连续区间里** —— bundler 复制时对 PE 打的一处补丁，
+不是另一份构建。而「装的是新代码」这件事的判据本来就不该是哈希（内嵌资源是 brotli 压过的，
+字节级 grep 也无效），是行为：见 §7.5。
+
+### 7.4 冷启动的两条时间线（装出来的二进制，不是 dev）
+
+| 量 | 第一次启动 | 第二次启动 |
+| --- | --- | --- |
+| 文档 `responseEnd` | — | 29 ms |
+| CSS `responseEnd` | — | 37 ms |
+| JS `responseEnd` | — | 42 ms |
+| DOMContentLoaded | 58 ms | 59 ms |
+| first-paint / FCP | 212 ms | 188 ms |
+
+**「首帧不再闪」在真窗口里成立，但理由是排序不是运气**：`seedFromCache` 是 `main.tsx` 里的同步
+语句，而 `<script type="module">` 按规范必须在 `DOMContentLoaded` 之前执行完；两次实测的 DCL
+（58 / 59 ms）都远早于 first-paint（212 / 188 ms）⇒ 浏览器能画出的第一帧已经带着主题。
+绝对毫秒会随机器变，这条不等式不会。
+
+### 7.5 强调色链路在 WebView2 里跑通的两个方向
+
+正向（面板取消勾选 → 原生 setter 写值 + dispatch `input` → 点保存）：
+
+| 观测点 | 值 |
+| --- | --- |
+| `settings.json`（磁盘） | `"accent": "#c2410c"` |
+| 行内 `--accent` / `-hover` / `-text` | `#c2410c` / `#d85722` / `#ffffff` |
+| 缓存 `qwen-do.theme` | `{"theme":"noir","mode":"dark","fontSize":15,"accent":"#c2410c"}`（四键白名单兑现，无 base_url、无模型名） |
+| 界面 | 会话项边框与文字、输入框 focus 环、正文链接即刻全部转成橙色，无需重启 |
+
+hover 按 `mode` 取方向（dark→更亮）这一条实测：ΔL(#c2410c→#d85722) = **0.0625** ≥ `MIN_LUMA_DELTA` 0.06。
+文字取黑白里更强的那支：L = 0.1528 时白 5.18:1 > 黑 4.06:1 ⇒ `#ffffff`，AA 达标。
+（顺带修正我自己的一次口算：写 brief 时我以为这支色会选黑字，代码是对的，我估错了。）
+
+反向（行内清空 → 回落预设），这是 jsdom 给不了的那一层：
+
+| 行内 `--accent` | computed `--accent` | computed `--accent-hover` |
+| --- | --- | --- |
+| `""` | `#8a5a2b`（paper 预设） | `#6d4218`（浅色档→更暗，方向对） |
+
+「清掉行内就退回预设」从这一刻起有实测，不再只是 `ACCENT_TOKENS ⊆ THEME_TOKENS` 的结构论证。
+
+### 7.6 原生控件的真实外观（本轮唯一只能靠眼睛的部分）
+
+| 项 | 实测 |
+| --- | --- |
+| `<input type="color">` 空态 | DOM 属性写的是 `""`，`input.value` 读回来是 **`#000000`** |
+| 它在 WebView2 里的样子 | 50×27 的圆角胶囊，里面一小块黑色矩形 —— 不是整块填色 |
+| 色块 chip | 16×16，`background-color: var(--accent)`，圆角 6px，始终跟着**生效值** |
+| 复选框 | 勾上时是 **Windows 蓝**，不跟主题 |
+
+三条结论：
+1. 「native 控件的 DOM 值与我们的 state 语义不同构」这条从 jsdom 推出来的判断，在真引擎里逐字兑现 ——
+   三态 `customHex` 不是多余的谨慎。
+2. 复选框的蓝色是本轮唯一看得见的破绽。一行 `accent-color: var(--accent)` 可修（Chromium 93+ 支持，零 hex）。
+3. 取色器胶囊里那块黑、旁边色块显示真值，同屏两个颜色，是「刚取消勾选、还没选过色」这一态的必然观感。
+   修它要把**当前生效**的预设色喂进 `defaultValue`，那得在面板里读 computed style（jsdom 测不到它）。
+   **本轮没动，留给 T48 人工验收一起判。**
+
+### 7.7 WebView2 的 CDP 缺一个能力（记下来免得下轮再试）
+
+`Page.addScriptToEvaluateOnNewDocument` **返回 `{"identifier":"1"}`、`Page.setBypassCSP` 也回 ok，
+但脚本永远不执行**：`Page.reload` 之后上一次留下的 `window.__marker` 没了（确实换了文档），
+`window.__probe` 却还是 `undefined`。⇒ document-start 注入这条路在 Tauri 的 WebView2 上不可用。
+
+代价是播种的**归因**测不到：把缓存涂成 `#00a0ff`（磁盘仍是 `#c2410c`）再冷启动，100 ms 的第一次
+采样读到的已经是磁盘值 —— `settings_get` 比采样更早落地。所以 §7.4 证的是「第一帧有主题」，
+不是「这个值是缓存给的」。缓存本身的行为有 13 条单测加 `tokens.test.ts` 那条 main.tsx 接线门兜着，
+这条限制只影响浏览器侧的归因，不影响结论成立。
+
+### 7.8 本轮进仓库的东西、和用户有关的东西
+
+- 唯一新文件：`docs/findings/scripts/cdp-probe.mjs`（零依赖，Node 24 内置 fetch + WebSocket；
+  子命令 `eval | arm | trace | shot`）。9222 是本机**无鉴权**端口，随进程生灭，
+  **没有**写进 `tauri.conf.json`，也不进任何配置。
+- `settings.json`：本轮把 `accent` 从 `""` 改成 `#c2410c` 又改回 `""`，走的是界面本身而不是改文件
+  （顺手把「勾回跟随预设并保存」这条路径也在真窗口里跑了一遍）。
+- 测量中途用户自己把 theme/mode 从 noir/dark 改成了 paper/light —— **保留用户的选择，未回滚**。
+- 当前开着的这个窗口是用 `--remote-debugging-port=9222` 起的；从快捷方式正常启动就没有这个端口。
+
