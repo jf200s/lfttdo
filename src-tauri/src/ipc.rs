@@ -14,12 +14,13 @@ use crate::permission::gate::PermissionGate;
 use crate::settings::{Settings, SettingsStore};
 use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::tools::registry::ToolRegistry;
+use crate::window_state::{self, Ev, WindowGeom, should_persist};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::ipc::InvokeBody;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WindowEvent};
 use tokio_util::sync::CancellationToken;
 
 /// 事件通道的 payload（plan:2842 / spec:285 钉死 `{ sessionId, event }`）。
@@ -669,6 +670,84 @@ fn init_logging(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// 把 `Monitor::work_area()` 摊平成 `window_state::{sane,pick}` 要的 `(x, y, width, height)`。
+/// 之所以在 `ipc.rs` 而不是 `window_state.rs` 里展开：那个模块不许依赖 Tauri
+/// （`lib.rs:4-6` 的边界规则），顺带换来它的 6 条测试不需要运行时也不需要接显示器。
+fn work_area(monitor: &tauri::Monitor) -> (i32, i32, u32, u32) {
+    // `tauri::Monitor` 的字段是 `pub(crate)`，只给访问器（`window/mod.rs:56-101`），
+    // 而 `work_area()` 返回的是 `&PhysicalRect`，那个结构体的字段才是公开的。
+    let area = monitor.work_area();
+    (
+        area.position.x,
+        area.position.y,
+        area.size.width,
+        area.size.height,
+    )
+}
+
+/// T46b：按存档几何恢复窗口。**任何一步不成立就退回 conf 里的默认尺寸**，
+/// 全程不许 panic —— 一个存坏的 `window.json` 不该有能力让应用打不开。
+fn restore_window_geometry(handle: &AppHandle) {
+    // conf 里的窗口是在 `setup` 钩子**之前**创建的（`tauri-2.12.4/src/app.rs:2692` 的
+    // `WebviewWindowBuilder::from_config`），所以到这里才拿得到 `main`。
+    // 这也是 Plan A 写死的那个 `"label": "main"` 第一次真的有消费者。
+    let Some(window) = handle.get_webview_window("main") else {
+        return;
+    };
+    let Ok(dir) = handle.path().app_data_dir() else {
+        return;
+    };
+    let Some(saved) = window_state::load(&dir.join(window_state::STATE_FILE)) else {
+        return;
+    };
+    // 枚举不到任何显示器就**不**恢复：无法证明「某块屏上看得见」的几何比默认尺寸更危险
+    // —— 拔掉副屏后重启、窗口落在 x=3000 上就是这么来的。
+    // 判定要对着**每一块**屏做，而不是只问 `current_monitor()`：这时窗口还是系统刚按默认位置
+    // 摆出来的那块（通常主屏），摆在副屏上的存档会被误判成越界丢掉，症状是「每次重启都从
+    // 副屏被拽回主屏」—— 等于这条需求对双屏用户白做。
+    let Ok(monitors) = window.available_monitors() else {
+        return;
+    };
+    let works: Vec<(i32, i32, u32, u32)> = monitors.iter().map(work_area).collect();
+    let Some(g) = window_state::pick(saved, &works) else {
+        return;
+    };
+    let restored = window
+        .set_size(PhysicalSize::new(g.width, g.height))
+        .and_then(|_| window.set_position(PhysicalPosition::new(g.x, g.y)));
+    if let Err(e) = restored {
+        tracing::warn!("窗口几何未能恢复，留在默认尺寸：{e}");
+    }
+}
+
+/// 关闭事件发生时把当前几何写回存档；取不到就什么也不写。
+fn persist_window_geometry(window: &tauri::Window) {
+    // 单窗口应用（spec §6.6）：别的 label 的窗口不该覆盖这份存档。
+    if window.label() != "main" {
+        return;
+    }
+    let Ok(dir) = window.path().app_data_dir() else {
+        return;
+    };
+    // `Destroyed` 这一臂很可能已经取不到几何了，那是「不写」而不是「写 (0,0,0,0)」：
+    // 写一份 zeros 进存档会把一次正常的关闭变成下一次启动要靠 `sane` 兜底的脏数据。
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        return;
+    };
+    // 最小化状态下关窗，Windows 报的是 (-32000, -32000) 一类的哨兵位置。这里**不加特例**：
+    // 照原样写进去，由下次启动的 `sane` 判成越界 ⇒ 回到默认尺寸。
+    // 在此识别「现在是 minimized」要多引一层窗口状态查询，换来的只是同一次重启少丢一个位置。
+    let geom = WindowGeom {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    };
+    if let Err(e) = window_state::save(&dir.join(window_state::STATE_FILE), geom) {
+        tracing::warn!("窗口位置未能保存：{e}");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -700,7 +779,29 @@ pub fn run() {
                 running: Arc::new(Mutex::new(None)),
                 log_path,
             });
+            // T46b：几何恢复放在 `manage` 之后、`Ok(())` 之前——`app_data_dir()` 与
+            // `create_dir_all` 已经在前头跑过，存档目录这时一定存在。
+            restore_window_geometry(app.handle());
             Ok(())
+        })
+        // T46b：落盘时机（计划 Step 2 的裁定）。一次拖拽会发来几百个 `Resized`/`Moved`，
+        // 全部写盘等于把「记住位置」做成「每移一次写一次磁盘」。**不为此引入定时器去抖**：
+        // 那是给「关窗时定时器还在写」新造一类竞态。决定本身抽成纯函数 `should_persist`，
+        // 于是这条取舍有测试而不是只有注释。代价如实记在这里：崩溃或强杀会丢窗口位置，
+        // 症状是「下一次回到默认尺寸」，不是数据丢失。
+        .on_window_event(|window, event| {
+            let ev = match event {
+                WindowEvent::Resized(_) => Ev::Resized,
+                WindowEvent::Moved(_) => Ev::Moved,
+                // `CloseRequested` 是带 `api` 字段的变体，而 `WindowEvent` 整个枚举
+                // `#[non_exhaustive]`（`app.rs:111`）⇒ 结构体变体要写 `{ .. }`、且必须有兜底臂。
+                WindowEvent::CloseRequested { .. } => Ev::CloseRequested,
+                WindowEvent::Destroyed => Ev::Destroyed,
+                _ => return,
+            };
+            if should_persist(ev) {
+                persist_window_geometry(window);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             send_message,
@@ -726,6 +827,10 @@ pub fn run() {
         // `tauri-build` 的 build script 在编译期解析，`//` 注释得到 `key must be a string at
         // line 15 column 9`，自由字段 `"_comment"` 得到 `unknown field _comment` —— JSON 里没有
         // 任何合法的注释位。红线：交出去的 conf 必须能被解析（`cargo check` rc=0 为准）。
+        // T46b 之后 conf 里那两行 `"width": 800, "height": 600` **保留**，它的身份是
+        // 「没有存档时的尺寸」：删掉它换到的是 Tauri 自己的默认尺寸，那才是第三份真相
+        //（存档 / conf / 框架默认），而 `window_state::sane` 丢掉一份越界存档之后
+        // 落到的正是这一行。
         .run(tauri::generate_context!())
         .expect("error while running qwen-do");
 }

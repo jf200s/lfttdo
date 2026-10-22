@@ -157,3 +157,116 @@ Plan B 的 `htmd` / `url` / `ipnet`（`fetch_url` 那条链）、`rmcp`（**dev-
 | 安装包 | `qwen-do_0.1.0_x64-setup.exe`，4,111,344 B，2026-10-22 09:57 |
 
 也就是说：**这个 3.92 MiB 的包已经带设置面板**，T47 拿它直接量冷启动，不必重打。
+（**这一句现在过期了一半**：见 §5 —— 那 3.92 MiB 量的是 `51a7eef` 的代码，T46b 在它之后
+又叠了一层窗口状态。没重测，所以别把这两个事实混着读。）
+
+---
+
+## 5. 窗口状态（T46b：spec §6.6 的「记住尺寸位置」）
+
+### 5.1 为什么是自己写的 ~80 行
+
+`tauri-plugin-window-state` 存在，但本计划的 Global Constraints 禁止新增直接依赖
+（每条依赖都要重算 §1 那个数），而越屏恢复的策略本来就必须是我们的代码 —— 插件的恢复判定不可控。
+动工前的现状用 grep 钉住：`window_state` / `set_size` / `outer_position` 在 `src-tauri/` 零命中，
+`tauri.conf.json:17-18` 把 `width: 800 / height: 600` 写死，`capabilities/default.json` 里也没有
+任何窗口权限。也就是说 spec :461 那半句「记住尺寸位置」当时**既没实现也没认领**。
+
+### 5.2 三个 API 形状是验过的，计划里的写法有两处不对
+
+按 `tauri-2.12.4` 与 `tauri-runtime-2.12.2` 的 vendored 源码逐条核对（行号为证）：
+
+| 要用的东西 | 实际形状 | 位置 |
+| --- | --- | --- |
+| 事件枚举 | `Resized(PhysicalSize<u32>)` / `Moved(PhysicalPosition<i32>)` / `CloseRequested { api }` / `Destroyed`，且整个枚举 `#[non_exhaustive]` ⇒ 必须有兜底臂、结构体变体要写 `{ .. }` | `tauri-2.12.4/src/app.rs:111` |
+| 事件回调签名 | `Fn(&Window<R>, &WindowEvent)` —— **事件是按引用给的**，计划正文按值写的 | `app.rs:2197` |
+| 取几何 / 落几何 | `outer_position() -> Result<PhysicalPosition<i32>>`、`outer_size() -> Result<PhysicalSize<u32>>`、`current_monitor() -> Result<Option<Monitor>>`、`set_size(S: Into<Size>)`、`set_position(Pos: Into<Position>)` | `window/mod.rs:1580/1594/1686/1924/1963` |
+| 显示器枚举 | `available_monitors() -> Result<Vec<Monitor>>`（恢复用它，不用 `current_monitor() -> Result<Option<Monitor>>`，理由见 5.3）；`Monitor` 在 `tauri` 这层字段是 `pub(crate)`，只给访问器，`work_area()` 返回 `&PhysicalRect`，其 `position`/`size` 才是公开字段 | `window/mod.rs:1718`、`window/mod.rs:56-101` |
+| 窗口何时存在 | conf 里的窗口在 `setup` 钩子**之前**创建（`WebviewWindowBuilder::from_config`，`app.rs:2692`）⇒ 恢复只能落在 `setup` 里，而那里一定拿得到 `main` | `app.rs:2688-2698` |
+
+`m.work_area`（按字段读）这一版**编译不过**，是本轮真实撞到的一条：
+`error[E0616]: field 'work_area' of struct 'Monitor' is private`（`cargo test` rc=101）⇒ 改成
+`m.work_area()`。留在这里的原因：计划说「若 v2 的形状与这里不同，按实际的写」，这条就是那条
+说明的账单。
+
+坐标系决定：取和放**全程用物理像素**（`outer_*` 给物理值，`set_*(PhysicalSize/PhysicalPosition)`
+收物理值时不缩放），所以 `window_state.rs` 不需要 `scale_factor`。存 logical 值的后果是换一块
+缩放不同的屏幕后窗口摆到错位置 —— 正是本模块要防的病。
+
+### 5.3 取舍和它们的代价
+
+- **只在关闭事件落盘**（`should_persist`：`CloseRequested`/`Destroyed` 为真，`Resized`/`Moved` 为假），
+  并且**不做定时器去抖**。一次拖拽会发来几百个 `Resized`，逐个写盘把「记住位置」做成
+  「每移一次写一次磁盘」；而去抖定时器是给「关窗时还在写」新造的一类竞态。
+  代价如实记着：**崩溃或强杀会丢窗口位置**，症状是「下一次回到默认尺寸」，不是数据丢失。
+  `Destroyed` 这一臂很可能已取不到几何，此时**不写**而不是写一份 `(0,0,0,0)`。
+- **越屏判定对着每一块接着的屏做**（`available_monitors()`，`window/mod.rs:1718` → `pick`），
+  而不是计划正文写的「`current_monitor()` 那一块」。这是本轮改掉的**一个真缺陷**：恢复发生在
+  窗口刚创建、还停在系统默认位置的时候，那时 `current_monitor()` 给的是主屏，于是摆在副屏上的
+  存档会被判成越界并丢掉 —— 症状不是崩溃，是「每次重启都从副屏被拽回主屏」，等于这条需求
+  对双屏用户白做，而 §5.1 那句「拔掉副屏」说的就是这批用户。
+  `pick` 仍然保守：一块屏都装不下 ⇒ `None` ⇒ 不恢复；枚举不到任何显示器同样不恢复。
+  一个无法证明「某块屏上看得见」的几何比默认尺寸更危险。
+  `sane()` 丢掉越界存档之后落到的正是 conf 那一行 —— 所以 `"width": 800, "height": 600` **保留**，
+  它的身份是「没有存档时的尺寸」，删掉它换来的是 Tauri 自己的默认值，那是第三份真相。
+  存档路径是 `%APPDATA%\com.qwa.do\window.json`，读不到/解不开一律按「没有」处理
+  （`load` 返回 `Option`，没有错误分支），理由写在测试里：一个存坏的配置文件不该有能力
+  让应用打不开。
+- 原子写照 `settings.rs:478-490`（同目录 temp → `write_all` → `sync_all` → `rename`），
+  但**不带** `SettingsStore` 那把实例锁：调用点只有窗口关闭事件，而窗口事件在同一根事件循环
+  线程上串行派发，进程内不存在两个并发写者。
+- **只存几何，不存窗口状态**（最小化 / 最大化一律不落盘）。最小化时关窗，Windows 报的是
+  `(-32000, -32000)` 一类的哨兵位置，这里不加特例 —— 写进去，下次启动由 `sane` 判成越界，
+  代价是那一次回到默认尺寸。换来的简洁是实在的：不用引一层「现在是不是 minimized」的查询，
+  也不多一份要维护的状态编码。
+
+### 5.4 证据（本轮逐条实跑）
+
+`cargo test --manifest-path src-tauri/Cargo.toml` 全量：
+**`test result: ok. 272 passed; 0 failed; 1 ignored`**（本任务前是 267 条，+6；
+`window_state::tests` 6 条全绿）。`rustfmt --edition 2024 --check` 逐文件数出的差异：
+`window_state.rs` 5 处、`ipc.rs` 1 处、`lib.rs` 0 处（`lib.rs` 会连带检查它声明的模块，
+所以单独数它时才用 HEAD 里那份副本对比过，确认既有代码本来就 rustfmt-clean）；
+`rustfmt` 落定后再 `--check` 三个文件全归零。`git diff -U0 -- src-tauri/src/ipc.rs` 的 6 个 hunk
+全在本次新增的区段里，既有代码一行没被 reformat。
+
+四条变异判据，每条都实测并贴出红的那一条，然后 `cp` 还原 + `cmp` 证字节一致：
+
+| 变异 | 结果 |
+| --- | --- |
+| `sane` 的「一个角在内即保留」改成「左上角在内才保留」 | `a_geometry_fully_off_the_current_work_area_is_discarded ... FAILED`（`x:1919` 那条），rc=101 |
+| 删掉 `load` 的解析失败分支（解不开时回一份 800×600 几何） | `a_corrupt_or_missing_state_file_is_absent_not_an_error ... FAILED`，panic 落在 `assertion left == right failed: 解不开就按『没有』处理…`，rc=101 |
+| `should_persist` 让 `Resized` 也返回真 | `only_the_close_events_persist ... FAILED`，panic 落在 `assertion failed: !should_persist(Ev::Resized)`，rc=101 |
+| `pick` 只看第一块屏（`works.first()`）—— 也就是把 §5.3 那个缺陷放回去 | `a_geometry_on_any_attached_monitor_is_kept ... FAILED`，panic 落在存档几何那一行（`window_state.rs:165`），rc=101 |
+
+RED 也是跑过的：先只写测试模块（`lib.rs` 加一行 `pub mod window_state;`），
+`cargo test` 报 **25 个 E0422/E0425/E0433「cannot find … in this scope」**、rc=101 ——
+是「功能不存在」而不是笔误；`pick` 那一条同样是先红（**3 个 `cannot find function 'pick'`**、rc=101）
+再实现。
+
+### 5.5 没做到的：接线没有测试，人工那两步还欠着
+
+- **`ipc.rs` 的 `restore_window_geometry` / `persist_window_geometry` 没有任何自动化证据**。
+  原因与 R106 抽 `Publish`/`run_turn` 那道 seam 是同一个：`AppHandle` 在测试里构造不出来。
+  纯函数那半边（判定、钳位、读、写、时机）全在 `window_state.rs` 里被测了；
+  「从窗口上取几何 + 事件映射」这半边只有 `cargo test` 的**类型正确性**背书。
+- **计划 Step 5 要求的两次真窗口确认：未执行（需人工在场）**。此刻 `target/debug/qwen-do.exe`
+  被一个**用户自己开着的实例**占着（PID 2556，启动于 10:26:38，窗口标题 `qwen-do`），
+  `cargo build` 因此在链接步 `拒绝访问 (os error 5)`、rc=101。我没有动那个进程，也没有起第二个
+  实例去共用它的 `qwen-do.db`。欠的两步是：
+  ① 拖到非默认位置 → 关闭 → 再启动，位置和尺寸必须保持；
+  ② 手工把 `%APPDATA%\com.qwa.do\window.json` 里的 `x` 改成 `3000` → 启动 → 必须回到看得见的位置
+  （落回 conf 的 800×600 即为通过）。这条自加验收存在的原因：spec §9 没给「记住尺寸位置」任何测法。
+- **§1 那个 3.92 MiB 是 T46b 之前的代码量出来的**。本任务新增约 200 行 Rust、
+  **零新依赖**（`tempfile` 早就在 `[dev-dependencies]`，不进产物），所以预期它不会动，
+  但**未重测** —— T47/T48 该重打一次再量。
+
+### 5.6 顺带数清 #29 那条旧账（不关它，也不动 capabilities）
+
+计划 Step 4 说做完本任务后「`core:window:allow-set-size`、`allow-start-dragging`、
+`dialog:allow-open` 三条仍无前端消费者，数成三条」。**这条已经不成立**：
+`capabilities/default.json:6` 现在恰好两项 —— `["core:default", "core:event:default"]`，
+文件描述自己写着「无 shell、无文件系统、无窗口尺寸/拖拽权限」，`dialog` 那条在评审 #29 就摘了。
+所以**无消费者权限是 0 条，不是 3 条**。本任务的恢复全在 Rust 侧（Rust 不受 capabilities 约束），
+`capabilities/default.json` 一行未动。
+
