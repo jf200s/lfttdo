@@ -27,10 +27,12 @@ pub struct ContextConfig {
     pub window_messages: usize,
     /// 压缩触发线：**占预算的比例**（spec 5.3 默认 0.85）。留给 15% 余量是为了
     /// 让压缩发生在两次对话之间、而不是把请求顶到 400 之后再补救。
-    /// 消费者在 T41；本任务只负责把它送进内核，`build()` 今天不读它。
+    /// 读它的是 [`plan_compaction`]（T40，纯决策）；发起摘要与落库的是 T41。
+    /// `build()` 今天不读它 —— 滑窗用的仍是全额预算。
     pub compact_threshold: f32,
     /// 压缩时保留原文的最近轮数 K（spec 5.3 默认 10）。K=0 意味着连刚说完的那轮
     /// 都被摘要掉 ⇒ 当场失忆，所以 `Settings::normalize` 夹 `1..=50`。
+    /// 「一轮」的定义只写在 [`plan_compaction`] 的文档注释里。
     pub keep_turns: usize,
 }
 
@@ -84,6 +86,18 @@ impl ContextBuilder {
             return;
         }
         self.calibration = factor.clamp(0.2, 3.0);
+    }
+
+    /// 读出当前的校准系数。
+    ///
+    /// **本任务内它没有生产调用方**：第一个真实消费者是 T41 的 `run_turn`，它要拿这个数
+    /// 去调 [`plan_compaction`]。这是仓库规则 R110（不给没有消费者的接口）的**一处授权例外**，
+    /// 由 Plan C Task 40 Step 3.5 明文指定，不是实施者自创；T41 若最终没用它，就按同一条
+    /// Step 3.5 的第二方案把 `plan_compaction` 挪成 `ContextBuilder` 的方法，别留双份。
+    /// 为什么要一个读口而不是让调用方自己算系数：系数住在私有字段里，
+    /// `set_calibration` 的夹取与非有限值过滤只在这一处生效，抄到调用方就有了第二套口径。
+    pub fn calibration(&self) -> f64 {
+        self.calibration
     }
 
     /// 组装本次请求的消息。预算 = 配置上限 - 输出预留，先受滑窗上限约束，
@@ -213,7 +227,10 @@ fn is_cjk(ch: char) -> bool {
 }
 
 /// 该消息是否携带 `ToolResult` 块（Task 5 的 `Message::tool(..)` 就是这一形态）。
-/// 只有 `build` 的切口需要它：丢弃位置归本片所有，Task 6 的协议映射不反过来依赖这里。
+/// 需要它的是**两处切口**，都在本文件：`build()` 的滑窗 advance，以及
+/// [`plan_compaction`] 的摘要刀口（外加「一轮」的定义要用它排除工具结果行）。
+/// 丢弃位置归本片所有，Task 6 的协议映射不反过来依赖这里 —— 也**不许**为压缩再造
+/// 第二个孤儿工具结果谓词，两处必须共用这一个（否则一份改了另一份没改，400 会回来）。
 fn has_tool_result(m: &Message) -> bool {
     m.blocks
         .iter()
@@ -257,6 +274,165 @@ pub fn degrade_old_images(msgs: &mut Vec<Message>, keep_recent: usize) {
             text: DEGRADED_IMAGE_NOTE.into(),
         };
     }
+}
+
+// ---- Task 40：`plan_compaction`（纯函数，只回答「哪一段该被摘要掉」）----
+//
+// **与 Task 20 的图片降级划清边界（Step 0，要求写进代码而不是只写进报告）**：
+// 「历史图片降级为 `[图片已移除以节省上下文]`」这件事**归 T20 所有**，落在
+// [`ContextBuilder::build`] 返回之前的 [`degrade_old_images`] + [`KEEP_IMAGE_RECENT`]。
+// 本任务**不实现它、不重命名它、也不调用它**：`plan_compaction` 只决定压哪一段，
+// 一次模型调用都不发起、一个字节都不写盘（那是 T41）。
+// 两者的唯一交集是**读同一份 `history`**，而且方向是安全的那一侧：因为这里刻意不
+// 走降级，带旧图的历史会按「图片仍在」计价，粗估只会**偏高** ⇒ 压缩发生在更早而不是更晚，
+// 不会出现「以为没超线、实际超了」。T41 落库时摘要的是「即将被删的那些行」，
+// 那些图片行的 `blocks` 原样躺在库里（`db.rs` 不做降级）。
+// 这条边界不依赖 T20 是否落地（派发到本文件时它已经在了，见 `mod image_degradation`）。
+
+/// 「最老的一半，**至少 4 轮**」里的 4（spec :359 压缩批量 N）。
+/// 由 [`plan_compaction`] 私有使用，不进 `ContextConfig`：它是「压得划算吗」这条
+/// 判断的一部分，不是用户能设的参数（用户能设的是阈值与 K，都在 `Settings` 里）。
+const MIN_COMPACT_TURNS: usize = 4;
+
+/// 「这次压哪一段」的答案。
+///
+/// **下标口径**：`drop_from`/`drop_to` 是**对话序列**（= `history` 去掉 `Role::System`
+/// 那几条之后的序列）里的位置，**不是 `history` 的下标**；`dropped` 与 `source.len()`
+/// 都是这段区间里的**消息条数**。理由是 T41 的 `Db::compact_session` 要按「第几条对话
+/// 消息」定位待删的行，而 system 摘要备注不参与那个计数（R69 让它们整行跳过事件投影）。
+#[derive(Debug, Clone)]
+pub struct CompactionPlan {
+    /// 恒为 0：Plan C 只压最老一段。「中段摘要」不在 spec 的参数表里，那是二期。
+    pub drop_from: usize,
+    /// 区间右端（不含）。它一定落在一次发送的开头，见 [`plan_compaction`] 文档第 ④ 步。
+    pub drop_to: usize,
+    /// 被压掉的**消息条数** = `drop_to - drop_from` = `source.len()`。
+    pub dropped: usize,
+    /// 要交给模型摘要的那些消息（`conv[drop_from..drop_to]` 的克隆）。
+    pub source: Vec<Message>,
+}
+
+/// 决定「要不要压、压哪一段」。**纯函数**：不调模型、不做 IO、不写库（那全是 T41 的活），
+/// 也不就地改 `history`。
+///
+/// **「一轮」的定义（Step 3.3 要求选定并写明）**：一次发送 = 一条 `Role::User` 且
+/// **不携带 `ToolResult`** 的消息开启一轮，往后一直吃到下一条这种消息之前，含它自己的
+/// assistant 行与工具行；`conv` 的下标 0 无条件开启一轮。
+/// 为什么必须把工具结果排除在「开轮」之外：`Message::tool(..)` 的 role 是 `Role::User`
+/// （types.rs 刻意不新增 `Role::Tool`，见该构造器的注释），所以「任何一条 user 都算一轮」
+/// 会把一个工具回合数成两轮 ⇒ 轮数翻倍 ⇒ 一半翻倍 ⇒ **`keep_turns: 10` 实际只保住 5 轮
+/// 真实对话**，而且切口正好最容易落在 `assistant(ToolCall)` 与它的结果之间。
+/// 症状就是 `compaction_takes_the_oldest_half…_keeps_k_verbatim` 那组断言红。
+/// 轮数与 `SessionConfig.max_turns` **无关**：那个是编排循环的回合上限，这个是压缩的计量单位。
+///
+/// 五步：① 划分备注/对话（与 [`ContextBuilder::build`] 同一套）；② 越线才压；
+/// ③ 批量算术；④ 刀口安全；⑤ `drop_from` 恒 0。
+///
+/// `calibration` 应当来自 [`ContextBuilder::calibration`]（那条路径已经把系数夹在
+/// `0.2..=3.0` 并挡掉非有限值）。本函数再挡一次非有限值：`(粗估 * NaN) as usize` 饱和成 0
+/// ⇒ 阈值永久静默失效，那正是 `set_calibration` 文档注释明文禁止的后果。
+pub fn plan_compaction(
+    history: &[Message],
+    cfg: &ContextConfig,
+    calibration: f64,
+) -> Option<CompactionPlan> {
+    // ① 与 `build()` 同一套划分：`Role::System` 是备注（T41 写的摘要备注就走这一路）。
+    let notes: Vec<&Message> = history.iter().filter(|m| m.role == Role::System).collect();
+    let conv: Vec<&Message> = history.iter().filter(|m| m.role != Role::System).collect();
+
+    // ② 触发判定。预算 = 配置上限 - 输出预留；`saturating_sub` 照 `build()` 的写法
+    // （`budget < reserve` 时预算是 0，不是 usize 下溢）。
+    let budget = cfg.budget_tokens.saturating_sub(cfg.reserve_output) as usize;
+    // 粗估按**逐消息相加**算（`estimate_tokens` 没有块间耦合项，见其文档注释），
+    // 而不是把 head+notes+conv 拼成一坨再整体估：那要 clone 整段历史，而带图历史
+    // 单张 base64 上限 5 MB，几百 MB 级纯 memcpy 花在一个字都不发出去的判断上。
+    let mut raw = estimate_tokens(&[Message::system_note(SYSTEM_PROMPT)]);
+    raw += notes.iter().map(|m| estimate_one(m)).sum::<usize>();
+    raw += conv.iter().map(|m| estimate_one(m)).sum::<usize>();
+    let calibration = if calibration.is_finite() {
+        calibration
+    } else {
+        1.0
+    };
+    let est = (raw as f64 * calibration) as usize;
+    // 阈值是**比例**，所以触发线 = 预算 × `compact_threshold`。判据写成 `est <= line`
+    // 才不压，即线**上**不算越线（spec :357「超过即压缩」）。
+    // 浮点：`f32` 的 0.85 存成 0.8500000238418579（**向上**舍入），`as usize` 又向下截断，
+    // 两者抵消的结果是 `line == floor(0.85 × 预算)` 精确成立：`0.85 × budget` 的小数部分
+    // 只可能是 `k/20`（最大 0.95），而舍入误差在预算 ≤ 32000 时不到 0.001 个 token，
+    // 永远跨不过那个 0.05 的格。所以线不会因为浮点漂移到「晚压」那一侧。
+    let line = (budget as f64 * f64::from(cfg.compact_threshold)) as usize;
+    if est <= line {
+        return None;
+    }
+
+    // ③ 批量算术，全程以「轮」为单位，最后一步才换成消息下标。
+    let starts = turn_start_indices(&conv);
+    let turns = starts.len();
+    let batch = (turns / 2).max(MIN_COMPACT_TURNS);
+    // 最近 K 轮必须留原文，而且「留原文」永远优先于「凑够 4 轮」；再夹一次
+    // 「至少留最近一轮」：`keep_turns: 0` 只可能来自手写的 `ContextConfig`
+    // （`Settings::normalize` 夹的是 `1..=50`），而「把整段历史压成一句摘要、原文
+    // 一条不剩」比 K=0 更糟。两个 `saturating_sub` 都是防 usize 下溢（K > turns 是
+    // 常态：刚压完一次之后 turns 就小于 K）。
+    let batch = batch
+        .min(turns.saturating_sub(cfg.keep_turns))
+        .min(turns.saturating_sub(1));
+    // 夹完够不到下限 ⇒ 这一压既没到「至少 4 轮」也不会真省下多少，压它只是白烧一次
+    // 摘要调用（而且下一轮照样超预算 —— 超的是本轮那条长输入）。让 `build()` 的滑窗兜底。
+    if batch < MIN_COMPACT_TURNS {
+        return None;
+    }
+
+    // ④ 刀口：第 `batch` 轮的起始下标 == 前 `batch` 轮的消息条数。
+    // `starts[batch]` 必定存在：上面 `.min(turns - 1)` 保证了 `batch ≤ turns - 1`。
+    let drop_from = 0usize;
+    let mut drop_to = starts[batch];
+    // 复用 `build()` 的同一个谓词（不新造第二个孤儿判定）：切口不许落在「带 ToolCall 的
+    // assistant」与「它的 tool 结果」之间，否则 T41 发出的请求被端点判 400（spec :364）。
+    // 按轮切本来就切不到工具结果上（工具结果不开新轮），所以这一圈是**双保险**，
+    // 守的是「以后有人放宽轮的定义」。终止性同 `build()` 的 advance：单调前进、
+    // 被 `drop_to < conv.len()` 夹住，最多 len 步。
+    while drop_to < conv.len() && has_tool_result(conv[drop_to]) {
+        drop_to += 1;
+    }
+    // 同样按构造不可达（切口是轮边界，`batch ≥ 1` 且 `batch ≤ turns - 1`）。留着是因为
+    // `conv[..drop_to]` 一旦被推到整段历史，就变成「把用户全部内容压成一句摘要」——
+    // 那种事必须整个不做，而不是做一半。
+    if drop_to == 0 || drop_to >= conv.len() {
+        return None;
+    }
+
+    // ⑤ 只有被压的那一段需要 owned 副本（它就是 T41 的摘要输入），尾部原地不动。
+    let source: Vec<Message> = conv[..drop_to].iter().map(|m| (*m).clone()).collect();
+    Some(CompactionPlan {
+        drop_from,
+        drop_to,
+        dropped: drop_to - drop_from,
+        source,
+    })
+}
+
+/// 单条消息的粗估。`estimate_tokens` 是逐消息相加的（见其文档注释），所以这里借
+/// `slice::from_ref` 复用**同一个计价口径**，不复制任何规则（副本迟早会和 `PNG_TOKENS`
+/// 那类常量分叉）。
+fn estimate_one(m: &Message) -> usize {
+    estimate_tokens(std::slice::from_ref(m))
+}
+
+/// 一轮的起始下标（相对 `conv`，即去掉 `Role::System` 之后的序列）。
+/// 定义只在 [`plan_compaction`] 的文档注释里写一遍，这里是那份定义的实现；
+/// `mod compaction_planning` 里的测试镜像按同一条定义**独立**再算一次，两份对撞
+/// 才测得出「K=10 保住 10 轮还是 5 轮」。
+fn turn_start_indices(conv: &[&Message]) -> Vec<usize> {
+    conv.iter()
+        .enumerate()
+        // 下标 0 无条件开一轮：历史可能以一条孤立 `ToolResult` 开头（`build()` 的
+        // advance 就是为它写的），那条也得归属到某一轮里，否则 `turns` 会少 1、
+        // 而 `starts` 与消息下标对不上。
+        .filter(|(i, m)| *i == 0 || (m.role == Role::User && !has_tool_result(m)))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 // 覆盖 spec :503 交给本片的「预算计算」与「丢弃兜底不报错」两条；
@@ -1088,5 +1264,408 @@ mod image_degradation {
                 .all(|m| m.text_of().starts_with("轮 ")),
             "全额降级也只替换图片块"
         );
+    }
+}
+
+// ---- Task 40：`plan_compaction` 的内联测试 ----
+
+/// 全部断言都是「哪一段该被摘要掉」的算术：阈值、批量、下限、保留 K、刀口安全。
+/// 这里**不**测模型调用、不测落库、不测事件（都属 T41），所以夹具一律是内存里的
+/// `Vec<Message>`，没有 `Db`、没有 `ScriptedModel`、没有 sink。
+#[cfg(test)]
+mod compaction_planning {
+    use super::*;
+    use crate::agent::types::ToolOutput;
+    use serde_json::json;
+
+    /// 单条消息的固定成本 = 4 结构开销 + 800 个 ASCII 字符 ÷ 4 = **204 token**。
+    /// 刻意用 ASCII 而不是中文：中文/标点的口径已经在 `mod tests` 里钉死了，
+    /// 本模块要的是「每条同价、总数可算」，不再重测一遍权重。
+    const MSG_COST: usize = MSG_TOKEN_OVERHEAD + 800 / 4;
+
+    fn msg(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// **`n` 的单位是「条」不是「轮」**：生成 n 条 user/assistant 交替消息（从 user 起），
+    /// 即 `n / 2` 轮。这个单位是 Step 2 那两条断言逼出来的 ——
+    /// `CompactionPlan.dropped` 与 `drop_from`/`drop_to` 数的都是**对话序列里的消息条数/下标**
+    /// （见 `plan_compaction` 文档注释），而 `assert_eq!(p.dropped, 20)` 与
+    /// `assert_eq!(p.source.len(), p.dropped)` 只有在「40 条 = 20 轮、压掉 10 轮 = 20 条」
+    /// 这组数上才同时成立；把 n 读成轮数（80 条）时前者会变成 40。
+    fn user_assistant_pairs(n: usize) -> Vec<Message> {
+        (0..n)
+            .map(|i| {
+                msg(
+                    if i % 2 == 0 {
+                        Role::User
+                    } else {
+                        Role::Assistant
+                    },
+                    &"x".repeat(800),
+                )
+            })
+            .collect()
+    }
+
+    /// Task 10 循环真实产出的一个完整工具回合：`user` → `assistant(ToolCall)` →
+    /// `tool 结果` → `assistant 收尾`，共 4 条、**只算 1 轮**。
+    /// 关键事实：`Message::tool(..)` 的 role 是 `Role::User`（types.rs:101-114 刻意不新增
+    /// `Role::Tool`），所以「一条 user 就开一轮」这种定义会把工具结果误当成新一轮的开头 ——
+    /// 那正是 Step 3.3 点名的「K=10 实际只保 5 轮」的来源。
+    fn tool_round(id: &str) -> Vec<Message> {
+        vec![
+            msg(Role::User, "帮我读文件"),
+            Message {
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::ToolCall {
+                    id: id.into(),
+                    name: "fs.read".into(),
+                    input: json!({"path": "a.txt"}),
+                }],
+            },
+            Message::tool(id, ToolOutput::text("文件内容"), false),
+            msg(Role::Assistant, "读完了"),
+        ]
+    }
+
+    /// 6 轮 / 16 条：中段（轮 2）一个工具回合、**尾部（轮 5）也一个工具回合**。
+    /// 尾部那个不是装饰：`keep_turns = 1` 时留在原文里的正好是最后一轮，
+    /// 于是「call 与 result 落在刀口同一侧」这条断言才真的有得查（否则尾部一条工具结果都没有，
+    /// 循环体一次都不执行，测试永远是绿的）。
+    fn pairs_with_a_tool_round_in_the_middle() -> Vec<Message> {
+        let mut v = user_assistant_pairs(4);
+        v.extend(tool_round("c1"));
+        v.extend(user_assistant_pairs(4));
+        v.extend(tool_round("c2"));
+        v
+    }
+
+    /// 与实现同口径的**校准前**粗估：`SYSTEM_PROMPT` 一条 + 全部非 system 历史。
+    /// 拆成两段相加而不是拼成一坨整体估，靠的是 `estimate_tokens` 的逐消息相加性质
+    /// （见该函数与 `build()` 里同一条注释）。
+    fn est_of(hist: &[Message]) -> usize {
+        estimate_tokens(&[Message::system_note(SYSTEM_PROMPT)]) + estimate_tokens(hist)
+    }
+
+    /// 预算小到任何一条真实历史都必然越线，于是「越线」这个前提被固定住，
+    /// 测试里唯一剩下的变量就是 `MIN_COMPACT_TURNS`。
+    /// `keep_turns: 0` 同样是刻意的：K 不许成为「不压」的理由（生产里 `Settings::normalize`
+    /// 夹的是 `1..=50`，0 只可能来自手写的 cfg），这样 `a_two_turn_session…` 的绿/红
+    /// 测到的才是下限本身，而不是 K 的副作用。名字里的 long 指「历史相对预算太长」。
+    fn long_budget_cfg() -> ContextConfig {
+        ContextConfig {
+            budget_tokens: 400,
+            reserve_output: 0,
+            keep_turns: 0,
+            ..Default::default()
+        }
+    }
+
+    /// 把预算钉成「这份夹具的粗估原样」，于是 est 正好等于 **1.0 × 预算** ——
+    /// 触发带 `(0.85, 1.0]` 的最右端，也是「刚好会触发压缩」的那一档。
+    /// 从夹具实际算出来而不写常量（Step 2 夹具说明给的理由）：写死的数会随
+    /// `ContextConfig::default()` 或 `SYSTEM_PROMPT` 长度漂移，悄悄变成「压根没过阈值」
+    /// 或「远超阈值」，那时 `the_cut_never…` 就在测别的东西了。
+    /// `keep_turns: 1`：6 轮压 4 轮、剩 2 轮，尾部正好含 `c2` 那个工具回合。
+    fn cfg_at_threshold() -> ContextConfig {
+        let raw = est_of(&pairs_with_a_tool_round_in_the_middle()) as u32;
+        ContextConfig {
+            budget_tokens: raw,
+            reserve_output: 0,
+            keep_turns: 1,
+            ..Default::default()
+        }
+    }
+
+    /// 「一轮」的**测试侧镜像**：定义与 `plan_compaction` 文档注释里那条逐字对应
+    /// （一条不带 `ToolResult` 的 user 消息开启一轮；下标 0 无条件开一轮）。
+    /// 刻意不直接调用实现的 `turn_start_indices`：K=10 到底保住 10 轮还是 5 轮，
+    /// 只有两份独立计算对撞才测得出来（Step 3.3 点名的就是这个症状）。
+    fn turn_starts(msgs: &[&Message]) -> Vec<usize> {
+        msgs.iter()
+            .enumerate()
+            .filter(|(i, m)| *i == 0 || (m.role == Role::User && !has_tool_result(m)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// 刀口两侧的工具回合完整性检查：返回被拆开的 `call_id`。
+    /// 只查尾部会漏掉「assistant 进了摘要、结果留在尾部」这种**正好触发 400** 的切法，
+    /// 所以两侧都查：每个 call_id 的 `ToolCall` 与 `ToolResult` 必须在同一侧。
+    fn split_tool_rounds(conv: &[&Message], cut: usize) -> Vec<String> {
+        let mut calls: Vec<(String, bool)> = Vec::new();
+        let mut results: Vec<(String, bool)> = Vec::new();
+        for (i, m) in conv.iter().enumerate() {
+            let in_source = i < cut;
+            for b in &m.blocks {
+                match b {
+                    ContentBlock::ToolCall { id, .. } => calls.push((id.clone(), in_source)),
+                    ContentBlock::ToolResult { call_id, .. } => {
+                        results.push((call_id.clone(), in_source));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut bad: Vec<String> = calls
+            .iter()
+            .filter(|(id, side)| !results.iter().any(|(r, s)| r == id && s == side))
+            .map(|(id, _)| id.clone())
+            .chain(
+                results
+                    .iter()
+                    .filter(|(id, side)| !calls.iter().any(|(c, s)| c == id && s == side))
+                    .map(|(id, _)| id.clone()),
+            )
+            .collect();
+        bad.sort();
+        bad.dedup();
+        bad
+    }
+
+    #[test]
+    fn the_fixture_cost_is_the_number_the_arithmetic_assumes() {
+        // 夹具守卫：本模块所有期望值（20 条、8 条、10 条…）都是从「一条消息 204 token、
+        // 一轮两条 = 408」推出来的。这条一旦红，说明 `MSG_TOKEN_OVERHEAD` 或估算口径搬家了，
+        // 而**不是** `plan_compaction` 错了 —— 先修这里，否则剩下六条会一起红得莫名其妙。
+        assert_eq!(estimate_tokens(&user_assistant_pairs(1)), MSG_COST);
+        assert_eq!(estimate_tokens(&user_assistant_pairs(2)), 2 * MSG_COST);
+        assert_eq!(MSG_COST, 204, "单条成本是字面量 204，不是「大约」");
+        let hist = user_assistant_pairs(40);
+        assert_eq!(
+            estimate_tokens(&hist),
+            40 * MSG_COST,
+            "40 条 = 8160 token：相加性在这里必须真的成立"
+        );
+        assert_eq!(turn_starts(&hist.iter().collect::<Vec<_>>()).len(), 20);
+        let tooly = pairs_with_a_tool_round_in_the_middle();
+        assert_eq!(
+            turn_starts(&tooly.iter().collect::<Vec<_>>()).len(),
+            6,
+            "16 条但只有 6 轮：两个工具回合各自 4 条算**一轮**"
+        );
+    }
+
+    #[test]
+    fn no_compaction_while_inside_the_threshold() {
+        let cfg = ContextConfig {
+            budget_tokens: 4096,
+            reserve_output: 512,
+            ..Default::default()
+        };
+        let hist = user_assistant_pairs(3); // 短历史
+        assert!(
+            est_of(&hist) <= 3046,
+            "夹具守卫：粗估 {est} 必须真的在阈内，否则这条测的是别的东西",
+            est = est_of(&hist)
+        );
+        assert!(
+            plan_compaction(&hist, &cfg, 1.0).is_none(),
+            "预算 3584 × 0.85 = 3046，远没到 ⇒ 一次都不该压，压了就是在无谓烧一次模型调用"
+        );
+    }
+
+    #[test]
+    fn the_threshold_leaves_headroom_so_we_never_land_exactly_on_the_wire() {
+        // Step 1 原文只写了注释，这里换成真断言。要测的是 spec :357
+        // 「超过即压缩，留出余量避免刚好卡线」这条**理由本身**，也就是触发带必须
+        // 正好是 `(0.85, 1.0] × 预算`：线上不压、线内要压、顶到硬预算也要压。
+        // 缺「带内要压」这一点，「留余量」就只是在巧合；Step 4 判据 (b)
+        // （阈值改 1.0 且 `>` 改 `>=`）红的也正是这个点。
+        let cfg = ContextConfig {
+            budget_tokens: 4000,
+            reserve_output: 0,
+            keep_turns: 1,
+            ..Default::default()
+        };
+        let budget = 4000usize;
+        // 与实现同一个表达式。`f32` 的 0.85 是 0.8500000238418579（向上舍入），
+        // `as usize` 再向下截断，两个误差抵消后线**精确**等于 floor(0.85 × 预算) = 3400
+        // （推导与预算上限的论证见 `plan_compaction` 里那条注释）。
+        // 钉成字面量而不是「从 cfg 推」：这条就是那个 3400 的独立锚点，
+        // 漂成 3399 或 3401 都意味着阈值口径变了，而下面的四个点会一起搬位置。
+        let line = (budget as f64 * f64::from(cfg.compact_threshold)) as usize;
+        assert_eq!(
+            line, 3400,
+            "0.85 阈值（含 f32 舍入）要有独立锚点，不能只靠 Default"
+        );
+        let mid = (line + budget) / 2;
+        assert!(line < mid && mid < budget, "带内那个点必须真的在带内");
+        for (est, should_fire) in [
+            (line - 1, false),
+            (line, false),
+            (mid, true),
+            (budget, true),
+        ] {
+            let hist = conv_costing(est);
+            let fired = plan_compaction(&hist, &cfg, 1.0).is_some();
+            assert_eq!(
+                fired,
+                should_fire,
+                "est = {est}（预算 {budget}、线 {line}）应当 {}，实际 {fired}",
+                if should_fire { "压" } else { "不压" }
+            );
+        }
+    }
+
+    /// 造一份「校准 1.0 时粗估正好是 `target`」的非 system 历史：4 轮打底，
+    /// 再用一条文本长度可调的 user 消息补齐差额（一条消息 = 4 开销 + `ceil(len/4)`，
+    /// 差额 ≥ 4 时能**精确**补上，全程不碰浮点）。
+    /// 为什么拿长度当旋钮而不是拿 `calibration` 当旋钮：校准系数会被
+    /// `set_calibration` 夹进 `0.2..=3.0`，用凑出来的系数会测到一个生产里送不进来的值。
+    fn conv_costing(target: usize) -> Vec<Message> {
+        let mut hist = user_assistant_pairs(8);
+        let used = est_of(&hist);
+        assert!(
+            target >= used + 4,
+            "夹具底子 {used} 已经贵过目标 {target}，filler 补不出差额"
+        );
+        let gap = target - used;
+        hist.push(msg(Role::User, &"y".repeat(4 * (gap - MSG_TOKEN_OVERHEAD))));
+        assert_eq!(
+            est_of(&hist),
+            target,
+            "夹具必须精确落到 target，否则测的是别的位置"
+        );
+        hist
+    }
+
+    #[test]
+    fn compaction_takes_the_oldest_half_but_at_least_four_turns_and_keeps_k_verbatim() {
+        let cfg = ContextConfig {
+            budget_tokens: 1024,
+            reserve_output: 0,
+            keep_turns: 10,
+            ..Default::default()
+        };
+        let hist = user_assistant_pairs(40);
+        let p = plan_compaction(&hist, &cfg, 1.0).expect("远超阈值");
+        assert_eq!(
+            p.dropped, 20,
+            "最老的一半：40 轮压掉 20 轮，不是「压到刚好卡线」——否则每轮都要重压一次"
+        );
+        assert!(p.drop_to <= 40 - 10, "最近 K=10 轮必须留在原文里");
+        assert_eq!(
+            p.source.len(),
+            p.dropped,
+            "source 就是要交给模型摘要的那些消息，不多不少"
+        );
+        // ↓ 这三条把「一轮」的定义钉住（Step 3.3：选错的症状就是 K=10 只保 5 轮）。
+        // 40 条 = 20 轮，一半 = 10 轮 = **20 条**，所以尾部还是 10 轮 / 20 条。
+        // 把轮数定义成「消息条数」的实现会切在同一个下标上（数值巧合），但尾部
+        // 只剩 5 轮 ⇒ 下面第一条红；把轮数定义成「任何 user 都算一轮」的实现
+        // 也一样红在这里。
+        let conv: Vec<&Message> = hist.iter().collect();
+        assert_eq!(
+            turn_starts(&conv[p.drop_to..]).len(),
+            cfg.keep_turns,
+            "K=10 保住的是 10 **轮**，不是 10 条消息"
+        );
+        assert_eq!(conv[p.drop_to..].len(), 2 * cfg.keep_turns);
+        assert_eq!(conv[p.drop_to].role, Role::User, "切口必须是一次发送的开头");
+        assert_eq!(p.drop_from, 0, "Plan C 只压最老一段，不做中段摘要");
+    }
+
+    #[test]
+    fn a_two_turn_session_is_not_worth_compacting_even_over_budget() {
+        // MIN_COMPACT_TURNS=4 的正面：只有 2 轮却超预算时，压它只会把「唯一的历史」变成一句摘要，
+        // 而下一轮照样超预算（超的是本轮那条长输入）。此时该让 build() 的滑窗去兜底。
+        let hist = user_assistant_pairs(2);
+        assert!(plan_compaction(&hist, &long_budget_cfg(), 1.0).is_none());
+        // 单位提醒：`user_assistant_pairs(n)` 的 n 是**条**（见其文档注释），上面那条
+        // 其实只有 1 轮；测试名字要的「2 轮」是 4 条这一条。再往前 3 轮同样压不动：
+        // 一半只有 1 轮，抬到 MIN 就要求吃掉 4 轮 > 全部 3 轮。
+        assert!(plan_compaction(&user_assistant_pairs(4), &long_budget_cfg(), 1.0).is_none());
+        let three = user_assistant_pairs(6);
+        assert!(plan_compaction(&three, &long_budget_cfg(), 1.0).is_none());
+        // 夹具守卫：三条都必须**真的**越线，否则 `is_none` 测的是「没到阈值」而不是下限。
+        let cfg = long_budget_cfg();
+        let line = (cfg.budget_tokens as f64 * f64::from(cfg.compact_threshold)) as usize;
+        assert!(
+            est_of(&three) > line,
+            "夹具没越线（{} > {line}）⇒ 上面三条全是白测",
+            est_of(&three)
+        );
+    }
+
+    #[test]
+    fn the_batch_floor_is_four_turns_not_the_half_when_half_is_smaller() {
+        // 6 轮：一半只有 3 轮，但 spec :359 写的是「最老的一半，**至少 4 轮**」。
+        // 这条是 Step 4 判据 (a)（删掉 `.max(MIN_COMPACT_TURNS)`）唯一有牙的地方：
+        // 40 轮/20 轮那两条夹具里 `max()` 根本没生效，删了照样绿。
+        assert_eq!(MIN_COMPACT_TURNS, 4, "「至少 4 轮」这条下限本身要有锚点");
+        let cfg = ContextConfig {
+            budget_tokens: 1024,
+            reserve_output: 0,
+            keep_turns: 1,
+            ..Default::default()
+        };
+        let hist = user_assistant_pairs(12); // 6 轮
+        let p = plan_compaction(&hist, &cfg, 1.0).expect("6 轮 ≥ MIN，越线就该压");
+        assert_eq!(
+            p.drop_to, 8,
+            "批量被下限抬到 4 轮 = 8 条；纯按「一半」只压 3 轮 = 6 条"
+        );
+        assert_eq!(p.dropped, 8);
+        assert_eq!(p.source.len(), 8);
+        let conv: Vec<&Message> = hist.iter().collect();
+        assert_eq!(
+            turn_starts(&conv[p.drop_to..]).len(),
+            2,
+            "6 轮压 4 轮，尾部正好剩 2 轮"
+        );
+    }
+
+    #[test]
+    fn the_cut_never_lands_between_an_assistant_tool_call_and_its_result() {
+        // `build()` 的 advance 在滑窗侧守的就是这条；摘要侧同样不能把
+        // assistant(ToolCall) 收进 source 而把它的 ToolResult 留在 tail —— 那正是 spec :364 的 400。
+        let hist = pairs_with_a_tool_round_in_the_middle();
+        let p = plan_compaction(&hist, &cfg_at_threshold(), 1.0).unwrap();
+        let conv: Vec<&Message> = hist.iter().collect();
+        assert!(
+            !has_tool_result(conv[p.drop_to]),
+            "切口后第一条不许是孤儿工具结果（has_tool_result 已在 context.rs，别新造一个）"
+        );
+        // 刀口必须落在**轮边界**（第 5 轮开头 = 下标 10），而不是任何「按条数取半」的位置。
+        assert_eq!(p.drop_to, 10, "6 轮里压 4 轮：0..10 条");
+        assert_eq!(p.dropped, 10);
+        // 真正的验收项：两侧的工具回合都完好（`c1` 整段进摘要、`c2` 整段留原文）。
+        assert_eq!(
+            split_tool_rounds(&conv, p.drop_to),
+            Vec::<String>::new(),
+            "call 与它的 result 被刀口拆开 ⇒ T41 发出去就是 400"
+        );
+        assert_eq!(
+            turn_starts(&conv[p.drop_to..]).len(),
+            2,
+            "keep_turns=1 之外只剩 2 轮原文，其中尾部那个就是 `c2` 工具回合"
+        );
+        assert!(
+            conv[..p.drop_to].iter().any(|m| has_tool_result(m))
+                && conv[p.drop_to..].iter().any(|m| has_tool_result(m)),
+            "夹具守卫：两侧各得有工具结果，否则上面那条拆开检查是空转"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_calibration_does_not_switch_the_threshold_off() {
+        let cfg = cfg_at_threshold();
+        let hist = pairs_with_a_tool_round_in_the_middle();
+        assert!(
+            plan_compaction(&hist, &cfg, 1.0).is_some(),
+            "夹具守卫：这条必须先真的越线"
+        );
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                plan_compaction(&hist, &cfg, bad).is_some(),
+                "非有限系数 {bad} 要当 1.0 处理：`(粗估 * NaN) as usize` 饱和成 0 ⇒ 阈值静默失效，\
+                 正是 `set_calibration` 文档注释写明禁止的那个后果"
+            );
+        }
     }
 }
