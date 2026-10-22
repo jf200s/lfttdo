@@ -460,8 +460,12 @@ fn classify_openai_error(err: OpenAIError, url: String) -> ModelError {
         e @ OpenAIError::Reqwest(_) => ModelError::Transport { url, source: e },
         e @ OpenAIError::StreamError(_) => ModelError::Transport { url, source: e },
         OpenAIError::JSONDeserialize(inner, raw) => ModelError::Decode(format!(
-            "响应体无法解析: {inner}｜响应正文: {}",
-            body_snippet(&raw)
+            "响应体无法解析: {inner}｜响应正文: {}｜请求地址: {}",
+            body_snippet(&raw),
+            // 地址夹到 120 字符：这条的总长上限（`an_unparseable_response_is_decode_with_a_bounded_body_snippet`）
+            // 是靠「正文 ≤ RAW_BODY_KEEP + 固定前后缀」撑的，而 base_url 是用户粘贴进来的自由文本，
+            // 不夹就等于把那个上限交给用户的手。
+            crate::text::truncate_display(&url, 120)
         )),
         OpenAIError::InvalidArgument(msg) => {
             ModelError::Decode(format!("请求构造失败（未发出网络请求）: {msg}"))
@@ -1446,6 +1450,33 @@ mod tests {
         }
         assert!(!format!("{m}").contains("无法连接"));
         assert!(!format!("{m}").contains("模型返回错误"));
+    }
+
+    /// 空正文那一支是**实测**出来的，不是设想：2026-10-22 用
+    /// `cargo run --example stream_probe` 把 `QWEN_BASE_URL` 依次设成
+    /// `…/compatible-mode/v1/`、`…/compatible-mode`、`https://dashscope.aliyuncs.com` 三种形态，
+    /// 三次都回 `JSONDeserialize(Error("EOF while parsing a value", line 1, column 0), "")`
+    /// ——非 2xx 且正文为空。这时「响应正文」那段是空的，整条错误里**没有任何东西指向设置页**，
+    /// 而 base_url 少填一段正是产生它最常见的原因（normalize 只会补 `/v1`，补不出
+    /// `/compatible-mode`）。所以这一支必须带上请求地址，否则用户拿到一句无法自助的术语。
+    #[test]
+    fn an_empty_response_body_still_names_the_url_it_came_from() {
+        let inner = serde_json::from_str::<serde_json::Value>("").expect_err("空正文不是合法 JSON");
+        let m = classify(OpenAIError::JSONDeserialize(inner, String::new()));
+        let line = format!("{m}");
+        assert!(matches!(m, ModelError::Decode(_)), "{line}");
+        assert!(
+            line.contains("https://x.test/v1"),
+            "正文为空时，请求地址是唯一的线索：{line}"
+        );
+        assert!(
+            !line.contains("无法连接模型端点"),
+            "有响应就不是网络问题：{line}"
+        );
+        assert!(
+            !line.contains("模型返回错误"),
+            "端点没报出可解析的错：{line}"
+        );
     }
 
     /// 客户端侧的参数/序列化问题（`chat.rs:82`、`client.rs:399`）：请求根本没出门。
