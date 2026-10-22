@@ -299,6 +299,8 @@ DevTools Performance 面板那条路本来也走不通：release 无 devtools（
 
 ### 3.4 本轮数字对应哪一份代码
 
+> 这一节是 §3.1–§3.3 那三组数字的**出处**，不是仓库里最新的字节数 —— 最新的在 §3.6。
+
 | 事实 | 值 |
 | --- | --- |
 | 来源 commit | `0107e03`（工作树除 `docs/findings/scripts/` 外干净） |
@@ -321,6 +323,36 @@ href "http://tauri.localhost/"  minHeightMessageList "0px"  overflowMessageList 
 ⇒ 外壳滚动容器真的能缩了、文档不再跟着滚。这条证据从「dev 实例 + vite」换成了「发布产物」，
 之前那条只是同一件事的弱证据。
 
+### 3.6 §3.4 的字节数已经过期：`c7bdfe6` 重打一次
+
+`c7bdfe6`（把 Composer 里那只原生 file 控件收进 token 体系）之后重新 `npx tauri build`，
+同一台机器、同一份工具链，只差前端那 20 来行 CSS：
+
+| 事实 | 值 | 对 §3.4 |
+| --- | --- | --- |
+| 构建命令 | `npx tauri build`，rc=0，16:02 | 同 |
+| `target/release/qwen-do.exe` | 11,287,040 B | **一字不差**（为什么没变：未测，只是记录） |
+| `bundle/nsis/qwen-do_0.1.0_x64-setup.exe` | **4,118,009 B（3.93 MiB）** | −854 B |
+| `dist/` | 582,348 B | +53 B |
+
+`dist` 涨 53 B、安装包反而降 854 B：内嵌资产是 brotli 压的，LZMA 再压一层，
+字节的增减方向和源文件字节数不同向 —— 这不是矛盾，是压缩。
+
+同一只产物里的计算样式（CDP，`href` 仍是 `http://tauri.localhost/`）：
+
+```
+input  fontSize 0px  border 0px none  bg rgba(0,0,0,0)  shadow none  85×29
+button fontSize 15px color rgb(232,230,227) bg rgb(29,29,33) radius 6px content "normal" cursor pointer
+```
+
+外壳 85×29 和按钮同宽 ⇒ UA 那行「未选择文件」占的宽度是 0，界面上真的没了；
+`content: "normal"` 是「那行死声明已经删掉」的正面证据（它当初能算出值、却不上屏）。
+
+⇒ **§6 第 1 行的证据换成这一只**（3.93 MiB / 15 MB，判定不变）。
+⇒ §3.1 冷启动、§3.2 内存、§3.3 流式那三组数字**没有**在 `c7bdfe6` 上重跑：它们量的都不是
+CSS 层的东西，而重跑一次冷启动要 5 次真启动、重跑内存要 60 s 空闲窗，本轮没有拿到
+「改了 20 行 CSS 所以那几个数会变」的理由。**下一轮若动 Rust 侧或依赖，这三组一律重测。**
+
 ---
 
 ## 6. spec §9 十二条判定表（T47 Step 4；#29 与 T48 的唯一输入）
@@ -330,7 +362,7 @@ href "http://tauri.localhost/"  minHeightMessageList "0px"  overflowMessageList 
 
 | # | 判据（spec :531-563 原文） | 测法 | 实测值 | 判定 |
 | --- | --- | --- | --- | --- |
-| 1 | 安装包 <15MB | NSIS 产物文件字节数 | 4,118,863 B = **3.93 MiB**（§3.4，`0107e03` 之后重打） | ✅ |
+| 1 | 安装包 <15MB | NSIS 产物文件字节数 | 4,118,009 B = **3.93 MiB**（§3.6，`c7bdfe6` 重打；`0107e03` 那次是 4,118,863 B） | ✅ |
 | 2 | 冷启动 <1.5s | 进程启动 → 输入框吃到一次按键，5 次中位数（§3.1） | **584 ms**（另两档：句柄 111 ms / `Responding` 132 ms） | ✅；**冷文件系统缓存的首次启动 未实测** |
 | 3 | 空闲常驻内存 <150MB | 递归 `ParentProcessId` 取整棵进程树求和，空闲 60 s，3 次（§3.2） | **394.4 MB** WorkingSet / 210.4 MB PrivateBytes；其中我们自己的进程 29 MB | ❌ 超标 2.6 倍，且 `--disable-gpu` 只省 14 MB ⇒ **判据本身要用户重述** |
 | 4 | 流式输出不掉帧 | 真流式窗口内 rAF 帧间隔 + T16 合帧单测（§3.3） | >16 ms 的帧 **0 个**（max 3.5 / 10.0 ms）；但渲染频率 **26–27 次/秒** | 帧间隔 ✅ / 「≤10 次/秒」❌ ⇒ 口径分叉，见 §3.3.1 |
