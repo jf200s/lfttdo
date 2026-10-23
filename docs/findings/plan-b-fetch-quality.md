@@ -281,6 +281,12 @@ cargo run --manifest-path src-tauri/Cargo.toml --example fetch_probe -- --live <
 
 # T24b 复测：换成 `readability` + `html2md` 之后（2026-10-23）
 
+> ⚠️ **本节测量对象已被修复轮 1/2 取代**：下面写的 `html2md 0.2.17`、`[profile.release] panic =
+> "unwind"`、「占位补丁兜住了相对链接」、「安装包没重打」**四条都不是落地事实**。
+> 落地形状见文末《T24b 落地：readability 定界 + htmd 转换（修复轮 1/2）》——
+> 尤其**不要照着本节改 `panic`**，那是 +5.4 MB 的代价（R267 换回 `htmd` 后 `abort` 已恢复）。
+> 本节保留原样，因为这张 html2md 的表是「为什么不凑合用」的真实判门证据（R272：不覆盖、只标注）。
+
 上面那一节（T24）**保持原样**，这一节是同一台机器、同一批页面、同一个探针
 （`src-tauri/examples/fetch_probe.rs`）在换掉抽取器之后的复跑。
 
@@ -418,3 +424,147 @@ cargo run --release --manifest-path src-tauri/Cargo.toml --example fetch_probe -
 cargo run --release --manifest-path src-tauri/Cargo.toml --example fetch_probe -- --live <URL>
 ```
 
+
+---
+
+# T24b 落地：readability 定界 + htmd 转换（修复轮 1/2，2026-10-23）
+
+前面《T24b 复测》那一节记录的是**首轮**（`readability` + `html2md`）的判门证据，那是真实发生过的
+测量，所以不覆盖它（R272）。**这一节才是落地形状**：代码在 `c979776`（首轮）→ `a11afc7`（修复轮 1）
+→ 本轮修复轮 2 之后，`Cargo.toml`/`fetch.rs` 的最终状态。所有数字是**这一轮在本机重跑实测**的，
+原始输出：`.superpowers/sdd/2026-10-21-plan-b-tools-mcp/t24b-fix2-probe.txt`。
+
+## 落地链条（`render_markdown` 的 HTML 臂）
+
+```text
+decode_body(content_type, body, is_html=true)      按声明字符集解码（R265/R268：encoding_rs，
+                                                   解不了就报错，全链路没有 from_utf8_lossy）
+  → readability::extractor::extract(&[u8], base)   正文定界；base = Fetched::final_url（R270）
+  → article_body_html(product.content)             只取 <body> 内层；Product.title 一个字不用
+  → htmd::convert(fragment)                        只把「裁剪后的片段」转 Markdown（R267）
+  → 定界结果判空 / 判下限（R271）：
+       空串        → 交 NO_ARTICLE_TEXT（「这一页抽不出正文…」）
+       非空 <200 字 → 一行标记 + 原文两段（见下面《R271：抽不出正文要说给模型听》）
+       其余        → 原样交 markdown
+```
+
+`text/plain` 与 `application/json` **不过这条链**：只过 `decode_body`，逐字透传，一条标记都不加。
+
+## profile：`panic = "abort"` 在落地位上（首轮那句「改成 unwind」已作废）
+
+首轮为了让 `html2md` 编过，把 `[profile.release] panic` 改成了 `"unwind"`，实测代价 **+5 436 416 字节**
+（`11 153 920` → `16 590 336`，见上文《体积账》）。R267 换回 `htmd`（默认 crate-type，纯 rlib）之后
+`abort` 恢复，本轮 `cargo build --release` 在 `abort` 下通过（2 m 00 s / exit 0）。
+
+**别照着《T24b 复测》那一节把 profile 改回 unwind** —— 那一节写的是首轮当时的处境，落地不是它。
+
+## 依赖账（实测：`Cargo.lock` 唯一 name+version 集合做差）
+
+```text
+基准 = 首轮 c979776（551 个唯一包）   落地 = a11afc7 / 本轮工作树（553 个唯一包，净 +2）
+
+移除 3：html2md 0.2.17
+        markup5ever_rcdom 0.39.0+unofficial
+        xml5ever 0.39.0
+新增 5：htmd 0.5.6
+        html5ever 0.38.0
+        markup5ever 0.38.0
+        markup5ever_rcdom 0.38.0+unofficial
+        xml5ever 0.38.0
+
+cargo tree -e normal 行数：T24（htmd）830 → T24b 首轮（readability+html2md）859 → 落地 869
+本轮（修复轮 2）与 a11afc7 的 Cargo.lock **逐包相同**（差集为空）：R271 只加了一行标记，没动依赖。
+```
+
+- **`encoding_rs 0.8.42` 是直接依赖**（`cargo tree -e normal` 里它是 `qwen-do` 的第一层孩子）。
+  plan 里那句「它随 html5ever 传递带入」的假设被实测**否掉**：加它之前 `cargo tree -e all | grep
+  encoding_rs` 空输出，`readability 0.3.0`（→html5ever 0.26）与 `htmd 0.5.6`（→html5ever 0.38）
+  两族都不带。R268 已裁定接受这一行。
+- `readability` 保持 `default-features = false`：它的默认特性会拉一整套 `reqwest 0.11`（含
+  native-tls 全家），而我们只喂已经取回来的字节。
+
+## 六页复测对照（同一批 URL、同一台机器、同一个探针）
+
+「首轮」列是《T24b 复测》那张表的 html2md 数（历史判门证据）；「修复轮 1」与「本轮」都是 htmd。
+本轮与前一轮的**唯一差别**是 R271 那一行标记 —— 所以正文本体的字符数两趟逐字相同，
+只有被标记的那两页总量各多 38 / 37 字（标记句 + 换行）。
+
+| # | 页面 | body 字节（本轮） | 首轮 html2md 字符 | 修复轮 1 htmd 字符 | 本轮 htmd+标记 总字符 | 对照（整页不定界）字符 | 判定 |
+|---|---|---|---|---|---|---|---|
+| 1 | 新闻 `qbitai.com/2026/10/504734.html` | 69 633 | 6 201 | 6 136 | **6 136**（无标记） | 31 725 | **过（可用）** |
+| 2 | 博客 `overreacted.io/how-are-function-components…` | 188 352 | 19 151 | 19 138 | **19 138**（无标记） | 149 764 | **过（可用）** |
+| 3 | 门户 `ithome.com/` | 145 245 | 186 | 187 | **225** = 187 正文 + 38 标记 | 64 733 | **过（有限制 → 现已明说）** |
+| 4 | 纯文本 `rfc-editor.org/rfc/rfc1945.txt` | 137 582 | 137 582 | 137 582 | **137 582**（透传，不加标记） | — | **过（逐字透传）** |
+| 5 | JSON `api.github.com/repos/tokio-rs/tokio` | 6 182 | 6 182 | 6 182 | **6 182**（透传，不加标记） | — | **过（逐字透传）** |
+| 6 | SPA 空壳 `36kr.com/` | 25 361 | 53 | 52 | **89** = 52 正文 + 37 标记 | 25 993 | **过（有限制 → 现已明说）** |
+| 附 | 门户 `sina.com.cn/`（不计入门） | 401 775 | 2 115 | 2 057 | **2 057**（高于下限，无标记） | 191 666 | 见下面 charset |
+
+抽取耗时（纯 CPU，同量级）：qbitai 3 ms、overreacted 4 ms、ithome 6 ms、36kr 0 ms、sina 10 ms。
+六页仍全部 0 跳、`换注册域: false` ⇒ `[已跳转至 …]` 与 `[上游返回 …]` 两句在真网上依旧没被打到。
+
+## R271：抽不出正文要说给模型听
+
+**失败形状**（独立评审提出，本轮修）：`readability` 的 `extract` 不返回 `Option`，「定界失败」表现为
+**降级成整份文档剩下的样板**。于是 ithome 交的是站点 slogan + 版权/举报页脚（187 字）、
+36kr 交的是火山引擎的反爬提示（52 字），**没有任何标记** ⇒ 模型会照原话答
+「这一页讲的是软媒旗下科技门户网站」。
+
+**落地的判据**（`MIN_ARTICLE_CHARS = 200`，字符数）：HTML 臂抽出非空但低于 200 字时，
+前面挂一行再交原文：
+
+```text
+[未能定界出正文，以下 {n} 字可能是站点样板或反爬提示，别当正文引用]
+```
+
+本轮真网的实际输出（前 120 字）：
+
+```text
+ithome → [未能定界出正文，以下 187 字可能是站点样板或反爬提示，别当正文引用]
+         IT之家，软媒旗下科技门户网站 - 爱科技，爱这里。 …
+36kr   → [未能定界出正文，以下 52 字可能是站点样板或反爬提示，别当正文引用]
+         正在进行安全检测... …
+```
+
+**为什么是「标记」而不是「报错」或「丢掉」**：标记的假阴性没有代价（文本照样交出去，只多一行说明）；
+丢掉的假阴性有代价（一页真短文被吞掉，模型和用户都无从发现）。`readability 0.3.0` 的 `Product`
+只有 `{title, content}`、**没有置信度**可用，所以只能判「少不少」，判不出「有没有」——
+少的时候说实话，不假装它不存在。阈值 200 照着六页摆：6 136 / 19 138 远高于线，187 / 52 低于线，
+被标记的正好是评审点名的那两页。空串那一支仍走 `NO_ARTICLE_TEXT`（另一句真话，两支没合并）。
+测试：`a_sub_floor_extraction_is_labelled_instead_of_dropped`（标记 + 原文都在、`NO_ARTICLE_TEXT` 不在）、
+`text_plain_below_the_floor_gets_no_label_at_all`（透传那两臂一条标记都不许加）。
+
+## 纠正首轮那句「占位补丁兜住了相对链接」——它没兜住
+
+《本任务新查出的两件事》第 2 条写的是：把 `https://fetch-url.invalid/` 从前缀里剥掉、
+「相对链接保持相对形状」。两头都不成立：
+
+1. `readability` 会按基地址把 `<img src>` **展开成绝对地址**，剥前缀的补丁只处理留在输出里的字面量，
+   绝对化后的地址照样带着 `.invalid` 出去 —— 首轮真网的 overreacted 尾部是
+   `![Smiling Pikachu](https://fetch-url.invalid/how-are-function-components-different-from-classes/pikachu.gif)`，
+   一条指向 RFC 2606 保留域的**死链**，模型会当真链接引用。
+2. 「保持相对形状」本身是坏的对模型承诺：相对链接交出去，模型没法照着它再取一次。
+
+**落地形状（R270）**：`render_markdown` 收 `base_url = Fetched::final_url`（实际取回内容那一跳，
+不是用户请求那条），占位地址与两条 `.replace(...)` 补丁一起删除。本轮实测 overreacted 尾部是
+`![Smiling Pikachu](https://overreacted.io/how-are-function-components-different-from-classes/pikachu.gif)`，
+qbitai 正文图是 `https://i.qbitai.com/wp-content/uploads/…webp`（ithome 页脚那两条 `//www.ruanmei.com`
+保持协议相对形式，两趟一样）。钉它的测试：
+`relative_links_are_resolved_against_the_real_page_url`、`after_a_redirect_links_resolve_against_the_final_url`、
+`an_unparseable_base_url_is_an_error_not_a_fallback`（基地址解析不出来**硬报错**，不降级成假地址）。
+
+## 体积：exe 与安装包（本轮实测）
+
+```text
+cargo build --release → src-tauri/target/release/qwen-do.exe
+                                    11 155 456 字节   （abort；修复轮 1 同一趟也是这个数，逐字相同）
+  abort 基线（T24 带 htmd、未接 fetch 依赖）  11 153 920 字节  ⇒ 整条 readability+htmd+encoding_rs 链净 +1 536 字节
+  首轮 unwind 产物                          16 588 800 字节  ⇒ 本轮比它小 5 433 344 字节
+npx tauri build 之后同一件 exe                11 312 128 字节 （tauri 把 bundle 类型信息打进二进制，
+                                                             这是**另一把尺子**，别拿它当 cargo build 的基准）
+NSIS 安装包（只构建，未安装未启动）
+  src-tauri/target/release/bundle/nsis/qwen-do_0.1.0_x64-setup.exe
+                                    4 127 508 字节 = 3.94 MiB   ⇒ <15 MiB 那条验收线**过**（余量 11.06 MiB）
+```
+
+首轮那句「安装包没重打」在落地形状上已经不成立：修复轮 1 第一次打出安装包（`4 128 708`），
+本轮重打是 `4 127 508`（差的 1 200 字节来自压缩后的内容差异，不是依赖变化 —— 本轮 `Cargo.lock` 逐包未变）。
