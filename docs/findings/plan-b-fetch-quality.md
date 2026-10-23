@@ -276,3 +276,145 @@ cargo run --manifest-path src-tauri/Cargo.toml --example fetch_probe -- --live <
 ```
 
 原始输出：`.superpowers/sdd/2026-10-21-plan-b-tools-mcp/t24-probe.txt`。
+
+---
+
+# T24b 复测：换成 `readability` + `html2md` 之后（2026-10-23）
+
+上面那一节（T24）**保持原样**，这一节是同一台机器、同一批页面、同一个探针
+（`src-tauri/examples/fetch_probe.rs`）在换掉抽取器之后的复跑。
+
+被检对象：`render_markdown` 的 HTML 分支，现在是
+`decode_body`（按声明字符集解码）→ `readability::extractor::extract`（正文定界）→
+只取 `<body>` 内层 → `html2md::parse_html`。版本：`readability 0.3.0`
+（`default-features = false`）、`html2md 0.2.17`、`encoding_rs 0.8.42`。
+探针的**对照列**换了口径：T24 那一列是「htmd 跳过 script/style/noscript」，
+这一节是「整页过一次 html2md、**不做**正文定界」—— 量的是定界这一步替模型挡掉多少字符。
+原始输出：`.superpowers/sdd/2026-10-21-plan-b-tools-mcp/t24b-probe.txt`。
+
+## 结论（一句话）
+
+**收紧后的通过线：六页全过。** 新闻页与博客页开头 400 字就是正文句子、脚本样式归零；
+门户页从 64 691 字符的链接 dump 掉到 186 字符、SPA 页从 25 992 字符的 CSS/JS 掉到 53 字符，
+两条「不允许再交一堆链接或 JS 正文」的红线都没有被踩到。三条限制照实在下面写着，
+不写成「完美」。
+
+## 前后对照表（同一批页面）
+
+| # | 页面 | T24（htmd）字符 | T24b 字符 | T24b 抽取 ms | 对照（整页不定界）字符 | 定界省掉 | 判定 |
+|---|---|---|---|---|---|---|---|
+| 1 | 新闻 `qbitai.com/2026/10/504734.html` | 31 639 | **6 201** | 4 | 33 199 | 81.3% | **可用** |
+| 2 | 博客 `overreacted.io/how-are-function-components…` | 149 764 | **19 151** | 5 | 146 670 | 86.9% | **可用** |
+| 3 | 门户 `ithome.com/` | 64 691 | **186** | 4 | 62 592 | 99.7% | **通过（有限制）** |
+| 4 | 纯文本 `rfc-editor.org/rfc/rfc1945.txt` | 137 582 | 137 582 | 0（不过抽取器） | — | — | **可用** |
+| 5 | JSON `api.github.com/repos/tokio-rs/tokio` | 6 182 | 6 182 | 0（不过抽取器） | — | — | **可用** |
+| 6 | SPA 空壳 `36kr.com/` | 25 992 | **53** | 0 | 25 624 | 99.8% | **通过（有限制）** |
+| 附 | 门户 `sina.com.cn/`（非 UTF-8 观察，不计入门） | 191 222 | **2 115** | 9 | 193 033 | 98.9% | 见下面「charset」 |
+
+六页仍然全部 0 跳、`换注册域: false`，所以 `[已跳转至 …]` 与 `[上游返回 …]` 两句在真网上
+**依旧没被打到**（T24 的未实测清单第 3 条照旧有效）。
+
+## 逐页判据
+
+1. **新闻（可用）**。前 400 字逐字开头是文章自己的引子块（`> 鹭羽 发自 凹非寺`、
+   `> 量子位 | 公众号 QbitAI`），紧接着是正文句子「不会……只有我这样做吧？」「现在每次去
+   医院看病前，我都会**让AI帮我跑一轮**。」—— 有正文句子这条过。T24 那一趟的开头是
+   一行内联 JS + `<title>` + 两大段 WordPress 内联 CSS，现在**一行脚本都没有**
+   （抽取 4 ms，比 htmd 的 11 ms 还快）。末尾是文章的结尾段落 + 官网链接 + 版权行，
+   不是备案号 dump。限制：开头那两个 blockquote 是作者署名/公众号行，属于文章 DOM 内部的
+   内容，不是我们从 `Product.title` 拼进去的（那条判据由
+   `title_and_byline_are_not_spliced_into_the_body` 钉住）。
+2. **博客（可用）**。前 400 字第一行就是 "How do React function components differ from
+   React classes?"，第二段起是连贯正文；19 151 字符对上 T24 对照趟（htmd 跳过脚本样式）的
+   19 673 —— 数量级一致，说明**正文定界一步就拿到了当年对照趟的水平**，而生产路径不再需要
+   任何 skip_tags 配置。代码块与长段落形状保住（长行字符占比 97.1%）。T24 尾部那种
+   Next.js RSC 转义 JSON 彻底消失。
+3. **门户（通过，有限制）**。186 字符，内容是页面自己的 description 元信息一句
+   （「IT之家，软媒旗下科技门户网站…」）+ 版权/举报页脚两行。**没有**再交 589 行导航链接
+   （T24 是 64 691 字符、链接行占 69.5%）——「不允许再交一堆链接」这条过。
+   限制照实写：门户页本来就没有单一正文，`readability` 的评分最后落在了页脚块上，
+   交出来的既不是「抽不出正文」那句、也不是任何正文。要更严的话下一步该加的是
+   「正文下限」（抽出字符数低于某个阈值就改说那一句），本任务没有擅自加。
+4. **纯文本（可用）**。逐字节透传，137 582 → 137 582；现在这一支过 `decode_body`
+   （声明的 `charset=utf-8` 参与解码），空行与缩进仍然一个不改。
+5. **JSON（可用）**。6 182 → 6 182，单行原样。
+6. **SPA 空壳（通过，有限制）**。53 字符 = 「正在进行安全检测…」+ 那句等待提示。
+   T24 的三重失败里，第 1 条（把 25 992 字符 CSS/JS 当正文）与第 3 条（`data:` URI 占半页）
+   现在**没了**：整页 25 624 字符被定界挡掉 99.8%，`![](data:image/png;base64,…)` 一条不剩。
+   残留的是第 2 条：这一页 status=200、没换注册域，所以 `[上游返回 …]` 与 `[已跳转至 …]`
+   两句都不会打，我们仍然把一块反爬提示当正文交了 53 字符 —— 比 T24 好两个数量级，
+   但「识别验证码/反爬页」这件事本任务没做到，也不假装做到。
+
+## charset 解码（R265）
+
+- 三条判据都落了地，但**真网上依旧一次都没打到**：六页 + sina 附加页全部返回 UTF-8
+  （sina 的 `content-type: text/html` 连 charset 参数都没有）。T24 未实测清单第 1 条
+  在这一点上**仍然没关掉**，只是从「没有实现」变成「实现由单测钉住、真网未验证」：
+  `a_gbk_html_page_decodes_instead_of_mojibake` 写死了真的 GBK 字节（`encoding_rs::GBK.encode`
+  现场造夹具，并断言同一批字节走 `from_utf8_lossy` 一定产 U+FFFD），
+  `an_unknown_charset_is_reported_not_lossy_decoded` 钉住未知标签报错。
+- 探针里 sina 那一页的输出形状值得记一条：`readability` 定界后剩下 2 115 字符，
+  内容是主页要闻列表的**模板文本**（`\<div class="uni-blk-bt clearfix"\>` 这种被 html2md
+  转义过的标签串），中文本身没乱。也就是说门户类页面在 readability 下仍可能交出
+  「嵌在 DOM 里的 HTML 源码」，不是链接 dump、但也不是散文。
+
+## 本任务新查出的两件事（T24 的清单里没有）
+
+1. **`html2md` 与 `panic = "abort"` 不兼容**（阻断级）。`html2md` 的
+   `[lib] crate-type = ["rlib","dylib","staticlib"]`，**0.2.6 到 0.2.17 全是这样**（逐个版本
+   实测过），dylib/staticlib 必须链 `panic_unwind`，在本仓库的 release profile 下报
+   `error: the linked panic runtime panic_unwind is not compiled with this crate's panic strategy abort`
+   ⇒ 本任务把 `[profile.release] panic` 改成了 `"unwind"`。体积代价见下表：**这是全部增量所在，
+   换依赖本身净变化是负的**。要换回 abort，只能换一个不带 dylib 的 Markdown 转换器（决策归用户）。
+2. **`readability` 需要一条基地址，而 `render_markdown` 的签名里没有 URL**。占位地址
+   `https://fetch-url.invalid/` 被它用来改写相对链接，博客页那张 `pikachu.gif` 就变成了
+   一个**不存在的绝对地址**交出去。修法：把占位前缀从结果里剥掉（`.invalid` 是 RFC 2606
+   保留域，撞不上真链接），相对链接保持相对形状；
+   测试 `the_placeholder_base_url_never_reaches_the_model` 钉住。
+   正解是把真实 URL 传进 `render_markdown` —— 那是签名改动，brief 明令不动，留给下一个任务定。
+
+## 体积账（Step 5，实测数字）
+
+```text
+cargo tree -e normal --manifest-path src-tauri/Cargo.toml | grep -c ''
+  T24（带 htmd）：830 行        T24b：859 行        （+29 行依赖边）
+  最初（没有 HTML 抽取器）：808 行
+git diff --numstat src-tauri/Cargo.lock
+  263  44  src-tauri/Cargo.lock
+Cargo.lock 唯一 name+version 集合前后做差（实测）
+  新增 26 个、移除 5 个（净 +21）：530 → 551
+  新增：readability 0.3.0、html2md 0.2.17、encoding_rs 0.8.42、core_detect 1.0.0、
+        html5ever 0.26.0、markup5ever 0.11.0、markup5ever_rcdom 0.2.0/0.39.0、
+        xml5ever 0.17.0/0.39.0、futf、mac、tendril 0.4.3、string_cache(_codegen)、
+        phf*、rand/rand_chacha/rand_core 0.8 一套、siphasher 0.3.11、multiversion_no_op
+  移除：htmd 0.5.6 与它那一族 0.38.0（html5ever/markup5ever/markup5ever_rcdom/xml5ever）
+release exe（`src-tauri/target/release/qwen-do.exe`，本机实测三趟）
+  HEAD（htmd + panic=abort）            11 153 920 字节
+  HEAD（htmd + panic=unwind，隔离用）   16 590 336 字节
+  T24b（readability+html2md+encoding_rs + panic=unwind）  16 588 800 字节
+  ⇒ profile 那一行 = +5 436 416 字节；**换依赖本身在同一 profile 下是 −1 536 字节**（几乎为零）
+```
+
+`encoding_rs` 不是传递依赖（`cargo tree -e all | grep encoding_rs` 在加它之前**空输出**，
+实测：`readability 0.3.0`→html5ever 0.26 与 `html2md 0.2.17`→html5ever 0.39 两族都不带它），
+所以按 brief 的规矩这一条属于「真新增包」，本任务**照实加了一行并在此提请裁定**，
+没有静吞。安装包数没重打（本任务不动打包），验收线 <15 MiB 的压力集中在 profile 那一行。
+
+## 未实测清单（T24b 之后的状态）
+
+1. 非 UTF-8 页面的**真网**代价：仍然没打到（六页 + sina 全 UTF-8）。实现由单测钉住。
+2. `readability` + `html2md` 的**质量**：这一节就是它的实测，从「一次都没跑过」变成
+   「六页跑过、判门已下」。仍未测：`<svg>` 内文本、`data:` URI（SPA 那一页现在一条不剩，
+   但那是这一页的形状，不是普适结论）、以及**同一站点多页的稳定性**（每页只打了一次）。
+3. 重定向与错误状态在真网上的形态：六页全 0 跳，两句自述行仍只有离线覆盖。
+4. 安装包体积（NSIS）在 `panic=unwind` 下的真实增量：没重打，只有 exe 数。
+5. 门户/SPA 两类「抽出来是页脚/反爬提示」的形状要不要走「正文下限」阈值：本任务不加，
+   等判门结果被复核后再定。
+
+## 复跑（T24b）
+
+```bash
+cargo run --release --manifest-path src-tauri/Cargo.toml --example fetch_probe -- --live
+cargo run --release --manifest-path src-tauri/Cargo.toml --example fetch_probe -- --live <URL>
+```
+

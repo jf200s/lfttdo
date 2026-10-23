@@ -1,9 +1,12 @@
-//! 风险 7 的判定门探针（非生产代码）：`htmd` 的抽取质量到底够不够交给模型读。
+//! 风险 7 的判定门探针（非生产代码）：HTML 抽取器交给模型的正文到底够不够读。
 //!
-//! 为什么要有这个文件：spec 5.5 选 `htmd` 的理由是「定位非编程场景，正文质量够用即可」，
-//! 而「够用」是一个**人眼**判断，单元测试证不了（单测只能证明「抽出了文本」，
-//! 证明不了「抽出的是正文还是导航条」）。所以这里走一遍生产路径，把每个页面的
-//! 抽取结果原样交出来看。
+//! 为什么要有这个文件：spec 5.5 选的抽取器「够用」是一个**人眼**判断，单元测试证不了
+//! （单测只能证明「抽出了文本」，证明不了「抽出的是正文还是导航条」）。所以这里走一遍
+//! 生产路径，把每个页面的抽取结果原样交出来看。
+//!
+//! T24 用它判了 `htmd`（结论：不达标，见 `docs/findings/plan-b-fetch-quality.md`）；
+//! T24b 用**同一个探针、同一批页面**复跑换掉之后的 `readability` + `html2md`，
+//! 前后对照写进同一份 findings 的新一节。
 //!
 //! 用法：
 //! ```text
@@ -29,10 +32,9 @@
 //! 折成可复跑的数字；判定门本身仍然是人眼读那 400 字 + 200 字，
 //! 结论与依据都写进 `docs/findings/plan-b-fetch-quality.md`。
 //!
-//! HTML 那一支另有一列**对照**：同一份 HTML 再用 `skip_tags(["script","style",
-//! "noscript"])` 抽一遍。判门不过时要把「噪声到底是脚本/样式正文还是导航条」说清楚
-//! —— 前者是配置问题，后者才是换 `readability` 的理由。对照列**不是**生产路径，
-//! 生产路径始终只有 `render_markdown` 那一趟。
+//! HTML 那一支另有一列**对照**：同一份 HTML 再用「不经过 readability 定界」的
+//! `html2md::parse_html(整页)` 抽一遍 —— 它量的是「readability 这次定界到底替模型挡掉了
+//! 多少字符」。对照列**不是**生产路径，生产路径始终只有 `render_markdown` 那一趟。
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -112,19 +114,17 @@ struct Shot {
     text: String,
     /// true = 走了白名单里的透传分支（text/plain、application/json），没经过抽取器。
     passed_through: bool,
-    /// 对照读数：同一份 HTML 用「跳过 script/style/noscript」的 htmd 配置再抽一遍。
+    /// 对照读数：同一份 HTML **不做正文定界**、整页过一次 `html2md`。
     /// **生产路径不是这一套** —— 本任务的判定门只认 `render_markdown` 的结果，
-    /// 加这一列只为了回答「首 400 字里的噪声到底是脚本正文还是导航条」，
-    /// 好让判门不过时的替代方案（`readability` + `html2md`）有个可对证的数。
+    /// 加这一列只为了量出「readability 的正文定界替模型挡掉了多少字符」，
+    /// 好让 T24 那份 findings 的前后对照有可对证的数。
     control: Option<Control>,
 }
 
 /// 对照抽取的读数。
 enum Control {
-    /// 抽出来了；`text` 是「跳过 script/style/noscript」之后的结果。
+    /// 抽出来了；`text` 是「整页过一次 html2md、不做正文定界」的结果。
     Converted { text: String, convert_ms: u128 },
-    /// 对照这一趟自己失败了（不影响生产路径的读数，只少一条对照）。
-    Failed(String),
 }
 
 #[tokio::main]
@@ -217,7 +217,6 @@ async fn main() {
         let control = match &s.control {
             None => "—".to_string(),
             Some(Control::Converted { text, .. }) => format!("{} 字符", text.chars().count()),
-            Some(Control::Failed(_)) => "对照失败".to_string(),
         };
         println!(
             "{:<34} {:>8} 字符  对照 {:>10}  抓 {:>6} ms  抽 {:>6} ms  {}",
@@ -226,7 +225,11 @@ async fn main() {
             control,
             s.fetch_ms,
             s.extract_ms,
-            if s.passed_through { "透传" } else { "htmd" }
+            if s.passed_through {
+                "透传"
+            } else {
+                "readability+html2md"
+            }
         );
     }
 }
@@ -253,23 +256,19 @@ async fn run_one(walker: &RedirectWalker, url: &str) -> Result<Shot, String> {
     };
     let extract_ms = t1.elapsed().as_millis();
 
-    // 对照趟：同一份 HTML 再抽一遍，这次跳过 script/style/noscript。
+    // 对照趟：同一份 HTML 再抽一遍，这次**不做正文定界**（整页过一次 html2md）。
     // 只在真的走了抽取分支时才做（透传那两条没有 HTML 可抽）。
     let control = if passed_through {
         None
     } else {
+        // 对照列**不是**生产路径，也不参与 charset 判据：这里只需要「整页过一次 html2md」
+        // 的字符数，所以直接 lossy —— 生产那三支持续不许出现这个函数（R265）。
         let html = String::from_utf8_lossy(&f.body).into_owned();
         let t2 = Instant::now();
-        let converted = htmd::HtmlToMarkdownBuilder::new()
-            .skip_tags(vec!["script", "style", "noscript"])
-            .build()
-            .convert(&html);
-        Some(match converted {
-            Ok(text) => Control::Converted {
-                text,
-                convert_ms: t2.elapsed().as_millis(),
-            },
-            Err(e) => Control::Failed(e.to_string()),
+        let converted = html2md::parse_html(&html);
+        Some(Control::Converted {
+            text: converted,
+            convert_ms: t2.elapsed().as_millis(),
         })
     };
 
@@ -303,7 +302,7 @@ fn print_shot(s: &Shot) {
         if s.passed_through {
             "白名单透传分支（不过抽取器）"
         } else {
-            "htmd 抽取分支"
+            "readability 定界 + html2md 转换"
         }
     );
     println!(
@@ -313,18 +312,15 @@ fn print_shot(s: &Shot) {
     metrics(&s.text);
     match &s.control {
         None => {}
-        Some(Control::Failed(e)) => {
-            println!("对照（跳过 script/style/noscript）：这一趟自己失败了：{e}")
-        }
         Some(Control::Converted { text, convert_ms }) => {
             let control_total = text.chars().count();
             let prod_total = s.text.chars().count();
-            let dropped = prod_total.saturating_sub(control_total);
+            let dropped = control_total.saturating_sub(prod_total);
             println!(
-                "对照（跳过 script/style/noscript）: {control_total} 字符（生产路径 {prod_total} 字符，\
-                 这一类标签占了 {} 字符 = {}），抽取 {convert_ms} ms",
+                "对照（整页、不做正文定界）: {control_total} 字符（生产路径 {prod_total} 字符，\
+                 正文定界这一类省掉 {} 字符 = {}），抽取 {convert_ms} ms",
                 dropped,
-                pct(dropped, prod_total)
+                pct(dropped, control_total)
             );
             let (head, _) = head_chars(text, 200);
             println!("--- 对照前 200 字 ---\n{head}");

@@ -62,12 +62,17 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "std",
 ] }
-# T24：`fetch_url` 的 HTML→Markdown 抽取（spec 5.5 选定，判门见
-# `docs/findings/plan-b-fetch-quality.md`）。新增 5 个包（htmd + html5ever +
-# markup5ever + markup5ever_rcdom + xml5ever），全是 html5ever 那一类解析器，
-# 没混进 `image`/`serde_yaml` 那种不相关的重依赖（体积账：task-24 报告 Step 5）。
-# 按 brief 要求保持**这一行原样**：不做 feature 裁剪实验。
-htmd = "0.5.6"
+# T24b：换掉 `htmd`（R264 —— spec 5.5 的判定门实测不过，见
+# `docs/findings/plan-b-fetch-quality.md`）。HTML 抽取改成两段：`readability` 定正文边界 +
+# `html2md` DOM→Markdown。**关掉 readability 的 default features**：它默认拉一整套
+# `reqwest 0.11`（含 native-tls 那一串），只为它的 `scrape()` 便利函数服务，而我们只喂
+# 已经取回的字节；`default-features = false` 把这条重复 HTTP 栈摘掉（体积账：task-24b 报告 Step 5）。
+readability = { version = "0.3.0", default-features = false }
+html2md = "0.2.17"
+# R265：charset 解码。brief 猜它「随 html5ever 传递带入」，实测**不是**
+# （`readability 0.3.0`→html5ever 0.26、`html2md 0.2.17`→html5ever 0.39 两族都不带 encoding_rs），
+# 所以这是一个真·新增包（自身零依赖，代价见报告，已按 brief 的要求在报告里提请裁定）。
+encoding_rs = "0.8.42"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -75,7 +80,13 @@ htmd = "0.5.6"
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# T24b：`panic = "abort"` 摘掉了 —— `html2md` 的 `[lib] crate-type` 里带 `dylib`/`staticlib`
+# （上游所有 0.2.x 版本都是，实测 0.2.6→0.2.17），而这两种 crate-type 必须链 `panic_unwind`，
+# 在 abort profile 下**编译不过**（`error: the linked panic runtime panic_unwind is not compiled
+# with this crate's panic strategy abort`）。代价是发布产物变大，前后实测数在
+# `.superpowers/sdd/2026-10-21-plan-b-tools-mcp/task-24b-report.md` 的 Step 5；
+# 要换回 abort 就得换一个不带 dylib 的 Markdown 转换器（决策归用户，不在本任务擅自换）。
+panic = "unwind"
 strip = true
 
 [dev-dependencies]

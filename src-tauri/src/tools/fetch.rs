@@ -471,30 +471,207 @@ pub const MAX_CHARS_CAP: usize = 24_000;
 /// 清单之外一律**报错**而不是返回空文本：空文本会被模型读成「这个页面是空的」，
 /// 而真相是「我们不去碰这种格式」，两者对模型的下一步完全不同（Step 1 的判据）。
 ///
-/// **已知欠账（未实测）**：`charset` 参数只用来认类型、不用来解码。非 UTF-8 页面
-/// （gb2312/big5/shift_jis 的老中文、日文站点）走 `from_utf8_lossy` ⇒ 乱码而不是报错。
-/// 修它要引 `encoding_rs`，而 `reqwest` 这边是 `default-features = false`（没有
-/// `charset` feature），装上就是给安装包 <15MB 那条线添一个新依赖，留给发布体积任务定。
+/// **T24b 的两处改动**（判门与裁定见 `docs/findings/plan-b-fetch-quality.md`）：
+/// - HTML 那一支不再用 `htmd`（R264：判门实测不过，正文里没有「正文边界」这个概念），
+///   改成 `readability` 定界 + `html2md` 转 Markdown。
+/// - `charset` 参数从「只用来认类型」升级为「真的参与解码」（R265）：三支共用
+///   `decode_body`，全链路**没有** `from_utf8_lossy` 了 —— 解不了就报错，
+///   绝不把 U+FFFD 交给抽取器或模型。
 pub fn render_markdown(content_type: &str, body: &[u8]) -> Result<String, ToolError> {
     let mt = media_type_of(content_type);
     match mt.as_str() {
         "text/html" | "application/xhtml+xml" => {
-            let html = String::from_utf8_lossy(body);
-            htmd::convert(&html).map_err(|e| {
-                ToolError::Failed(format!("content-type 是 {mt}，但正文抽取失败：{e}"))
-            })
+            let html = decode_body(content_type, body, true)?;
+            let markdown = extract_article_markdown(&html, &mt)?;
+            // 空串是假话（「页面是空的」），整页转换是真话但更坏（一堆链接与 JS）。
+            // 这一句和 `slice_page` 的「正文为空」同一取向：把失败原因交给模型。
+            if markdown.trim().is_empty() {
+                Ok(NO_ARTICLE_TEXT.to_string())
+            } else {
+                Ok(markdown)
+            }
         }
         // 原文透传：纯文本的空行与缩进、JSON 的结构本身就是内容，过一次 markdown
-        // 转换器只会把它们变成装饰或丢掉。
-        "text/plain" | "application/json" => Ok(String::from_utf8_lossy(body).into_owned()),
+        // 转换器只会把它们变成装饰或丢掉。**解码**仍共用同一个辅助（判据 3）。
+        "text/plain" | "application/json" => decode_body(content_type, body, false),
         other => Err(ToolError::Failed(format!(
             "content-type「{other}」不在白名单内：fetch_url 只取 text/html、text/plain、application/json 三种格式"
         ))),
     }
 }
 
+/// `readability` 定界失败（抽不出正文）时交给模型的那一句。
+const NO_ARTICLE_TEXT: &str =
+    "[这一页抽不出正文（可能是脚本渲染的页面），可以试 text/plain 的原始来源或换一个 URL]";
+
+/// 按**声明**的字符集把字节解成文本；解不了就报错，绝不 lossy（R265 的三条判据）。
+///
+/// 1. HTTP `Content-Type` 里有 `charset=` ⇒ 按声明解（`encoding_rs` 的 LABEL 表，
+///    gb2312/gbk/big5/shift_jis/windows-1252/… 都在里面）。
+/// 2. 声明缺失、或声明与内容矛盾时：HTML 页**再读一次** `<meta charset>`（同 LABEL 表）。
+///    认不出的标签 ⇒ 明确报错「这个页面声明的字符集 X 我不解」，**不**走 `from_utf8_lossy`：
+///    静默乱码比报错坏，模型会把乱码当内容引用。
+/// 3. 非 HTML 两支（`text/plain`/`application/json`）没有 `<meta>` 可读，缺声明时先试
+///    严格 UTF-8，再按 WHATWG 给 `text/*` 的缺省 `windows-1252` 解 —— 那一趟逐字节都有出处、
+///    **不产 U+FFFD**，这是它和 lossy 的区别；给了声明却对不上 ⇒ 报错（同上）。
+fn decode_body(content_type: &str, body: &[u8], is_html: bool) -> Result<String, ToolError> {
+    let declared = charset_param(content_type);
+    if let Some(label) = declared.as_deref() {
+        let enc = encoding_for(label)?;
+        if let Some(text) = enc.decode_without_bom_handling_and_without_replacement(body) {
+            return Ok(text.into_owned());
+        }
+        if !is_html {
+            return Err(ToolError::Failed(format!(
+                "这个页面声明的字符集「{label}」和取回的字节对不上，我不猜：硬解出来的字符没有出处。"
+            )));
+        }
+    } else if !is_html {
+        return match std::str::from_utf8(body) {
+            Ok(text) => Ok(text.to_string()),
+            // 没有声明、又不是合法 UTF-8 ⇒ 按 WHATWG 给 `text/*` 的缺省 windows-1252 解。
+            // 它**不**是 lossy：表里那 5 个未定义码位（0x81/0x8D/0x8F/0x90/0x9D）在这里
+            // 直接报错，而不是换成 U+FFFD 交出去。
+            Err(_) => encoding_rs::WINDOWS_1252
+                .decode_without_bom_handling_and_without_replacement(body)
+                .map(|text| text.into_owned())
+                .ok_or_else(|| {
+                    ToolError::Failed(
+                    "这一页没有字符集声明、也不是合法 UTF-8，按缺省的 windows-1252 也解不出来，\
+                     我不猜：猜出来的乱码会被当正文引用。"
+                        .to_string(),
+                )
+                }),
+        };
+    }
+
+    // HTML：没有声明、或声明与内容矛盾 ⇒ `<meta charset>` 再试一次（判据 2）。
+    if let Some(label) = meta_charset(body) {
+        let enc = encoding_for(&label)?;
+        if let Some(text) = enc.decode_without_bom_handling_and_without_replacement(body) {
+            return Ok(text.into_owned());
+        }
+    }
+    match std::str::from_utf8(body) {
+        Ok(text) => Ok(text.to_string()),
+        Err(_) => Err(ToolError::Failed(
+            "这一页既没有可用的字符集声明、也不是合法 UTF-8，我不猜：猜出来的乱码会被当正文引用。"
+                .to_string(),
+        )),
+    }
+}
+
+/// LABEL → 解码器。认不出来就是**错误**，不是「换个编码再试试」。
+fn encoding_for(label: &str) -> Result<&'static encoding_rs::Encoding, ToolError> {
+    encoding_rs::Encoding::for_label(label.as_bytes()).ok_or_else(|| {
+        ToolError::Failed(format!(
+            "这个页面声明的字符集「{label}」我不解：它不在 encoding_rs 的 LABEL 表里。"
+        ))
+    })
+}
+
+/// `Content-Type` 里的 `charset=` 参数（小写、去引号）。`media_type_of` 把它丢掉是
+/// 白名单的口径（只认类型），这里单独把它读回来 —— 两条互不影响。
+fn charset_param(content_type: &str) -> Option<String> {
+    content_type.split(';').skip(1).find_map(|param| {
+        let (key, value) = param.split_once('=')?;
+        if key.trim().eq_ignore_ascii_case("charset") {
+            let value = value.trim().trim_matches(['\'', '"']);
+            (!value.is_empty()).then(|| value.to_ascii_lowercase())
+        } else {
+            None
+        }
+    })
+}
+
+/// 从前 2 KiB 里读 `<meta … charset=X …>`（判据 2 的那「一次」）。
+/// 只在字节层扫 ASCII 标签名 —— 任何字符集下 `<meta` 和 `charset=` 都是 ASCII；
+/// UTF-16 之类的页扫不到 `<meta`，那就走「没有声明」那支。
+fn meta_charset(body: &[u8]) -> Option<String> {
+    let lower = body[..body.len().min(2048)].to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(meta) = find_window(&lower, b"<meta", from) {
+        // 标签正文到第一个 `>` 为止（没闭合就到窗口末尾，浏览器也这么宽容）。
+        let end = find_window(&lower[meta..], b">", 0)
+            .map(|i| meta + i)
+            .unwrap_or(lower.len());
+        if let Some(cs) = find_window(&lower[meta..end], b"charset=", 0) {
+            let start = meta + cs + b"charset=".len();
+            let label: Vec<u8> = lower[start..end]
+                .iter()
+                .copied()
+                .take_while(|b| {
+                    !matches!(
+                        b,
+                        b'"' | b'\'' | b';' | b'=' | b',' | b' ' | b'\t' | b'\r' | b'\n'
+                    )
+                })
+                .collect();
+            // 标签本来就是 ASCII：解不出来（畸形字节）就当没有声明，而不是硬造一个名字。
+            if let Ok(label) = String::from_utf8(label)
+                && !label.is_empty()
+            {
+                return Some(label);
+            }
+        }
+        from = meta + b"<meta".len();
+    }
+    None
+}
+
+/// `haystack` 里 `needle` 第一次出现的位置（从 `from` 起）。
+fn find_window(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    haystack
+        .get(from..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
+}
+
+/// `readability` 定界 + `html2md` 转 Markdown；只用正文那一段。
+fn extract_article_markdown(html: &str, mt: &str) -> Result<String, ToolError> {
+    // `render_markdown` 的签名里没有 URL（T24 的对外承诺），而 `readability::extract`
+    // 要一条基地址来改写相对链接 —— 给一条**必然解析不到真实站点**的占位地址：
+    // 相对链接改不出来（少几条链接），绝对链接照旧，两种都不影响「只用正文」这条判据。
+    let base = Url::parse("https://fetch-url.invalid/").expect("常量地址必须可解析");
+    let mut reader: &[u8] = html.as_bytes();
+    let product = readability::extractor::extract(&mut reader, &base)
+        .map_err(|e| ToolError::Failed(format!("content-type 是 {mt}，但正文抽取失败：{e}")))?;
+    // 这个 crate 的 `extract` 不返回 `Option`（它总交回一个 `Product`）：「没有可辨识正文」
+    // 在它这儿表现为**降级成整份文档**，`<head>`（title、站点名、内联样式）会留在
+    // `content` 里。所以这里只取 `<body>` 的内层，`Product.title` 一个字都不用 ——
+    // 拼进去模型就当页面内容引用了（brief Step 1 判据 2）。
+    let body_html = article_body_html(&product.content);
+    let markdown = html2md::parse_html(&body_html);
+    // 相对链接与图片被 `readability` 按上面那条占位地址改写成了
+    // `https://fetch-url.invalid/…` —— 那是**不存在的地址**，模型会当真实链接引用
+    // （真网复测在 overreacted 那张 gif 上打到了，见 findings）。`.invalid` 是 RFC 2606
+    // 保留域，撞不上任何真链接，所以把占位前缀剥回去：相对链接保持相对，绝对链接不受影响。
+    Ok(markdown
+        .replace("https://fetch-url.invalid/", "/")
+        .replace("https://fetch-url.invalid", ""))
+}
+
+/// 取序列化结果里 `<body>…</body>` 的内层；没有 body 标签（选中了某个 div 当正文）时
+/// 原样交回 —— 那种情况下 `content` 本来就是正文片段。
+fn article_body_html(content: &str) -> String {
+    let lower = content.to_ascii_lowercase();
+    let (Some(open), Some(close)) = (lower.find("<body"), lower.rfind("</body")) else {
+        return content.to_string();
+    };
+    let Some(start) = lower[open..].find('>').map(|i| open + i + 1) else {
+        return content.to_string();
+    };
+    if start >= close {
+        return String::new();
+    }
+    // `start`/`close` 都落在 ASCII 标签名的字节上，切片不会切在字符中间。
+    content[start..close].to_string()
+}
+
 /// 媒体类型归一：取 `;` 前那段、去空白、小写。
-/// 参数（`charset=…`）在这里被丢掉是**有意的**——白名单只认类型，不认参数。
+/// 参数（`charset=…`）在这里被丢掉是**有意的**——白名单只认类型，不认参数；
+/// 参数由 `charset_param` 单独读回来参与**解码**（R265），两件事各有入口、互不影响。
 fn media_type_of(content_type: &str) -> String {
     content_type
         .split(';')
@@ -1379,6 +1556,120 @@ mod tests {
         // 非 UTF-8 字节流不许 panic，也不许静默丢内容之外的东西：lossy 解码是**已记欠账**
         // （不引 `encoding_rs`，见函数文档），这里只钉「不 panic」。
         assert!(render_markdown("text/plain", b"\xff\xfe bad bytes").is_ok());
+    }
+
+    // ————————————————————— Step 3（T24b）：抽取器与字符集 ————————————————
+    //
+    // 这四条钉的是 T24b 换抽取器（`readability` + `html2md`）与补 charset 解码（R265）
+    // 的四件事：按声明解、解不了就报错、抽不出正文明说、只用正文那一段。
+
+    /// 组装一段**真的**GBK 字节（不靠本机 codepage，和 T25 的 gbk.txt 同一取向）。
+    fn gbk_html(sentence: &str) -> Vec<u8> {
+        let html = format!(
+            "<html><head><meta charset=\"gb2312\"><title>旧中文站的标题</title></head><body>\
+             <div class=\"article\"><p>{sentence}这一段够长，逗号也够多，readability 才会把它当正文评分。</p>\
+             <p>第二句还是正文，继续加长，免得候选节点选不中这一段。</p></div>\
+             <script>var noise = \"这一串是脚本正文，不该出现在结果里\";</script></body></html>"
+        );
+        let gbk = encoding_rs::GBK.encode(&html).0;
+        assert!(
+            std::str::from_utf8(&gbk).is_err(),
+            "夹具必须真的不是 UTF-8，否则这条测试什么都没钉住"
+        );
+        gbk.into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_gbk_html_page_decodes_instead_of_mojibake() {
+        let sentence = "上海今天多云转晴，气温二十度，出行记得带伞。";
+        let body = gbk_html(sentence);
+        // 同一份字节按 UTF-8 解必然产 U+FFFD —— 那正是旧代码 `from_utf8_lossy` 的行为。
+        assert!(
+            String::from_utf8_lossy(&body).contains('\u{FFFD}'),
+            "这条测试只在「lossy 会坏」的前提下才有意义"
+        );
+        let md = render_markdown("text/html; charset=gb2312", &body).unwrap();
+        assert!(
+            md.contains(sentence),
+            "按声明的 gb2312 解出真中文，实得：{md}"
+        );
+        assert!(!md.contains('\u{FFFD}'), "不许把 U+FFFD 喂给抽取器：{md}");
+        assert!(!md.contains("这一串是脚本正文"), "脚本正文不许进结果：{md}");
+    }
+
+    /// 三支共用同一个解码辅助，所以三种白名单类型都得报错（判据 2 + 判据 3）。
+    #[tokio::test]
+    async fn an_unknown_charset_is_reported_not_lossy_decoded() {
+        for ct in [
+            "text/html; charset=not-a-real-label",
+            "text/plain; charset=not-a-real-label",
+            "application/json; charset=not-a-real-label",
+        ] {
+            let e = render_markdown(ct, "正文".as_bytes()).unwrap_err();
+            let msg = e.to_string();
+            assert!(
+                msg.contains("字符集") && msg.contains("not-a-real-label"),
+                "{ct} 必须报错并点名那个标签，实得：{msg}"
+            );
+            assert!(
+                !msg.contains('\u{FFFD}'),
+                "错误文案自己也不许带替换符：{msg}"
+            );
+        }
+    }
+
+    /// SPA 空壳（root 是空 div、内容全在 script 里）：明确一句「抽不出正文」，
+    /// 不许交空串、不许交整页链接、也不许交 JS 正文。
+    #[tokio::test]
+    async fn readability_failing_to_find_article_is_said_explicitly() {
+        let spa = "<!doctype html><html><head><title>某单页应用</title>\
+                   <style>html,body{height:100%;margin:0}</style></head>\
+                   <body><div id=\"root\"></div>\
+                   <script>window.__INITIAL_STATE__={\"bundle\":\"abcdef\"};</script>\
+                   <noscript>请启用 JavaScript</noscript></body></html>";
+        let out = render_markdown("text/html; charset=utf-8", spa.as_bytes()).unwrap();
+        assert!(
+            out.contains("抽不出正文"),
+            "必须明说抽不出正文，实得：{out}"
+        );
+        assert!(!out.trim().is_empty(), "不许交空串：{out}");
+        assert!(!out.contains("__INITIAL_STATE__"), "不许交 JS 正文：{out}");
+        assert!(
+            !out.contains("(http") && !out.contains("](/"),
+            "不许退化成一堆链接：{out}"
+        );
+    }
+
+    /// `readability` 会把 `<title>`、站点名、byline 一起交出来（`Product.title` 是独立字段，
+    /// 降级时 `<head>` 整段还会留在 `content` 里）——只用正文那一段，一个字都不许拼进来：
+    /// 模型会把它们当页面内容引用。
+    #[tokio::test]
+    async fn title_and_byline_are_not_spliced_into_the_body() {
+        let html = "<html><head><title>站点名：这篇报道的标题</title></head><body>\
+                    <div class=\"byline\">作者：某某某｜责任编辑：某某某</div>\
+                    <div class=\"article\"><p>正文第一句，讲的是本地生活，读起来像个段落。</p>\
+                    <p>正文第二句，把段落写长一点，好让候选评分选中它。</p></div>\
+                    </body></html>";
+        let md = render_markdown("text/html; charset=utf-8", html.as_bytes()).unwrap();
+        assert!(md.contains("正文第一句"), "正文必须在，实得：{md}");
+        assert!(!md.contains("这篇报道的标题"), "title 不许拼进正文：{md}");
+        assert!(!md.contains("站点名"), "站点名不许拼进正文：{md}");
+        assert!(!md.contains("责任编辑"), "byline 不许拼进正文：{md}");
+    }
+
+    /// 真网复测打到的缺陷（findings 第 2 页 overreacted 的那张 gif）：`readability` 拿
+    /// 占位基地址改写相对链接，会造出一个**不存在的 host** 交进正文。占位前缀必须剥掉。
+    #[tokio::test]
+    async fn the_placeholder_base_url_never_reaches_the_model() {
+        let html = "<html><body><article><p>正文第一句，带一张相对路径的图，字数要够多才不会被降权。\
+                    <img src=\"/img/pic.gif\" alt=\"配图\"><a href=\"/next\">下一页</a></p>\
+                    <p>第二段仍然属于正文，继续加长以通过 readability 的候选评分。</p></article></body></html>";
+        let md = render_markdown("text/html", html.as_bytes()).unwrap();
+        assert!(
+            !md.contains("fetch-url.invalid"),
+            "占位地址不许泄漏给模型（它会当真实链接引用）：{md}"
+        );
+        assert!(md.contains("/img/pic.gif"), "相对链接要保住形状：{md}");
     }
 
     // ————————————————————— Step 2：截断与分页 —————————————————————
