@@ -125,6 +125,9 @@ impl RedirectWalker {
         loop {
             // 到这一步 `current` 一定已过 `check_url`；解析结果整集复验由
             // `resolve_target` 负责（`Host::Domain` 才查 DNS，字面 IP 绝不二次解析）。
+            // 这条 `resolve` **必须留在循环里**（每跳重新解析 + 整集复验）：
+            // 把它提升到循环外，`a_redirect_to_a_host_resolving_private_is_denied_at_the_address_level`
+            // 与 `every_red_line_range_is_rechecked_as_a_redirect_target_by_address` 必红（已实测）。
             let target = self.resolve(&current).await?;
             let addrs = socket_pins(&target.url, &target.addrs)?;
             let mut res = self
@@ -550,6 +553,25 @@ mod tests {
         }
     }
 
+    /// 能**按主机给出不同答案**的解析器：`ok.*` 给公网地址，其余主机给 `private`。
+    /// `PublicResolver` 表达不出的形状就靠它钉住「hop ≥ 2 的地址级复验真的在跑」：
+    /// 若把 walker 循环里的 `self.resolve` 提升到循环外（每跳复用首跳的地址集），
+    /// 全公网替身下所有测试照绿，只有按主机差异作答的解析器能让这种实现变红。
+    struct Selective {
+        private: IpAddr,
+    }
+
+    impl Resolver for Selective {
+        fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, GuardError> {
+            let h = host.trim_end_matches('.').to_ascii_lowercase();
+            if h.starts_with("ok.") {
+                Ok(vec!["93.184.216.34".parse().unwrap()])
+            } else {
+                Ok(vec![self.private])
+            }
+        }
+    }
+
     // ————————————————————— Step 1：每跳复验 —————————————————————
 
     #[tokio::test]
@@ -765,6 +787,72 @@ mod tests {
                     "尾点回显形状变了，T36 的消费口径要跟着改：{e:?}"
                 );
             }
+        }
+    }
+
+    /// 审查发现补强：第二跳的**名字无害**（`check_url` 放行），只有「对重解析结果做
+    /// 地址级复验」这一道闸能拦住它 —— `PublicResolver` 恒答公网，表达不出这个形状。
+    /// 把 `self.resolve` 从 walker 循环里提升到循环外（只在首跳解析一次），本测试必红：
+    /// walker 会带着**过期的首跳目标**去敲 transport 的第 2 次调用（脚本只有 1 步，
+    /// panic 即证据），永远等不到 `PrivateInDnsSet`。transport 恰好只被调 1 次是
+    /// 「私网第二 hop 死在解析复验、请求没发出去」的判据。
+    #[tokio::test]
+    async fn a_redirect_to_a_host_resolving_private_is_denied_at_the_address_level() {
+        let t = Arc::new(ScriptedTransport::new(vec![ok302(
+            "https://ok.example/",
+            "https://rebind.example/x",
+        )]));
+        let w = RedirectWalker::new(
+            Arc::new(Selective {
+                private: "169.254.169.254".parse().unwrap(),
+            }),
+            t.clone(),
+        )
+        .with_max_hops(5)
+        .with_max_bytes(1024);
+        let e = w.fetch("https://ok.example/").await.unwrap_err();
+        assert!(
+            matches!(&e, GuardError::PrivateInDnsSet { addr }
+                if addr.to_string() == "169.254.169.254"),
+            "第 2 跳的 DNS 结果混入链路本地/元数据地址必须整集拒绝并点名，实得 {e:?}"
+        );
+        assert_eq!(
+            *t.next.lock().unwrap_or_else(|e| e.into_inner()),
+            1,
+            "地址复验必须在 transport 之前拦住第 2 跳：transport 只许被调用一次"
+        );
+    }
+
+    /// 红线网段作为**重定向目标**（经 DNS 到达，名字闸放行的无害主机名）的全部复验：
+    /// 10/8、172.16/12、192.168/16 与 169.254/16。既有测试在 hop 上只覆盖过
+    /// 字面 127.0.0.1 和 `localhost` 系名称；这里的每一条都带「transport 恰好 1 次」
+    /// 判据，提升到循环外的 `resolve` 无法在这些测试下保持绿色。
+    #[tokio::test]
+    async fn every_red_line_range_is_rechecked_as_a_redirect_target_by_address() {
+        for private in [
+            "10.1.2.3",        // 10/8
+            "172.16.0.1",      // 172.16/12
+            "192.168.7.7",     // 192.168/16
+            "169.254.169.254", // 链路本地/云元数据
+        ] {
+            let addr: IpAddr = private.parse().unwrap();
+            let t = Arc::new(ScriptedTransport::new(vec![ok302(
+                "https://ok.example/",
+                "https://later.example/x",
+            )]));
+            let w = RedirectWalker::new(Arc::new(Selective { private: addr }), t.clone())
+                .with_max_hops(5)
+                .with_max_bytes(1024);
+            let e = w.fetch("https://ok.example/").await.unwrap_err();
+            assert!(
+                matches!(&e, GuardError::PrivateInDnsSet { addr: a } if *a == addr),
+                "{private} 作为重定向目标必须被第 2 跳的地址级复验点名拒绝，实得 {e:?}"
+            );
+            assert_eq!(
+                *t.next.lock().unwrap_or_else(|e| e.into_inner()),
+                1,
+                "{private}：复验拒绝后不许再敲 transport，第 2 跳的请求一个都没发出去"
+            );
         }
     }
 
