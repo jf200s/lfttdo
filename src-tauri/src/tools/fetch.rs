@@ -1,7 +1,9 @@
-// Plan B 的网络层（task 23）：逐跳重定向遍历 + 地址钉死 + 体积闸门。
+// Plan B 的网络层：task 23 的逐跳重定向遍历 + 地址钉死 + 体积闸门，
+// 和 task 24 的 `fetch_url` 工具（内容类型白名单 + HTML→Markdown 抽取 + 按字符分页）。
 //
-// 本文件**只做**三件事：走跳、每跳复验、把体积按上限边收边卡。
-// HTML→Markdown、内容类型白名单、分页都是 task 24 的活（plan:317）。
+// T23 那一半**只做**三件事：走跳、每跳复验、把体积按上限边收边卡。
+// 「取回来的字节怎么变成交给模型的文本」全部住在文件后半段的 T24 那一节（plan:317），
+// 两节的分界线就是 `Fetched` 这个类型：前半段造它，后半段消费它。
 //
 // # 为什么自己走跳，而不是让 reqwest 跟
 //
@@ -33,9 +35,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde_json::{Value, json};
 use url::{Host, Url};
 
+use crate::agent::types::{Risk, ToolOutput};
+use crate::text::head_chars;
 use crate::tools::fetch_guard::{GuardError, Resolver, Target, check_url, resolve_target};
+use crate::tools::registry::{Tool, ToolCtx, ToolError, ToolMeta};
 
 /// spec 5.4「明确 UA」：写死的常量，`ReqwestTransport` 的每一条请求都带着它。
 /// 改动这个值等同于改动对外承诺，要在计划层面被看见，所以它是 `const` 而不是配置项。
@@ -250,6 +256,14 @@ fn deny_userinfo(url: Url) -> Result<Url, GuardError> {
 /// `https://a.example/x` → `https://www.a.example/y` 不算（同一注册域），
 /// → `https://login.b.example/` 算。供 task 24 生成「已跳转至 <host>」提示用，
 /// 本任务**不做**验证码页识别。
+///
+/// T24 消费侧的定位（写在这里而不是只写在 T24，因为判据的强度是这条线的属性）：
+/// 那个提示是给模型的 **HINT**，**任何地方都不许拿它 gate** —— 不许因为它是假就放行、
+/// 也不许因为它是真就丢掉正文。理由：`registrable` 取末两段，实测有一种形状会
+/// **少报**（`foo.co.uk` 与 `bar.co.uk` 被折成同一个 `co.uk`，见
+/// `registrable_is_the_last_two_labels_with_the_documented_imprecision`），
+/// 而它本来就只看主机名不看内容。少报的后果是一句提示没出现，不是安全判定变松
+/// （SSRF 一条地址都没少验，那是逐跳复验的职责）。
 fn cross_host(from: &str, to: &str) -> bool {
     registrable(from) != registrable(to)
 }
@@ -416,10 +430,281 @@ fn transport_err(url: &Url, e: reqwest::Error) -> GuardError {
     }
 }
 
+// ══════════════════════════ T24：`fetch_url` ══════════════════════════
+//
+// 到这里为止，前面那一层只回答「这个地址能不能连、连上去取到了什么」。
+// 本段回答「取到的东西怎么交给模型」：内容类型白名单、HTML→Markdown、按字符分页，
+// 以及三条自述信息 —— 两条挂在正文之前（换了注册域、上游返回错误状态码），
+// 一条挂在正文末尾（被截断时自报原文字符总数）。
+//
+// # 为什么这里有两个 HTTP client（R251 的落点，**不是**遗漏）
+//
+// `ToolCtx.http` 那个共享 client 本工具**一条请求都不发**，这是故意的分工：
+//
+// - `ctx.http` 是**进程级共享**的那一个：一条连接池、一套默认头，给别的工具
+//   （以及任何不需要逐跳定制的调用点）用。共享的前提是「所有调用点接受同一份
+//   client 级配置」。
+// - `RedirectWalker` 要的两条恰好**做不到**「一份配置共享」：
+//   `redirect(Policy::none())`（库自己一条重定向都不许跟，见文件头那条 DNS rebinding
+//   的理由），以及 `resolve_to_addrs(host, addrs)` —— 而 `resolve_to_addrs` 是按**主机**
+//   键控的 client 级配置，链上每一跳的主机都在换，所以 `ReqwestTransport` 只能
+//   **每一跳新建一个 client**（`pinned_client`）。
+//
+// 一个共享 client 装不下「每跳一个主机一套钉定地址」，硬塞的结果是把上一跳的钉定关系
+// 带进这一跳 —— 那正是这条防线要防的东西。所以两个 client 各干各的：本工具用
+// `self.walker`，`ctx.http` 留给不需要逐跳复验的用户。
+// （本段用的 `Risk`/`ToolOutput`/`Tool*`/`json!`/`head_chars` 都在文件顶部那组 `use` 里，
+// 与 T23 的导入同处，不在这里重复导入。）
+
+/// 每页默认交出去的字符数（模型一次读一页的直觉上限；`slice_page` 按**字符**不按字节）。
+pub const DEFAULT_MAX_CHARS: usize = 8_000;
+
+/// `max_chars` 的硬上限。没有这一条，模型只要写 `max_chars: 10000000` 就能把整个
+/// 2 MiB 正文一次塞进上下文 —— 体积闸（`DEFAULT_MAX_BYTES`）管的是「收多少字节」，
+/// 管不了「一次交多少字符」，两条是不同问题的两道闸。
+pub const MAX_CHARS_CAP: usize = 24_000;
+
+/// 内容类型白名单（spec 5.4「只处理文本形态」的正面清单）。
+///
+/// 三类各走各的路：`html` 过抽取器，`text/plain` 与 `application/json` 交原文
+/// —— 见 `html_becomes_markdown_while_plain_text_and_json_pass_through`。
+/// 清单之外一律**报错**而不是返回空文本：空文本会被模型读成「这个页面是空的」，
+/// 而真相是「我们不去碰这种格式」，两者对模型的下一步完全不同（Step 1 的判据）。
+///
+/// **已知欠账（未实测）**：`charset` 参数只用来认类型、不用来解码。非 UTF-8 页面
+/// （gb2312/big5/shift_jis 的老中文、日文站点）走 `from_utf8_lossy` ⇒ 乱码而不是报错。
+/// 修它要引 `encoding_rs`，而 `reqwest` 这边是 `default-features = false`（没有
+/// `charset` feature），装上就是给安装包 <15MB 那条线添一个新依赖，留给发布体积任务定。
+pub fn render_markdown(content_type: &str, body: &[u8]) -> Result<String, ToolError> {
+    let mt = media_type_of(content_type);
+    match mt.as_str() {
+        "text/html" | "application/xhtml+xml" => {
+            let html = String::from_utf8_lossy(body);
+            htmd::convert(&html).map_err(|e| {
+                ToolError::Failed(format!("content-type 是 {mt}，但正文抽取失败：{e}"))
+            })
+        }
+        // 原文透传：纯文本的空行与缩进、JSON 的结构本身就是内容，过一次 markdown
+        // 转换器只会把它们变成装饰或丢掉。
+        "text/plain" | "application/json" => Ok(String::from_utf8_lossy(body).into_owned()),
+        other => Err(ToolError::Failed(format!(
+            "content-type「{other}」不在白名单内：fetch_url 只取 text/html、text/plain、application/json 三种格式"
+        ))),
+    }
+}
+
+/// 媒体类型归一：取 `;` 前那段、去空白、小写。
+/// 参数（`charset=…`）在这里被丢掉是**有意的**——白名单只认类型，不认参数。
+fn media_type_of(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// 按**字符**切一页，并把「还有没有下文」写进结果里。
+///
+/// 三条口径都是测试钉死的对外承诺（Step 2）：
+/// 1. 单位是字符不是字节：中日韩一个字 3 字节，按字节切既不符合模型对「第 8000 字」
+///    的直觉，又必然落在 UTF-8 边界上 panic（`string[..n]` 的经典事故），而 panic 恰好
+///    发生在「内容太大所以要切」这支 —— 最不该 panic 的时刻。
+/// 2. 截断标记**自报原文字符总数**（`total_note=true`）：不带总数的「已截断」让模型无法
+///    决定还要不要翻页、翻几次。`total_note=false` 留给正文前已经说过总数的调用方。
+/// 3. 取到末尾就不挂标记（否则模型以为还有）；offset 越界单独说一句并带上总数
+///    （交空串等于让模型自己猜是取空了还是越界了）；正文整体为空也单独一句，
+///    因为对 offset 0 说「超出范围」是假话 —— SPA 空壳抽不出文本时就是这个形状。
+pub fn slice_page(text: &str, offset: usize, max_chars: usize, total_note: bool) -> String {
+    let total = text.chars().count();
+    if total == 0 {
+        return "[正文为空：上游文档里没有可交给模型的文本（SPA 空壳、纯脚本页、空 body 都走到这里）]".to_string();
+    }
+    if offset >= total {
+        return format!("[offset {offset} 超出范围：原文共 {total} 字符]");
+    }
+    // 复用 `crate::text::head_chars`：全仓库唯一的「按字符边界切 + 报丢弃多少」。
+    // 代价是先把剩余部分 collect 出来 —— 在 2 MiB 字节闸之下这次分配无所谓，
+    // 而在本文件再写一份 `chars().skip().take()` 就造出了第二个切法（R77 的反面）。
+    let rest: String = text.chars().skip(offset).collect();
+    let (head, dropped) = head_chars(&rest, max_chars);
+    if dropped == 0 {
+        head
+    } else if total_note {
+        format!("{head}[已截断，原文 {total} 字符]")
+    } else {
+        format!("{head}[已截断]")
+    }
+}
+
+/// 正文前那几行提示（最多两条），以及它们的出现条件。
+///
+/// 同域跳转**不产生任何行**：`Fetched.cross_host` 为假时正文就是正文，前面不挂噪声
+/// （brief Step 3 那句）。判据在测试里写成「输出与正文逐字相等」。
+fn prefix_lines(f: &Fetched) -> Vec<String> {
+    let mut lines = Vec::new();
+    // `cross_host` 在前：同域那一跳根本不必去解析主机名。解析不出主机就不加这一行
+    // （见 `landing_host`），所以这里是「且」而不是嵌套 `if`。
+    if f.cross_host
+        && let Some(host) = landing_host(&f.final_url)
+    {
+        // 反爬/登录页场景的判据是「明示最终主机」，不是「识别验证码页」——
+        // 后者我们做不到，假装做到就是在给用户假信息（T23 已写明）。
+        lines.push(format!("[已跳转至 {host}]"));
+    }
+    // brief 点名 403/429；实现按**整个错误状态类**（≥400）而不是按这两个码：
+    // 404/500 的 error page 不带状态行喂进去，模型无从和真正文区分。
+    // 状态码写在行里，所以它也必然出现在 `preview`（前 200 字，`agent::types`）里 ——
+    // 卡片上看不见的状态等于没告诉模型「这是被拦了」。
+    if f.status >= 400 {
+        lines.push(format!("[上游返回 {}，内容可能受限]", f.status));
+    }
+    lines
+}
+
+/// 提示行里的主机名：复用 `host_of`（全文件唯一的主机归一处，去尾点 + 小写）。
+/// 解析不出或没有主机 ⇒ 不加这一行：宁可少一句提示，也不在正文前挂一个乱码主机。
+fn landing_host(final_url: &str) -> Option<String> {
+    Url::parse(final_url)
+        .ok()
+        .map(|u| host_of(&u))
+        .filter(|h| !h.is_empty())
+}
+
+/// 可选的非负整数入参。缺省与显式 `null` 都按「没给」处理（模型常拿 `null` 填默认值）；
+/// 给了但形状不对（负数、字符串、小数）一律 `BadInput` 而不是静默按默认值跑 ——
+/// 静默之下模型以为自己的 `offset` 生效了，下一页它会读到重复内容。
+fn optional_uint(input: &Value, key: &str) -> Result<Option<usize>, ToolError> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) => Ok(Some(n as usize)),
+            None => Err(ToolError::BadInput(format!(
+                "{key} 必须是非负整数（按字符计），实得 {v}"
+            ))),
+        },
+    }
+}
+
+/// `fetch_url`：只读地取一个公网页面，交给模型 Markdown/原文。
+///
+/// R262：本类型**没有**泛型参数（plan 与早期台账猜的
+/// `FetchTool<R = SystemResolver, T = ReqwestTransport>` 形状作废）。可注入性由
+/// `RedirectWalker` 内部的 `Arc<dyn Resolver>` + `Arc<dyn FetchTransport>` 提供，
+/// 测试替身在这一层注入：本文件的内联 `mod tests` 与生产同模块，可以直接构造私有字段
+/// （R251：生产类型上**不开** `pub fn with_transport`）。
+pub struct FetchTool {
+    walker: RedirectWalker,
+}
+
+impl FetchTool {
+    /// 生产接线：`SystemResolver`（R259，同步解析 + `spawn_blocking`）+
+    /// `ReqwestTransport`（每跳新建 pinned client、一条重定向都不跟）。
+    /// 构造本身不联网：`Client` 只建配置，请求要到 `execute` 才发。
+    pub fn new() -> Self {
+        Self {
+            walker: RedirectWalker::new(Arc::new(SystemResolver), Arc::new(ReqwestTransport)),
+        }
+    }
+}
+
+/// 与 `new()` 同一条生产接线（`clippy::new_without_default`）。注册表那边（T27）拿
+/// `FetchTool::default()` 与 `FetchTool::new()` 是同一个东西，不留两种写法。
+impl Default for FetchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for FetchTool {
+    fn meta(&self) -> ToolMeta {
+        ToolMeta {
+            name: "fetch_url".to_string(),
+            // 分页单位必须写在描述里：`read_file`（T25）按**行**分页，本工具按**字符**，
+            // 而模型只看得到 description（plan Task 25 那条「两处各自写清单位」的要求）。
+            description: "抓取一个公网网页/文本并交给模型。只接受 http/https，内网、环回、\
+                          云元数据主机名一律拒绝（SSRF 红线）。分页按【字符】计，不是行、\
+                          不是字节：`offset` 是起始字符下标（从 0 开始），`max_chars` 是这一页\
+                          最多交多少个字符（默认 8000，上限 24000）；正文被截断时末尾会带\
+                          「[已截断，原文 N 字符]」，续页就填 offset = 上次 offset + max_chars。\
+                          只处理 text/html（转成 Markdown）、text/plain 与 application/json（原文）；\
+                          图片、PDF 等格式返回一条明确的拒绝消息。换了注册域或上游返回错误状态码时，\
+                          正文前会有一行提示。"
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "完整地址，必须带 http:// 或 https:// 方案"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "从第几个字符开始交（按字符，不是行不是字节），默认 0"
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "这一页最多交多少个字符，默认 8000，上限 24000"
+                    }
+                },
+                "required": ["url"]
+            }),
+            // Read：spec 5.1「内置工具全为 Read ⇒ 全程零弹窗」的那一条就落在这个返回值上。
+            risk: Risk::Read,
+        }
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        // 注册表也查一次取消（R53）；这里是工具侧那一次，为了在**进 walker 之前**停下。
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        // 入参校验全部排在发请求之前：`a_missing_or_non_string_url_is_bad_input_before_any_request`
+        // 用的脚本是 0 步的，真去敲 transport 就会 panic 在「吐完了还请求」。
+        let raw = input
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| ToolError::BadInput("fetch_url 需要非空字符串参数 url".to_string()))?;
+        let offset = optional_uint(&input, "offset")?.unwrap_or(0);
+        let max_chars = optional_uint(&input, "max_chars")?
+            .unwrap_or(DEFAULT_MAX_CHARS)
+            .clamp(1, MAX_CHARS_CAP);
+
+        // 安全判决原样上抛：`GuardError` 的 `Display` 就是给用户看的那句人话（回显地址/
+        // 主机名，spec 风险 5），包装时不许换成 "fetch failed" 那种糊话。
+        let f = self
+            .walker
+            .fetch(raw)
+            .await
+            .map_err(|e| ToolError::Failed(e.to_string()))?;
+
+        // 取消臂只补「取回之后」这一段：抽取 + 分页是纯 CPU，用户按了停止就没必要再算
+        // 一遍并把它塞进 history。DNS/请求在途的取消仍不在本任务范围（T23 台账：
+        // 注册表的 execute 前守卫 + 每跳 20s 超时已覆盖用户可见路径）。
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+
+        let text = render_markdown(&f.content_type, &f.body)?;
+        let mut out = String::new();
+        for line in prefix_lines(&f) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out.push_str(&slice_page(&text, offset, max_chars, true));
+        Ok(ToolOutput::text(out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
 
     // ———————— 测试替身（plan 共享辅助表逐个签名钉死；只住本模块，不进生产） ————————
 
@@ -1009,5 +1294,436 @@ mod tests {
         };
         assert!(e.to_string().contains("https://ok.example/"), "{e}");
         assert!(e.to_string().contains("不是安全策略拒绝"), "{e}");
+    }
+
+    // ══════════════════════════ T24：`fetch_url` 工具 ══════════════════════════
+    //
+    // Step 1–3 的判据**逐字**来自 brief（那三段字符串是测试钉死的对外承诺）。
+    // R251：`fetch_with_transport` 吃**已构造好的** `ScriptedTransport`、交回 Text
+    // payload —— brief 共享辅助表那句「吃 `Vec<Step>`、返回 `GuardError`」与 Step 3
+    // 的测试现场互相矛盾，以测试现场为准。
+    // R262：`FetchTool` 不带泛型参数，替身靠「同模块内可直接写私有字段」注入，
+    // 生产类型上**不开** `pub fn with_transport`。
+
+    fn fetch_tool_with(transport: ScriptedTransport) -> FetchTool {
+        FetchTool {
+            walker: RedirectWalker::new(Arc::new(PublicResolver), Arc::new(transport)),
+        }
+    }
+
+    /// `FetchTool` 用的是**自己的** `RedirectWalker`（文件尾部的注释写明为什么和
+    /// `ctx.http` 是两个 client），所以这里的 ctx 只是 `execute` 签名要的壳；
+    /// `reqwest::Client::new()` 不联网。
+    fn test_ctx() -> ToolCtx {
+        ToolCtx {
+            http: reqwest::Client::new(),
+            cancel: CancellationToken::new(),
+            roots: vec![],
+        }
+    }
+
+    async fn fetch_with_transport(transport: ScriptedTransport) -> Result<String, ToolError> {
+        let out = fetch_tool_with(transport)
+            .execute(json!({"url": "https://news.example/"}), &test_ctx())
+            .await?;
+        match out {
+            ToolOutput::Text { text } => Ok(text),
+            other => Err(ToolError::Failed(format!(
+                "fetch_url 只许产出文本，实得 {other:?}"
+            ))),
+        }
+    }
+
+    // ————————————————————— Step 1：内容类型白名单 —————————————————————
+
+    #[tokio::test]
+    async fn only_html_text_and_json_are_accepted() {
+        for ct in ["text/html; charset=utf-8", "text/plain", "application/json"] {
+            assert!(render_markdown(ct, b"hello").is_ok(), "{ct} 必须接受");
+        }
+        for ct in [
+            "image/png",
+            "application/pdf",
+            "application/octet-stream",
+            "text/css",
+        ] {
+            let e = render_markdown(ct, b"x").unwrap_err();
+            assert!(
+                e.to_string().contains("content-type"),
+                "{ct} 必须给明确错误而不是空文本，实得 {e}"
+            );
+        }
+    }
+
+    /// 白名单**之内**的三类各走自己那条路：html 过 `htmd`，纯文本与 JSON 交原文。
+    /// 「JSON 也拿去喂 markdown 转换器」会把 `{"a": 1}` 变成装饰文本，
+    /// 「纯文本也过一遍」会吃掉日志/源码里的手工缩进 —— 两条都在这里钉住。
+    #[tokio::test]
+    async fn html_becomes_markdown_while_plain_text_and_json_pass_through() {
+        let md = render_markdown("text/html", "<h1>Hello</h1><p>世界</p>".as_bytes()).unwrap();
+        assert!(md.contains("# Hello"), "html 必须真的过抽取器，实得 {md}");
+        // 中文正文必须活着走到 Markdown 里（抽取器丢中文是很现实的失效模式）。
+        assert!(md.contains("世界"), "中文正文不许被丢掉：{md}");
+        assert_eq!(
+            render_markdown("text/plain", b"a\n\n\nb").unwrap(),
+            "a\n\n\nb",
+            "纯文本一个字节都不许改写（缩进与空行就是它的语义）"
+        );
+        assert_eq!(
+            render_markdown("application/json", b"{\"a\":1}").unwrap(),
+            "{\"a\":1}",
+            "JSON 交原文，不重排版"
+        );
+        // 大小写与参数都不许影响判定（`check_url` 那边也是这个口径）。
+        assert!(render_markdown("TEXT/HTML; charset=UTF-8", b"<i>x</i>").is_ok());
+        // 非 UTF-8 字节流不许 panic，也不许静默丢内容之外的东西：lossy 解码是**已记欠账**
+        // （不引 `encoding_rs`，见函数文档），这里只钉「不 panic」。
+        assert!(render_markdown("text/plain", b"\xff\xfe bad bytes").is_ok());
+    }
+
+    // ————————————————————— Step 2：截断与分页 —————————————————————
+
+    #[test]
+    fn truncation_is_explicit_and_offset_pages_forward() {
+        let long = "字".repeat(9_000); // 每字 3 字节，同时测「按字符不按字节」
+        let note = "[已截断，原文 9000 字符]";
+        let first = slice_page(&long, 0, 8_000, true);
+        assert!(first.ends_with(note), "尾部标记不对：{first}");
+        assert_eq!(
+            first.chars().count(),
+            8_000 + note.chars().count(),
+            "正文必须正好 8000 字符，标记另计"
+        );
+        let second = slice_page(&long, 8_000, 8_000, true);
+        assert_eq!(second.chars().count(), 1_000, "第二段只剩 1000 字");
+        assert!(
+            !second.contains("已截断"),
+            "取到末尾时不许再挂截断标记，否则模型会以为还有内容"
+        );
+        assert!(
+            slice_page(&long, 99_000, 100, true).contains("超出范围"),
+            "offset 越界要说明，不能返回空串让模型猜"
+        );
+    }
+
+    /// `total_note` 这个参数必须有实际含义，否则它就是签名里的装饰品。
+    #[test]
+    fn the_note_can_drop_the_total_when_the_caller_already_said_it() {
+        let long = "字".repeat(9_000);
+        let p = slice_page(&long, 0, 8_000, false);
+        assert!(p.ends_with("[已截断]"), "实得尾部：{p}");
+        assert_eq!(p.chars().count(), 8_000 + "[已截断]".chars().count());
+        assert!(!p.contains("原文"), "total_note=false 就不许报原文长度");
+    }
+
+    /// 越界那句必须带上「原文共多少字符」：模型拿到「超出范围」而无原文长度，
+    /// 唯一能做的就是再猜一个 offset —— 那是在花一次往返换一句废话。
+    #[test]
+    fn the_out_of_range_page_names_the_total_so_the_model_can_back_off() {
+        let long = "字".repeat(9_000);
+        assert_eq!(
+            slice_page(&long, 99_000, 100, true),
+            "[offset 99000 超出范围：原文共 9000 字符]"
+        );
+        // 恰好落在末尾：那里没有字符可交，按越界同一口径说清楚（不返回空串）。
+        assert_eq!(
+            slice_page(&long, 9_000, 100, true),
+            "[offset 9000 超出范围：原文共 9000 字符]"
+        );
+        // 抽取结果为空（SPA 空壳就是这个形状）：对 offset 0 说「超出范围」是假话，
+        // 交空串又让模型自己猜，所以单独一句。
+        assert!(
+            slice_page("", 0, 8_000, true).starts_with("[正文为空"),
+            "空正文的说法不对：{}",
+            slice_page("", 0, 8_000, true)
+        );
+    }
+
+    // ————————————————————— Step 3：跨主提示与状态提示 —————————————————————
+
+    #[tokio::test]
+    async fn a_cross_host_landing_is_announced_in_the_output_text() {
+        // 反爬/登录页场景：spec 要求「不把验证码页喂给模型」。判据实现为「明示最终主机」，
+        // 而不是假装能识别验证码。
+        let out = fetch_with_transport(ScriptedTransport::new(vec![
+            ok302(
+                "https://news.example/",
+                "https://passport.other.example/login",
+            ),
+            ok200(
+                "https://passport.other.example/login",
+                "text/html",
+                "<h1>登录</h1>".as_bytes(),
+            ),
+        ]))
+        .await
+        .unwrap();
+        assert!(
+            out.starts_with("[已跳转至 passport.other.example]"),
+            "实得 {out}"
+        );
+    }
+
+    /// 同域跳转**不许**加提示行（brief Step 3 正文那句）。判据写成「输出与正文逐字相等」：
+    /// 只断 `!contains("已跳转至")` 的话，挂上任何别的头部行都还是绿的。
+    #[tokio::test]
+    async fn a_same_domain_landing_adds_no_prefix_line_at_all() {
+        let body: &[u8] = "<p>正文</p>".as_bytes();
+        let out = fetch_with_transport(ScriptedTransport::new(vec![
+            ok302("https://news.example/x", "https://www.news.example/y"),
+            ok200("https://www.news.example/y", "text/html", body),
+        ]))
+        .await
+        .unwrap();
+        assert_eq!(
+            out,
+            render_markdown("text/html", body).unwrap(),
+            "同域跳转的输出必须就是正文本身"
+        );
+    }
+
+    /// 403/429 前置一行，且**状态码必须在 preview 里**：事件流卡片只交前 200 个字符
+    /// （`agent::types::PREVIEW_CHARS`），看不见状态码就等于没告诉模型「这是被拦了不是正文」。
+    #[tokio::test]
+    async fn an_upstream_403_or_429_is_announced_before_the_body() {
+        for code in [403u16, 429] {
+            let out = fetch_with_transport(ScriptedTransport::new(vec![Step {
+                status: code,
+                content_type: "text/html".to_string(),
+                chunks: vec![b"<p>are you a robot?</p>".to_vec()],
+                location: None,
+            }]))
+            .await
+            .unwrap();
+            assert!(
+                out.starts_with(format!("[上游返回 {code}，内容可能受限]").as_str()),
+                "实得 {out}"
+            );
+            assert!(out.contains("are you a robot?"), "正文不许被丢掉：{out}");
+            assert!(
+                ToolOutput::text(out.clone()).preview().contains("上游返回"),
+                "状态行必须进 preview（前 200 字），实得 {out}"
+            );
+        }
+    }
+
+    /// 同一句模板对**全部** 4xx/5xx 生效（brief 点名 403/429，实现按状态类而不是按码）：
+    /// 404/500 的 error page 不带状态行喂进去，模型无法和真正文区分。2xx/3xx 不许挂。
+    #[tokio::test]
+    async fn every_error_status_gets_the_line_and_2xx_does_not() {
+        for code in [404u16, 409, 451, 500, 503] {
+            let out = fetch_with_transport(ScriptedTransport::new(vec![Step {
+                status: code,
+                content_type: "text/plain".to_string(),
+                chunks: vec![b"nope".to_vec()],
+                location: None,
+            }]))
+            .await
+            .unwrap();
+            assert!(
+                out.starts_with(format!("[上游返回 {code}，内容可能受限]").as_str()),
+                "实得 {out}"
+            );
+        }
+        for code in [200u16, 204, 304] {
+            let out = fetch_with_transport(ScriptedTransport::new(vec![Step {
+                status: code,
+                content_type: "text/plain".to_string(),
+                chunks: vec![b"ok".to_vec()],
+                location: None,
+            }]))
+            .await
+            .unwrap();
+            assert_eq!(out, "ok", "{code} 不许挂状态行，实得 {out}");
+        }
+    }
+
+    // ————————————————————— 工具声明与入参 —————————————————————
+
+    /// `meta()` 的三项对外承诺：名字、风险、schema。风险必须是 Read —— spec 5.1
+    /// 「内置工具全为 Read ⇒ 全程零弹窗」的前提就落在这个返回值上。
+    #[test]
+    fn the_tool_meta_is_fetch_url_read_with_the_pinned_schema() {
+        let m = FetchTool::new().meta();
+        assert_eq!(m.name, "fetch_url");
+        assert_eq!(m.risk, Risk::Read);
+        assert!(
+            m.description.contains("字符"),
+            "分页单位必须写进描述（`read_file` 按行、本工具按字符，模型只看描述）：{}",
+            m.description
+        );
+        let s = m.input_schema;
+        assert_eq!(s["type"], json!("object"));
+        assert_eq!(s["required"], json!(["url"]), "只有 url 是必填");
+        let props = s["properties"].as_object().expect("properties 必须是对象");
+        assert_eq!(props.len(), 3, "只声明 url/offset/max_chars：{props:?}");
+        assert!(
+            props.contains_key("url")
+                && props.contains_key("offset")
+                && props.contains_key("max_chars")
+        );
+        assert_eq!(props["url"]["type"], json!("string"));
+        assert_eq!(props["offset"]["type"], json!("integer"));
+        assert_eq!(props["max_chars"]["type"], json!("integer"));
+    }
+
+    /// R262 的生产接线 + 默认上限：`FetchTool::new()` 必须组装出
+    /// `RedirectWalker::new(SystemResolver, ReqwestTransport)`，且**不联网**
+    /// （`Client::new()` 只建连接池配置，一条请求都不发）。
+    #[test]
+    fn the_production_constructor_keeps_the_walker_defaults() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FetchTool>();
+        let t = FetchTool::new();
+        assert_eq!(t.walker.max_hops, DEFAULT_MAX_HOPS);
+        assert_eq!(t.walker.max_bytes, DEFAULT_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_non_string_url_is_bad_input_before_any_request() {
+        // 脚本 0 步：真去敲 transport 就会 panic 在「吐完了还请求」，所以这条同时是
+        // 「入参校验发生在发请求之前」的判据。
+        for input in [
+            json!({}),
+            json!({"url": 42}),
+            json!({"url": ""}),
+            json!({"url": "   "}),
+        ] {
+            let e = fetch_tool_with(ScriptedTransport::new(vec![]))
+                .execute(input.clone(), &test_ctx())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(e, ToolError::BadInput(_)),
+                "{input} 必须 BadInput，实得 {e:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_integer_offset_or_max_chars_is_bad_input_not_silently_defaulted() {
+        // 静默按默认值跑 = 模型以为自己的 offset 生效了，下一页它会读到重复内容。
+        for input in [
+            json!({"url": "https://news.example/", "offset": -1}),
+            json!({"url": "https://news.example/", "offset": "8000"}),
+            json!({"url": "https://news.example/", "max_chars": 1.5}),
+        ] {
+            let e = fetch_tool_with(ScriptedTransport::new(vec![]))
+                .execute(input.clone(), &test_ctx())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, ToolError::BadInput(m) if m.contains("整数")),
+                "{input} 必须报「必须是非负整数」，实得 {e:?}"
+            );
+        }
+        // 显式 null 交给可选参数按「没给」处理（模型常这么填默认值）。
+        assert!(
+            fetch_tool_with(ScriptedTransport::new(vec![ok200(
+                "https://news.example/",
+                "text/plain",
+                b"ok",
+            )]))
+            .execute(
+                json!({"url": "https://news.example/", "offset": null}),
+                &test_ctx()
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_ctx_stops_before_the_walker_is_touched() {
+        let ctx = test_ctx();
+        ctx.cancel.cancel();
+        let e = fetch_tool_with(ScriptedTransport::new(vec![]))
+            .execute(json!({"url": "https://news.example/"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ToolError::Cancelled), "{e:?}");
+    }
+
+    /// 安全闸的判决必须原样到人眼前（spec 风险 5：能回显地址的一律回显），
+    /// 而不是被 `Failed("fetch failed")` 这种糊话吃掉。
+    #[tokio::test]
+    async fn the_guard_decision_reaches_the_caller_with_the_address_in_it() {
+        let e = fetch_tool_with(ScriptedTransport::new(vec![]))
+            .execute(json!({"url": "http://127.0.0.1/secret"}), &test_ctx())
+            .await
+            .unwrap_err();
+        assert!(matches!(e, ToolError::Failed(_)), "{e:?}");
+        assert!(
+            e.to_string().contains("127.0.0.1"),
+            "拒绝文案必须回显地址，实得 {e}"
+        );
+    }
+
+    /// 端到端的按字符分页：默认页 8000 字 + 标记，第二次调用接着往下走且不重复。
+    #[tokio::test]
+    async fn a_long_page_pages_by_characters_across_two_calls() {
+        let body = "字".repeat(9_000); // 27000 字节，远在 2 MiB 闸门之下
+        let steps = || {
+            vec![ok200(
+                "https://news.example/",
+                "text/plain",
+                body.as_bytes(),
+            )]
+        };
+        let first = fetch_with_transport(ScriptedTransport::new(steps()))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.chars().count(),
+            DEFAULT_MAX_CHARS + "[已截断，原文 9000 字符]".chars().count()
+        );
+        assert!(first.ends_with("[已截断，原文 9000 字符]"), "实得 {first}");
+
+        let tool = fetch_tool_with(ScriptedTransport::new(steps()));
+        let out = tool
+            .execute(
+                json!({"url": "https://news.example/", "offset": DEFAULT_MAX_CHARS}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text { text: second } = out else {
+            panic!("fetch_url 只交文本");
+        };
+        assert_eq!(
+            second,
+            body.chars().skip(DEFAULT_MAX_CHARS).collect::<String>(),
+            "第二页必须正好接在第一页后面"
+        );
+    }
+
+    /// `max_chars` 有上限：不设的话模型可以一次把 2 MiB 正文整个塞进上下文。
+    #[tokio::test]
+    async fn max_chars_is_clamped_to_the_cap() {
+        let body = "字".repeat(60_000);
+        let tool = fetch_tool_with(ScriptedTransport::new(vec![ok200(
+            "https://news.example/",
+            "text/plain",
+            body.as_bytes(),
+        )]));
+        let out = tool
+            .execute(
+                json!({"url": "https://news.example/", "max_chars": 10_000_000}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text { text } = out else {
+            panic!("fetch_url 只交文本");
+        };
+        let got = text.chars().count();
+        assert!(
+            got <= MAX_CHARS_CAP + "[已截断，原文 60000 字符]".chars().count(),
+            "一次调用交出去 {got} 个字符，说明上限没生效"
+        );
+        assert!(
+            text.ends_with("[已截断，原文 60000 字符]"),
+            "实得尾部 {text}"
+        );
     }
 }
