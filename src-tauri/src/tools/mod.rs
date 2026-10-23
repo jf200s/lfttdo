@@ -2,4 +2,5 @@
 pub mod echo;
 pub mod fetch;
 pub mod fetch_guard;
+pub mod read_file;
 pub mod registry;

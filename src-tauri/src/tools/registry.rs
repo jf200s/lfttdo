@@ -52,8 +52,13 @@ impl ToolCtx {
     ///
     /// 符号链接 / Windows junction 的逃逸：`canonicalize()` 会解析 reparse point，
     /// 父目录里任何一层软链都在比对前被展开，因此落到 root 外的会被拒。
-    /// **这一条在本环境未实测** —— 创建符号链接/junction 需要特权，本机拿不到。
-    /// Plan B 上线 `read_file` 之前必须补一条目录 junction 测试（见 task-9-report）。
+    /// **Task 25 已实测**（R275：junction 标准用户可建，`mklink /J`）：逃逸与
+    /// 「root 本身是链接不得过度收紧」两头由本模块 tests 的
+    /// `a_junction_inside_the_root_pointing_outside_is_denied` 与
+    /// `a_root_that_is_itself_a_junction_is_not_over_tightened` 钉住。**文件级符号链接**
+    /// 需开发者模式、本机建不了（实测报「没有足够的权限」）⇒ 该子形态**未实测**；
+    /// 而「最后一段自己是指针」本就归 canonicalize 父目录的设计管不到，由
+    /// `tools/read_file.rs` 在读之前把整条路径二次 canonicalize、交回本函数复验补上。
     pub fn resolve_within_roots(&self, raw: &str) -> Result<PathBuf, ToolError> {
         // 规则 4：先整体校验 root 表。
         let mut roots: Vec<PathBuf> = Vec::with_capacity(self.roots.len());
@@ -459,6 +464,81 @@ mod tests {
         let err = ctx.resolve_within_roots(abs.to_str().unwrap()).unwrap_err();
         std::fs::remove_dir_all(&dir).ok();
         assert!(matches!(err, ToolError::BadInput(_)), "{err:?}");
+    }
+
+    // ---- Task 25：把 `resolve_within_roots` 文档里那句「未实测」变成实测（junction 两头都钉） ----
+
+    /// R275：文件符号链接要开发者模式（本机实测建不了），但目录 junction 标准用户
+    /// 可建且同为 reparse point，canonicalize 对它走同一条展开路径。
+    /// `mklink` 是 cmd 内建：参数走数组、绝不拼命令串。
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target_dir: &Path) {
+        let out = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.display().to_string(),
+                &target_dir.display().to_string(),
+            ])
+            .output()
+            .expect("启动 cmd.exe 建 junction 失败");
+        assert!(
+            out.status.success(),
+            "建 junction 失败 {} -> {}: {}",
+            link.display(),
+            target_dir.display(),
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// 判据（brief Step 1）：**canonicalize 之后的候选路径**必须 starts_with
+    /// **canonicalize 之后的 root**。root 自己也在 :60-65 被 canonicalize（fail-closed
+    /// 循环，Task 25 台账核实：brief「改为对 root 也 canonicalize」一句是 stale，
+    /// 现状已满足）——所以 root 是 junction 时不会被误杀（见正向那条）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_junction_inside_the_root_pointing_outside_is_denied() {
+        let dir = tmp_dir("junction-out");
+        let root = dir.join("root");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"do-not-read").unwrap();
+        make_junction(&root.join("link_dir"), &outside);
+
+        let cand = root.join("link_dir").join("secret.txt");
+        let err = ctx_with_roots(vec![root.clone()])
+            .resolve_within_roots(cand.to_str().unwrap())
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::BadInput(m) if m.contains("越界")),
+            "root 内指向 root 外的 junction 必须在父目录 canonicalize 时被展开并拒，实得 {err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 过度收紧同样是缺陷（同一条 brief 判据的另一头）：root 本身是 junction 时，
+    /// 它「里面」的正常文件必须放行 —— 两侧比的都是 canonical 形态的同一把尺子。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_root_that_is_itself_a_junction_is_not_over_tightened() {
+        let dir = tmp_dir("junction-root");
+        let target = dir.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("note.txt"), b"hi").unwrap();
+        let jroot = dir.join("jroot");
+        make_junction(&jroot, &target);
+
+        let cand = jroot.join("note.txt");
+        let got = ctx_with_roots(vec![jroot.clone()])
+            .resolve_within_roots(cand.to_str().unwrap())
+            .unwrap();
+        assert!(
+            got.starts_with(target.canonicalize().unwrap()),
+            "root 是 junction 时正常路径必须解析成功，实得 {got:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 同上（与 gate 那条一对）：Task 13 要把注册表塞进 `AppState`，
