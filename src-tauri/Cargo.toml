@@ -46,6 +46,10 @@ thiserror = "2.0.21"
 # default-features=false + default-tls 保持 rustls（async-openai 已带入）。
 # 打开 native-tls 会多出一整套系统 TLS 依赖，安装包 <15MB 是验收线，别放宽这行。
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "default-tls"] }
+# T22：SSRF 判定层（tools/fetch_guard.rs）需要 URL 解析与 IP 网段判定。两者此前
+# 已是传递依赖（reqwest→url/ipnet），提为直接依赖才能 `use`，cargo tree 无新增包。
+url = "2"
+ipnet = "2"
 tokio-util = "0.7.20"
 uuid = { version = "1.28.0", features = ["v4"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

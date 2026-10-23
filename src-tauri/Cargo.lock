@@ -2963,6 +2963,7 @@ dependencies = [
  "base64 0.23.1",
  "futures",
  "image",
+ "ipnet",
  "keyring-core",
  "rand 0.9.5",
  "reqwest",
@@ -2978,6 +2979,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "windows-native-keyring-store",
 ]
