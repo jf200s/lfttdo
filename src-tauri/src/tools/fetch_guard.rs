@@ -43,6 +43,12 @@ pub enum GuardError {
     TooManyHops(String),
     /// 响应体超过 `limit` 字节上限。
     TooLargeBody { limit: usize },
+    /// 网络层自身的失败（连接被拒/超时/TLS/读流中断/被中断的解析任务）。
+    ///
+    /// T23 交付 `ReqwestTransport` 时新增（同 R260 的理由）：这类错误既不是策略拒绝
+    /// （`Denied*` 意味着「本来就不许连」），也不是 DNS 故障（`Resolution` 会被上层
+    /// 归因成「域名解析不了」）；硬塞进这两个变体之一，就是给用户的一条错消息。
+    Transport { url: String, reason: String },
 }
 
 impl fmt::Display for GuardError {
@@ -67,6 +73,12 @@ impl fmt::Display for GuardError {
             Self::Resolution(host, msg) => write!(f, "解析主机 {host} 失败：{msg}"),
             Self::TooManyHops(url) => write!(f, "重定向次数超过上限，已停止在：{url}"),
             Self::TooLargeBody { limit } => write!(f, "响应体超过 {limit} 字节上限"),
+            Self::Transport { url, reason } => {
+                write!(
+                    f,
+                    "访问 {url} 失败：{reason}（网络层错误，不是安全策略拒绝）"
+                )
+            }
         }
     }
 }
