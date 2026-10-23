@@ -5,8 +5,9 @@
 //! 生产路径，把每个页面的抽取结果原样交出来看。
 //!
 //! T24 用它判了 `htmd`（结论：不达标，见 `docs/findings/plan-b-fetch-quality.md`）；
-//! T24b 用**同一个探针、同一批页面**复跑换掉之后的 `readability` + `html2md`，
-//! 前后对照写进同一份 findings 的新一节。
+//! T24b 用**同一个探针、同一批页面**复跑换掉之后的 `readability` + `htmd`
+//! （修复轮 1 的 R267：定界那一步留下的正文片段喂给 `htmd`，脚本样式在定界时就已经不在
+//! 片段里 —— 与 T24 判门的**整页**输入不是同一件事），前后对照写进同一份 findings 的新一节。
 //!
 //! 用法：
 //! ```text
@@ -33,7 +34,7 @@
 //! 结论与依据都写进 `docs/findings/plan-b-fetch-quality.md`。
 //!
 //! HTML 那一支另有一列**对照**：同一份 HTML 再用「不经过 readability 定界」的
-//! `html2md::parse_html(整页)` 抽一遍 —— 它量的是「readability 这次定界到底替模型挡掉了
+//! `htmd::convert(整页)` 抽一遍 —— 它量的是「readability 这次定界到底替模型挡掉了
 //! 多少字符」。对照列**不是**生产路径，生产路径始终只有 `render_markdown` 那一趟。
 use std::sync::Arc;
 use std::time::Instant;
@@ -89,11 +90,12 @@ const PAGES: &[Page] = &[
         ask: "JS 渲染的页面抽出来是不是接近空（`slice_page` 那句「正文为空」会不会被打到）",
         urls: &["https://36kr.com/", "https://juejin.cn/"],
     },
-    // 附加观察，不属于六个种类：非 UTF-8 页面。`render_markdown` 只按 UTF-8 lossy 解码
-    // （不引 `encoding_rs`，见函数文档里那条已记欠账），这里量一下代价长什么样。
+    // 附加观察，不属于六个种类：老 charset 的中文门户。R265/R268 之后 `render_markdown`
+    // 按**声明**的字符集解（`encoding_rs`，解不了就报错、绝不 lossy），这里量一下真网上
+    // 到底能不能打到这一支（首轮复测：这一页返回的其实是 UTF-8，一次都没打到）。
     Page {
         kind: "附加：非 UTF-8 门户（gb2312/gbk）",
-        ask: "charset 参数不参与解码的代价（乱码率，不计入判定门）",
+        ask: "charset 声明参与解码在真网上的形态（乱码率 / 报错，不计入判定门）",
         urls: &["https://www.sina.com.cn/"],
     },
 ];
@@ -114,7 +116,7 @@ struct Shot {
     text: String,
     /// true = 走了白名单里的透传分支（text/plain、application/json），没经过抽取器。
     passed_through: bool,
-    /// 对照读数：同一份 HTML **不做正文定界**、整页过一次 `html2md`。
+    /// 对照读数：同一份 HTML **不做正文定界**、整页过一次 `htmd`。
     /// **生产路径不是这一套** —— 本任务的判定门只认 `render_markdown` 的结果，
     /// 加这一列只为了量出「readability 的正文定界替模型挡掉了多少字符」，
     /// 好让 T24 那份 findings 的前后对照有可对证的数。
@@ -123,8 +125,11 @@ struct Shot {
 
 /// 对照抽取的读数。
 enum Control {
-    /// 抽出来了；`text` 是「整页过一次 html2md、不做正文定界」的结果。
+    /// 抽出来了；`text` 是「整页过一次 htmd、不做正文定界」的结果。
     Converted { text: String, convert_ms: u128 },
+    /// 对照趟自己失败了。生产路径那一趟（`render_markdown`）**已经成功**，所以这一条
+    /// 只让对照列缺一格数，不影响这一页的判定读数。
+    Failed(String),
 }
 
 #[tokio::main]
@@ -217,6 +222,7 @@ async fn main() {
         let control = match &s.control {
             None => "—".to_string(),
             Some(Control::Converted { text, .. }) => format!("{} 字符", text.chars().count()),
+            Some(Control::Failed(_)) => "对照失败".to_string(),
         };
         println!(
             "{:<34} {:>8} 字符  对照 {:>10}  抓 {:>6} ms  抽 {:>6} ms  {}",
@@ -228,7 +234,7 @@ async fn main() {
             if s.passed_through {
                 "透传"
             } else {
-                "readability+html2md"
+                "readability+htmd"
             }
         );
     }
@@ -245,7 +251,8 @@ async fn run_one(walker: &RedirectWalker, url: &str) -> Result<Shot, String> {
     let passed_through = !is_html(&f.content_type);
 
     let t1 = Instant::now();
-    let text = match render_markdown(&f.content_type, &f.body) {
+    // R270：基地址就是生产那一条 `final_url`（实际取回内容那一跳），探针不造占位地址。
+    let text = match render_markdown(&f.content_type, &f.body, &f.final_url) {
         Ok(s) => s,
         Err(e) => {
             return Err(format!(
@@ -256,20 +263,24 @@ async fn run_one(walker: &RedirectWalker, url: &str) -> Result<Shot, String> {
     };
     let extract_ms = t1.elapsed().as_millis();
 
-    // 对照趟：同一份 HTML 再抽一遍，这次**不做正文定界**（整页过一次 html2md）。
+    // 对照趟：同一份 HTML 再抽一遍，这次**不做正文定界**（整页过一次 htmd）。
     // 只在真的走了抽取分支时才做（透传那两条没有 HTML 可抽）。
     let control = if passed_through {
         None
     } else {
-        // 对照列**不是**生产路径，也不参与 charset 判据：这里只需要「整页过一次 html2md」
+        // 对照列**不是**生产路径，也不参与 charset 判据：这里只需要「整页过一次 htmd」
         // 的字符数，所以直接 lossy —— 生产那三支持续不许出现这个函数（R265）。
         let html = String::from_utf8_lossy(&f.body).into_owned();
         let t2 = Instant::now();
-        let converted = html2md::parse_html(&html);
-        Some(Control::Converted {
-            text: converted,
-            convert_ms: t2.elapsed().as_millis(),
-        })
+        match htmd::convert(&html) {
+            Ok(converted) => Some(Control::Converted {
+                text: converted,
+                convert_ms: t2.elapsed().as_millis(),
+            }),
+            // 对照列自己坏了：让这一格缺一组数，**不**把这一页判成「未实测」——
+            // 生产路径那一趟在上面已经成功，判定门读的是那一趟的结果。
+            Err(e) => Some(Control::Failed(format!("{e}"))),
+        }
     };
 
     Ok(Shot {
@@ -302,7 +313,7 @@ fn print_shot(s: &Shot) {
         if s.passed_through {
             "白名单透传分支（不过抽取器）"
         } else {
-            "readability 定界 + html2md 转换"
+            "readability 定界 + htmd 转换"
         }
     );
     println!(
@@ -324,6 +335,9 @@ fn print_shot(s: &Shot) {
             );
             let (head, _) = head_chars(text, 200);
             println!("--- 对照前 200 字 ---\n{head}");
+        }
+        Some(Control::Failed(why)) => {
+            println!("对照（整页、不做正文定界）: 这一格失败了（{why}）；生产路径的读数不受影响");
         }
     }
     println!();

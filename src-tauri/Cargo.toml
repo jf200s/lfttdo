@@ -62,16 +62,25 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
     "std",
 ] }
-# T24b：换掉 `htmd`（R264 —— spec 5.5 的判定门实测不过，见
-# `docs/findings/plan-b-fetch-quality.md`）。HTML 抽取改成两段：`readability` 定正文边界 +
-# `html2md` DOM→Markdown。**关掉 readability 的 default features**：它默认拉一整套
+# T24b：HTML 抽取两段式 —— `readability` 定正文边界（R264：T24 判门证明「没有正文边界」这个
+# 概念的整页转换器不合格，见 `docs/findings/plan-b-fetch-quality.md`）+ 一个 DOM→Markdown
+# 转换器把那段片段转给模型。**关掉 readability 的 default features**：它默认拉一整套
 # `reqwest 0.11`（含 native-tls 那一串），只为它的 `scrape()` 便利函数服务，而我们只喂
 # 已经取回的字节；`default-features = false` 把这条重复 HTTP 栈摘掉（体积账：task-24b 报告 Step 5）。
 readability = { version = "0.3.0", default-features = false }
-html2md = "0.2.17"
+# T24b 修复轮 1（R267）：Markdown 那一步换回 `htmd`。不是推翻 R264，而是 R264 挂的**不是这一步**：
+# T24 判门量的是「整页喂给 htmd」⇒ 没有正文边界这个概念，`<script>/<style>` 的文本和整条导航
+# 全都进结果。现在它拿到的是 **readability 已经裁掉的正文片段**，脚本与样式在 `scorer::clean`
+# 的样板清单里就已经不在片段里了 ⇒ 同一个转换器在裁剪后的输入上合格。
+# 换回来的真正理由是**体积线**：`html2md` 的 `[lib] crate-type` 带 `dylib`/`staticlib`
+# （0.2.6→0.2.17 全是），这两种 crate-type 必须链 `panic_unwind`，在 `panic = "abort"` 下
+# **编译不过** ⇒ 首轮被迫把 profile 改成 `unwind`，代价 +5 436 416 字节（首轮报告 Step 5）。
+# `htmd` 是默认 crate-type（rlib），`abort` 下能编（首轮之前的 release 产物就是它）。
+htmd = "0.5.6"
 # R265：charset 解码。brief 猜它「随 html5ever 传递带入」，实测**不是**
-# （`readability 0.3.0`→html5ever 0.26、`html2md 0.2.17`→html5ever 0.39 两族都不带 encoding_rs），
+# （`readability 0.3.0`→html5ever 0.26、`htmd 0.5.6`→html5ever 0.38 两族都不带 encoding_rs），
 # 所以这是一个真·新增包（自身零依赖，代价见报告，已按 brief 的要求在报告里提请裁定）。
+# R268：本轮**保留原样**，不动。
 encoding_rs = "0.8.42"
 
 
@@ -80,13 +89,9 @@ encoding_rs = "0.8.42"
 codegen-units = 1
 lto = true
 opt-level = 3
-# T24b：`panic = "abort"` 摘掉了 —— `html2md` 的 `[lib] crate-type` 里带 `dylib`/`staticlib`
-# （上游所有 0.2.x 版本都是，实测 0.2.6→0.2.17），而这两种 crate-type 必须链 `panic_unwind`，
-# 在 abort profile 下**编译不过**（`error: the linked panic runtime panic_unwind is not compiled
-# with this crate's panic strategy abort`）。代价是发布产物变大，前后实测数在
-# `.superpowers/sdd/2026-10-21-plan-b-tools-mcp/task-24b-report.md` 的 Step 5；
-# 要换回 abort 就得换一个不带 dylib 的 Markdown 转换器（决策归用户，不在本任务擅自换）。
-panic = "unwind"
+# 本仓库既有设定（<15MB 安装包是验收线）。首轮为了 `html2md` 把它改成过 `unwind`，
+# 那是 5.4 MB 增量的**唯一来源**；R267 换掉 html2md 之后这里恢复 `abort`。
+panic = "abort"
 strip = true
 
 [dev-dependencies]

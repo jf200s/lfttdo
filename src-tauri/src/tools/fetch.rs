@@ -471,18 +471,28 @@ pub const MAX_CHARS_CAP: usize = 24_000;
 /// 清单之外一律**报错**而不是返回空文本：空文本会被模型读成「这个页面是空的」，
 /// 而真相是「我们不去碰这种格式」，两者对模型的下一步完全不同（Step 1 的判据）。
 ///
-/// **T24b 的两处改动**（判门与裁定见 `docs/findings/plan-b-fetch-quality.md`）：
-/// - HTML 那一支不再用 `htmd`（R264：判门实测不过，正文里没有「正文边界」这个概念），
-///   改成 `readability` 定界 + `html2md` 转 Markdown。
+/// **T24b 的三处改动**（判门与裁定见 `docs/findings/plan-b-fetch-quality.md`）：
+/// - HTML 那一支不再用「整页过一次 Markdown 转换器」（R264：判门实测不过，正文里没有
+///   「正文边界」这个概念），改成 `readability` 定界 + 把**裁剪后的片段**转 Markdown
+///   （修复轮 1 的 R267：那一步用 `htmd`，理由写在 `Cargo.toml` 的 `htmd` 那行注释上）。
 /// - `charset` 参数从「只用来认类型」升级为「真的参与解码」（R265）：三支共用
 ///   `decode_body`，全链路**没有** `from_utf8_lossy` 了 —— 解不了就报错，
 ///   绝不把 U+FFFD 交给抽取器或模型。
-pub fn render_markdown(content_type: &str, body: &[u8]) -> Result<String, ToolError> {
+/// - R270：多收一条 `base_url` —— 就是**实际取回内容那一跳的地址**（`Fetched::final_url`）。
+///   `readability` 要一条基地址才能把正文里的相对链接改写成可再取一次的绝对地址；
+///   首轮这里塞的是一条占位假地址（外加「把假地址剥回去」的补丁），两条都在本轮删掉了：
+///   假数据会留在交给模型的文本里，而相对链接保持相对形状时模型根本没法照着它翻页。
+///   透传那两支（`text/plain`/`application/json`）**不碰** `base_url`，原文逐字照旧。
+pub fn render_markdown(
+    content_type: &str,
+    body: &[u8],
+    base_url: &str,
+) -> Result<String, ToolError> {
     let mt = media_type_of(content_type);
     match mt.as_str() {
         "text/html" | "application/xhtml+xml" => {
             let html = decode_body(content_type, body, true)?;
-            let markdown = extract_article_markdown(&html, &mt)?;
+            let markdown = extract_article_markdown(&html, &mt, base_url)?;
             // 空串是假话（「页面是空的」），整页转换是真话但更坏（一堆链接与 JS）。
             // 这一句和 `slice_page` 的「正文为空」同一取向：把失败原因交给模型。
             if markdown.trim().is_empty() {
@@ -628,12 +638,14 @@ fn find_window(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|p| p + from)
 }
 
-/// `readability` 定界 + `html2md` 转 Markdown；只用正文那一段。
-fn extract_article_markdown(html: &str, mt: &str) -> Result<String, ToolError> {
-    // `render_markdown` 的签名里没有 URL（T24 的对外承诺），而 `readability::extract`
-    // 要一条基地址来改写相对链接 —— 给一条**必然解析不到真实站点**的占位地址：
-    // 相对链接改不出来（少几条链接），绝对链接照旧，两种都不影响「只用正文」这条判据。
-    let base = Url::parse("https://fetch-url.invalid/").expect("常量地址必须可解析");
+/// `readability` 定界 + 把**裁剪后的正文片段**转 Markdown；只用正文那一段。
+fn extract_article_markdown(html: &str, mt: &str, base_url: &str) -> Result<String, ToolError> {
+    // R270：基地址是**真实**的那一条（调用方给 `Fetched::final_url`），不是首轮的占位假地址。
+    // 解析不出来就报错，**不**降级成假基地址：相对链接按一个不存在的站点展开，交出去的是
+    // 一条模型会照着去取的错链接，比这一页失败更难发现。
+    let base = Url::parse(base_url).map_err(|e| ToolError::Failed(format!(
+        "content-type 是 {mt}，但这一页的地址「{base_url}」解析不出来（{e}），我不拿一条假地址去改写相对链接"
+    )))?;
     let mut reader: &[u8] = html.as_bytes();
     let product = readability::extractor::extract(&mut reader, &base)
         .map_err(|e| ToolError::Failed(format!("content-type 是 {mt}，但正文抽取失败：{e}")))?;
@@ -642,14 +654,14 @@ fn extract_article_markdown(html: &str, mt: &str) -> Result<String, ToolError> {
     // `content` 里。所以这里只取 `<body>` 的内层，`Product.title` 一个字都不用 ——
     // 拼进去模型就当页面内容引用了（brief Step 1 判据 2）。
     let body_html = article_body_html(&product.content);
-    let markdown = html2md::parse_html(&body_html);
-    // 相对链接与图片被 `readability` 按上面那条占位地址改写成了
-    // `https://fetch-url.invalid/…` —— 那是**不存在的地址**，模型会当真实链接引用
-    // （真网复测在 overreacted 那张 gif 上打到了，见 findings）。`.invalid` 是 RFC 2606
-    // 保留域，撞不上任何真链接，所以把占位前缀剥回去：相对链接保持相对，绝对链接不受影响。
-    Ok(markdown
-        .replace("https://fetch-url.invalid/", "/")
-        .replace("https://fetch-url.invalid", ""))
+    // `htmd::convert` 返回 `Result`，所以这一步的失败**上报**而不是交回一个空串：
+    // 空串会走到 `render_markdown` 的「抽不出正文」那一句，那是假话 —— 片段是有内容的，
+    // 坏的是转换这一步。
+    htmd::convert(&body_html).map_err(|e| {
+        ToolError::Failed(format!(
+            "content-type 是 {mt}，正文已定界，但转成 Markdown 失败：{e}"
+        ))
+    })
 }
 
 /// 取序列化结果里 `<body>…</body>` 的内层；没有 body 标签（选中了某个 div 当正文）时
@@ -866,7 +878,10 @@ impl Tool for FetchTool {
             return Err(ToolError::Cancelled);
         }
 
-        let text = render_markdown(&f.content_type, &f.body)?;
+        // R270：基地址用 `final_url`（实际取回内容那一跳），**不是**用户请求里那条：
+        // 正文里的相对链接是相对于** Serving 这个内容的那个地址**的，按请求地址展开
+        // 会指到另一台机器上的同类路径。
+        let text = render_markdown(&f.content_type, &f.body, &f.final_url)?;
         let mut out = String::new();
         for line in prefix_lines(&f) {
             out.push_str(&line);
@@ -1513,10 +1528,16 @@ mod tests {
 
     // ————————————————————— Step 1：内容类型白名单 —————————————————————
 
+    /// R270 之后 `render_markdown` 多收一条基地址。测试一律用**真实形状**的地址
+    /// （首轮的占位假地址已删）：相对链接要真能被它展开，否则那几条判据什么都没钉住。
+    /// 和 `fetch_with_transport` 请求的那条同一个，好让「直接调 `render_markdown`」与
+    /// 「走 `execute`」两条路的输出可以逐字比对（见 `a_same_domain_landing_…`）。
+    const PAGE: &str = "https://news.example/";
+
     #[tokio::test]
     async fn only_html_text_and_json_are_accepted() {
         for ct in ["text/html; charset=utf-8", "text/plain", "application/json"] {
-            assert!(render_markdown(ct, b"hello").is_ok(), "{ct} 必须接受");
+            assert!(render_markdown(ct, b"hello", PAGE).is_ok(), "{ct} 必须接受");
         }
         for ct in [
             "image/png",
@@ -1524,7 +1545,7 @@ mod tests {
             "application/octet-stream",
             "text/css",
         ] {
-            let e = render_markdown(ct, b"x").unwrap_err();
+            let e = render_markdown(ct, b"x", PAGE).unwrap_err();
             assert!(
                 e.to_string().contains("content-type"),
                 "{ct} 必须给明确错误而不是空文本，实得 {e}"
@@ -1532,36 +1553,43 @@ mod tests {
         }
     }
 
-    /// 白名单**之内**的三类各走自己那条路：html 过 `htmd`，纯文本与 JSON 交原文。
+    /// 白名单**之内**的三类各走自己那条路：html 过抽取器 + Markdown 转换器，纯文本与 JSON 交原文。
     /// 「JSON 也拿去喂 markdown 转换器」会把 `{"a": 1}` 变成装饰文本，
     /// 「纯文本也过一遍」会吃掉日志/源码里的手工缩进 —— 两条都在这里钉住。
+    ///
+    /// R269：夹具原来是 `<h1>Hello</h1>`。换抽取器后 `readability` 把文档级 `<h1>` 当页面
+    /// 标题样板剥掉（这条新语义由 `a_document_level_h1_is_stripped_…` 显式钉住），而这条测试
+    /// 的真实意图是「HTML 走抽取、纯文本与 JSON 原样透传」，不是 `<h1>` 的形状 ⇒ 样本换成
+    /// `<h2>`，三条承诺一个字没改。
     #[tokio::test]
     async fn html_becomes_markdown_while_plain_text_and_json_pass_through() {
-        let md = render_markdown("text/html", "<h1>Hello</h1><p>世界</p>".as_bytes()).unwrap();
-        assert!(md.contains("# Hello"), "html 必须真的过抽取器，实得 {md}");
+        let md =
+            render_markdown("text/html", "<h2>Hello</h2><p>世界</p>".as_bytes(), PAGE).unwrap();
+        assert!(md.contains("## Hello"), "html 必须真的过抽取器，实得 {md}");
         // 中文正文必须活着走到 Markdown 里（抽取器丢中文是很现实的失效模式）。
         assert!(md.contains("世界"), "中文正文不许被丢掉：{md}");
         assert_eq!(
-            render_markdown("text/plain", b"a\n\n\nb").unwrap(),
+            render_markdown("text/plain", b"a\n\n\nb", PAGE).unwrap(),
             "a\n\n\nb",
             "纯文本一个字节都不许改写（缩进与空行就是它的语义）"
         );
         assert_eq!(
-            render_markdown("application/json", b"{\"a\":1}").unwrap(),
+            render_markdown("application/json", b"{\"a\":1}", PAGE).unwrap(),
             "{\"a\":1}",
             "JSON 交原文，不重排版"
         );
         // 大小写与参数都不许影响判定（`check_url` 那边也是这个口径）。
-        assert!(render_markdown("TEXT/HTML; charset=UTF-8", b"<i>x</i>").is_ok());
-        // 非 UTF-8 字节流不许 panic，也不许静默丢内容之外的东西：lossy 解码是**已记欠账**
-        // （不引 `encoding_rs`，见函数文档），这里只钉「不 panic」。
-        assert!(render_markdown("text/plain", b"\xff\xfe bad bytes").is_ok());
+        assert!(render_markdown("TEXT/HTML; charset=UTF-8", b"<i>x</i>", PAGE).is_ok());
+        // 非 UTF-8 字节流不许 panic，也不许静默丢内容之外的东西：解码走 `encoding_rs`
+        // （R265/R268），这一支缺声明时按严格 UTF-8 → windows-1252 两趟，这里只钉「不 panic」。
+        assert!(render_markdown("text/plain", b"\xff\xfe bad bytes", PAGE).is_ok());
     }
 
     // ————————————————————— Step 3（T24b）：抽取器与字符集 ————————————————
     //
-    // 这四条钉的是 T24b 换抽取器（`readability` + `html2md`）与补 charset 解码（R265）
-    // 的四件事：按声明解、解不了就报错、抽不出正文明说、只用正文那一段。
+    // 这几条钉的是 T24b 换抽取器（`readability` 定界 + 裁剪片段转 Markdown，R267/R269）
+    // 与补 charset 解码（R265/R268）的四件事：按声明解、解不了就报错、抽不出正文明说、
+    // 只用正文那一段；修复轮 1 再加两条：基地址是真的（R270）、脚本样式进不来（R267 的理由）。
 
     /// 组装一段**真的**GBK 字节（不靠本机 codepage，和 T25 的 gbk.txt 同一取向）。
     fn gbk_html(sentence: &str) -> Vec<u8> {
@@ -1588,7 +1616,7 @@ mod tests {
             String::from_utf8_lossy(&body).contains('\u{FFFD}'),
             "这条测试只在「lossy 会坏」的前提下才有意义"
         );
-        let md = render_markdown("text/html; charset=gb2312", &body).unwrap();
+        let md = render_markdown("text/html; charset=gb2312", &body, PAGE).unwrap();
         assert!(
             md.contains(sentence),
             "按声明的 gb2312 解出真中文，实得：{md}"
@@ -1605,7 +1633,7 @@ mod tests {
             "text/plain; charset=not-a-real-label",
             "application/json; charset=not-a-real-label",
         ] {
-            let e = render_markdown(ct, "正文".as_bytes()).unwrap_err();
+            let e = render_markdown(ct, "正文".as_bytes(), PAGE).unwrap_err();
             let msg = e.to_string();
             assert!(
                 msg.contains("字符集") && msg.contains("not-a-real-label"),
@@ -1627,7 +1655,7 @@ mod tests {
                    <body><div id=\"root\"></div>\
                    <script>window.__INITIAL_STATE__={\"bundle\":\"abcdef\"};</script>\
                    <noscript>请启用 JavaScript</noscript></body></html>";
-        let out = render_markdown("text/html; charset=utf-8", spa.as_bytes()).unwrap();
+        let out = render_markdown("text/html; charset=utf-8", spa.as_bytes(), PAGE).unwrap();
         assert!(
             out.contains("抽不出正文"),
             "必须明说抽不出正文，实得：{out}"
@@ -1650,7 +1678,7 @@ mod tests {
                     <div class=\"article\"><p>正文第一句，讲的是本地生活，读起来像个段落。</p>\
                     <p>正文第二句，把段落写长一点，好让候选评分选中它。</p></div>\
                     </body></html>";
-        let md = render_markdown("text/html; charset=utf-8", html.as_bytes()).unwrap();
+        let md = render_markdown("text/html; charset=utf-8", html.as_bytes(), PAGE).unwrap();
         assert!(md.contains("正文第一句"), "正文必须在，实得：{md}");
         assert!(!md.contains("这篇报道的标题"), "title 不许拼进正文：{md}");
         assert!(!md.contains("站点名"), "站点名不许拼进正文：{md}");
@@ -1658,18 +1686,110 @@ mod tests {
     }
 
     /// 真网复测打到的缺陷（findings 第 2 页 overreacted 的那张 gif）：`readability` 拿
-    /// 占位基地址改写相对链接，会造出一个**不存在的 host** 交进正文。占位前缀必须剥掉。
+    /// **占位**基地址改写相对链接，会造出一个**不存在的 host** 交进正文。
+    /// R270 之后占位地址本身已经没了：`render_markdown` 收真实 URL，相对链接就按真实
+    /// 页面地址展开。两条判据一起钉 —— 既不许出现假主机，也不许把相对链接留在相对形状
+    /// （留在相对形状 = 基地址没用上，模型无法照着链接再取一次）。
     #[tokio::test]
-    async fn the_placeholder_base_url_never_reaches_the_model() {
+    async fn relative_links_are_resolved_against_the_real_page_url() {
         let html = "<html><body><article><p>正文第一句，带一张相对路径的图，字数要够多才不会被降权。\
                     <img src=\"/img/pic.gif\" alt=\"配图\"><a href=\"/next\">下一页</a></p>\
                     <p>第二段仍然属于正文，继续加长以通过 readability 的候选评分。</p></article></body></html>";
-        let md = render_markdown("text/html", html.as_bytes()).unwrap();
+        let md = render_markdown("text/html", html.as_bytes(), PAGE).unwrap();
         assert!(
             !md.contains("fetch-url.invalid"),
             "占位地址不许泄漏给模型（它会当真实链接引用）：{md}"
         );
-        assert!(md.contains("/img/pic.gif"), "相对链接要保住形状：{md}");
+        assert!(
+            md.contains("https://news.example/img/pic.gif"),
+            "相对链接要按真实页面地址展开：{md}"
+        );
+        assert!(
+            md.contains("https://news.example/next"),
+            "锚链接同样按真实页面地址展开：{md}"
+        );
+    }
+
+    /// R269：换抽取器后**有意接受**的语义，写显式断言钉住，不留成"漏了一条测试"。
+    /// `readability 0.3.0` 的 `scorer::clean`（`src/scorer.rs:331`）把 `h1` 和
+    /// script/style/header/footer/aside 一起列进样板清单 —— 文档级 `<h1>` 一律删掉，
+    /// 因为 arc90 算法把它当**页面标题**（站点名）而不是文章小标题。
+    /// 这不是遗漏：h2–h6 全部保留，正是下面那条断言的另一半。
+    #[tokio::test]
+    async fn a_document_level_h1_is_stripped_while_h2_stays_a_heading() {
+        let html = "<html><body><article>\
+                    <h1>整站大标题（readability 当页面标题剥掉）</h1>\
+                    <h2>这一节讲的是什么</h2>\
+                    <p>正文第一句，段落要够长才不会被候选评分降权。</p>\
+                    <p>第二段仍然是正文，继续加长以保证候选节点选中这个 article。</p>\
+                    </article></body></html>";
+        let md = render_markdown("text/html", html.as_bytes(), PAGE).unwrap();
+        assert!(
+            !md.contains("整站大标题"),
+            "`<h1>` 会被 readability 剥掉 —— 这是换抽取器后有意接受的语义，不是遗漏：{md}"
+        );
+        assert!(
+            md.contains("## 这一节讲的是什么"),
+            "h2 必须活着走到 Markdown 里，且是 ATX 形状（`##` 前缀）：{md}"
+        );
+    }
+
+    /// R267 的理由钉在这条：同一个 Markdown 转换器，喂**整页**不合格（T24 判门），
+    /// 喂 **readability 已裁剪的正文片段**合格 —— 脚本与样式的文本在定界那一步就已经
+    /// 不在片段里了（`scorer::clean` 的样板清单）。所以这条测的是「片段里没有的东西
+    /// 不会从 Markdown 那一步漏回来」。
+    /// 变异核验（见报告）：把交给 Markdown 那一步的输入从 `article_body_html(...)` 换成
+    /// **整页 HTML**，这条立刻变红 —— 判据不是空转的。
+    #[tokio::test]
+    async fn script_and_style_text_never_reaches_the_markdown_step() {
+        let html = "<html><head><style>body{color:#111 /* 内联样式正文 */}</style></head><body>\
+                    <article><p>正文第一句，段落要够长才不会被候选评分降权。</p>\
+                    <script>var hidden = \"脚本正文不该出现在结果里\";</script>\
+                    <p>第二段仍然是正文，继续加长以保证候选节点选中这个 article。</p></article>\
+                    </body></html>";
+        let md = render_markdown("text/html", html.as_bytes(), PAGE).unwrap();
+        assert!(md.contains("正文第一句"), "正文必须在：{md}");
+        assert!(
+            !md.contains("脚本正文不该出现在结果里"),
+            "脚本正文不许进结果：{md}"
+        );
+        assert!(!md.contains("内联样式正文"), "样式正文不许进结果：{md}");
+        assert!(!md.contains("<script"), "连标签壳都不许残留：{md}");
+    }
+
+    /// R270 的调用点判据：`FetchTool::execute` 交出去的是 **`final_url`**（实际取回内容
+    /// 的那一跳），不是用户请求里那条。重定向后还在按请求地址展开链接，等于把正文里的
+    /// 链接指向另一个站点的同类路径 —— 那是一条模型看不见的错。
+    #[tokio::test]
+    async fn after_a_redirect_links_resolve_against_the_final_url() {
+        let html = "<html><body><article><p>正文第一句，带一个指向下一页的相对链接，字数要够多才不会被降权。\
+                    <a href=\"/next\">下一页</a></p>\
+                    <p>第二段仍然属于正文，继续加长以通过 readability 的候选评分。</p></article></body></html>";
+        let out = fetch_with_transport(ScriptedTransport::new(vec![
+            ok302(
+                "https://news.example/",
+                "https://files.other.example/article/1",
+            ),
+            ok200(
+                "https://files.other.example/article/1",
+                "text/html",
+                html.as_bytes(),
+            ),
+        ]))
+        .await
+        .unwrap();
+        assert!(
+            out.contains("https://files.other.example/next"),
+            "相对链接要按**最终落地地址**展开，实得：{out}"
+        );
+        assert!(
+            !out.contains("news.example/next"),
+            "不许按请求里的地址展开（那是另一台机器上的同类路径）：{out}"
+        );
+        assert!(
+            !out.contains("fetch-url.invalid"),
+            "抽取链上任何地方都不该再出现占位地址：{out}"
+        );
     }
 
     // ————————————————————— Step 2：截断与分页 —————————————————————
@@ -1768,7 +1888,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            render_markdown("text/html", body).unwrap(),
+            // 基地址这里是**落地那一跳**（`final_url`），和 `execute` 交给 `render_markdown`
+            // 的那一条同一个值（R270）——「输出与正文逐字相等」这句判据才有基地址可言。
+            render_markdown("text/html", body, "https://www.news.example/y").unwrap(),
             "同域跳转的输出必须就是正文本身"
         );
     }
