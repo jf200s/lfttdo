@@ -279,6 +279,38 @@ describe("SettingsPanel", () => {
     ).toMatch(/background(-color)?:\s*var\(--accent\)/);
   });
 
+  it("lets the checkbox take the theme accent instead of the system one", () => {
+    // 真窗口实测（R245）：勾上「跟随预设」时那个勾是 **Windows 蓝** —— 勾是操作系统画的，
+    // CSS 的 `color`/`background` 都管不到它，只有 `accent-color` 是命令它的标准属性。
+    // 一个跟主题无关的蓝色方块是这一屏唯一看得见的破绽，所以它进闸而不进「以后再说」。
+    const css = stripComments(readFileSync(pathOf("../styles.css"), "utf8"));
+    const box = /\.panel-row input\[type="checkbox"\]\s*\{([^}]*)\}/.exec(css);
+    expect(box, ".panel-row input[type=\"checkbox\"] 没有声明了").not.toBeNull();
+    expect(
+      box?.[1] ?? "",
+      "复选框没有 accent-color —— 勾会退回系统蓝，不跟主题",
+    ).toMatch(/accent-color:\s*var\(--accent\)/);
+  });
+
+  it("sizes the colour picker as a well, not as a text field", () => {
+    // 同一次实测：取色器渲染成 50×27 的胶囊，里面一条 26×14 的黑色矩形。那条小矩形不是原生
+    // 控件的错，是我们自己给它 `padding: 6px 12px`（跟着文本框那条规则继承来的）把色块挤没了。
+    // 不用 `::-webkit-color-swatch` 剥它：`selector-no-vendor-prefix` 会红，口径同 styles.css
+    // 末尾「滚动条走标准属性」那条。判据落在源码上：这一条必须存在、且横向不许留内边距。
+    const css = stripComments(readFileSync(pathOf("../styles.css"), "utf8"));
+    const well = /input\[type="color"\]\s*\{([^}]*)\}/.exec(css);
+    expect(well, "取色器没有自己的尺寸规则 —— 它会继续继承文本框的 6px 12px 内边距").not.toBeNull();
+    const body = well?.[1] ?? "";
+    // 单独把 padding 的值取出来判，而不是拿正则在整条规则体里搜：后者会把「padding 后面还有
+    // 别的声明」误读成「padding 有第二个值」，判据就会随声明顺序漂。
+    const padding = /padding:\s*([^;]+);/.exec(body);
+    expect(padding, "取色器没有 padding —— 色块会被文本框那套内边距挤成一条").not.toBeNull();
+    expect(
+      padding?.[1].trim() ?? "",
+      "取色器的 padding 带了第二个值（横向内边距）—— 色块左右会缩进去",
+    ).not.toMatch(/\s/);
+  });
+
   it("renders no control that this slice has no design for", async () => {
     // 禁名单的历史（一路变了三次，别把这条当成还在测「存不存得进去」）：
     // T39 之后 `temperature`/`compact_threshold`/`keep_turns` 是存得进去的（spec 5.3 的三个内部

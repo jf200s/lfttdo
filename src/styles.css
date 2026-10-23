@@ -701,6 +701,19 @@ a:hover {
 .panel-row input[type="checkbox"] {
   width: auto;
   background-color: transparent;
+  accent-color: var(--accent);
+}
+
+/* 取色器要按「一块色」而不是「一个输入框」来量。全局那条 `button, input, textarea` 给所有
+   输入框 `padding: 6px 12px`，原生色块被挤成胶囊里的一条小矩形（真窗口实测 50×27 里嵌 26×14）。
+   撤掉它只用标准属性：`::-webkit-color-swatch` 那两个伪元素会被 stylelint 的
+   `selector-no-vendor-prefix` 打回，口径同文件末尾「滚动条走标准属性」那条注释。
+   圆角用 `--radius-sm` 与旁边的色块 chip 同级，`--radius` 在这个尺寸上会圆成一颗药丸。 */
+.panel-accent input[type="color"] {
+  width: 34px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  padding: 2px;
 }
 
 /* chip 显示的必须是界面**真的**在用的那支 accent，所以色值只有这一份、写在 CSS 里取
