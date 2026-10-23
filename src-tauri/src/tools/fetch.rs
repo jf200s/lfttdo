@@ -483,6 +483,11 @@ pub const MAX_CHARS_CAP: usize = 24_000;
 ///   首轮这里塞的是一条占位假地址（外加「把假地址剥回去」的补丁），两条都在本轮删掉了：
 ///   假数据会留在交给模型的文本里，而相对链接保持相对形状时模型根本没法照着它翻页。
 ///   透传那两支（`text/plain`/`application/json`）**不碰** `base_url`，原文逐字照旧。
+/// - R271（修复轮 2）：HTML 臂抽出**非空但低于 `MIN_ARTICLE_CHARS`** 的 Markdown 时，前面
+///   挂一行「未能定界出正文……」的标记再交原文。定界失败那一支交的是降级剩下的样板，
+///   不标记就等于让模型把站点 slogan/反爬提示当正文引用；标记而不是丢掉/报错的理由在
+///   `MIN_ARTICLE_CHARS` 的注释上。空串那一支仍交 `NO_ARTICLE_TEXT`（另一句真话，两支没合并）。
+///   透传那两支**不受这条影响**，一条标记都不许加。
 pub fn render_markdown(
     content_type: &str,
     body: &[u8],
@@ -498,7 +503,17 @@ pub fn render_markdown(
             if markdown.trim().is_empty() {
                 Ok(NO_ARTICLE_TEXT.to_string())
             } else {
-                Ok(markdown)
+                // R271：非空但**低于正文下限** ⇒ 定界这一步其实没成功，交出去的是降级
+                // 剩下的站点样板/反爬提示。这一支**不丢文本**（模型还得自己判），只在前面
+                // 挂一行说明「这不是定界出来的正文」——评审点名的失败形状是模型会照原话答
+                // 「这一页讲的是软媒旗下科技门户网站」，缺的就是这一句。
+                // 选「标记」而不是「报错/丢掉」的理由写在 `MIN_ARTICLE_CHARS` 上。
+                let n = markdown.chars().count();
+                if n < MIN_ARTICLE_CHARS {
+                    Ok(format!("{}\n{markdown}", sub_floor_label(n)))
+                } else {
+                    Ok(markdown)
+                }
             }
         }
         // 原文透传：纯文本的空行与缩进、JSON 的结构本身就是内容，过一次 markdown
@@ -513,6 +528,27 @@ pub fn render_markdown(
 /// `readability` 定界失败（抽不出正文）时交给模型的那一句。
 const NO_ARTICLE_TEXT: &str =
     "[这一页抽不出正文（可能是脚本渲染的页面），可以试 text/plain 的原始来源或换一个 URL]";
+
+/// R271：正文下限（**字符**数，不是字节数）。HTML 臂抽出的 Markdown 非空但低于这条线时，
+/// 前面挂一行「这不是定界出来的正文」的标记，**文本照样交出去**。
+///
+/// 为什么阈值这一侧选「标记」而不是「报错/丢掉」：**标记的假阴性没有代价**（一页真短文
+/// 只是多了一行说明，内容一个字没少），**丢掉的假阴性有代价**（一页真短文被吞掉，模型和
+/// 用户都无从发现它被吞了）。而 `readability 0.3.0` 的 `Product` 只有 `{title, content}`、
+/// **没有置信度**可用，判不出「有没有正文」，只能判「少不少」—— 少的时候说实话，
+/// 不假装它不存在。
+///
+/// 200 这个数是照着真网六页定的：qbitai 6 136、overreacted 19 138 远高于线（不标记），
+/// ithome 187、36kr 52 低于线（标记）—— 被标记的正好是评审点名的那两页样板/反爬提示。
+/// **只作用于 HTML 臂**：`text/plain` 与 `application/json` 是逐字透传，一条标记都不许加
+/// （`text_plain_below_the_floor_gets_no_label_at_all` 钉住）。
+pub const MIN_ARTICLE_CHARS: usize = 200;
+
+/// 低于 `MIN_ARTICLE_CHARS` 时挂在正文前面那一行（`{n}` = 后面交出去的字符数）。
+/// 句子是 R271 定的逐字文案，改它等于改对外承诺。
+fn sub_floor_label(n: usize) -> String {
+    format!("[未能定界出正文，以下 {n} 字可能是站点样板或反爬提示，别当正文引用]")
+}
 
 /// 按**声明**的字符集把字节解成文本；解不了就报错，绝不 lossy（R265 的三条判据）。
 ///
@@ -1561,11 +1597,22 @@ mod tests {
     /// 标题样板剥掉（这条新语义由 `a_document_level_h1_is_stripped_…` 显式钉住），而这条测试
     /// 的真实意图是「HTML 走抽取、纯文本与 JSON 原样透传」，不是 `<h1>` 的形状 ⇒ 样本换成
     /// `<h2>`，三条承诺一个字没改。
+    ///
+    /// R273（修复轮 2，只改这句话不说谎的说明，**断言本身没放宽也没删**）：`contains("## Hello")`
+    /// 证的是「HTML 那一臂过了 Markdown 转换、出来的是 ATX 标题形状」——它在 T24 判过不合格的
+    /// **整页 htmd** 下同样会绿，所以它**不**能拿来证明抽取器被调用。证明那件事的覆盖在
+    /// `script_and_style_text_never_reaches_the_markdown_step` 与
+    /// `a_document_level_h1_is_stripped_while_h2_stays_a_heading` 两条上，二者都由变异核验过
+    /// （整页形状下当场红）。
     #[tokio::test]
     async fn html_becomes_markdown_while_plain_text_and_json_pass_through() {
         let md =
             render_markdown("text/html", "<h2>Hello</h2><p>世界</p>".as_bytes(), PAGE).unwrap();
-        assert!(md.contains("## Hello"), "html 必须真的过抽取器，实得 {md}");
+        assert!(
+            md.contains("## Hello"),
+            "html 必须真的过了 Markdown 转换这一步、拿到的是 ATX 标题形状（setext 不算），\
+             实得 {md}"
+        );
         // 中文正文必须活着走到 Markdown 里（抽取器丢中文是很现实的失效模式）。
         assert!(md.contains("世界"), "中文正文不许被丢掉：{md}");
         assert_eq!(
@@ -1688,7 +1735,8 @@ mod tests {
     /// 真网复测打到的缺陷（findings 第 2 页 overreacted 的那张 gif）：`readability` 拿
     /// **占位**基地址改写相对链接，会造出一个**不存在的 host** 交进正文。
     /// R270 之后占位地址本身已经没了：`render_markdown` 收真实 URL，相对链接就按真实
-    /// 页面地址展开。两条判据一起钉 —— 既不许出现假主机，也不许把相对链接留在相对形状
+    /// 页面地址展开。两条判据一起钉 —— 既要把展开后的**绝对地址**（连 Markdown 形状）钉在
+    /// 占位地址原来该在的位置上，也不许把相对链接留在相对形状
     /// （留在相对形状 = 基地址没用上，模型无法照着链接再取一次）。
     #[tokio::test]
     async fn relative_links_are_resolved_against_the_real_page_url() {
@@ -1697,8 +1745,14 @@ mod tests {
                     <p>第二段仍然属于正文，继续加长以通过 readability 的候选评分。</p></article></body></html>";
         let md = render_markdown("text/html", html.as_bytes(), PAGE).unwrap();
         assert!(
-            !md.contains("fetch-url.invalid"),
-            "占位地址不许泄漏给模型（它会当真实链接引用）：{md}"
+            md.contains("![配图](https://news.example/img/pic.gif)"),
+            "图片链接要按真实页面地址展开成 Markdown 形状（修复轮 1 里那条 `fetch-url.invalid` \
+             负断言比较的字符串在代码里已经不存在 ⇒ 永远绿；换成这条：占位地址原来该在的\
+             位置上必须出现展开后的绝对地址）：{md}"
+        );
+        assert!(
+            !md.contains("![配图](/img/pic.gif)") && !md.contains("[下一页](/next)"),
+            "相对形状留在原位 = 基地址根本没生效，模型照着它翻不了页：{md}"
         );
         assert!(
             md.contains("https://news.example/img/pic.gif"),
@@ -1711,7 +1765,7 @@ mod tests {
     }
 
     /// R269：换抽取器后**有意接受**的语义，写显式断言钉住，不留成"漏了一条测试"。
-    /// `readability 0.3.0` 的 `scorer::clean`（`src/scorer.rs:331`）把 `h1` 和
+    /// `readability 0.3.0` 的 `scorer::clean`（`src/scorer.rs:332`）把 `h1` 和
     /// script/style/header/footer/aside 一起列进样板清单 —— 文档级 `<h1>` 一律删掉，
     /// 因为 arc90 算法把它当**页面标题**（站点名）而不是文章小标题。
     /// 这不是遗漏：h2–h6 全部保留，正是下面那条断言的另一半。
@@ -1787,8 +1841,96 @@ mod tests {
             "不许按请求里的地址展开（那是另一台机器上的同类路径）：{out}"
         );
         assert!(
-            !out.contains("fetch-url.invalid"),
-            "抽取链上任何地方都不该再出现占位地址：{out}"
+            out.contains("[下一页](https://files.other.example/next)"),
+            "占位地址原来该在的那个位置上，必须是一条**展开后的绝对地址**（连 Markdown 链接形状\
+             一起钉，光钉裸 URL 的话 `[下一页](/next)` 这种「基地址没生效」的形状抓不住）：{out}"
+        );
+    }
+
+    // ————————————————————— 修复轮 2（R271）：正文下限的标记句 ————————————————
+
+    /// R271 的失败形状（评审亲测：ithome 187 字 = 站点 slogan + 版权页脚、36kr 52 字 = 反爬提示）：
+    /// `readability` **定界失败**那一支不返回空，而是降级成「整份文档剩下的样板」，于是这些
+    /// 样板被当正文静静交出去，模型会照原话答「这一页讲的是软媒旗下科技门户网站」。
+    /// 这条钉住修法：低于下限**不丢文本**，改成「一行标记 + 原文」两段，且**不**与空串那一支
+    /// （`NO_ARTICLE_TEXT`）合并成一句 —— 那是两句不同的真话。
+    #[tokio::test]
+    async fn a_sub_floor_extraction_is_labelled_instead_of_dropped() {
+        // 一份 readability 定界不出来的门户页：正文位置只剩站点 slogan、站点简介
+        // 与版权/举报/备案页脚，合计一百来字 —— 真网上打到的是 ithome 的 187 字。
+        let html = "<!doctype html><html><head><title>软媒网｜某科技门户</title>\
+                    <meta name=\"description\" content=\"软媒旗下科技门户网站\"></head>\
+                    <body><div class=\"wrap\">\
+                    <p>软媒旗下科技门户网站，速享科技每一刻。</p>\
+                    <p>本站收录前沿科技新闻、新品资讯、手机评测与智能设备导购，是数码爱好者每天要逛的科技站。</p>\
+                    <p>© 2026 软媒 版权所有｜违法和不良信息举报电话 010-00000000｜京公网安备 11010802035028 号</p>\
+                    </div></body></html>";
+        let out = render_markdown("text/html", html.as_bytes(), PAGE).unwrap();
+        let (label_line, body) = out
+            .split_once('\n')
+            .unwrap_or_else(|| panic!("标记句必须单独占一行、原文跟在它下面，实得：{out}"));
+        assert_eq!(
+            label_line,
+            format!(
+                "[未能定界出正文，以下 {} 字可能是站点样板或反爬提示，别当正文引用]",
+                out.chars().count() - label_line.chars().count() - 1
+            ),
+            "标记句要逐字是那句，且句里的 {{n}} 必须等于它下面交出去的字符数（报假数比不报更坏）：{out}"
+        );
+        // **没丢掉**：那几十上百字样板本体必须在结果里。
+        assert!(
+            body.contains("软媒旗下科技门户网站，速享科技每一刻。")
+                && body.contains("违法和不良信息举报电话"),
+            "低于下限不许把文本吞掉，样板本体必须照样交给模型：{out}"
+        );
+        assert!(
+            body.chars().count() < MIN_ARTICLE_CHARS && !body.trim().is_empty(),
+            "夹具必须真的落在「非空但低于下限」那一格里，否则这条什么都没钉住：{} 字",
+            body.chars().count()
+        );
+        // **没合并**：空串那一支的另一句真话不许串到这里。
+        assert!(
+            !out.contains(NO_ARTICLE_TEXT),
+            "非空但低于下限走的是标记句，不是「抽不出正文」那句（两支没合并）：{out}"
+        );
+    }
+
+    /// 透传那两臂**不受阈值影响**（rfc1945 与 JSON 逐字透传是它们判「过」的理由）：
+    /// 一段低于下限的 `text/plain` 必须逐字等于输入，一条标记都不许加。
+    #[tokio::test]
+    async fn text_plain_below_the_floor_gets_no_label_at_all() {
+        let short = "第 1 行\n第 2 行留着缩进\n\t第 3 行\ttab\n";
+        assert!(
+            short.chars().count() < MIN_ARTICLE_CHARS,
+            "夹具必须真的低于下限，否则这条守的是「长文本不标记」——那不是本条的判据"
+        );
+        assert_eq!(
+            render_markdown("text/plain", short.as_bytes(), PAGE).unwrap(),
+            short,
+            "text/plain 逐字透传的承诺不许被 R271 的阈值污染"
+        );
+        assert_eq!(
+            render_markdown("application/json", br#"{"a":1}"#, PAGE).unwrap(),
+            "{\"a\":1}",
+            "application/json 同样逐字透传"
+        );
+    }
+
+    /// 评审判断 2 的缺口：`extract_article_markdown` 在 base 解析不出来时**硬报错、不降级**，
+    /// 这个决定之前零测试。降级成假基地址交出去的是「模型会照着去取的错链接」，
+    /// 比这一页失败更难发现 —— 所以这里钉的是「报错」这个形状，不许改成兜底。
+    #[tokio::test]
+    async fn an_unparseable_base_url_is_an_error_not_a_fallback() {
+        let html = "<html><body><article><p>正文第一句。</p></article></body></html>";
+        let e = render_markdown("text/html", html.as_bytes(), "not a url").unwrap_err();
+        assert!(
+            matches!(e, ToolError::Failed(_)),
+            "解析不出基地址必须是 Failed，实得 {e:?}"
+        );
+        let msg = e.to_string();
+        assert!(
+            msg.contains("假地址") && msg.contains("not a url"),
+            "错误里要同时有「我不拿假地址改写链接」这句原话和那条坏输入，实得：{msg}"
         );
     }
 
