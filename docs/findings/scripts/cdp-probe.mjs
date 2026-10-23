@@ -2,6 +2,9 @@
 // 用法：
 //   node cdp-probe.mjs eval   '<js 表达式>'     在页面里求值并打印 JSON
 //   node cdp-probe.mjs arm                       注册 document-start 探针 → 重新加载 → 打印时间线
+//   node cdp-probe.mjs trace                     冷启动紧轮询采样（首帧主题用）
+//   node cdp-probe.mjs setfile <选择器> <路径…>   往 input[type=file] 里塞真文件并触发 change
+//   node cdp-probe.mjs wait '<js 表达式>' [ms]    轮询到表达式为真（流式回答落地用）
 //   node cdp-probe.mjs shot  <out.png>           截图
 // 前提：目标进程是用 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222 起的。
 // 9222 是本机**无鉴权**端口，随进程生灭；探针跑完就把窗口留着，不驻留、不写配置。
@@ -154,6 +157,42 @@ const main = async () => {
       console.log(JSON.stringify({ at: `+${wait}ms`, sample: await evaluate(c.send, SAMPLE) }));
     }
     c.close();
+  } else if (cmd === "setfile") {
+    // 把真文件塞进 `<input type="file">` 并触发 change。为什么要它：图片进入界面的三个入口
+    // （拖放 / 粘贴 / 文件控件）里，只有文件控件能被 CDP 确定性地喂进去 —— 拖放要合成
+    // DataTransfer、粘贴要写系统剪贴板，两者都可能在「喂」这一步失败而被误读成「功能坏了」。
+    // DOM.setFileInputFiles 走的是浏览器自己的文件选择路径，React 的 onChange 照常触发。
+    const [, , , selector, ...files] = process.argv;
+    await send("DOM.enable");
+    const { root } = await send("DOM.getDocument", { depth: -1, pierce: true });
+    const { nodeId } = await send("DOM.querySelector", { nodeId: root.nodeId, selector });
+    if (!nodeId) throw new Error(`页面上找不到 ${selector}`);
+    await send("DOM.setFileInputFiles", { nodeId, files });
+    // 有的实现只设 `files` 不发事件；补一次冒泡的 change，React 的委托监听才收得到。
+    await evaluate(
+      send,
+      `(() => { const el = document.querySelector(${JSON.stringify(selector)});
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return el.files.length; })()`,
+    );
+    console.log(JSON.stringify({ selector, files, accepted: files.length }));
+  } else if (cmd === "wait") {
+    // 轮询一个返回真值的页面表达式：流式回答没有 IPC 完成事件可读，只能看界面。
+    const expr = process.argv[3];
+    const budgetMs = Number(process.argv[4] ?? 60000);
+    const t0 = Date.now();
+    for (;;) {
+      const v = await evaluate(send, expr);
+      if (v) {
+        console.log(JSON.stringify({ waitedMs: Date.now() - t0, value: v }));
+        break;
+      }
+      if (Date.now() - t0 > budgetMs) {
+        console.log(JSON.stringify({ waitedMs: Date.now() - t0, value: null, timeout: true }));
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
   } else if (cmd === "shot") {
     const r = await send("Page.captureScreenshot", { format: "png" });
     const fs = await import("node:fs");
