@@ -37,7 +37,7 @@ pub struct ToolCtx {
 }
 
 impl ToolCtx {
-    /// 路径穿越防线。四条规则，每条都有测试钉着（R47）：
+    /// 路径穿越防线。五条规则，每条都有测试钉着（R47）：
     /// 1. **只接受绝对路径**：相对路径的含义随进程 cwd 漂移，不能拿去和 root 比。
     /// 2. **canonicalize 的是候选路径的父目录**，再把最后一段原样接回去。于是
     ///    `/tmp/../etc/passwd` 会先在文件系统上把 `..` 走掉（落地 `/etc`）再比 root，
@@ -49,16 +49,20 @@ impl ToolCtx {
     ///    所以这条必须按词法看最后一段，不能只靠那两个 API。）
     /// 4. **任何 canonicalize 失败都返回 `BadInput`**，绝不 `unwrap_or_else(原始值)`：
     ///    root 表里有一条解析不了就整体拒绝（失败关闭），拿一把假尺子比等于没有检查。
+    /// 5. **末段存在时整条再 canonicalize 一次**（R279）：父目录那一次展开不到「最后一段
+    ///    自己就是 reparse point」，而写工具与只读工具都会碰到已存在的文件 —— 这道判定
+    ///    归闸门管，不归某个调用者自觉。
     ///
     /// 符号链接 / Windows junction 的逃逸：`canonicalize()` 会解析 reparse point，
-    /// 父目录里任何一层软链都在比对前被展开，因此落到 root 外的会被拒。
-    /// **Task 25 已实测**（R275：junction 标准用户可建，`mklink /J`）：逃逸与
-    /// 「root 本身是链接不得过度收紧」两头由本模块 tests 的
+    /// 父目录里任何一层软链都在比对前被展开，因此落到 root 外的会被拒；末段自己是指针的
+    /// 形状由规则 5 展开。**Task 25 已实测**（R275：junction 标准用户可建，`mklink /J`）：
+    /// 逃逸与「root 本身是链接不得过度收紧」两头由本模块 tests 的
     /// `a_junction_inside_the_root_pointing_outside_is_denied` 与
-    /// `a_root_that_is_itself_a_junction_is_not_over_tightened` 钉住。**文件级符号链接**
-    /// 需开发者模式、本机建不了（实测报「没有足够的权限」）⇒ 该子形态**未实测**；
-    /// 而「最后一段自己是指针」本就归 canonicalize 父目录的设计管不到，由
-    /// `tools/read_file.rs` 在读之前把整条路径二次 canonicalize、交回本函数复验补上。
+    /// `a_root_that_is_itself_a_junction_is_not_over_tightened` 钉住，末段那一头由
+    /// `the_shared_gate_itself_denies_a_final_component_junction` 钉住，规则 2 的另一头
+    /// （新建文件仍要放行）由 `a_new_file_in_an_existing_root_dir_still_resolves` 钉住。
+    /// **文件级符号链接**需开发者模式、本机建不了（实测报「没有足够的权限」）⇒ 该子形态
+    /// **未实测**（同形状的目录 junction 已实测）。
     pub fn resolve_within_roots(&self, raw: &str) -> Result<PathBuf, ToolError> {
         // 规则 4：先整体校验 root 表。
         let mut roots: Vec<PathBuf> = Vec::with_capacity(self.roots.len());
@@ -96,13 +100,44 @@ impl ToolCtx {
         })?;
         let resolved = parent_c.join(file_name);
 
+        // 规则 5（R279）：末段**自己**也可能是指向 root 外的 reparse point，父目录那一次
+        // canonicalize 管不到它。首轮这道防线长在 `read_file.rs` 里（工具拿到闸门结果后再
+        // canonicalize 一次、交回本函数复验）—— 判据是对的，归属是错的：下一个消费者
+        // （`write_file`、任何只读工具）不记得抄一遍，就会穿过末段 junction 读写到 root 外，
+        // 而同一条安全判据不该有两个强度版本。所以现在长在闸门上、所有消费者共用：
+        //   * 末段存在 ⇒ 对**整条** canonicalize；失败按规则 4 拒，落到 root 外按越界拒。
+        //   * 末段不存在 ⇒ 保持规则 2（只 canonicalize 父目录再接回末段）—— 那是「已存在
+        //     目录里建新文件」的合法形状，整条 canonicalize 会把 `write_file` 的新建全判死。
+        // 用 `symlink_metadata` 而不是 `exists()`：它不跟随链接，而 NotFound 之外的错误
+        // （权限等）宁可交给 canonicalize 去报，不在这里降级成「当作不存在」。
+        let guarded = match std::fs::symlink_metadata(&resolved) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => resolved,
+            // 探测本身失败也走这一支：交给下面的 canonicalize 报出真错，不静默放行。
+            _ => resolved.canonicalize().map_err(|err| {
+                ToolError::BadInput(format!("路径无法解析: {}: {err}", resolved.display()))
+            })?,
+        };
+
         // 规则 1/2 的比对：两边都是 canonical 形态（Windows 上是 `\\?\C:\…`，
         // 盘符大小写与前缀形式都由 canonicalize 统一掉），`starts_with` 才是逐组件比。
-        if roots.iter().any(|r| resolved.starts_with(r)) {
-            return Ok(resolved);
+        // 这里的 `roots` 是规则 4 那份**已 canonicalize** 的表，`guarded` 是规则 5 的结果；
+        // 拿 `self.roots`（未 canonicalize）和词法 `p` 比是首轮评审判过的另一个形状。
+        if roots.iter().any(|r| guarded.starts_with(r)) {
+            return Ok(guarded);
         }
         Err(ToolError::BadInput(format!("路径越界: {raw}")))
     }
+}
+
+/// 取 Windows 路径里的盘符前缀（`C:`、`\\?\C:`），统一成小写比较。
+/// 只有测试在用：跨盘符那条夹具的**前提检查**要在，前提不成立时要能跳过而不是造假失败，
+/// 所以 `tools::registry` 与 `tools::read_file` 的测试共用这一把小尺子（R77：不留两份）。
+#[cfg(test)]
+pub(crate) fn drive_of(p: &Path) -> Option<String> {
+    p.components().find_map(|c| match c {
+        std::path::Component::Prefix(x) => Some(x.as_os_str().to_string_lossy().to_lowercase()),
+        _ => None,
+    })
 }
 
 #[async_trait]
@@ -185,7 +220,7 @@ mod tests {
     use crate::agent::types::{Risk, ToolOutput};
     use crate::tools::echo::{EchoTool, RiskOverrideTool};
     use serde_json::json;
-    use std::path::{Component, Path, PathBuf};
+    use std::path::{Path, PathBuf};
     use tokio_util::sync::CancellationToken;
 
     fn tmp_dir(tag: &str) -> PathBuf {
@@ -200,13 +235,6 @@ mod tests {
             cancel: CancellationToken::new(),
             roots,
         }
-    }
-
-    fn drive_of(p: &Path) -> Option<String> {
-        p.components().find_map(|c| match c {
-            Component::Prefix(x) => Some(x.as_os_str().to_string_lossy().to_lowercase()),
-            _ => None,
-        })
     }
 
     // ---- 注册 / 查表 / 执行 ----
@@ -493,8 +521,8 @@ mod tests {
     }
 
     /// 判据（brief Step 1）：**canonicalize 之后的候选路径**必须 starts_with
-    /// **canonicalize 之后的 root**。root 自己也在 :60-65 被 canonicalize（fail-closed
-    /// 循环，Task 25 台账核实：brief「改为对 root 也 canonicalize」一句是 stale，
+    /// **canonicalize 之后的 root**。root 自己也在上面那个 fail-closed 循环里被
+    /// canonicalize（Task 25 台账核实：brief「改为对 root 也 canonicalize」一句是 stale，
     /// 现状已满足）——所以 root 是 junction 时不会被误杀（见正向那条）。
     #[cfg(windows)]
     #[tokio::test]
@@ -539,6 +567,52 @@ mod tests {
             "root 是 junction 时正常路径必须解析成功，实得 {got:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- R279：末段 reparse 的防线搬进闸门（安全归属）----
+
+    /// Important-3 的正解：这道防线**必须长在闸门上**，不是长在某个工具里。
+    /// 首轮 `read_file.rs` 自己补了一次「整条 canonicalize 再交回闸门复验」，评审判它是真防线
+    /// 但归属错了 —— 下一个消费者（`write_file`、任何只读工具）不记得抄一遍，
+    /// 就会经「末段是 junction」读写到 root 外，而同一条安全判据不该有两个强度版本。
+    /// 所以这条**不经任何工具**，直接打 `resolve_within_roots`。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_shared_gate_itself_denies_a_final_component_junction() {
+        let dir = tmp_dir("gate-final-junction");
+        let root = dir.join("root");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"do-not-read").unwrap();
+        make_junction(&root.join("peek"), &outside);
+
+        let err = ctx_with_roots(vec![root.clone()])
+            .resolve_within_roots(root.join("peek").to_str().unwrap())
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::BadInput(m) if m.contains("越界")),
+            "末段自己是 junction 时闸门本身必须拒（不得靠调用者补一次 canonicalize），实得 {err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 搬进去的那条判定**不许**顺手改成「整条 canonicalize」（规则 2 存在的理由）：
+    /// root 内一个还不存在的路径 = `write_file` 要新建文件的形状，必须仍然 `Ok`。
+    #[tokio::test]
+    async fn a_new_file_in_an_existing_root_dir_still_resolves() {
+        let root = tmp_dir("gate-new-file");
+        std::fs::create_dir(root.join("sub")).unwrap();
+        let cand = root.join("sub").join("new.txt");
+        assert!(!cand.exists(), "夹具前提：末段必须还不存在");
+        let got = ctx_with_roots(vec![root.clone()])
+            .resolve_within_roots(cand.to_str().unwrap())
+            .unwrap();
+        assert!(
+            got.starts_with(root.canonicalize().unwrap()),
+            "已存在目录里建新文件的形状必须放行，实得 {got:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// 同上（与 gate 那条一对）：Task 13 要把注册表塞进 `AppState`，
