@@ -711,3 +711,20 @@ hover 按 `mode` 取方向（dark→更亮）这一条实测：ΔL(#c2410c→#d8
 computed style —— jsdom 测不到那一步，留给 T48 一起判。
 体积：4,126,116 B（3.93 MiB），比 §7.1 那次少 1,112 B。
 
+
+---
+
+## 复测（2026-10-24，Plan B 收尾）—— 本文件前文的体积/冷启动/内存读数已过期
+
+Plan B 把 `rmcp`（MCP client）与 `windows` 的三个 JobObject feature 编进了主二进制，
+所以本文件 §1/§3 的数字不再代表今天的产物。新读数与逐项归因见
+`plan-b-slice4-checks.md` §5 与 §7；摘要：
+
+| 指标 | 本文件（旧） | 2026-10-24（Plan B 之后） |
+| --- | --- | --- |
+| NSIS 安装包 | 3.92 MiB | **4.79 MiB**（+21.9%，rmcp + windows features） |
+| 冷启动·窗口句柄（5 次中位） | 111 ms | **110 ms** |
+| 冷启动·Responding（5 次中位） | 132 ms | **138 ms** |
+| 空闲常驻（树 WorkingSet） | 394.4 MB | **416.8 MB**（单次采样） |
+
+结论不变：**<15 MB 体积线与 <1.5 s 冷启动线仍然成立；<150 MB 常驻线仍然不成立**（93% 是 WebView2）。

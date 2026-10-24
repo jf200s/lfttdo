@@ -161,3 +161,25 @@ messages=6
 - 抓包环境已全部还原：`settings.json` 从 `%USERPROFILE%\settings.json.pre-r319` 复回
   （`base_url=http://127.0.0.1:11434/v1`、`model=huihui_ai/qwen3-abliterated:14b-q4_K_M`），
   代理进程与日志已删除，`node.exe` 回到连接前的基线 6 个。
+
+### 7.3 MCP 启动自举（交付前最后一个功能）
+
+「每次打开应用都要手点重连」不是成品行为，所以 T35 之后加了启动自举：`setup` 里
+`app.state::<AppState>()` 取桥与注册表，后台 `mcp_bootstrap` 逐台连接并注册工具
+（串行：首启时并发 npx 下载对磁盘不友好，而自举本来就在后台）。
+
+- 开发构建实测：冷启动后**不做任何点击**，20 s 内 `invoke("mcp_servers")` 给出
+  `[{"name":"everything","status":"ready","tools":16,"trust":"auto","reason":null}]`；
+  控制台同时出现服务器自己的 `Starting default (STDIO) server...`（说明是真握手，不是缓存状态）。
+- **安装产物**实测（`%LOCALAPPDATA%\qwen-do\qwen-do.exe`，由本轮安装包装好）：
+  启动后 `node.exe` 从基线 6 个变为 8 个（MCP 服务器在场）；
+  `taskkill /IM qwen-do.exe`（**不** `/F`，走正常退出）5 秒后回到基线 6 个 ⇒ 安装版也没有孤儿。
+- 交付状态：`mcp.json` 里留着 `server-everything` 作为开箱即用的示例（16 个工具、trust=auto）；
+  删掉这个文件即回到「无可连 server」，面板会显示添加提示。
+
+## 8. 交付产物
+
+| 产物 | 路径 | 大小 |
+| --- | --- | --- |
+| 安装包 | `src-tauri/target/release/bundle/nsis/qwen-do_0.1.0_x64-setup.exe` | **4.79 MiB / 5,024,953 B** |
+| 已安装 | `%LOCALAPPDATA%\qwen-do\qwen-do.exe` | 14,366,720 B |
