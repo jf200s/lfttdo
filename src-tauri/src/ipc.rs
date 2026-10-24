@@ -723,6 +723,26 @@ pub async fn mcp_reconnect_of(
     Ok(count)
 }
 
+/// 启动时的 MCP 自举：按 `mcp.json` 逐台连接并注册工具。
+///
+/// 为什么要有它：没有这一步，用户每次打开应用都得先进面板点「重连」，否则模型看不到
+/// 任何 MCP 工具——那不是一个成品该有的行为。逐台串行（复用 `mcp_reconnect_of`）而不是
+/// `connect_all`：后者会并发起 N 个 npx，首启时同时下载/解压对磁盘和日志都不友好，
+/// 而自举本来就在后台，慢几秒没人等它。
+pub async fn mcp_bootstrap(
+    bridge: &Arc<McpBridge>,
+    registry: &ToolRegistry,
+    servers: Vec<ServerDef>,
+) -> Vec<(String, Result<usize, String>)> {
+    let mut out = Vec::with_capacity(servers.len());
+    for def in servers {
+        let name = def.name().to_string();
+        let result = mcp_reconnect_of(bridge, registry, def).await;
+        out.push((name, result));
+    }
+    out
+}
+
 #[tauri::command]
 pub fn mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerView>, String> {
     let cfg = crate::mcp::config::load(&state.mcp_dir);
@@ -1118,6 +1138,7 @@ pub fn run() {
             // Task 27 起生产表里有两把工具（见 `build_production_registry`），两把都是
             // `Risk::Read` ⇒ 自动放行仍然成立、用户侧仍然零弹窗；而 sink 还没换上的窗口里
             // `check` 给的是 deny（R44：headless ≠ 全授权）。
+            let mcp = Arc::new(McpBridge::new());
             app.manage(AppState {
                 db,
                 settings,
@@ -1128,8 +1149,24 @@ pub fn run() {
                 log_path,
                 // T35：桥在装配期建好（此时不 spawn 任何进程，`connect_all` 才连）；
                 // `mcp_dir` 就是 `mcp.json` 所在的 app data 目录。
-                mcp: Arc::new(McpBridge::new()),
+                mcp,
                 mcp_dir: dir.clone(),
+            });
+            // 后台自举：句柄从刚装好的 State 里取（保持装配行仍是唯一一条
+            // `registry: build_production_registry()` —— 那条守卫测试盯着它）。
+            let managed = app.state::<AppState>();
+            let (bootstrap_bridge, bootstrap_registry, bootstrap_dir) = (
+                managed.mcp.clone(),
+                managed.registry.clone(),
+                managed.mcp_dir.clone(),
+            );
+            // 不挡窗口出现（冷启动 110ms 那条线不受影响），失败只落状态台账。
+            tauri::async_runtime::spawn(async move {
+                let cfg = crate::mcp::config::load(&bootstrap_dir);
+                if cfg.servers.is_empty() {
+                    return;
+                }
+                let _ = mcp_bootstrap(&bootstrap_bridge, &bootstrap_registry, cfg.servers).await;
             });
             // T46b：几何恢复放在 `manage` 之后、`Ok(())` 之前——`app_data_dir()` 与
             // `create_dir_all` 已经在前头跑过，存档目录这时一定存在。
@@ -2796,6 +2833,12 @@ mod tests {
             v[0].reason.as_deref(),
             Some("spawn 失败：program not found")
         );
+    }
+
+    #[tokio::test]
+    async fn an_empty_mcp_config_bootstraps_to_nothing() {
+        let out = mcp_bootstrap(&Arc::new(McpBridge::new()), &ToolRegistry::new(), vec![]).await;
+        assert!(out.is_empty(), "没有配置就不许 spawn 任何东西");
     }
 
     #[test]
