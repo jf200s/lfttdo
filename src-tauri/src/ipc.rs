@@ -1589,10 +1589,12 @@ mod tests {
         // 生产那只在 :915 的 `ToolRegistry::new()` 一行不动 —— 注册是 Task 27 的事。
         f.registry.register(spy.clone());
 
-        // 两条真目录 + 一条**不存在**的路径，原样塞进 `TurnDeps.roots` —— 那是设置文件里的
-        // 形状（R284 之后读写两侧不再裁盘，所以到这一层的表就是用户写的那份）。把不存在的那条
-        // 塞进来是故意的，它就是 Important-1 的现场：用户拔了 U 盘，那条 root 照旧在设置里，
-        // 但这一轮不许把它交给闸门 —— 规则 4 会整体拒绝，连带让别的合法 root 也读不到东西。
+        // 两条真目录 + 一条**不存在**的路径 + 一条**相对**路径，原样塞进 `TurnDeps.roots` ——
+        // 那是设置文件里的形状（R284 之后读写两侧不再裁盘，所以到这一层的表就是用户写的那份）。
+        // 把不存在的那条塞进来是故意的，它就是 Important-1 的现场：用户拔了 U 盘，那条 root 照旧在
+        // 设置里，但这一轮不许把它交给闸门 —— 规则 4 会整体拒绝，连带让别的合法 root 也读不到东西。
+        // 相对那条钉的是 R285 的**使用点**一半：`"."` 是解得开的（就解在进程 CWD 上），
+        // 所以只有绝对性这条判据能拦住它，而拦住它的地方必须是交闸门之前，不只是 settings 层。
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
         let ghost = a.path().join("never-created");
@@ -1600,6 +1602,7 @@ mod tests {
             a.path().to_path_buf(),
             b.path().to_path_buf(),
             ghost.clone(),
+            PathBuf::from("."),
         ];
 
         let model = Arc::new(Scripted {
@@ -1646,7 +1649,10 @@ mod tests {
             ],
             "交到执行点的必须是**有效表**（绝对 + 解得开 + canonical 形态），不是设置文件里 \
              那份原表；这一条同时守住 R276 的单一入口 —— 删掉 `run_turn` 里 `.with_roots(..)` \
-             那一行，这里就空了；实得 {:?}（原表 {:?}）",
+             那一行，这里就空了。夹具里那条 `\".\"` 钉的是绝对性：它 canonicalize 得开（就解在进程 \
+             CWD 上），所以拦得住它的只有「绝对」这一条判据（R285），而拦截必须发生在交闸门之前 —— \
+             删掉 `effective_roots` 里的 `is_absolute()`，这里就多出一条 `\\\\?\\<进程 CWD>`，\
+             等于程序替用户选了一个他没指过的目录；实得 {:?}（原表 {:?}）",
             seen[0],
             roots
         );

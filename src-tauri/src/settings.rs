@@ -424,7 +424,9 @@ fn lexical_root(r: &Path) -> PathBuf {
 /// 2. `canonicalize()` 成功。一个系统调用同时做完三件事：展开符号链接/junction、判它**在不在**、
 ///    把盘符大小写 / 尾斜杠这些写法差异统一成同一种形态 —— 于是交给闸门的和闸门
 ///    （`registry.rs::resolve_within_roots` 规则 4）比的是**同一种形状**。
-/// 3. 过了两道判据的按 canonical 形态去重、保留首次出现的顺序（上一版的第 3 步原样搬到这里）。
+///
+/// 过了这两条的，再按 canonical 形态去重、保留首次出现的顺序（这一句不是第三条判据，
+/// 是判据之后的整理 —— 上一版的第 3 步原样搬到这里）。
 ///
 /// 为什么相对路径**永远**不算有效（R285）：相对路径是按**进程 CWD** 落地的，而 Tauri 起在哪个
 /// 目录不是用户能预测的，所以「用户写的 `notes`」和「程序解出的 `<CWD>\notes`」是两回事。
@@ -1874,6 +1876,77 @@ mod tests {
         let mut again = s.clone();
         again.normalize();
         assert_eq!(again.roots, s.roots, "词法归一必须幂等");
+    }
+
+    /// R284 的这条半边：词法整理**只收冗余，不砍根**。为什么值得单独钉 ——
+    /// `lexical_root` 用 `components()` 而不是 `trim_end_matches(分隔符)` 的理由就写在它自己的
+    /// 注释里（`C:\` 砍成 `C:` 指的是「C 盘的当前目录」，`/` 砍成空串指的是相对路径），
+    /// 而一份**理由**不是一条**证据**：换成naive trim 之后上面那条去重测试照样绿
+    /// （它用的 tempdir 不是盘根），只有拿盘根去量才量得出来。
+    /// UNC 那条钉的是「别把绝对收成相对」：`\\nas\books` 归一后可能多个尾分隔符（评审 Minor-2
+    /// 实测的 `components()` 重序列化形状），但它必须**仍然绝对** —— 变成 `nas\books` 就是
+    /// 把用户指过的一条 root 换成一条相对路径，而相对路径按 R285 永远不算有效，
+    /// 症状是「用户明明写了 UNC 目录，read_file 却读不到」。
+    #[test]
+    fn the_lexical_shape_normalizes_redundancy_without_chopping_a_root() {
+        let sep = std::path::MAIN_SEPARATOR;
+        // ① 根本身：一条只有「盘符 + 分隔符」的 root 不许被砍成「盘符 + 当前目录」。
+        let drive_root = if cfg!(windows) {
+            PathBuf::from(format!("C:{sep}"))
+        } else {
+            PathBuf::from("/")
+        };
+        let out = dedupe_roots(&[drive_root.clone()]);
+        assert_eq!(
+            out.len(),
+            1,
+            "根是一条 root，去重不许把它凭空抹掉；实得 {out:?}"
+        );
+        assert_eq!(
+            out[0], drive_root,
+            "根必须逐字留形：砍掉尾分隔符就换了所指（`C:` 是 C 盘的当前目录，不是 C 盘根）；\
+             实得 {out:?}"
+        );
+        assert!(
+            out[0].is_absolute(),
+            "归一之后还得是**绝对**路径，否则这一条按 R285 就永远进不了使用表；实得 {:?}",
+            out[0]
+        );
+        // ② 冗余分隔符收进同一条：三种写法必须**收敛**，否则「同一条目录写两遍」会真的占两格。
+        let dir = tempfile::tempdir().unwrap();
+        let one = format!("{}", dir.path().display());
+        let doubled = dedupe_roots(&[
+            PathBuf::from(&one),
+            PathBuf::from(format!("{one}{sep}")),
+            PathBuf::from(format!("{one}{sep}{sep}")),
+        ]);
+        assert_eq!(
+            doubled.len(),
+            1,
+            "同一条目录的三种写法（无尾、单尾、双尾分隔符）必须收敛成一条；实得 {doubled:?}"
+        );
+        // ③ UNC：可能补上尾分隔符（已接受的重序列化形状），但**不许**收成相对。
+        #[cfg(windows)]
+        {
+            let unc = PathBuf::from(r"\\nas\books");
+            let once = dedupe_roots(&[unc.clone()]);
+            assert_eq!(
+                once.len(),
+                1,
+                "UNC 是一条 root，不该和别的东西撞上；实得 {once:?}"
+            );
+            assert!(
+                once[0].is_absolute(),
+                "UNC 归一后必须仍然绝对（丢掉 `\\\\` 前缀就变成相对路径，从此永远不算有效）；\
+                 实得 {:?}",
+                once[0]
+            );
+            assert_eq!(
+                dedupe_roots(&once),
+                once,
+                "词法归一对 UNC 也得是定点：存一次盘、形状自己变一次就是脏；实得 {once:?}"
+            );
+        }
     }
 
     /// R285：相对路径的 root **永远不算有效** —— 它按**进程 CWD** 落地，而 Tauri 起在哪个
