@@ -28,6 +28,11 @@ pub const MCP_FILE: &str = "mcp.json";
 ///
 /// **没有 `#[derive(Debug)]`**（Step 3 / R294）：derive 会把 `env`/`headers` 的明文值
 /// 打进任何 `{:?}`。先例：`settings.rs` 的 `SettingsError`、`openai_compat.rs` 的 `ModelConfig`。
+///
+/// `Clone` 是 T34 加的：连接闭包要**拥有**一份配置才能把 `connect_stdio` 的 future 变成 `'static`
+/// （`connect_all_with` 的可注入闭包按 `BoxFuture<'static, _>` 收）。它不泄露任何东西——
+/// clone 出来的 `ServerDef` 与原来走同一套手写 `Debug`。
+#[derive(Clone)]
 pub enum ServerDef {
     Stdio {
         name: String,

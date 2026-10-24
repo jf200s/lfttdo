@@ -106,3 +106,32 @@ T31 把 `rmcp` 从 `[dev-dependencies]` 挪进 `[dependencies]`（桥是产品�
 - 真实网络故障下的错误文案（只测了「解析不到」与「对端不回」两条，都是注入的）。
 - 并发多 server 的真机握手（单测用注入的 300 ms 超时腿覆盖了隔离与超时；真 npx 只跑了一条）。
 - 安装包体积 / 冷启动（见 §6）。
+
+## §7 T34：JobObject 带走三层树（`examples/mcp_kill_probe.rs`）
+
+```text
+CMD_PID=16128
+NODE_PID=19920
+PING_PID=34924
+ALIVE_BEFORE[16128]=true
+ALIVE_BEFORE[19920]=true
+ALIVE_BEFORE[34924]=true
+KILL_ALL_OK in 313 ms
+```
+
+- 形状与真 npx 同层：`cmd.exe → node.exe → ping.exe`。`drop(job)` 之后三个 pid **全部**消失，
+  313 ms。这正是 `taskkill /T /F` 当年做不到的那件事（findings/plan-a-risk-verification.md:649-694）。
+- 同一结论在单测 `mcp::process::dropping_the_job_takes_the_whole_tree_with_it` 里也跑了一遍
+  （直接子进程层面），两条证据互不冒充：单测证明「代码路径真的 assign 了」，探针证明「祖孙三代一起走」。
+- **为什么连应用退出也不用写收尾代码**：`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 是内核语义 ——
+  进程死亡时所有句柄自动关闭，job 随之关闭，树被终止。即使 `AppState` 的 `Drop` 没跑、即使
+  Tauri 的退出路径直接把进程干掉，这条都成立。**这是它相对 `taskkill` 的本质差别**：
+  不是「我们记得清理」，而是「内核替我们清」。
+- 残余风险：如果某个孙进程自己用 `CREATE_BREAKAWAY_FROM_JOB` 跳出 job（它得先有权），
+  job 管不到 —— 不在本项目的威胁模型里（server 是我们配置里自己写的程序）。
+
+### 失败策略（R323）
+
+`create_kill_job()` / `assign()` 任何一步失败 ⇒ 这条 server `Disconnected`，**不是**「不带 job 直接 spawn」。
+`connect_all` 在建 job 就失败时会把**整批**标成 `Disconnected { reason }` 并返回（一条都不 spawn）。
+「拿不到 job 就静默退化」正是「关窗后 npx 堆积」的成因，这条在代码注释与测试名里都写着。

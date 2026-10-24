@@ -113,3 +113,13 @@ rand = "0.9"
 [target."cfg(windows)".dependencies]
 keyring-core = "1.0.1"
 windows-native-keyring-store = "1.1.0"
+# T34 / R322：JobObject 的进程树回收。`windows` 0.62.2 本来就在 Cargo.lock 里（Tauri 的传递依赖），
+# 这里只是把它提成直接依赖并**只开三个 feature**（Foundation / Threading / JobObjects）；
+# 不新增任何 crate，代价是编译这两个模块。手写 `extern "system"` 也能做，但
+# `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 的嵌套布局写错时是**静默失败**（SetInformationJobObject
+# 收一个 void* + 长度），核对成本高于直接用它。
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+] }

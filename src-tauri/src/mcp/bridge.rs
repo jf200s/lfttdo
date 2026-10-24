@@ -516,6 +516,8 @@ struct Slot {
 /// 与 T29 的字典序、T30 R302 的「稳定喂入序」同一条链。
 pub struct McpBridge {
     slots: std::sync::Mutex<std::collections::BTreeMap<String, Slot>>,
+    /// 进程树回收的 job（T34）：一条桥一个，所有 MCP 子进程共享。`None` = 还没连过或建失败。
+    job: std::sync::Mutex<Option<std::sync::Arc<crate::mcp::process::KillOnCloseJob>>>,
 }
 
 impl Default for McpBridge {
@@ -528,6 +530,7 @@ impl McpBridge {
     pub fn new() -> Self {
         Self {
             slots: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            job: std::sync::Mutex::new(None),
         }
     }
 
@@ -576,9 +579,36 @@ impl McpBridge {
     /// 并行连接（R308）：结果顺序 = 输入顺序；一条失败不影响其余。
     pub async fn connect_all(&self, servers: &[ServerDef]) -> Vec<(String, Result<usize, String>)> {
         let names: Vec<String> = servers.iter().map(|s| s.name().to_string()).collect();
-        let make = |name: &str| -> BoxFuture<'_, Result<Handshake, String>> {
-            match servers.iter().find(|def| def.name() == name) {
-                Some(def) => Box::pin(connect_stdio(def)),
+        // T34：先建**一个** kill-on-close job，所有子进程共享；建不出来就整批 Disconnected，
+        // **绝不**退化成「不带 job 直接 spawn」（R323）。
+        let job = match crate::mcp::process::create_kill_job() {
+            Ok(job) => std::sync::Arc::new(job),
+            Err(reason) => {
+                for name in &names {
+                    self.set_status(
+                        name,
+                        ServerStatus::Disconnected {
+                            reason: reason.clone(),
+                        },
+                    );
+                }
+                return names.into_iter().map(|name| (name, Err(reason.clone()))).collect();
+            }
+        };
+        *crate::lock::guard(&self.job) = Some(job.clone());
+
+        // `'static` future：闭包按名字 clone 一份配置、job 用 `Arc` 带进去 ⇒ 返回的 future
+        // 不借用任何局部变量（`ServerDef` 因此需要 `Clone`）。
+        let defs: std::collections::BTreeMap<String, ServerDef> = servers
+            .iter()
+            .map(|def| (def.name().to_string(), def.clone()))
+            .collect();
+        let make = move |name: &str| -> BoxFuture<'static, Result<Handshake, String>> {
+            match defs.get(name).cloned() {
+                Some(def) => {
+                    let job = job.clone();
+                    Box::pin(async move { connect_stdio(&def, &job).await })
+                }
                 None => Box::pin(async { Err("配置里没有这条 server".to_string()) }),
             }
         };
@@ -592,11 +622,11 @@ impl McpBridge {
 
     /// `connect_all` 的可注入内核（R308/R305）：超时与「怎么建一条连接」都是参数。
     /// T36 的 HTTP 传输只需要换掉 `make`，状态台账与并行/隔离语义原样复用。
-    pub async fn connect_all_with<'a>(
-        &'a self,
+    pub async fn connect_all_with(
+        &self,
         names: &[String],
         timeout: std::time::Duration,
-        make: &(dyn Fn(&str) -> BoxFuture<'a, Result<Handshake, String>> + Sync + 'a),
+        make: &(dyn Fn(&str) -> BoxFuture<'static, Result<Handshake, String>> + Sync),
     ) -> Vec<(String, Result<usize, String>)> {
         for name in names {
             self.set_status(name, ServerStatus::Connecting);
@@ -697,11 +727,19 @@ impl McpBridge {
 
 /// 真 stdio 连接（R309）：pid 必须在 `.serve()` **消费** transport 之前取出来
 /// （`TokioChildProcess::id()`，rmcp `transport/child_process.rs:72`；3.5.1 没有 `process_handle()`）。
-async fn connect_stdio(def: &ServerDef) -> Result<Handshake, String> {
+async fn connect_stdio(
+    def: &ServerDef,
+    job: &crate::mcp::process::KillOnCloseJob,
+) -> Result<Handshake, String> {
     let plan = spawn_command(def, &resolve_program_in_path)?;
     let child = TokioChildProcess::new(plan.into_command())
         .map_err(|e| trim_reason(format!("启动 `{}` 失败：{e}", def.name())))?;
     let pid = child.id();
+    // T34：pid 是唯一能把它放进 job 的时刻（`.serve()` 会消费 transport，之后拿不到）。
+    // 放不进 job ⇒ 这条不连：一条不受管的长命 node 树比连不上更难收拾（R323）。
+    if let Some(pid) = pid {
+        job.assign(pid).map_err(trim_reason)?;
+    }
     let (tools, service) = handshake(child).await?;
     Ok(Handshake {
         pid,
