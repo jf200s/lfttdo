@@ -9,6 +9,11 @@
 // 脱敏红线（R294）：`env`/`headers` 的值一律打码为固定 `"***"`（键名留着排查），
 // 不复用 `settings.rs` 的 `mask_key` —— 那「前 4 + … + 后 4」的 8 个字符对第三方令牌
 // 是真泄露。`url` 的 userinfo 也遮（R295）。`Debug` 全部手写，一处 `derive(Debug)` 都不许有。
+//
+// 失败分层（R296）：条目级失败进 `skipped`，值域固定**五条** —— 「名字为空」「command 为空」
+// 「没有 command 也没有 url」「同名重复」「字段类型不对」；`parse_error` 从此只管**整份文件坏**
+// （JSON 语法坏、根不是对象、`mcpServers` 不是对象）。一个条目里的字段类型写错
+// （`"args": "-y"` 少写方括号，手抄配置的常规形态）不许把其余条目一起清零。
 
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
@@ -81,14 +86,17 @@ impl ServerDef {
 }
 
 /// 一次读取的全部结果（R290：三字段，不是一个）。
-/// 没有 `Serialize`、没有任何会回吐原值的 API；`parse_error` 只放 serde_json 的错误摘要。
+/// 没有 `Serialize`、没有任何会回吐原值的 API。
+/// `parse_error` 只管**整份文件坏**（R296：JSON 语法坏 / 根不是对象 / `mcpServers` 不是对象，
+/// 外加非 NotFound 的读失败）；条目级坏走 `skipped`，绝不升级到这里。
 pub struct McpConfig {
     pub servers: Vec<ServerDef>,
     pub skipped: Vec<Skipped>,
     pub parse_error: Option<String>,
 }
 
-/// 被跳过的条目台账。`reason` 用 `&'static str`（R290/R292：值域是固定四条，
+/// 被跳过的条目台账。`reason` 用 `&'static str`（R290/R292 + R296：值域是固定五条 ——
+/// 「名字为空」「command 为空」「没有 command 也没有 url」「同名重复」「字段类型不对」，
 /// 措辞必须可枚举，给台账与 T35 界面直接摆出来用）。
 pub struct Skipped {
     pub name: String,
@@ -194,7 +202,8 @@ impl std::fmt::Debug for Skipped {
 }
 
 /// 判别 `command`/`url` 用中间结构体，不用 `#[serde(flatten)]`（简报 §三·4：flatten +
-/// untagged 会把「两个字段都没有」和「字段类型不对」揉成同一个错，毁掉 R292 的四条 reason）。
+/// untagged 会把「两个字段都没有」和「字段类型不对」揉成同一个错，毁掉 R292 + R296 的五条 reason
+/// —— 「字段类型不对」这一条正是靠「先收 `Value`、再逐条 `from_value`」单独可见才钉得住的）。
 /// 未知字段**忽略**（向前兼容，与 R91 同取向；Claude/Cline/Roo 各家还有 `disabled`、
 /// `alwaysAllow`、`type` 之类的键，拒了就等于读不了别人的配置）。
 #[derive(Deserialize, Default)]
@@ -215,6 +224,10 @@ struct RawServer {
 /// 唯一名时结果与 BTreeMap 遍历序逐字相同（简报 §三·3 钉的字典序语义不变，
 /// `servers_follow_alphabetical_order_not_written_order` 仍绿），重复名时保留出现序
 /// （稳定排序不动第一条 ⇒ 「留第一条」）。冲突与取舍详见 task-29 报告。
+///
+/// R296：值这一侧存 `serde_json::Value` 而**不是** `RawServer` —— 逐对收集时就把类型转换
+/// 推迟给 `load` 里的**逐条** `from_value`，这样「某一条的字段类型写错」只杀掉那一条
+/// （进 `skipped`），不会像整体 `from_str::<RawFile>` 那样把整份文件的条目一起清零。
 #[derive(Deserialize)]
 struct RawFile {
     #[serde(
@@ -222,17 +235,19 @@ struct RawFile {
         default,
         deserialize_with = "deserialize_servers"
     )]
-    servers: Vec<(String, RawServer)>,
+    servers: Vec<(String, serde_json::Value)>,
 }
 
-fn deserialize_servers<'de, D>(deserializer: D) -> Result<Vec<(String, RawServer)>, D::Error>
+fn deserialize_servers<'de, D>(
+    deserializer: D,
+) -> Result<Vec<(String, serde_json::Value)>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     struct ServersVisitor;
 
     impl<'de> serde::de::Visitor<'de> for ServersVisitor {
-        type Value = Vec<(String, RawServer)>;
+        type Value = Vec<(String, serde_json::Value)>;
 
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("an mcpServers object mapping names to server definitions")
@@ -243,7 +258,9 @@ where
             mut map: A,
         ) -> Result<Self::Value, A::Error> {
             let mut entries = Vec::new();
-            while let Some(entry) = map.next_entry::<String, RawServer>()? {
+            // 值先收成 `Value`：类型对不对是**条目级**的事，交给 `load` 逐条判（R296），
+            // 这一层只管「`mcpServers` 是不是对象」与「重复键也要留下」。
+            while let Some(entry) = map.next_entry::<String, serde_json::Value>()? {
                 entries.push(entry);
             }
             Ok(entries)
@@ -299,8 +316,10 @@ pub fn load(dir: &impl AsRef<Path>) -> McpConfig {
     // 重复名时保留出现序 ⇒ 「留第一条」成立（见 RawFile 上的冲突记录）。
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, entry) in entries {
-        // 条目级失败的四条 reason（R292，逐字；值域封闭，第五种形态「整体 JSON 坏」
-        // 走 parse_error，不进 skipped）。判定序：名字 → 内容 → 同名。
+        // 条目级失败的五条 reason（R292 的四条逐字未动 + R296 的「字段类型不对」；值域封闭）。
+        // 判定序不变：名字 → 内容（类型 → 有无 → 空串）→ 同名。
+        // 「整份文件坏」（JSON 语法、根不是对象、`mcpServers` 不是对象）才走 `parse_error`，
+        // 一条坏条目的 serde 错误**不许**升级成文件级（R296）。
         if name.is_empty() {
             skipped.push(Skipped {
                 name,
@@ -308,6 +327,15 @@ pub fn load(dir: &impl AsRef<Path>) -> McpConfig {
             });
             continue;
         }
+        // R296：逐条转换。这一条的字段类型写错（如 `"args": "-y"`）只杀掉这一条，
+        // 其余条目照常；serde 的具体文案不进 `parse_error`（那是文件级的通道）。
+        let Ok(entry) = serde_json::from_value::<RawServer>(entry) else {
+            skipped.push(Skipped {
+                name,
+                reason: "字段类型不对",
+            });
+            continue;
+        };
         let def = if let Some(command) = entry.command {
             if command.is_empty() {
                 skipped.push(Skipped {
@@ -440,6 +468,25 @@ mod tests {
         assert_eq!(empty_cmd.skipped[0].reason, "command 为空");
     }
 
+    // R296：一个条目里的字段类型写错（`"args":"-y"`，少写方括号 —— 用户手抄配置时的常规错误形态，
+    // 不是理论形态）不许把整份 `mcp.json` 清零。控制器实测过的红读数见 task-29 报告「修复轮 1」。
+    #[test]
+    fn one_bad_field_type_does_not_sink_the_other_servers() {
+        let c = load_json(
+            r#"{ "mcpServers": {
+          "ok1": {"command":"a"}, "broken": {"command":"b","args":"-y"}, "ok2": {"url":"https://x/y"} }}"#,
+        );
+        assert_eq!(c.servers.len(), 2, "坏的那条被隔离，好的两条必须活下来");
+        assert_eq!(c.skipped.len(), 1);
+        assert_eq!(c.skipped[0].name, "broken");
+        assert_eq!(c.skipped[0].reason, "字段类型不对");
+        assert!(
+            c.parse_error.is_none(),
+            "条目级失败不许升级成文件级：{:?}",
+            c.parse_error
+        );
+    }
+
     #[test]
     fn debug_never_prints_env_or_headers() {
         let s = ServerDef::Stdio {
@@ -504,5 +551,20 @@ mod tests {
         );
         let after = names(dir.path());
         assert_eq!(before, after, "load 不许动目录里的任何文件");
+    }
+
+    // R297：`load` 里 `Err(e) if e.kind() != NotFound` 那一支（非 NotFound 的读失败 ⇒
+    // `parse_error` 摘要、不 panic）是上一轮自己新增的判断（报告 J8），这一条给它补判据。
+    // 造失败用的是「mcp.json 位置上放一个目录」：Windows 上 `read_to_string` 给 `PermissionDenied`
+    // （os error 5），Linux 上给 `Is a directory` —— 两边都不是 `NotFound`，所以两台机器走同一支。
+    // 断言**不比错误文案**（跨平台不同），只钉「不 panic + servers 空 + parse_error 非空」。
+    #[test]
+    fn a_directory_named_mcp_json_yields_a_parse_error_not_a_panic() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("mcp.json")).unwrap();
+        let c = load(&dir);
+        assert!(c.servers.is_empty());
+        let e = c.parse_error.expect("读失败要有摘要，不许静默");
+        assert!(!e.is_empty(), "摘要不许是空串：{e:?}");
     }
 }
