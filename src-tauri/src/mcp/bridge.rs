@@ -134,9 +134,12 @@ pub fn spawn_command(
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Result<SpawnPlan, String> {
     let Some(command) = def.command() else {
-        // 本层只做 stdio（HTTP 传输归 T36）；这条不是「坏了」，是「不归这里」，文案要认得出来。
+        // T36 的**显式降级**（R325）：`transport-streamable-http-client` 会再引入一层
+        // HTTP 栈（`sse-stream`/`http`/`bytes`，并可能要 `reqwest/stream`），本构建没有启用。
+        // 明确降级比悄悄拖大安装包好（plan :1374 的原话）；用户配了 url 会看到这句原因，
+        // 而不是一个难读的 connect 超时。
         return Err(format!(
-            "{} 没有 command：stdio 桥只接 stdio server，HTTP 传输归 T36",
+            "{} 是 HTTP 传输：此构建未启用 HTTP 传输（stdio 之外的 server 暂不可用）",
             def.name()
         ));
     };
@@ -1330,6 +1333,26 @@ mod tests {
             render_for_assert(&output),
             "echo:search",
             "server 的原话要原样到模型；同时证明参数走的是原始工具名"
+        );
+    }
+
+    #[test]
+    fn an_http_server_reports_the_explicit_http_degradation() {
+        // R325：本构建不启用 HTTP 传输 ⇒ 必须是「一条指名原因的 Disconnected」，
+        // 不是 panic、不是一个难读的 connect 超时。
+        let def = ServerDef::Http {
+            name: "remote".into(),
+            url: "https://example.test/mcp".into(),
+            headers: HashMap::new(),
+        };
+        let err = spawn_command(&def, &|_: &str| None).expect_err("HTTP 条目选型必须失败");
+        assert!(
+            err.contains("未启用 HTTP 传输"),
+            "原因要认得出来是构建能力问题：{err}"
+        );
+        assert!(
+            err.chars().count() <= 200,
+            "仍然受 200 char 上限约束：{err}"
         );
     }
 
