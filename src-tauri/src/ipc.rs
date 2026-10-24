@@ -12,7 +12,7 @@ use crate::agent::types::{ContentBlock, Message};
 use crate::model::openai_compat::{OpenAiCompat, is_loopback_endpoint};
 use crate::model::provider::ModelProvider;
 use crate::permission::gate::PermissionGate;
-use crate::settings::{Settings, SettingsStore};
+use crate::settings::{Settings, SettingsStore, effective_roots};
 use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::tools::registry::ToolRegistry;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
@@ -267,6 +267,9 @@ pub struct TurnDeps {
     /// 路已经有 builder 方法 `AgentSession::with_roots`（`session.rs:86`），两处都能收 roots
     /// 就是「一个设置两个门」，两边给的值可以不一致而没人报错。R276 因此把它钉成一条线：
     /// `TurnDeps.roots` → `.with_roots(...)` → `ToolCtx.roots`，只此一处。
+    /// T26 修复轮 1（R284）：这一项交的是**用户写的那份原表**（读写两侧不再裁盘），
+    /// 「今天哪几条解得开」由 `run_turn` 在 `.with_roots(..)` 那一处经
+    /// `settings::effective_roots` 现算 —— 使用点是文件系统依赖的唯一落点。
     /// 空表是**允许值**而且是默认值：那时 `read_file` 一律拒绝，那是设计（R90 取向），
     /// 不是这一层漏了什么。
     pub roots: Vec<PathBuf>,
@@ -427,10 +430,12 @@ pub async fn run_turn(
     // T26（R276）：**全仓库唯一一处**调用 `AgentSession::with_roots` 的生产代码。
     // 在它之前这一行不存在，于是 `ToolCtx.roots` 恒空、T25 的 `read_file` 对任何路径都
     // fail-closed —— 缺陷不补，切片 3 交付的第二个工具就是死的。
-    // 表**原样**交下去，这里一处也不过滤：过滤（去重、丢不存在项、canonicalize）只住在
-    // `settings.rs::normalize_roots`，读盘与落盘各跑一次。第二处过滤意味着两处答案
-    // 可以不一致，而那正是 R276 把它钉成一条线的原因。
-    .with_roots(roots);
+    // T26 修复轮 1（R284）：这里拿的是**有效表**，不是 `TurnDeps.roots` 那份原表。
+    // 文件系统依赖的裁剪（绝对性 + canonicalize）从读写两侧搬到了这个使用点，每轮现算一次
+    // （R276 的「每轮从 `Settings` 现取、不缓存」因此更硬了：今天的答案只在今天有效）。
+    // 过滤仍然**只此一处** —— `settings.rs::effective_roots` 是它的唯一实现，本行是它唯一的
+    // 生产调用点；第二处过滤意味着两处答案可以不一致，那正是 R276 把它钉成一条线的原因。
+    .with_roots(effective_roots(&roots));
     let session_cancel = session.cancel_handle();
     token.install(session_cancel.clone());
     if compaction.is_cancelled() {
@@ -552,9 +557,11 @@ pub async fn send_message(
             temperature,
             // T26（R276）：roots 和上面两项同源 —— 同一个 `store.load()` 的每一轮现取，
             // 因此**用户改完设置发下一条消息就生效**，这里没有任何缓存可以过期。
+            // R284：交的是设置文件里那份**原表**（不再是在读盘时被裁过的），裁剪在
+            // `run_turn` 的 `.with_roots(..)` 那一处、每轮一次。
             // 这一行没法单测（`#[tauri::command]` 在单测里调不动，见本模块测试头 R103 段
             // 的说明）：它保证的是「来源是本轮那份 `Settings`」，而「值真的抵达 `ToolCtx`」
-            // 由下面的 `run_turn_hands_the_settings_roots_to_the_session` 钉。
+            // 由下面的 `run_turn_hands_the_effective_roots_not_the_persisted_list` 钉。
             roots: settings.roots.clone(),
             cancel: state.cancel.clone(),
         },
@@ -1474,14 +1481,16 @@ mod tests {
         );
     }
 
-    // ==== Task 26：装配层真的把 settings.roots 交给了会话（R276 的唯一入口）====
+    // ==== Task 26：装配层真的把**有效表**交给了会话（R276 的唯一入口 + R284 的使用点）====
     //
     // 为什么这条测试非得住在 ipc 里：`session.rs` 那条
     // `run_turn_passes_configured_roots_into_tool_ctx` 量的是 `AgentSession::with_roots`
     // **这个方法本身**能用；而本任务修的是「它在生产里从未被调用」。把 `run_turn` 里
-    // `AgentSession::new(..).with_roots(roots)` 那一行删掉（现 :433），`session.rs` 全绿、
-    // `settings.rs` 全绿，只有这里红 ——
+    // `AgentSession::new(..).with_roots(effective_roots(&roots))` 那一行删掉（现 :438），
+    // `session.rs` 全绿、`settings.rs` 全绿，只有这里红 ——
     // 判据必须能被打红，不然它不构成一条线（R56 的老规矩）。
+    // R284 之后这里还多钉一件事：把那一行的 `effective_roots(&roots)` 换回 `roots`，
+    // 同一处当场红（够不着的那条 root 就又能把闸门整体拖死了）。
     //
     // 取证方式和 `session.rs` 那边一致：从**工具自己手里**读 `ctx.roots`。`ToolCtx` 是
     // 会话内部造的（`session.rs:123`），从 `AgentSession` 的字段读回来属于自证。
@@ -1567,9 +1576,12 @@ mod tests {
         ]
     }
 
-    /// brief Step 5 的生产侧那条线：`TurnDeps.roots` 必须一路走到 `ToolCtx.roots`。
+    /// brief Step 5 的生产侧那条线：`TurnDeps.roots`（= 用户写的那张表）必须**在交给会话的
+    /// 那一刻**被裁成有效表，然后一路走到 `ToolCtx.roots`。R284 把「这条今天还在不在」的
+    /// 判定从读写两侧搬到这里，所以这条测试钉的两件事是：**使用点裁剪**和 **R276 的单一入口**
+    /// —— 把 `run_turn` 里 `.with_roots(..)` 那一行删掉这里当场红（表变空）。
     #[tokio::test]
-    async fn run_turn_hands_the_settings_roots_to_the_session() {
+    async fn run_turn_hands_the_effective_roots_not_the_persisted_list() {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
         let spy = Arc::new(RootsSpy::default());
@@ -1577,9 +1589,10 @@ mod tests {
         // 生产那只在 :915 的 `ToolRegistry::new()` 一行不动 —— 注册是 Task 27 的事。
         f.registry.register(spy.clone());
 
-        // 两条真存在的临时目录 + 一条**不存在**的路径。把不存在的那条也塞进来是故意的：
-        // 装配层不做筛选，筛选是 `settings.rs::normalize_roots` 在读盘时干的**唯一**一件事。
-        // 这里要是「顺手」过滤一遍，roots 就有了第二处决定它的地方，而那正是 R276 要避免的。
+        // 两条真目录 + 一条**不存在**的路径，原样塞进 `TurnDeps.roots` —— 那是设置文件里的
+        // 形状（R284 之后读写两侧不再裁盘，所以到这一层的表就是用户写的那份）。把不存在的那条
+        // 塞进来是故意的，它就是 Important-1 的现场：用户拔了 U 盘，那条 root 照旧在设置里，
+        // 但这一轮不许把它交给闸门 —— 规则 4 会整体拒绝，连带让别的合法 root 也读不到东西。
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
         let ghost = a.path().join("never-created");
@@ -1626,8 +1639,21 @@ mod tests {
             "夹具只安排了一次工具调用，取证点就得恰好记下一条；0 条说明工具压根没跑，那条断言是空的"
         );
         assert_eq!(
-            seen[0], roots,
-            "roots 没传到执行点 ⇒ read_file 永远 fail-closed，这是本任务存在的唯一理由"
+            seen[0],
+            vec![
+                a.path().canonicalize().unwrap(),
+                b.path().canonicalize().unwrap()
+            ],
+            "交到执行点的必须是**有效表**（绝对 + 解得开 + canonical 形态），不是设置文件里 \
+             那份原表；这一条同时守住 R276 的单一入口 —— 删掉 `run_turn` 里 `.with_roots(..)` \
+             那一行，这里就空了；实得 {:?}（原表 {:?}）",
+            seen[0],
+            roots
+        );
+        assert!(
+            !seen[0].iter().any(|p| p == &ghost),
+            "暂时够不着的那条 root 不许进这一轮的使用表（R284）；实得 {:?}",
+            seen[0]
         );
     }
 

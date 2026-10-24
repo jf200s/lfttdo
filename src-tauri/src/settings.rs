@@ -293,7 +293,8 @@ pub struct Settings {
     ///
     /// 落点唯一（R276）：`ipc.rs::run_turn` 每轮从 `Settings` 现取，经
     /// `AgentSession::with_roots` 送进 `ToolCtx`；不在 `SessionDeps` 上再开第二个入口。
-    /// 归一只在 `normalize_roots` 一处定义（读写两侧各过一次，同 R86）。
+    /// 归一分两处（R284）：`dedupe_roots` 只管用户写的那份（读写两侧各过一次，同 R86，
+    /// 不碰盘、一条都不丢），`effective_roots` 只管这一轮能用哪几条（使用点，每轮一次）。
     pub roots: Vec<PathBuf>,
 }
 
@@ -369,38 +370,90 @@ pub fn normalize_accent(s: &str) -> String {
     format!("#{}", expanded.to_lowercase())
 }
 
-/// T26（R277）：`roots` 的**唯一**归一处。签名是纯的（进一张表、出一张表，不接闭包、不碰
-/// `self`），但它**确实做文件系统调用** —— 见 `normalize()` 里那句新增的说明。
-/// 三步，顺序是要害：
-/// 1. 逐条 `canonicalize`。一个系统调用同时做完三件事：展开符号链接/junction、判它**在不在**、
-///    把尾斜杠 / `.` / 盘符大小写这些写法差异统一成同一种形态。于是存下来的和闸门
-///    （`registry.rs::resolve_within_roots` 规则 4）比的是**同一种形状**，不会一边 canonical、
-///    一边用户粘贴的原样。
-/// 2. **解析失败就丢这一条**（目录不存在、没权限、路径根本不是路径都算这一支），不报错、
-///    不回落默认、也不留占位 —— 一个到处的 root 交给闸门只会变成「root 无法解析」的整体拒绝
-///    （规则 4），留着它反而让**别的**合法 root 一起读不到东西。
-/// 3. 按 canonical 形态去重，**保留首次出现的顺序**。
+/// T26（R284 的第一半）：`roots` 在**持久化路径**上的归一处。签名是纯的（进一张表、出一张表，
+/// 不接闭包、不碰 `self`），而且**一个文件系统调用都不做** —— 这是它和上一版
+/// （`normalize_roots`：既 canonicalize 又去重）唯一的、也是全部的区别。
+/// 两步，全部只在字符串层面：
+/// 1. 逐条 `lexical_root()`：trim 首尾空白 + 按 `Path::components()` 收敛分隔符写法
+///    （`C:\notes\` 与 `C:\notes` 是同一条目录的两种写法，先收敛成一种才谈得上
+///    「按 trim 后的字符串去重」）。
+/// 2. 按归一后的形态去重，**保留首次出现的那一条**；**一条都不丢**。
 ///
-/// 为什么这里**不**接一个可注入的 `exists` 闭包（brief Step 1 原稿的那种写法）：`canonicalize`
-/// 已经把「目录不存在」和「解析失败」两条判据一起覆盖了，同一个系统调用、两个语义；造一个假的
-/// `exists` 只会让测试对着一个从未发生过的失败说话（R277）。测试因此用 `tempfile` 真目录
-/// 加一条**真的**不存在的路径。
+/// 为什么这里**不许**裁掉「今天解不开」的那条（R284 的归属判据）：持久化的必须是**用户写的
+/// 那份**。`E:\notes`（U 盘）或 `\\nas\books` 这类条目只是当下够不着，而「在读写两侧都裁一遍」
+/// 的写法会让用户改个主题按一次保存就把它永久删掉 —— 静默、不可恢复（这一片还没有 roots
+/// 界面，R282），症状是「read_file 什么都读不到」，和从来没配过一模一样。
+/// 「这条现在还在不在」是**每一轮使用时**才决定的事，那份判定住在使用点 `effective_roots`。
+///
+/// 也不接可注入的 `exists` 闭包（R277 仍然成立）：整条函数压根不碰盘，没有可注入的缝，
+/// 测试因此用真目录 + 一条**真的**不存在的路径来读「它还在」。
+///
+/// 幂等（`normalize` 在读写两侧各跑一次，见 `load`/`save`）：词法形状再过一遍还是它自己。
+pub fn dedupe_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(roots.len());
+    for r in roots {
+        let lexical = lexical_root(r);
+        // 条目数量级是「用户手写的几行目录」，线性 `contains` 够用 ——
+        // 为去重引 `indexmap` 之类新依赖不值（而且 `IndexSet` 会把「保留首次顺序」变成库的行为，
+        // 不再是这里的代码）。
+        if !out.contains(&lexical) {
+            out.push(lexical);
+        }
+    }
+    out
+}
+
+/// 单条 root 的**词法**形状。为什么走 `components()` 而不是字符串 `trim_end_matches('/')`：
+/// Windows 上分隔符有 `/` 与 `\` 两种，而且有两种「砍掉尾部就变味」的根 —— `C:\` 砍成 `C:`
+/// 指的是「C 盘的当前目录」，`/` 砍成空串指的是相对路径。`components()` 把根留着、只收掉冗余
+/// 与尾部分隔符，并且不碰文件系统（不展开符号链接、不查在不在、不加 `\\?\` 前缀）。
+fn lexical_root(r: &Path) -> PathBuf {
+    let trimmed = match r.to_str() {
+        // 解不出 UTF-8 的路径（POSIX 上合法）不 trim、也不改写：`to_string_lossy()` 会把用户
+        // 那条路径换成带 U+FFFD 的另一条，那不是整理，是损坏。
+        Some(s) => Path::new(s.trim()),
+        None => r,
+    };
+    trimmed.components().collect()
+}
+
+/// T26（R284 的第二半 + R285）：**使用点**的过滤 —— 这台机器今天能用、可以交给闸门的那张表。
+/// 和 `dedupe_roots` 的分工：**一个管用户意图，一个管这台机器今天的答案。**
+/// 两条判据，任一不过就不进结果（丢的是**这一轮的使用表**，不是用户那张表）：
+/// 1. `is_absolute()`；
+/// 2. `canonicalize()` 成功。一个系统调用同时做完三件事：展开符号链接/junction、判它**在不在**、
+///    把盘符大小写 / 尾斜杠这些写法差异统一成同一种形态 —— 于是交给闸门的和闸门
+///    （`registry.rs::resolve_within_roots` 规则 4）比的是**同一种形状**。
+/// 过了两道判据的按 canonical 形态去重、保留首次出现的顺序（上一版的第 3 步原样搬到这里）。
+///
+/// 为什么相对路径**永远**不算有效（R285）：相对路径是按**进程 CWD** 落地的，而 Tauri 起在哪个
+/// 目录不是用户能预测的，所以「用户写的 `notes`」和「程序解出的 `<CWD>\notes`」是两回事。
+/// 宁可这一轮没有这条 root，也不要 grant 一个用户没指过的目录。原始那条照旧留在设置文件里
+/// （`dedupe_roots` 那一半保证），用户自己把它改成绝对路径就好。
+///
+/// 为什么 canonicalize 失败也静默跳过、不报错也不留占位（R277 的理由，只是换了落点）：一条够不着
+/// 的 root 交给闸门只会变成「root 无法解析」的整体拒绝（规则 4），留着它反而让**别的**合法 root
+/// 一起读不到东西。
+///
+/// 为什么这里**不**接可注入的 `exists` 闭包（R277）：`canonicalize` 已经把「目录不存在」和
+/// 「解析失败」两条判据一起覆盖了，同一个系统调用、两个语义；造一个假的 `exists` 只会让测试
+/// 对着一个从未发生过的失败说话。测试因此用 `tempfile` 真目录加一条**真的**不存在的路径。
 ///
 /// 也不判「是不是目录」：指向一个**文件**的 root 只会让前缀比对什么都命中不了 —— 那是少放行，
 /// 不是多放行，为它加第二条判据不值。
 ///
-/// 幂等（`normalize` 在读写两侧各跑一次，见 `load`/`save`）：canonical 形态再过一遍这条流水线
-/// 出来的还是它自己。顺序保留 ⇒ 去重后的表逐字稳定。
-pub fn normalize_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+/// 幂等：canonical 形态既绝对又解得开，再过一遍这条流水线出来的还是它自己。
+pub fn effective_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::with_capacity(roots.len());
     for r in roots {
-        // 第 2 步：`Err` 一支静默丢弃，`continue` 就是它的处置。
+        // 第 1 条判据（R285）：相对的一律不进这一轮的使用表。
+        if !r.is_absolute() {
+            continue;
+        }
+        // 第 2 条判据：`Err` 一支静默丢弃，`continue` 就是它的处置。
         let Ok(canonical) = r.canonicalize() else {
             continue;
         };
-        // 第 3 步：条目数量级是「用户手写的几行目录」，线性 `contains` 够用 ——
-        // 为去重引 `indexmap` 之类新依赖不值（而且 `IndexSet` 会把「保留首次顺序」变成库的行为，
-        // 不再是这里的代码）。
         if !out.contains(&canonical) {
             out.push(canonical);
         }
@@ -451,15 +504,14 @@ impl Settings {
         // 一个不是颜色的字符串没法夹成颜色，于是回落 `""`（跟随预设）。
         // 放在这里而不是只放在 `save` 前：`load()` 也走 `normalize`，磁盘上的脏值出不了读侧。
         self.accent = normalize_accent(&self.accent);
-        // T26：`roots` 的归一见 `normalize_roots`（同一个字段只有一个纠正处，R86 同规）。
-        // 这里要如实记一笔**新代价**：`normalize()` 从此不再是不碰文件系统的纯钳位 ——
-        // 它每条 root 做一次 `canonicalize`。条目是「用户手写的几行目录」，量级让这点 IO
-        // 在 `load`/`save` 的 `spawn_blocking` 线程上完全可以忽略。
-        // 随之而来的一个**已知后果**也要写在这而不是藏在测试里：一条目录被用户临时挪走
-        // （拔了移动盘、卸了网络共享）时，下一次 `save()` 落盘的表里就没有它了。
-        // 判据本身是裁定要的（R277：解析失败即丢，留着只会让闸门整体拒绝），
-        // 但「设置里的目录会自己消失」这条后果得让下一个读代码的人一眼看见。
-        self.roots = normalize_roots(&self.roots);
+        // T26（R284）：`roots` 的归一见 `dedupe_roots`（同一个字段只有一个**持久化**纠正处，
+        // R86 同规）。搬走的判据记在这里，别让下一个读代码的人去考古：上一版 `normalize()`
+        // 每条 root 做一次 `canonicalize`，于是「一条目录被用户临时挪走（拔了移动盘、卸了网络
+        // 共享），下一次 `save()` 落盘的表里就没有它了」—— 那是评审 Important-1 的缺陷本身，
+        // 不是可接受的代价。现在读写两侧只做词法整理（去重、尾部分隔符归一、顺序），
+        // **不碰文件系统、一条都不丢**；「今天解不开就这一轮不用它」住在使用点
+        // `effective_roots`（`ipc.rs::run_turn` 每轮一次）。
+        self.roots = dedupe_roots(&self.roots);
     }
 
     /// 归一后的副本。派生方法用它，省掉「调用者忘了先 normalize」这条静默错误路径。
@@ -1609,9 +1661,15 @@ mod tests {
             "不许替用户决定允许读哪些目录（与 R90 的空 base_url 同一取向）"
         );
         // 归一只清洗、不补充：空表进、空表出（往这里塞默认目录就是上面那句破例）。
+        // R284 之后两处都要各判一次 —— 持久化那处（`dedupe_roots`）和使用点那处
+        // （`effective_roots`）都不许凭空造出一条 root。
         assert!(
-            normalize_roots(&s.roots).is_empty(),
-            "normalize_roots 不许凭空造出 root"
+            dedupe_roots(&s.roots).is_empty(),
+            "dedupe_roots 不许凭空造出 root"
+        );
+        assert!(
+            effective_roots(&s.roots).is_empty(),
+            "effective_roots 不许凭空造出 root"
         );
         let mut s = s;
         s.normalize();
@@ -1643,7 +1701,10 @@ mod tests {
     }
 
     #[test]
-    fn normalize_roots_dedupes_canonicalizes_and_drops_dirs_that_are_not_there() {
+    fn effective_roots_dedupes_canonicalizes_and_drops_dirs_that_are_not_there() {
+        // T26 修复轮 1（R284）：这条测试原来量的是 `normalize_roots`（读写两侧那一处）。
+        // 文件系统依赖的裁剪从此只住在使用点，于是它整条改量 `effective_roots`，
+        // 三条断言一个字没放宽 —— 放宽判据就等于把搬走的这一步悄悄抹掉。
         // R277：判据走真实文件系统。`canonicalize` 一个系统调用同时覆盖「目录不存在」和
         // 「解析失败」两种坏形状，为了可注入而造一个假的 `exists` 闭包反而什么都测不到
         // ——假闭包说「不存在」时，被测代码并没有真的处理过一条不存在的目录。
@@ -1667,7 +1728,7 @@ mod tests {
             "夹具前提：尾斜杠那条得和第一条**原始写法**不同，否则去重这一步压根没被跑过 \
              （比 `os_str` 而不是 `Path`：`Path` 的相等把尾斜杠视作同一个组件序列，那样这里永远相等）"
         );
-        let out = normalize_roots(&[
+        let out = effective_roots(&[
             a.path().to_path_buf(),
             trailing.clone(),
             a.path().to_path_buf(),
@@ -1686,7 +1747,7 @@ mod tests {
 
         // 第二条真目录：证明去重**没有**顺手把不同的目录合并掉，且顺序按首次出现。
         let b = tempfile::tempdir().unwrap();
-        let out = normalize_roots(&[
+        let out = effective_roots(&[
             a.path().to_path_buf(),
             ghost.clone(),
             b.path().to_path_buf(),
@@ -1702,9 +1763,154 @@ mod tests {
             "不存在的那条必须被丢掉，实得 {out:?}"
         );
 
-        // 幂等：`normalize` 在读写两侧各跑一次（`load()` 直接调、`save()` 经 `normalized()`），
-        // 第二遍把第一遍的输出判成脏就是「存一次盘设置自己变空」（同 `normalize_accent` 那条理由）。
-        assert_eq!(normalize_roots(&out), out, "归一必须幂等");
+        // 幂等：canonical 形态既绝对又解得开，再过一遍使用点还是它自己。（读写两侧那一遍现在
+        // 归 `dedupe_roots`，它的幂等由 `roots_are_deduped_without_touching_the_filesystem` 钉。）
+        assert_eq!(effective_roots(&out), out, "使用点归一必须幂等");
+    }
+
+    /// R284（评审 Important-1 的钉子）：设置落盘不许删掉它没能力删的东西。
+    /// 一条**暂时够不着**的 root（U 盘当下没插、`\\nas` 今天没上线）在「用户只是改了个主题」
+    /// 之后必须**原样还在** `settings.roots` 里。归属判据：持久化的是**用户写的那份**，
+    /// 「这条今天能不能用」是**每一轮使用时**才决定的事 —— 文件系统依赖的裁剪从读写两侧
+    /// 搬到使用点，于是这里红一次就是那个缺陷本身。
+    #[test]
+    fn a_root_that_is_currently_unreachable_survives_a_load_save_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        let real = tempfile::tempdir().unwrap();
+        // 夹具按**用户手写 `settings.json`** 的形状进场：尾部分隔符照写，于是「归一后的形状」
+        // 那半句判据落在断言里，不是只写在注释里。
+        let sep = std::path::MAIN_SEPARATOR;
+        let real_written = format!("{}{}", real.path().display(), sep);
+        // `Z:\no-such-drive\books` 是「设备当下不在」的形状；非 Windows 目标上换成同样
+        // 解不开的一条绝对路径，判据一个字不变。
+        let ghost_written = if cfg!(windows) {
+            format!(r"Z:\no-such-drive\books{sep}")
+        } else {
+            format!("/no-such-volume/books{sep}")
+        };
+        let ghost_kept = PathBuf::from(if cfg!(windows) {
+            r"Z:\no-such-drive\books"
+        } else {
+            "/no-such-volume/books"
+        });
+        assert!(
+            Path::new(&ghost_written).canonicalize().is_err(),
+            "夹具前提：这条 root 必须**真的**解不开（canonicalize 失败），否则演不出「暂时够不着」（实得 {ghost_written:?}）"
+        );
+        let raw = serde_json::json!({
+            "theme": "noir",
+            "roots": [real_written, ghost_written],
+        });
+        std::fs::write(store.path(), serde_json::to_string(&raw).unwrap()).unwrap();
+
+        // 用户做的全部事情：改主题、保存。`roots` 一个字都没碰。
+        let mut s = store.load().unwrap();
+        s.theme = "paper".into();
+        store.save(&s).unwrap();
+        let again = store.load().unwrap();
+
+        assert_eq!(
+            again.roots,
+            vec![real.path().to_path_buf(), ghost_kept.clone()],
+            "改个主题不许让一条 root 消失（R284）：尾部分隔符归一之后两条都还得在，\
+             顺序不许变 —— 静默丢掉就是用户手改设置却永久失去那条目录，且这一片没有 roots \
+             界面（R282）可把它补回来；实得 {:?}",
+            again.roots
+        );
+        // 归属判据的另一半：它**还在设置里**，但**不在这一轮的使用表里** ——
+        // 「这条今天还在不在」是每一轮使用时才决定的事。
+        let eff = effective_roots(&again.roots);
+        assert_eq!(
+            eff,
+            vec![real.path().canonicalize().unwrap()],
+            "有效表只许有当下解得开的那条（canonical 形态），暂时够不着的那条留在文件里、\
+             不进这一轮（R284）；实得 {eff:?}"
+        );
+    }
+
+    /// R284 的另一半：读写两侧的归一从此**只做词法整理** —— 同一条目录的两种写法按
+    /// 「trim + 尾部分隔符归一」收敛成一条、顺序按首次出现、**一条都不丢**。
+    /// 「不碰文件系统」的证据就是那条 `ghost`：它 canonicalize 必败，却照旧留在表里 ——
+    /// 判据不许靠 `exists` 闭包（R277 仍然成立），也不许靠真目录把「删掉」判成对的。
+    #[test]
+    fn roots_are_deduped_without_touching_the_filesystem() {
+        let a = tempfile::tempdir().unwrap();
+        let ghost = a.path().join("ghost-dir-that-was-never-created");
+        assert!(
+            ghost.canonicalize().is_err(),
+            "夹具前提：这条必须**真的**解不开，它才是「不碰盘」的读数（实得 {ghost:?}）"
+        );
+        // brief Step 4 的原样四条：同一条目录的三种写法 + 一条不存在的。
+        let trailing = PathBuf::from(format!(
+            "{}{}",
+            a.path().display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        assert_ne!(
+            a.path().as_os_str(),
+            trailing.as_os_str(),
+            "夹具前提：尾斜杠那条得和第一条**原始写法**不同，否则去重这一步压根没被跑过"
+        );
+        let mut s = Settings {
+            roots: vec![
+                a.path().to_path_buf(),
+                trailing,
+                a.path().to_path_buf(),
+                ghost.clone(),
+            ],
+            ..Default::default()
+        };
+        s.normalize();
+        assert_eq!(
+            s.roots,
+            vec![a.path().to_path_buf(), ghost],
+            "四条进、两条出：真目录那种写法只留首次出现的那一种，而那条不存在的**必须还在**\
+             （丢它的权力在使用点 `effective_roots`，不在读写两侧，R284）；实得 {:?}",
+            s.roots
+        );
+        // 幂等：`normalize` 读写两侧各跑一次，第二遍若把自己的输出判成脏，就等于「存一次盘、
+        // 设置自己变一次形状」。
+        let mut again = s.clone();
+        again.normalize();
+        assert_eq!(again.roots, s.roots, "词法归一必须幂等");
+    }
+
+    /// R285：相对路径的 root **永远不算有效** —— 它按**进程 CWD** 落地，而 Tauri 起在哪个
+    /// 目录不是用户能预测的，「用户写的 `notes`」和「程序解出的 `<CWD>\notes`」是两回事。
+    /// 相对那两条里 `"."` 是**能** canonicalize 的，这是有意的：只有「存在又能解析」的相对路径
+    /// 才量得出挡掉它的是**绝对性**这一条判据，而不是它碰巧解不开。
+    /// 原始条目照旧留在设置文件里（`roots_are_deduped_without_touching_the_filesystem` 钉那半边），
+    /// 用户自己把它改成绝对路径就好 —— 宁可这一轮没有这条 root，也不要 grant 一个没指过的目录。
+    #[test]
+    fn effective_roots_drop_relative_and_unresolvable_entries() {
+        let real = tempfile::tempdir().unwrap();
+        let real_c = real.path().canonicalize().unwrap();
+        let ghost = if cfg!(windows) {
+            PathBuf::from(r"Z:\no-such-drive\books")
+        } else {
+            PathBuf::from("/no-such-volume/books")
+        };
+        assert!(
+            ghost.canonicalize().is_err(),
+            "夹具前提：这条绝对路径必须**真的**解不开，它才是「设备当下不在」的读数（实得 {ghost:?}）"
+        );
+        let out = effective_roots(&[
+            PathBuf::from("."),        // 相对，但解得开 ⇒ 只能被绝对性这条挡掉
+            PathBuf::from("notes"),    // 相对，且不存在（用户手写的那种形状）
+            ghost.clone(),             // 绝对，解不开
+            real.path().to_path_buf(), // 绝对，存在 —— 唯一该进结果的那条
+        ]);
+        assert_eq!(
+            out,
+            vec![real_c.clone()],
+            "有效表只许有那一条真目录，而且是 canonical 形态（闸门 `resolve_within_roots` \
+             规则 4 比的就是这一种形状）；实得 {out:?}"
+        );
+        // 使用点丢掉的条目不许反过来把用户那条也带走：这一轮的答案是「一条」，不是「零条」。
+        assert_eq!(out.len(), 1, "三条不合格的都不许进结果；实得 {out:?}");
+        // 幂等：有效表再过一次使用点还是它自己（canonical 形态本身绝对、且解得开）。
+        assert_eq!(effective_roots(&out), out, "有效表必须幂等");
     }
 
     // ---- R89：不加没有消费者的字段 ----
@@ -1890,13 +2096,24 @@ mod tests {
             serde_json::Value::Null,
             "`mcp` 必须留在「被忽略」那一侧：settings.json 不是 MCP 配置的家（R283/T29）"
         );
-        // 后一半：`roots` 被读回，而且是过 `normalize_roots` 之后的形态（`load()` 里那一次
+        // 后一半：`roots` 被读回，而且是过 `dedupe_roots` 之后的形态（`load()` 里那一次
         // `normalize()`）。这里断的是**内容**而不只是长度：长度对了但内容被抹成空表
         // （`#[serde(default)]` 写错、或字段名打不成 `roots`）是最坏的那种假绿。
+        // R284 修的是这半句的**形状**：读回来的仍是**用户写的那一条**，不再是 canonicalize
+        // 之后的那一种 —— 裁剪只住在使用点，所以这里既没放宽（仍逐字断内容），也不许被改回
+        // 断 `kept_c`（那正是本轮要搬走的那一步）。
         assert_eq!(
             got.roots,
-            vec![kept_c],
+            vec![kept.path().to_path_buf()],
             "`roots` 是已知字段，必须被读回并留在表里（读不回来 = read_file 永远全拒）"
+        );
+        // 使用点那一侧照旧给 canonical 形态（闸门比的是那一种形状）：同一份原表，
+        // 两处各有各的答案，这正是 R284 的分工。
+        assert_eq!(
+            effective_roots(&got.roots),
+            vec![kept_c],
+            "有效表必须是 canonical 形态，实得 {:?}",
+            effective_roots(&got.roots)
         );
         assert!(corrupt_backups(d.path()).is_empty());
     }

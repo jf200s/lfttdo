@@ -763,8 +763,9 @@ mod tests {
             temperature,
         })
         // R276：roots 进 `ToolCtx` 只有这一个入口 —— builder 方法，不在 `SessionDeps` 上
-        // 再开第二个字段。表**原样**送下去，这里不做任何过滤：能不能用是
-        // `settings.rs::normalize_roots` 在读盘时定的事，执行点只负责按表放行。
+        // 再开第二个字段。表**原样**送下去，这里不做任何过滤：今天哪几条能用是
+        // `settings.rs::effective_roots` 在**使用点**（`ipc.rs::run_turn`）定的事，
+        // 执行点只负责按交进来的表放行（R284 把裁剪从读写两侧搬到了这里）。
         .with_roots(roots);
         (session, sink, gate)
     }
@@ -1786,12 +1787,13 @@ mod tests {
     /// brief Step 4。这条测试存在的理由写在断言消息里：`with_roots` 在本任务之前**从未被调用**
     /// ⇒ `ToolCtx.roots` 恒空 ⇒ T25 交付的 `read_file` 在生产里对任何路径都 fail-closed。
     /// 循环这一侧的线只有在这里能量到（生产那一侧由 `ipc.rs` 的
-    /// `run_turn_hands_the_settings_roots_to_the_session` 钉，装配点不在本文件）。
+    /// `run_turn_hands_the_effective_roots_not_the_persisted_list` 钉，装配点不在本文件）。
     #[tokio::test]
     async fn run_turn_passes_configured_roots_into_tool_ctx() {
         // 夹具是**真目录**（R277 的口径：不注入假的 `exists`），外加一条真的不存在的路径。
         // 那条幽灵路径是故意的，而且**必须照样抵达**：会话是传送带，不是第二把尺子 ——
-        // 「丢弃不存在的目录」归 `settings.rs::normalize_roots` 一处（R86 同规）。
+        // 「今天哪几条解得开」归 `settings.rs::effective_roots` 一处，由 `ipc.rs::run_turn`
+        // 每轮在交给会话那一刻算一次（R284 把它从读写两侧搬到了使用点）。
         // 谁哪天在循环里顺手 filter 一遍，这条会红，而那正是「同一判据长出两个强度版本」的开头。
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();

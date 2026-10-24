@@ -140,8 +140,10 @@ export interface Settings {
    * 与 `registry.rs::no_roots_denies_everything` 一起把它钉成设计（R90 取向：不替用户决定）。
    *
    * Rust 侧类型是 `Vec<PathBuf>`，序列化后就是字符串数组（那条形状测试钉着）；
-   * 每一项在**读写两侧**都过过一次 `normalize_roots()`（canonicalize、去重、丢掉不存在的），
-   * 所以到这里的一定是已规范化的绝对路径 —— TS 侧不规范化第二遍（同 `font_size` 的 R123 规矩）。
+   * 每一项过的是一次 `dedupe_roots()`（**只做词法整理**：trim、尾部分隔符归一、按字符串去重，
+   * 不 canonicalize、一条都不丢，R284），所以这里可能是相对路径、也可能是当下够不着的那条
+   * （U 盘拔了、`\\nas` 没上线）—— 「这一轮能用哪几条」由 Rust 在每轮的使用点
+   * `effective_roots()` 现算。TS 侧两样都不做第二遍（同 `font_size` 的 R123 规矩）。
    *
    * 本切片**没有**界面控件：`SettingsPanel` 不渲染它，但必须原样带走它
    * （`SettingsPanel.test.tsx` 的 carry-through 那条盯着），否则用户手改进
