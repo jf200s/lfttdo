@@ -4,3 +4,4 @@
 // 真正的 stdio/HTTP 桥是 T31/T36 的事；管理界面（唯一的写入者）是 T35 的事。
 
 pub mod config;
+pub mod naming;
