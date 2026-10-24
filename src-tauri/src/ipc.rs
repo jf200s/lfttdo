@@ -1287,8 +1287,12 @@ mod tests {
                     // `the_session_temperature_reaches_the_chat_request` 钉）。
                     temperature: None,
                     // 夹具默认不带 roots：除了那条专门量 roots 的测试（它自己搭 `TurnDeps`），
-                    // 其余测试走的是生产的空表形状 —— 表空时 `read_file` 会拒，而这里没有
-                    // `read_file` 可调用（生产工具表为空，:915）。
+                    // 其余测试走的是生产的空表形状 —— 表空时 `read_file` 会拒。
+                    // T27（R286）之后这里还要多说一句：`build_production_registry()` 的表里
+                    // **有** `read_file`，但空 roots 那一轮交给模型的声明表里没有它，
+                    // 而夹具的 registry 本来就是空的 —— 两件事各自成立，别混着读。
+                    // 生产装配点那行由 `the_assembly_wires_the_production_registry` 钉（M4：
+                    // 把 `app.manage` 换回空表，405 条单测全绿，所以判据只能是源码级守卫）。
                     roots: Vec::new(),
                     cancel: self.cancel.clone(),
                 },
@@ -2505,5 +2509,68 @@ mod tests {
                 Ok(String::new())
             );
         }
+    }
+
+    /// T27 的**接线**判据（评审 Important-1 → R287）。为什么只能是这样：
+    /// `app.manage(AppState{…})` 在 Tauri 的 setup 闭包里，单测既造不出 `App` 也进不去那个闭包，
+    /// 于是 `build_production_registry()` 自己绿了 405 条，**装配那行退回空表却一条都抓不到**
+    /// （实现者亲跑的 M4 就是这个形状：405 passed / 0 failed）。
+    /// 本项目对「宏/闭包造不出来的接线」已有同一路判例 —— `the_normalization_command_is_registered_in_the_handler_list`
+    /// （`:2435`，`generate_handler!` 是宏）与前端 `tokens.test.ts`（解析 styles.css），
+    /// 所以这里读自己的源码，不新开机制，只沿用既有那条线。
+    /// 取法：**逐行**取 `registry:` 那一行并按行剥掉注释与尾逗号。为什么不按 `,` 拆整个字面量 ——
+    /// 本文件是 CRLF，按 `,` 拆会把行尾注释和下一行粘成一段（M4 第一次跑就是这样露出来的），
+    /// 而 `rustfmt` 对这个 7 字段字面量恒按「一字段一行」排；不硬依赖尾逗号则是 F6-N4 的教训。
+    #[test]
+    fn the_assembly_wires_the_production_registry() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ipc.rs"));
+        let manage = src
+            .split("app.manage(AppState {")
+            .nth(1)
+            .and_then(|rest| rest.split("});").next())
+            .expect("找不到 app.manage(AppState { … }) 那段装配");
+        let wired: Vec<&str> = manage
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("registry:"))
+            .map(|line| line.split("//").next().unwrap_or("").trim())
+            .map(|line| line.trim_end_matches(',').trim())
+            .collect();
+        assert_eq!(
+            wired.len(),
+            1,
+            "装配段里 `registry:` 那一行必须**恰好一条**（0 条=换了写法或没了，2 条=两条装配路径）；\
+             实得 {wired:?}"
+        );
+        assert_eq!(
+            wired[0], "registry: build_production_registry()",
+            "装配点没接上生产工具表：模型永远只有 0 把工具，而其余 405 条单测全绿 \
+             （`production_registry_ships_fetch_url_and_read_file` 量的是那个函数自己，\
+             不是这行接线 —— 实现者亲跑的 M4 就是这个形状）；实得 {:?}",
+            wired[0]
+        );
+        // 第二半：`#[cfg(test)]` 之前**只许**有一处 `Arc::new(ToolRegistry::new())`，而且它必须在
+        // `build_production_registry` 的函数体里 —— 出现第二处就等于有了第二条装配路径，
+        // 而 R101（一个目录只许一个 `SettingsStore`）说的正是这种重复会各自漂移。
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("找不到 #[cfg(test)] 边界");
+        let empty_constructions: Vec<&str> = production
+            .lines()
+            .filter(|line| line.contains("Arc::new(ToolRegistry::new())"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            empty_constructions.len(),
+            1,
+            "生产侧只许在 `build_production_registry` 体内空构造注册表一次；实得 {empty_constructions:?}"
+        );
+        assert!(
+            empty_constructions[0].starts_with("let registry ="),
+            "那唯一一处空构造必须是 `build_production_registry` 的第一行，不是别处的第二条装配路径；\
+             实得 {:?}",
+            empty_constructions[0]
+        );
     }
 }

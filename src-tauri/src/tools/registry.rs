@@ -1,8 +1,9 @@
 // 工具层：`Tool` 抽象 + 注册表 + 执行上下文。
 //
 // Plan A 的生产工具表是**空的**（plan:1854：`echo` 仅测试与循环验证用、不注册进生产），
-// 于是 spec 5.1「MVP 内置工具全为 Read，因此全程零弹窗」为真；Plan B 只需 `register`
-// 一个 `fetch_url`，本文件的机制一行不改。
+// 于是 spec 5.1「MVP 内置工具全为 Read，因此全程零弹窗」为真。Task 27 起生产表里有
+// `fetch_url` + `read_file`（`ipc.rs::build_production_registry`，两把都是 `Risk::Read`，
+// 所以那句话**仍然**为真），本文件的机制一行没改 —— 这句是它当初的承诺，现在是事实。
 //
 // 风险的唯一真相源是 `risk_of`（= 注册表里那份 `ToolMeta.risk`）。`ToolDef` 里没有 risk
 // 字段，模型看不到也改不了自己的权限级别；未知工具按 `Risk::Exec`（最严的一档）处理，
