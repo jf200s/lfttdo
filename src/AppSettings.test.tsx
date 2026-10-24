@@ -53,10 +53,10 @@ const row = (id: string, updated_at: number): SessionRow => ({
   updated_at,
 });
 
-// 夹具写满 14 个键（`SettingsView` 是 flatten 后拍平一层的形状，12 个可写 + 2 只读）：
+// 夹具写满 15 个键（`SettingsView` 是 flatten 后拍平一层的形状，13 个可写 + 2 只读）：
 // App 若把 view 降级成只剩面板渲染的那几键再传进面板，`api_key_masked` / `corrupt_backup`
 // 那两块界面会**静默消失**，少写一项 TS 当场报错 —— 这是这份夹具唯一有用的报错方式。
-// T39 那三键 + T43 的 `accent`（四只面板都不渲染）必须一路带到保存，
+// T39 那三键 + T43 的 `accent` + T26 的 `roots`（五只面板都不渲染）必须一路带到保存，
 // 所以它们在这里也得不漏 —— 漏了就是 `SettingsPanel.test.tsx` 那条 carry-through 测试的现场。
 const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   base_url: "https://example.invalid/v1",
@@ -71,6 +71,10 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   compact_threshold: 0.85,
   keep_turns: 10,
   accent: "",
+  // T26：故意给**非默认**的两条目录（Rust 默认是空表）。空表在这里是看不出来的错值：
+  // 面板把它抹回默认 = 抹成空 = 下面那条 `toHaveBeenCalledWith` 照样绿，而用户手改进
+  // settings.json 的目录表已经没了，症状是「read_file 什么都读不到」。
+  roots: ["C:\\notes", "D:\\code"],
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -147,9 +151,10 @@ describe("App 设置接线", () => {
       target: { value: "17" },
     });
     fireEvent.click(within(dialog).getByRole("button", { name: /保存/ }));
-    // 载荷是**整表 12 键**：App 这一层不许重新拼一份「只发送编辑过的字段」，
-    // 也不许在把 view 交给面板的路上把 `temperature`/`compact_threshold`/`keep_turns`/`accent`
-    // 这四只面板不渲染的键丢掉（丢了不报错，`serde(default)` 会替用户把它们抹回默认值）。
+    // 载荷是**整表 13 键**：App 这一层不许重新拼一份「只发送编辑过的字段」，
+    // 也不许在把 view 交给面板的路上把 `temperature`/`compact_threshold`/`keep_turns`/`accent`/`roots`
+    // 这五只面板不渲染的键丢掉（丢了不报错，`serde(default)` 会替用户把它们抹回默认值；
+    // `roots` 的默认值是**空表**，抹上去的代价是 read_file 从此一律拒绝）。
     await waitFor(() =>
       expect(h.setSettings).toHaveBeenCalledWith({
         base_url: "https://example.invalid/v1",
@@ -164,6 +169,7 @@ describe("App 设置接线", () => {
         compact_threshold: 0.85,
         keep_turns: 10,
         accent: "",
+        roots: ["C:\\notes", "D:\\code"],
       }),
     );
     // 保存成功才改界面：这三项是 `applyTheme` 唯一的三个可见后果。

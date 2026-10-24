@@ -56,6 +56,9 @@ const view = (): SettingsView => ({
   compact_threshold: 0.85,
   keep_turns: 10,
   accent: "",
+  // T26 的 `roots`：空数组 = 生产默认值 = 「read_file 一律拒绝」（理由写在 `App.test.tsx`
+  // 那同款夹具的注释里）。本文件不断言保存载荷，键在这里的作用只有一个：少写就编译不过。
+  roots: [],
   api_key_masked: "…abcd",
   corrupt_backup: null,
 });

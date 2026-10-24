@@ -9,7 +9,7 @@
 //   src-tauri/src/ipc.rs:24-32,146        `AgentPayload`（唯一 camelCase 的一层）+ 通道名 `"agent"`
 //   src-tauri/src/ipc.rs:630-641          `SettingsView`（`#[serde(flatten)]` ⇒ 线上拍平一层）
 //   src-tauri/src/settings.rs:251-255     `Mode`（`rename_all = "lowercase"`）
-//   src-tauri/src/settings.rs:261-284     `Settings` 的 12 个键（T43 起含 `accent`）
+//   src-tauri/src/settings.rs:261-284     `Settings` 的 13 个键（T43 起含 `accent`，T26 起含 `roots`）
 //   src-tauri/src/store/db.rs:239-246     `SessionRow`（无 `rename_all` ⇒ snake_case，R128）
 //
 // 本文件除类型外**只导出一个运行期值**：通道名 `AGENT_CHANNEL`（:115）。
@@ -101,7 +101,7 @@ export interface SessionRow {
 }
 
 /**
- * `Settings`（settings.rs:261-284）：12 个键，`serde` 无 `rename_all` ⇒ 全 snake_case；
+ * `Settings`（settings.rs:261-284）：13 个键，`serde` 无 `rename_all` ⇒ 全 snake_case；
  * `mode` 是 `rename_all = "lowercase"` 的 `"light"|"dark"`（settings.rs:250-253），
  * 和 `applyTheme` 收的那个 `Mode` 是同一支，所以这里**引用**它而不是再抄一份字面量。
  * 数值一律 `number`：Rust 侧是 `u32`/`usize`/`f32`，钳位只有 `settings.rs` 的
@@ -134,16 +134,34 @@ export interface Settings {
    * 消费者是 T44 的 `applyTheme`；本切片**没有**控件，所以它也绝不会由界面产生。
    */
   accent: string;
+  /**
+   * T26（R276）：`read_file` 被允许读的目录表，**由用户自己列出**。默认 `[]`，
+   * 而**空表意味着一律拒绝** —— 这不是没做完：Rust 侧的 `roots_default_empty_and_read_file_therefore_refuses_everything`
+   * 与 `registry.rs::no_roots_denies_everything` 一起把它钉成设计（R90 取向：不替用户决定）。
+   *
+   * Rust 侧类型是 `Vec<PathBuf>`，序列化后就是字符串数组（那条形状测试钉着）；
+   * 每一项在**读写两侧**都过过一次 `normalize_roots()`（canonicalize、去重、丢掉不存在的），
+   * 所以到这里的一定是已规范化的绝对路径 —— TS 侧不规范化第二遍（同 `font_size` 的 R123 规矩）。
+   *
+   * 本切片**没有**界面控件：`SettingsPanel` 不渲染它，但必须原样带走它
+   * （`SettingsPanel.test.tsx` 的 carry-through 那条盯着），否则用户手改进
+   * `settings.json` 的目录表会在下一次点「保存」时被静默抹回空表 —— 而抹回空表的症状
+   * 不是「设置没了」，是「read_file 突然什么都读不到」。
+   */
+  roots: string[];
 }
 
 /**
  * `settings_get` 真正的返回形状（第 3 条裁定）：**不是** `Settings`。
  * `ipc.rs:630-641` 是 `struct SettingsView { #[serde(flatten)] settings, api_key_masked, corrupt_backup }`
- * ⇒ `#[serde(flatten)]` 把内层 12 个键**摊平到同一层**，线上是一层扁平对象，外加两个可空键：
+ * ⇒ `#[serde(flatten)]` 把内层 13 个键**摊平到同一层**，线上是一层扁平对象，外加两个可空键：
  * - `api_key_masked: Option<String>` —— `null` 表示未配置（R99：读不到走 `Err`，不在这个键里编故事）
  * - `corrupt_backup: Option<PathBuf>` —— 字符串路径或 `null`（R102：紧跟那次 `load()` 取走）
- * `setSettings` 反过来只收 `Settings` 那 12 个键，不许把整个 view 原样送回去。
- * T43 的 `accent` 因此**不需要动 `ipc.rs`**：它在 `Settings` 里，flatten 自动把它带上出口、也带上入口。
+ * `setSettings` 反过来只收 `Settings` 那 13 个键，不许把整个 view 原样送回去。
+ * T43 的 `accent`、T26 的 `roots` 因此**都不需要动 `ipc.rs`**（R282 明说这一处是空转）：
+ * 它们在 `Settings` 里，flatten 自动把它们带上出口、也带上入口。不改成嵌套正是前端的读法
+ * （`settings.roots`）成立的前提，这条形状由 `ipc.rs::tests::the_settings_view_carries_roots_at_the_top_level_as_strings`
+ * 从 Rust 那一侧钉着 —— 类型镜像看不见运行期的形状，所以那一条才是真防线。
  */
 export interface SettingsView extends Settings {
   api_key_masked: string | null;

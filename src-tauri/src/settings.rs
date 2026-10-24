@@ -6,8 +6,9 @@
 // key「不写 settings 表、不进导出、不写日志」，三条里最容易失守的是第一条，而靠纪律
 // （「记得别写」）守的规矩一定会被下一次加字段破掉；字段不存在才是结构性防线：
 // serde 写不出一个不存在的字段，`{:?}` 打不出它，导出也就无从带上它。
-// `serialized_field_names_are_exactly_the_twelve_settings_fields` 那条测试钉的正是这件事，
+// `serialized_field_names_are_exactly_the_thirteen_settings_fields` 那条测试钉的正是这件事，
 // 它同时也是 R89 的防线：加字段必须先给出它的消费者，否则 Plan A 里多一个没人读的键。
+// （T26 落 `roots` 时它的名字从 `twelve` 变成 `thirteen` —— 名字里的数字就是这条防线的读数。）
 //
 // 「不写日志」那一条还有第二道闸，而且不在结构体上：`SettingsError` 的 `Debug` 是**手写**的
 // （R94，见 `impl fmt::Debug`）。`keyring_core::Error` 自己 derive 了 `Debug`，而它的
@@ -281,6 +282,19 @@ pub struct Settings {
     /// （`base_url` 归一形态、`model` 由端点报错兜底，都挡不住「把 `tomato` 写进 `--accent`」）。
     /// 校验只有 `normalize_accent` 一处定义，读写两侧各过一次（R86 同规）。
     pub accent: String,
+    /// T26：`read_file` 能读的范围 —— **由用户自己列出的目录表**。
+    ///
+    /// **默认空，而空表意味着一律拒绝**（`ToolCtx::resolve_within_roots` 拿到空表是全拒、
+    /// 不是全放行，`registry.rs::no_roots_denies_everything` 钉着）。这不是没做完：它和 R90 的
+    /// 空 `base_url` 是同一个取向 —— 「允许读哪些目录」是用户的决定，程序替他挑一个
+    /// （HOME？Documents？）就是把 roots 外的东西交出去，而那正是这把工具唯一的用途所在。
+    /// 本切片**没有**界面控件（任务明确不许加），所以这个键目前只能由用户手改
+    /// `settings.json` 填上；填不上就是「read_file 什么都读不到」—— 真话比替用户编一个好。
+    ///
+    /// 落点唯一（R276）：`ipc.rs::run_turn` 每轮从 `Settings` 现取，经
+    /// `AgentSession::with_roots` 送进 `ToolCtx`；不在 `SessionDeps` 上再开第二个入口。
+    /// 归一只在 `normalize_roots` 一处定义（读写两侧各过一次，同 R86）。
+    pub roots: Vec<PathBuf>,
 }
 
 impl Default for Settings {
@@ -302,6 +316,10 @@ impl Default for Settings {
             // `""` 是「跟随预设」而不是「没配好」：T44 的 `applyTheme` 据此决定要不要覆盖
             // 主题自带的 accent，所以这里不能给一个具体颜色当默认。
             accent: String::new(),
+            // 空表 = `read_file` 一律拒绝，这是**设计**不是缺省待补（字段文档那句 R90 的话）。
+            // 任何「先给个常用目录试试看」的写法都会让一把只读工具在用户没同意的前提下
+            // 读到用户没打算给的东西，而那正是 spec 5.1「内置工具零弹窗」兑不兑现的前提。
+            roots: Vec::new(),
         }
     }
 }
@@ -351,6 +369,45 @@ pub fn normalize_accent(s: &str) -> String {
     format!("#{}", expanded.to_lowercase())
 }
 
+/// T26（R277）：`roots` 的**唯一**归一处。签名是纯的（进一张表、出一张表，不接闭包、不碰
+/// `self`），但它**确实做文件系统调用** —— 见 `normalize()` 里那句新增的说明。
+/// 三步，顺序是要害：
+/// 1. 逐条 `canonicalize`。一个系统调用同时做完三件事：展开符号链接/junction、判它**在不在**、
+///    把尾斜杠 / `.` / 盘符大小写这些写法差异统一成同一种形态。于是存下来的和闸门
+///    （`registry.rs::resolve_within_roots` 规则 4）比的是**同一种形状**，不会一边 canonical、
+///    一边用户粘贴的原样。
+/// 2. **解析失败就丢这一条**（目录不存在、没权限、路径根本不是路径都算这一支），不报错、
+///    不回落默认、也不留占位 —— 一个到处的 root 交给闸门只会变成「root 无法解析」的整体拒绝
+///    （规则 4），留着它反而让**别的**合法 root 一起读不到东西。
+/// 3. 按 canonical 形态去重，**保留首次出现的顺序**。
+///
+/// 为什么这里**不**接一个可注入的 `exists` 闭包（brief Step 1 原稿的那种写法）：`canonicalize`
+/// 已经把「目录不存在」和「解析失败」两条判据一起覆盖了，同一个系统调用、两个语义；造一个假的
+/// `exists` 只会让测试对着一个从未发生过的失败说话（R277）。测试因此用 `tempfile` 真目录
+/// 加一条**真的**不存在的路径。
+///
+/// 也不判「是不是目录」：指向一个**文件**的 root 只会让前缀比对什么都命中不了 —— 那是少放行，
+/// 不是多放行，为它加第二条判据不值。
+///
+/// 幂等（`normalize` 在读写两侧各跑一次，见 `load`/`save`）：canonical 形态再过一遍这条流水线
+/// 出来的还是它自己。顺序保留 ⇒ 去重后的表逐字稳定。
+pub fn normalize_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(roots.len());
+    for r in roots {
+        // 第 2 步：`Err` 一支静默丢弃，`continue` 就是它的处置。
+        let Ok(canonical) = r.canonicalize() else {
+            continue;
+        };
+        // 第 3 步：条目数量级是「用户手写的几行目录」，线性 `contains` 够用 ——
+        // 为去重引 `indexmap` 之类新依赖不值（而且 `IndexSet` 会把「保留首次顺序」变成库的行为，
+        // 不再是这里的代码）。
+        if !out.contains(&canonical) {
+            out.push(canonical);
+        }
+    }
+    out
+}
+
 impl Settings {
     /// 钳位与归一的**唯一**定义处（R86）。`load` 之后、`save` 之前各调一次，
     /// 两个派生方法也走它 —— 于是「base_url 谁负责归一」这个问题永远只有一个答案。
@@ -394,6 +451,15 @@ impl Settings {
         // 一个不是颜色的字符串没法夹成颜色，于是回落 `""`（跟随预设）。
         // 放在这里而不是只放在 `save` 前：`load()` 也走 `normalize`，磁盘上的脏值出不了读侧。
         self.accent = normalize_accent(&self.accent);
+        // T26：`roots` 的归一见 `normalize_roots`（同一个字段只有一个纠正处，R86 同规）。
+        // 这里要如实记一笔**新代价**：`normalize()` 从此不再是不碰文件系统的纯钳位 ——
+        // 它每条 root 做一次 `canonicalize`。条目是「用户手写的几行目录」，量级让这点 IO
+        // 在 `load`/`save` 的 `spawn_blocking` 线程上完全可以忽略。
+        // 随之而来的一个**已知后果**也要写在这而不是藏在测试里：一条目录被用户临时挪走
+        // （拔了移动盘、卸了网络共享）时，下一次 `save()` 落盘的表里就没有它了。
+        // 判据本身是裁定要的（R277：解析失败即丢，留着只会让闸门整体拒绝），
+        // 但「设置里的目录会自己消失」这条后果得让下一个读代码的人一眼看见。
+        self.roots = normalize_roots(&self.roots);
     }
 
     /// 归一后的副本。派生方法用它，省掉「调用者忘了先 normalize」这条静默错误路径。
@@ -1529,10 +1595,122 @@ mod tests {
         assert_eq!(Settings::default().to_model_config("k").base_url, "");
     }
 
+    // ---- T26：`roots`（read_file 的唯一作用域） ----
+
+    #[tokio::test]
+    async fn roots_default_empty_and_read_file_therefore_refuses_everything() {
+        // 这条测试**记录设计**而不是记录缺陷。空表让 T25 的 `read_file` 一上线就全拒，
+        // 看着像 bug，但它和 R90 的空 `base_url` 是同一取向：读哪些目录是用户的决定，
+        // 程序不许替他挑一个「大概是想要的那个」（那是把 root 外的东西交出去）。
+        // 所以这里**不许**顺手给默认值补上 `HOME`、`Documents` 或「程序目录」。
+        let s = Settings::default();
+        assert!(
+            s.roots.is_empty(),
+            "不许替用户决定允许读哪些目录（与 R90 的空 base_url 同一取向）"
+        );
+        // 归一只清洗、不补充：空表进、空表出（往这里塞默认目录就是上面那句破例）。
+        assert!(
+            normalize_roots(&s.roots).is_empty(),
+            "normalize_roots 不许凭空造出 root"
+        );
+        let mut s = s;
+        s.normalize();
+        assert!(
+            s.roots.is_empty(),
+            "normalize() 之后仍然为空 —— 拒绝不是 normalize 补出来的"
+        );
+
+        // 名字里那半句「因此一律拒绝」得在同一个测试里**看得见**，不能只写在注释里：
+        // 拿这份空表去解一条真实存在、正常可读的文件，必须被拒。夹具用真文件（R277 同口径：
+        // 不注入假的 `exists`），于是「拒」的原因只能是空 root 表，不是路径不存在。
+        // 闸门那一头另有 `registry.rs::no_roots_denies_everything` 钉着，这里是它的**消费侧配对**：
+        // 设置默认值 → 闸门全拒 这条路真的接得上。
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("note.txt");
+        std::fs::write(&file, "真的想读我".as_bytes()).unwrap();
+        let ctx = crate::tools::registry::ToolCtx {
+            http: reqwest::Client::new(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            roots: Settings::default().roots,
+        };
+        let e = ctx
+            .resolve_within_roots(&file.to_string_lossy())
+            .expect_err("空 roots 必须拒掉一条真实存在的文件，不许全放行");
+        assert!(
+            matches!(&e, crate::tools::registry::ToolError::BadInput(m) if m.contains("越界")),
+            "空 roots 下的拒绝必须是**越界**判定，不是碰巧的 IO 失败：实得 {e:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_roots_dedupes_canonicalizes_and_drops_dirs_that_are_not_there() {
+        // R277：判据走真实文件系统。`canonicalize` 一个系统调用同时覆盖「目录不存在」和
+        // 「解析失败」两种坏形状，为了可注入而造一个假的 `exists` 闭包反而什么都测不到
+        // ——假闭包说「不存在」时，被测代码并没有真的处理过一条不存在的目录。
+        let a = tempfile::tempdir().unwrap();
+        let a_c = a.path().canonicalize().unwrap();
+        let ghost = a.path().join("ghost-dir-that-was-never-created");
+        assert!(
+            !ghost.exists(),
+            "夹具前提：这条路径必须**真的**不存在（实得 {ghost:?}）"
+        );
+
+        // brief Step 2 的原样四条：同一条目录的三种写法 + 一条不存在的。
+        let trailing = PathBuf::from(format!(
+            "{}{}",
+            a.path().display(),
+            std::path::MAIN_SEPARATOR
+        ));
+        assert_ne!(
+            a.path().as_os_str(),
+            trailing.as_os_str(),
+            "夹具前提：尾斜杠那条得和第一条**原始写法**不同，否则去重这一步压根没被跑过 \
+             （比 `os_str` 而不是 `Path`：`Path` 的相等把尾斜杠视作同一个组件序列，那样这里永远相等）"
+        );
+        let out = normalize_roots(&[
+            a.path().to_path_buf(),
+            trailing.clone(),
+            a.path().to_path_buf(),
+            ghost.clone(),
+        ]);
+        // 先判长度再判内容：只断言长度的话，「顺序和内容同时错掉」也能绿。
+        assert_eq!(
+            out.len(),
+            1,
+            "四条进、一条出：去重（含尾斜杠写法）+ 丢不存在的，实得 {out:?}"
+        );
+        assert_eq!(
+            out[0], a_c,
+            "留下的必须是 canonical 形态，不是用户粘贴的那一种"
+        );
+
+        // 第二条真目录：证明去重**没有**顺手把不同的目录合并掉，且顺序按首次出现。
+        let b = tempfile::tempdir().unwrap();
+        let out = normalize_roots(&[
+            a.path().to_path_buf(),
+            ghost.clone(),
+            b.path().to_path_buf(),
+            a.path().to_path_buf(),
+        ]);
+        assert_eq!(
+            out,
+            vec![a_c.clone(), b.path().canonicalize().unwrap()],
+            "顺序按首次出现，第二条目录不许被去重去掉"
+        );
+        assert!(
+            !out.iter().any(|p| p.starts_with(ghost.as_path())),
+            "不存在的那条必须被丢掉，实得 {out:?}"
+        );
+
+        // 幂等：`normalize` 在读写两侧各跑一次（`load()` 直接调、`save()` 经 `normalized()`），
+        // 第二遍把第一遍的输出判成脏就是「存一次盘设置自己变空」（同 `normalize_accent` 那条理由）。
+        assert_eq!(normalize_roots(&out), out, "归一必须幂等");
+    }
+
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_twelve_settings_fields() {
+    fn serialized_field_names_are_exactly_the_thirteen_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -1553,6 +1731,7 @@ mod tests {
                 "mode",
                 "model",
                 "reserve_output",
+                "roots",
                 "temperature",
                 "theme",
                 "window_messages"
@@ -1562,15 +1741,50 @@ mod tests {
         // 再放进这个名单就会自我矛盾（它测的是「这个键压根不存在」，不是「它没被序列化」）。
         // T43 起 `accent` 同样认识了，所以它进的是上面的**键名数组**而不是这里 ——
         // brief §3 明说这一步「删 `accent`」是空转：T39 落地时这个列表就只剩 `api_key` 了。
-        // 剩下唯一永远不该出现的键只有 `api_key`：它住凭据管理器，不住 settings.json（R89/spec :473）。
-        // 后面的切片再落 `roots`/MCP 时同样要从这里**确认它不在**、而不是删东西。
+        // 剩下永远不该出现的键只有两个：
+        // · `api_key` —— 它住凭据管理器，不住 settings.json（R89/spec :473）。
+        // · `mcp` —— T26 落 `roots` 时**没有**落 MCP：R283 明说 MCP 配置在 T29 走独立文件
+        //   （`mcp.json`），永远不进 settings.json。把它留在这里当哨兵，等谁哪天往 `Settings`
+        //   上挂一个 `mcp` 字段，这条会当场红并把人指回那条裁定 —— 而不是等到 T29 的落盘
+        //   测试才发现两份真相已经长出来了。
+        // 后面的切片再落别的键时同样要从这里**确认它不在**、而不是删东西。
         let raw = serde_json::to_string(&Settings::default()).unwrap();
-        for banned in ["api_key"] {
+        for banned in ["api_key", "mcp"] {
             assert!(
                 !raw.contains(banned),
                 "{banned} 不该出现在 settings.json 里"
             );
         }
+    }
+
+    #[test]
+    fn roots_serializes_as_an_array_of_strings_for_the_frontend_mirror() {
+        // TS 镜像 `src/types.ts` 的 `Settings.roots: string[]` 靠这条钉着（R282）。
+        // `PathBuf` 走 serde 的默认序列化 = 一个字符串，**不是**字节数组或 `{components:[]}`
+        // 那种结构体形状；不钉这一条，前端拿到的可能就是 `["C:\\notes"]` 也可能是
+        // `[{"components":...}]`，而 tsc 对着 `string[]` 什么都看不出来。
+        let s = Settings {
+            roots: vec![
+                PathBuf::from(r"\\?\C:\notes"),
+                PathBuf::from(r"\\?\D:\code"),
+            ],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        let arr = v["roots"]
+            .as_array()
+            .unwrap_or_else(|| panic!("roots 必须是 JSON 数组，实得 {:?}", v["roots"]));
+        assert_eq!(arr.len(), 2);
+        for (i, want) in [r"\\?\C:\notes", r"\\?\D:\code"].into_iter().enumerate() {
+            assert_eq!(
+                arr[i].as_str(),
+                Some(want),
+                "第 {i} 项必须是**字符串**而不是对象/字节数组：前端 `roots: string[]` 的根据"
+            );
+        }
+        // 空表也是数组，不是 `null`、也不是键整个消失（`#[serde(default)]` 只管读侧）。
+        let empty = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(empty["roots"], serde_json::json!([]));
     }
 
     #[test]
@@ -1638,16 +1852,51 @@ mod tests {
         // 夹具必须用**永远不会被认识**的键。原来这里写的是 `"temperature":0.7,"accent":"#ffffff"`，
         // 而 T39 把 `temperature` 变成了 `Settings` 的真字段 —— 测试照绿，但它声称的
         // 「不认识的字段被忽略」从此没人测了（前置事实 4 的第二半，那才是真正的坑）。
-        std::fs::write(
-            store.path(),
-            r##"{"model":"qwen-turbo","quantum_mode":true,"legacy_engine":"x"}"##,
-        )
-        .unwrap();
+        //
+        // T26（R283）把这条拆成**对称的两半**，因为 `roots` 从此是已知字段了：
+        // · `quantum_mode` / `legacy_engine` / `mcp` 仍然必须**被忽略** —— 前两个是
+        //   「永远不会被认识」的哨兵，`mcp` 是 R283 点名要留在这一侧的（T29 的 MCP 配置走
+        //   独立的 `mcp.json`，永远不进 settings.json：留着它等于允许两份配置真相）。
+        // · `roots` 必须**被读回** —— 少读一遍就是「用户在设置里填了目录、read_file 还是全拒」，
+        //   而症状和「他什么都没填」长得一模一样。
+        // 两半写在同一条测试里不是为了省一个函数体，是因为它们共用同一个判据：
+        // **一份文件里同时有认识的和不认识的键时，认识的照单全收、不认识的静默放过**（R91）。
+        let kept = tempfile::tempdir().unwrap();
+        let kept_c = kept.path().canonicalize().unwrap();
+        // 走 `json!` 而不是手写字符串字面量：路径里的反斜杠要按 JSON 规则转义，
+        // 手抄那份转义在别的机器上（盘符、用户名）就是一份会随夹具漂移的暗雷。
+        let raw = serde_json::json!({
+            "model": "qwen-turbo",
+            "quantum_mode": true,
+            "legacy_engine": "x",
+            "mcp": { "servers": [] },
+            "roots": [kept.path()],
+        });
+        std::fs::write(store.path(), serde_json::to_string(&raw).unwrap()).unwrap();
         let got = store.load().unwrap();
         assert_eq!(got.model, "qwen-turbo");
         assert_eq!(
             got.window_messages, 40,
             "不认识字段时其余设置必须照原样保住（R91）"
+        );
+        // 前两半：`mcp` 被忽略了 ⇒ 文件照读、其余照留、不当成损坏。
+        // 下面那句 `to_value(got)["mcp"] == null` **今天是必然为真**的（结构体里没这个字段，
+        // serde 写不出它），它存在的理由是**向前**：谁在 T29 往 `Settings` 上挂一个 `mcp`
+        // 字段，这条就当场红，并把他指回 R283 那句「MCP 配置的家是 `mcp.json`，不是
+        // settings.json」。同上面 `banned` 名单里那个 `mcp` 是一对（那里管写侧、这里管读侧），
+        // 两处都验不了「现在」，两处都验的是「别再长出来」。
+        assert_eq!(
+            serde_json::to_value(&got).unwrap()["mcp"],
+            serde_json::Value::Null,
+            "`mcp` 必须留在「被忽略」那一侧：settings.json 不是 MCP 配置的家（R283/T29）"
+        );
+        // 后一半：`roots` 被读回，而且是过 `normalize_roots` 之后的形态（`load()` 里那一次
+        // `normalize()`）。这里断的是**内容**而不只是长度：长度对了但内容被抹成空表
+        // （`#[serde(default)]` 写错、或字段名打不成 `roots`）是最坏的那种假绿。
+        assert_eq!(
+            got.roots,
+            vec![kept_c],
+            "`roots` 是已知字段，必须被读回并留在表里（读不回来 = read_file 永远全拒）"
         );
         assert!(corrupt_backups(d.path()).is_empty());
     }

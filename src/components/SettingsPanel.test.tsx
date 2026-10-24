@@ -37,6 +37,10 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   // T43 的 `accent` 同一条理由（Rust 默认是 `""` = 跟随预设）：面板不渲染它，
   // 所以这里也得是一支**看得见差别**的颜色，而不是那个「漏带和带错长得一样」的空串。
   accent: "#aa00ff",
+  // T26 的 `roots` 是同一条规矩的第五次应用，而且这里最要紧：Rust 默认是**空表**，
+  // 空表 = `read_file` 一律拒绝，「漏带」与「带对」在断言里会长得一模一样。
+  // 两条目录而不是一个字符串数组字面量：也顺手钉住「它是数组、不是被 stringify 过的整串」。
+  roots: ["C:\\notes", "D:\\code"],
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -84,15 +88,16 @@ describe("SettingsPanel", () => {
       compact_threshold: 0.5,
       keep_turns: 3,
       accent: "#aa00ff",
+      roots: ["C:\\notes", "D:\\code"],
     });
   });
 
   it("carries the fields it does not render through a save", async () => {
     // T39 给 Rust 的 `Settings` 加了 `temperature`/`compact_threshold`/`keep_turns`，
-    // T43 又加了 `accent`：面板**不渲染**这四键（渲染一个存不进去的输入框才是 bug，见下面那条），
+    // T43 又加了 `accent`，T26 加了 `roots`：面板**不渲染**这五键（渲染一个存不进去的输入框才是 bug，见下面那条），
     // 于是逐字段列名单的 `settingsOf` 会少带它们。少带不报错：`settings.rs:260` 的结构体级
     // `#[serde(default)]` 会把它们抹回 Rust 默认值 ⇒ **一次普通的点保存，就把用户手改进
-    // settings.json 的温度、压缩阈值、K 和强调色全数清零**。这条测试存在的理由就是这个静默路径。
+    // settings.json 的温度、压缩阈值、K、强调色和目录表全数清零**。这条测试存在的理由就是这个静默路径。
     const p = setup();
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
     await waitFor(() => expect(p.onSave).toHaveBeenCalled());
@@ -103,6 +108,10 @@ describe("SettingsPanel", () => {
     // T43：`accent` 是第四只「面板不渲染但必须带走」的键。夹具里它不等于 Rust 默认值 `""`，
     // 所以「漏带」和「带成默认」在这里是两种都看得出来的错。
     expect(sent.accent).toBe("#aa00ff");
+    // T26：第五只。这里断的是**整串数组**而不是 `length`：`settingsOf` 若哪天把 roots
+    // 拼成一个字符串（或者反过来把 `[]` 当成「没有」而删键），长度断言都还是绿的，
+    // 而落盘的那份已经不是用户列出的那张表了。
+    expect(sent.roots).toEqual(["C:\\notes", "D:\\code"]);
     // 同一次展开不许把 `SettingsView` 那两只只读键一起带进 body：
     // `settings_set` 收的是 `Settings`，把掩码当设置存盘是另一件事（上面那条 toEqual 也守着）。
     expect(sent).not.toHaveProperty("api_key_masked");
@@ -318,8 +327,11 @@ describe("SettingsPanel", () => {
     // `/强调色/` `/accent/i` 两项预告；任务 #64（计划 :942）把控件补上了 ⇒ **这两项今天删掉**，
     // 面板从此渲染强调色那一行（上面那四条取色器用例就是它的判据）。
     // 剩下四项继续禁：它们的后端字段存在、面板**有意**不渲染，那是「有意的不渲染」不是遗漏。
+    // `/目录|roots/i` 这一项从 T26 起也在名单里：brief 没给 roots 控件，任务裁定也明说
+    // 「本任务不加 UI 控件」（R282）—— 目录表要能改，得先有一个「选目录 + 列表 + 删除」的
+    // 形状，那是另一件事，不在这一片里半拉子地开一个输入框。
     // 这里钉的从来不是「存不存得进」，而是「不许半拉子地先加一个没有校验、没有说明的输入框」——
-    // 上面那条 carry-through 测试保证「不渲染」不等于「不带上」：那四键照样得原样回到 `settings_set`。
+    // 上面那条 carry-through 测试保证「不渲染」不等于「不带上」：那五键照样得原样回到 `settings_set`。
     for (const label of [/温度/, /temperature/i, /压缩|阈值|keep_turns/i, /目录|roots/i, /MCP/i]) {
       expect(screen.queryByLabelText(label)).toBeNull();
     }

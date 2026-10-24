@@ -260,6 +260,16 @@ pub struct TurnDeps {
     /// 由 `Settings::to_model_config()` 给（T39）：`None` = 请求体不带 `temperature`，
     /// 端点自己定。和 `context` 同样理由 —— 会话不许自己去读 `Settings`。
     pub temperature: Option<f32>,
+    /// T26（R276）：`read_file` 能读的那张目录表，**每轮从 `Settings` 现取**（`send_message`
+    /// 头里那一次 `store.load()` 是它唯一的来源，不缓存 —— 用户改了设置，下一轮就该生效）。
+    ///
+    /// 为什么它是 `TurnDeps` 的一项、而不是 `SessionDeps` 上再加一个字段：`SessionDeps` 那条
+    /// 路已经有 builder 方法 `AgentSession::with_roots`（`session.rs:86`），两处都能收 roots
+    /// 就是「一个设置两个门」，两边给的值可以不一致而没人报错。R276 因此把它钉成一条线：
+    /// `TurnDeps.roots` → `.with_roots(...)` → `ToolCtx.roots`，只此一处。
+    /// 空表是**允许值**而且是默认值：那时 `read_file` 一律拒绝，那是设计（R90 取向），
+    /// 不是这一层漏了什么。
+    pub roots: Vec<PathBuf>,
     pub cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
@@ -374,6 +384,7 @@ pub async fn run_turn(
         sink,
         context,
         temperature,
+        roots,
         cancel,
     } = deps;
     let sid = session_id.to_string();
@@ -412,7 +423,14 @@ pub async fn run_turn(
         sink,
         context: builder,
         temperature,
-    });
+    })
+    // T26（R276）：**全仓库唯一一处**调用 `AgentSession::with_roots` 的生产代码。
+    // 在它之前这一行不存在，于是 `ToolCtx.roots` 恒空、T25 的 `read_file` 对任何路径都
+    // fail-closed —— 缺陷不补，切片 3 交付的第二个工具就是死的。
+    // 表**原样**交下去，这里一处也不过滤：过滤（去重、丢不存在项、canonicalize）只住在
+    // `settings.rs::normalize_roots`，读盘与落盘各跑一次。第二处过滤意味着两处答案
+    // 可以不一致，而那正是 R276 把它钉成一条线的原因。
+    .with_roots(roots);
     let session_cancel = session.cancel_handle();
     token.install(session_cancel.clone());
     if compaction.is_cancelled() {
@@ -532,6 +550,12 @@ pub async fn send_message(
             context: settings.to_context_config(),
             // T39：同上，温度的唯一来源是上面那个 `ModelConfig`（同一个 `normalize()` 出来的）。
             temperature,
+            // T26（R276）：roots 和上面两项同源 —— 同一个 `store.load()` 的每一轮现取，
+            // 因此**用户改完设置发下一条消息就生效**，这里没有任何缓存可以过期。
+            // 这一行没法单测（`#[tauri::command]` 在单测里调不动，见本模块测试头 R103 段
+            // 的说明）：它保证的是「来源是本轮那份 `Settings`」，而「值真的抵达 `ToolCtx`」
+            // 由下面的 `run_turn_hands_the_settings_roots_to_the_session` 钉。
+            roots: settings.roots.clone(),
             cancel: state.cancel.clone(),
         },
         &session_id,
@@ -1230,6 +1254,10 @@ mod tests {
                     // （`run_turn` 侧的那条线由 `session.rs` 的
                     // `the_session_temperature_reaches_the_chat_request` 钉）。
                     temperature: None,
+                    // 夹具默认不带 roots：除了那条专门量 roots 的测试（它自己搭 `TurnDeps`），
+                    // 其余测试走的是生产的空表形状 —— 表空时 `read_file` 会拒，而这里没有
+                    // `read_file` 可调用（生产工具表为空，:915）。
+                    roots: Vec::new(),
                     cancel: self.cancel.clone(),
                 },
                 sid,
@@ -1443,6 +1471,280 @@ mod tests {
         assert!(
             f.cancel.lock().unwrap().is_none(),
             "一轮跑完不许把令牌留在槽里"
+        );
+    }
+
+    // ==== Task 26：装配层真的把 settings.roots 交给了会话（R276 的唯一入口）====
+    //
+    // 为什么这条测试非得住在 ipc 里：`session.rs` 那条
+    // `run_turn_passes_configured_roots_into_tool_ctx` 量的是 `AgentSession::with_roots`
+    // **这个方法本身**能用；而本任务修的是「它在生产里从未被调用」。把 `run_turn` 里
+    // `AgentSession::new(..).with_roots(roots)` 那一行删掉（现 :433），`session.rs` 全绿、
+    // `settings.rs` 全绿，只有这里红 ——
+    // 判据必须能被打红，不然它不构成一条线（R56 的老规矩）。
+    //
+    // 取证方式和 `session.rs` 那边一致：从**工具自己手里**读 `ctx.roots`。`ToolCtx` 是
+    // 会话内部造的（`session.rs:123`），从 `AgentSession` 的字段读回来属于自证。
+
+    use crate::agent::types::ToolOutput;
+    use crate::tools::registry::{Tool, ToolCtx, ToolError, ToolMeta};
+    // `ModelDelta`/`ModelError`/`ChatRequest`/`ModelProvider`/`Stream`/`async_trait`/
+    // `VecDeque` 都由本模块后头那组 `use`（Task 24/41 段）带进来了 —— 模块级 `use` 与
+    // 书写顺序无关，这里再写一遍就是 E0252 重复导入。
+
+    /// 记下**执行那一刻**的 `ctx.roots`，每次调用一条。
+    #[derive(Default)]
+    struct RootsSpy {
+        seen: Mutex<Vec<Vec<PathBuf>>>,
+    }
+
+    #[async_trait]
+    impl Tool for RootsSpy {
+        fn meta(&self) -> ToolMeta {
+            ToolMeta {
+                name: "roots_spy".into(),
+                description: "记下执行那一刻 ctx.roots 的取证工具".into(),
+                input_schema: json!({"type": "object"}),
+                // Read 档是有意的：这条测试量的是 roots 到没到。Ask 档要在测试里搭一套
+                // 应答任务，那会把「roots 没接上」的读数埋进应答时序里。
+                risk: Risk::Read,
+            }
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            self.seen.lock().unwrap().push(ctx.roots.clone());
+            Ok(ToolOutput::text("记下了"))
+        }
+    }
+
+    impl RootsSpy {
+        fn seen(&self) -> Vec<Vec<PathBuf>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// 按轮吐剧本的模型。本模块原有的两只都不会发 `tool_call`（Plan A 的生产工具表是空的），
+    /// 而 roots 的唯一消费者就是工具 —— 不让模型真的调一次工具，「传到执行点」就无从取证。
+    /// **取空了就是夹具写错**，不许安静地回一条空消息把测试做绿。
+    struct Scripted {
+        rounds: Mutex<VecDeque<Vec<ModelDelta>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for Scripted {
+        fn stream<'a>(
+            &'a self,
+            _req: ChatRequest,
+        ) -> std::pin::Pin<Box<dyn Stream<Item = Result<ModelDelta, ModelError>> + Send + 'a>>
+        {
+            let round = self
+                .rounds
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("夹具轮数不够");
+            Box::pin(futures::stream::iter(
+                round.into_iter().map(Ok).collect::<Vec<_>>(),
+            ))
+        }
+    }
+
+    /// 一轮工具调用：id 带轮次（R57 —— 全复用 `"c1"` 的话配对断言会 latch 到早先那次）。
+    fn tool_round(round: usize, name: &str) -> Vec<ModelDelta> {
+        vec![
+            ModelDelta::ToolCallStart {
+                index: 0,
+                id: Some(format!("r{round}c0")),
+                name: Some(name.to_string()),
+            },
+            ModelDelta::ToolCallArgs {
+                index: 0,
+                fragment: "{}".to_string(),
+            },
+        ]
+    }
+
+    /// brief Step 5 的生产侧那条线：`TurnDeps.roots` 必须一路走到 `ToolCtx.roots`。
+    #[tokio::test]
+    async fn run_turn_hands_the_settings_roots_to_the_session() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let spy = Arc::new(RootsSpy::default());
+        // 注册在**夹具的** registry 上（`Fixture::new` 每轮现构一只空表），
+        // 生产那只在 :915 的 `ToolRegistry::new()` 一行不动 —— 注册是 Task 27 的事。
+        f.registry.register(spy.clone());
+
+        // 两条真存在的临时目录 + 一条**不存在**的路径。把不存在的那条也塞进来是故意的：
+        // 装配层不做筛选，筛选是 `settings.rs::normalize_roots` 在读盘时干的**唯一**一件事。
+        // 这里要是「顺手」过滤一遍，roots 就有了第二处决定它的地方，而那正是 R276 要避免的。
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let ghost = a.path().join("never-created");
+        let roots = vec![
+            a.path().to_path_buf(),
+            b.path().to_path_buf(),
+            ghost.clone(),
+        ];
+
+        let model = Arc::new(Scripted {
+            rounds: Mutex::new(VecDeque::from(vec![
+                tool_round(0, "roots_spy"),
+                vec![ModelDelta::Text("看完了".into())],
+            ])),
+        });
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        let reason = run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model,
+                sink: sink.clone(),
+                context: ContextConfig::default(),
+                temperature: None,
+                roots: roots.clone(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "读一下我的笔记".into(),
+            }],
+        )
+        .await
+        .expect("带一次工具调用的一轮必须整体成功");
+        sink.flush();
+        assert_eq!(reason, StopReason::EndTurn, "剧本第二轮就是收尾文本");
+
+        let seen = spy.seen();
+        assert_eq!(
+            seen.len(),
+            1,
+            "夹具只安排了一次工具调用，取证点就得恰好记下一条；0 条说明工具压根没跑，那条断言是空的"
+        );
+        assert_eq!(
+            seen[0], roots,
+            "roots 没传到执行点 ⇒ read_file 永远 fail-closed，这是本任务存在的唯一理由"
+        );
+    }
+
+    /// 空表也要**原样**传下去：装配层不许在 roots 为空时替用户补一个「看起来合理」的目录
+    /// （进程 cwd、可执行文件目录、app data 目录都在此列）。R90 的空 `base_url` 是同一个
+    /// 取向 —— 那一支真被补过，症状是把会话内容发给用户没选过的端点；这一支补了的代价是
+    /// 模型能读用户没批准过的目录。两条都是「界面替用户做主」，只是方向相反。
+    #[tokio::test]
+    async fn an_empty_roots_table_is_handed_over_empty_instead_of_a_default_directory() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let spy = Arc::new(RootsSpy::default());
+        f.registry.register(spy.clone());
+
+        let model = Arc::new(Scripted {
+            rounds: Mutex::new(VecDeque::from(vec![
+                tool_round(0, "roots_spy"),
+                vec![ModelDelta::Text("没读到东西".into())],
+            ])),
+        });
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model,
+                sink: sink.clone(),
+                context: ContextConfig::default(),
+                temperature: None,
+                roots: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "读一下我的笔记".into(),
+            }],
+        )
+        .await
+        .expect("空 roots 不是错误，一轮照常跑完");
+        sink.flush();
+
+        let seen = spy.seen();
+        assert_eq!(seen.len(), 1, "同上：取证点必须真的跑过一次");
+        assert!(
+            seen[0].is_empty(),
+            "roots 为空时执行点却拿到了 {:?} —— 那是装配层替用户做的决定",
+            seen[0]
+        );
+    }
+
+    /// R282：`SettingsView` 的线上形状 —— `roots` 落在**顶层**、是**字符串数组**。
+    ///
+    /// brief Step 5 写的是「`SettingsView` 加 `roots: Vec<String>`」，而那是**空转**：
+    /// `settings` 那一项是 `#[serde(flatten)]`（:655），新字段自己就冒到顶层来了，
+    /// 手加一个 `roots` 字段反而是同一份设置的两个来源（R276 要避免的那个形状，另一个方向）。
+    /// 但「不用改代码」不等于「不用测」：flatten 一旦被人改成嵌套（或者给这个 struct 加了
+    /// `rename_all`），前端 `settings.roots` 就静默变成 `undefined`，而 `tsc` 对着 Rust 侧
+    /// 什么都看不见。这条测试钉的就是这个形状，前端镜像（`src/types.ts`）由它兜住。
+    #[test]
+    fn the_settings_view_carries_roots_at_the_top_level_as_strings() {
+        let view = SettingsView {
+            settings: Settings {
+                // `\\?\` 前缀是刻意选的：`PathBuf` 的 serde 实现原样交字符串，
+                // 于是这条测试同时也在钉「Windows 长路径前缀不会被拆成结构体」。
+                roots: vec![
+                    PathBuf::from(r"\\?\C:\notes"),
+                    PathBuf::from(r"\\?\D:\code"),
+                ],
+                ..Default::default()
+            },
+            api_key_masked: None,
+            corrupt_backup: None,
+        };
+        let v = serde_json::to_value(&view).unwrap();
+        let obj = v
+            .as_object()
+            .unwrap_or_else(|| panic!("view 必须序列化成一个对象，实得 {v:?}"));
+        assert!(
+            obj.contains_key("roots"),
+            "`roots` 没在顶层 —— flatten 臂被改坏了，前端读到的会是 undefined。顶层键：{:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        let arr = v["roots"]
+            .as_array()
+            .unwrap_or_else(|| panic!("roots 必须是 JSON 数组，实得 {:?}", v["roots"]));
+        assert_eq!(
+            arr.iter()
+                .map(|x| x.as_str().unwrap_or("<非字符串>"))
+                .collect::<Vec<_>>(),
+            vec![r"\\?\C:\notes", r"\\?\D:\code"],
+            "每一项都得是字符串：TS 镜像声明的是 string[]，混进对象就是镜像骗人"
+        );
+        // 视图自带的两项与 flatten 进来的十三项**共处一层**（`roots` 不许被挤进 `settings` 里），
+        // 而明文 key 依旧不许出现在任何一个键名上（R83 / spec:473）。
+        assert!(obj.contains_key("api_key_masked") && obj.contains_key("corrupt_backup"));
+        assert!(
+            !obj.contains_key("settings"),
+            "顶层冒出了嵌套的 `settings` 对象，前端镜像是按顶层读的"
+        );
+        assert!(
+            !obj.contains_key("api_key"),
+            "明文 key 不许出现在这条边界上（这里能出现 `api_key_masked`，不能出现 `api_key`）"
+        );
+        // 默认值那一支也得有键：空表序列化成 `[]` 而不是整个键消失，
+        // 否则前端的 `settings.roots.map(...)` 在生产默认配置下直接抛。
+        let empty = serde_json::to_value(SettingsView {
+            settings: Settings::default(),
+            api_key_masked: None,
+            corrupt_backup: None,
+        })
+        .unwrap();
+        assert_eq!(
+            empty["roots"].as_array().map(|a| a.len()),
+            Some(0),
+            "空 roots 必须是可见的空数组，不是缺键"
         );
     }
 
@@ -1915,6 +2217,7 @@ mod tests {
                 sink: sink.clone(),
                 context: compacting_cfg(),
                 temperature: None,
+                roots: Vec::new(),
                 cancel: f.cancel.clone(),
             },
             &sid,

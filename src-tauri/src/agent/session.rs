@@ -578,6 +578,40 @@ mod tests {
         }
     }
 
+    /// T26 Step 4 的取证点：记下**执行那一刻**的 `ctx.roots`。
+    /// 判据只能从工具这一侧拿 —— `ToolCtx` 是 `run()` 内部构造的（`session.rs:120`），
+    /// 从 `AgentSession` 的字段读回来等于自证，看不见「构造时到底填了什么」。
+    /// Read 档是有意的：这条测试要量的是 roots 到没到，弹窗那条线 `gate.rs` 自己钉着，
+    /// 这里不想为了取证再搭一套应答任务（那会把「roots 没接上」的读数埋进应答时序里）。
+    #[derive(Clone, Default)]
+    struct AssertRootsTool(Arc<Mutex<Vec<Vec<PathBuf>>>>);
+
+    #[async_trait]
+    impl Tool for AssertRootsTool {
+        fn meta(&self) -> ToolMeta {
+            ToolMeta {
+                name: "assert_roots".into(),
+                description: "记下执行那一刻 ctx.roots 的假工具".into(),
+                input_schema: json!({"type": "object"}),
+                risk: Risk::Read,
+            }
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            self.0.lock().unwrap().push(ctx.roots.clone());
+            Ok(ToolOutput::text("记下了"))
+        }
+    }
+
+    impl AssertRootsTool {
+        fn roots_seen(&self) -> Vec<Vec<PathBuf>> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
     // ---- 装配 ----
 
     /// 一套完整装配：真注册表、真权限门、真滑窗，模型是脚本化的。
@@ -615,13 +649,41 @@ mod tests {
             (rig, tool)
         }
 
+        /// 装配 + 一条 roots 表 + 额外的工具（T26 Step 4）。
+        /// 夹具经的是**生产同一个入口** `AgentSession::with_roots`（R276：roots 进 `ToolCtx`
+        /// 只有这一条路），所以这条测试量到的就是那条线本身，而不是夹具在 `SessionDeps`
+        /// 上另开的第三条路。
+        fn with_roots(
+            rounds: Vec<Vec<ModelDelta>>,
+            roots: Vec<PathBuf>,
+            extra_tools: Vec<Arc<dyn Tool>>,
+        ) -> Rig {
+            let model = ScriptedModel::new(rounds);
+            let recorder = model.recorder.clone();
+            let (session, sink, gate) = parts(
+                model,
+                ContextConfig::default(),
+                None,
+                extra_tools,
+                // 温度这一支与 `assembled` 同样给 `None`：这条测试不量温度，
+                // 温度那条线由 `the_session_temperature_reaches_the_chat_request` 钉。
+                roots,
+            );
+            Rig {
+                session,
+                sink,
+                gate,
+                recorder,
+            }
+        }
+
         fn assembled(
             model: Arc<dyn ModelProvider>,
             context: ContextConfig,
             recorder: Recorder,
             extra_tools: Vec<Arc<dyn Tool>>,
         ) -> Rig {
-            let (session, sink, gate) = parts(model, context, None, extra_tools);
+            let (session, sink, gate) = parts(model, context, None, extra_tools, Vec::new());
             Rig {
                 session,
                 sink,
@@ -672,11 +734,17 @@ mod tests {
 
     /// 温度作为第 3 个入参而不是藏在夹具默认里：`the_session_temperature_reaches_the_chat_request`
     /// 要能换着值喂它，而其它测试要的「不带温度」= 生产上端点自己定那个状态，写明白比默认好。
+    ///
+    /// `roots` 是 T26 加的第 5 个入参，同样是「显式而不是默认」：绝大多数 rig 要的是**空表**
+    /// （生产默认，`read_file` 因此全拒），只有 `run_turn_passes_configured_roots_into_tool_ctx`
+    /// 要一张非空的表。把空表写成每个调用点的 `vec![]` 而不是塞进默认值，为的是让
+    /// 「这条测试到底在什么 roots 下跑」在读测试的人眼前就是一个具体值。
     fn parts(
         model: Arc<dyn ModelProvider>,
         context: ContextConfig,
         temperature: Option<f32>,
         extra_tools: Vec<Arc<dyn Tool>>,
+        roots: Vec<PathBuf>,
     ) -> (AgentSession, Arc<VecSink>, Arc<PermissionGate>) {
         let sink = Arc::new(VecSink::default());
         let registry = Arc::new(ToolRegistry::new());
@@ -693,7 +761,11 @@ mod tests {
             sink: sink.clone(),
             context: ContextBuilder::new(context),
             temperature,
-        });
+        })
+        // R276：roots 进 `ToolCtx` 只有这一个入口 —— builder 方法，不在 `SessionDeps` 上
+        // 再开第二个字段。表**原样**送下去，这里不做任何过滤：能不能用是
+        // `settings.rs::normalize_roots` 在读盘时定的事，执行点只负责按表放行。
+        .with_roots(roots);
         (session, sink, gate)
     }
 
@@ -1699,6 +1771,7 @@ mod tests {
                 ContextConfig::default(),
                 want,
                 vec![],
+                Vec::new(),
             );
             assert_eq!(
                 session.request().temperature,
@@ -1706,6 +1779,96 @@ mod tests {
                 "{want:?} 必须原样进请求"
             );
         }
+    }
+
+    // ---- T26：roots 必须真的送到执行点 ----
+
+    /// brief Step 4。这条测试存在的理由写在断言消息里：`with_roots` 在本任务之前**从未被调用**
+    /// ⇒ `ToolCtx.roots` 恒空 ⇒ T25 交付的 `read_file` 在生产里对任何路径都 fail-closed。
+    /// 循环这一侧的线只有在这里能量到（生产那一侧由 `ipc.rs` 的
+    /// `run_turn_hands_the_settings_roots_to_the_session` 钉，装配点不在本文件）。
+    #[tokio::test]
+    async fn run_turn_passes_configured_roots_into_tool_ctx() {
+        // 夹具是**真目录**（R277 的口径：不注入假的 `exists`），外加一条真的不存在的路径。
+        // 那条幽灵路径是故意的，而且**必须照样抵达**：会话是传送带，不是第二把尺子 ——
+        // 「丢弃不存在的目录」归 `settings.rs::normalize_roots` 一处（R86 同规）。
+        // 谁哪天在循环里顺手 filter 一遍，这条会红，而那正是「同一判据长出两个强度版本」的开头。
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let ghost = a.path().join("never-created");
+        assert!(!ghost.exists(), "夹具前提：这条路径必须真的不存在");
+        let roots = vec![
+            a.path().to_path_buf(),
+            ghost.clone(),
+            b.path().to_path_buf(),
+        ];
+
+        let tool = Arc::new(AssertRootsTool::default());
+        let mut rig = Rig::with_roots(
+            vec![
+                tool_round(0, &[("assert_roots", "{}")]),
+                deltas(&["收到了"]),
+            ],
+            roots.clone(),
+            vec![tool.clone()],
+        );
+        assert_eq!(rig.run("列一下 roots").await, StopReason::EndTurn);
+
+        let seen = tool.roots_seen();
+        // 先确认工具**真的被跑过**：一次都没执行的话，下面那条断言是空的真（绿色但什么都没说）。
+        assert_eq!(
+            seen.len(),
+            1,
+            "假工具一次都没被执行 ⇒ 这条测试什么都没量到，事件序列 {:?}",
+            rig.sink.kinds()
+        );
+        assert_eq!(
+            seen[0], roots,
+            "roots 没传到执行点 ⇒ read_file 永远 fail-closed，这是本任务存在的唯一理由"
+        );
+    }
+
+    /// 同一条线的**默认那一头**：不配 roots 时抵达执行点的必须还是空表，
+    /// 于是 `read_file` 当场拒读一条真实存在的文件。
+    /// 这条不是多余的对称：把「空表就补个默认目录」写成实现的人，会让上面那条照绿、这条红。
+    /// 这里注册的是**真的 `ReadFileTool`**（不是假工具），所以拒的是那个用户真正会看到的错误，
+    /// 而不是某个替身自己编的说法。
+    #[tokio::test]
+    async fn an_unconfigured_session_reaches_the_tool_ctx_with_no_roots_and_read_file_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "真的想读我".as_bytes()).unwrap();
+        // 参数走 `json!` 而不是手拼字符串：路径里的反斜杠要按 JSON 规则转义，
+        // 手抄那份转义在别的机器上就是一份随夹具漂移的暗雷（`settings.rs` 同一条理由）。
+        let args = json!({ "path": file }).to_string();
+
+        let mut rig = Rig::with_roots(
+            vec![
+                tool_round(0, &[("read_file", args.as_str())]),
+                deltas(&["被拒了"]),
+            ],
+            Vec::new(),
+            vec![Arc::new(crate::tools::read_file::ReadFileTool)],
+        );
+        assert_eq!(rig.run("读那个文件").await, StopReason::EndTurn);
+
+        let results = rig.sink.tool_results();
+        assert_eq!(
+            results.len(),
+            1,
+            "工具没跑 ⇒ 什么都没量到：{:?}",
+            rig.sink.kinds()
+        );
+        let (id, is_error, preview) = &results[0];
+        assert_eq!(id, "r0c0");
+        assert!(
+            *is_error,
+            "空 roots 下 read_file 必须**报错而不是读到内容**（读到就是越权）：{preview}"
+        );
+        assert!(
+            preview.contains("越界"),
+            "拒绝要归因到 containment 门（「越界」），而不是碰巧的 IO 失败：{preview}"
+        );
     }
 
     // ---- 预览：一次大输出不许压垮 IPC 与前端 ----

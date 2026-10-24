@@ -56,6 +56,11 @@ const view = (over: Partial<SettingsView> = {}): SettingsView => ({
   compact_threshold: 0.85,
   keep_turns: 10,
   accent: "",
+  // T26 的 `roots`：这两份夹具（`App.test.tsx` / `AppImages.test.tsx`）不断言保存载荷，
+  // 所以这里给的是**生产默认值**那个空数组 —— 「面板/ App 会不会把它抹掉」由
+  // `AppSettings.test.tsx` 与 `SettingsPanel.test.tsx` 里那两条用非空值断言的测试管，
+  // 空数组在这儿只承担一件事：让这份镜像少一键就当场编译不过。
+  roots: [],
   api_key_masked: "…abcd",
   corrupt_backup: null,
   ...over,
