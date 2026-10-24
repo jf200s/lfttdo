@@ -488,11 +488,37 @@ pub const MAX_CHARS_CAP: usize = 24_000;
 ///   不标记就等于让模型把站点 slogan/反爬提示当正文引用；标记而不是丢掉/报错的理由在
 ///   `MIN_ARTICLE_CHARS` 的注释上。空串那一支仍交 `NO_ARTICLE_TEXT`（另一句真话，两支没合并）。
 ///   透传那两支**不受这条影响**，一条标记都不许加。
+///
+/// 本函数是**对外那一串**（有标记时 = 标记行 + 换行 + 正文），三条臂的实际代码在
+/// `render_markdown_with_label`；`FetchTool::execute` 直接走那一个，原因写在那一个的注释上。
 pub fn render_markdown(
     content_type: &str,
     body: &[u8],
     base_url: &str,
 ) -> Result<String, ToolError> {
+    let (label, markdown) = render_markdown_with_label(content_type, body, base_url)?;
+    if label.is_empty() {
+        Ok(markdown)
+    } else {
+        Ok(format!("{label}\n{markdown}"))
+    }
+}
+
+/// 与 `render_markdown` 同一条链，但把「R271 的标记句」和「可分页的正文」**分开交**：
+/// 第一个元素是标记句，空串 = 这一支没有标记（正文达标 / 透传两支 / 抽不出正文那一支）。
+///
+/// 为什么要多这一个入口，而不是让 `execute` 继续切 `render_markdown` 那一串：黏在一起之后，
+/// 标记句就占进了分页的预算，于是三条对外承诺会一起漏 ——
+/// ①`max_chars` 比标记句还短时，被切掉的正是「别当正文引用」那半句，交出去的是半句真话；
+/// ②`slice_page` 的 `total` 把标记句自己的字数也算进「原文 N 字符」，同篇正文报出两个 N；
+/// ③第 1 页替标记句吃掉的字符不算在正文里 ⇒ 模型按工具描述那句
+/// 「续页就填 offset = 上次 offset + max_chars」续页时读到重叠内容。
+/// 判据是「标记句不参与计数、不被截断、偏移只数正文」，只有**分页之前**分开才做得到。
+fn render_markdown_with_label(
+    content_type: &str,
+    body: &[u8],
+    base_url: &str,
+) -> Result<(String, String), ToolError> {
     let mt = media_type_of(content_type);
     match mt.as_str() {
         "text/html" | "application/xhtml+xml" => {
@@ -501,7 +527,7 @@ pub fn render_markdown(
             // 空串是假话（「页面是空的」），整页转换是真话但更坏（一堆链接与 JS）。
             // 这一句和 `slice_page` 的「正文为空」同一取向：把失败原因交给模型。
             if markdown.trim().is_empty() {
-                Ok(NO_ARTICLE_TEXT.to_string())
+                Ok((String::new(), NO_ARTICLE_TEXT.to_string()))
             } else {
                 // R271：非空但**低于正文下限** ⇒ 定界这一步其实没成功，交出去的是降级
                 // 剩下的站点样板/反爬提示。这一支**不丢文本**（模型还得自己判），只在前面
@@ -510,15 +536,17 @@ pub fn render_markdown(
                 // 选「标记」而不是「报错/丢掉」的理由写在 `MIN_ARTICLE_CHARS` 上。
                 let n = markdown.chars().count();
                 if n < MIN_ARTICLE_CHARS {
-                    Ok(format!("{}\n{markdown}", sub_floor_label(n)))
+                    Ok((sub_floor_label(n), markdown))
                 } else {
-                    Ok(markdown)
+                    Ok((String::new(), markdown))
                 }
             }
         }
         // 原文透传：纯文本的空行与缩进、JSON 的结构本身就是内容，过一次 markdown
         // 转换器只会把它们变成装饰或丢掉。**解码**仍共用同一个辅助（判据 3）。
-        "text/plain" | "application/json" => decode_body(content_type, body, false),
+        "text/plain" | "application/json" => {
+            Ok((String::new(), decode_body(content_type, body, false)?))
+        }
         other => Err(ToolError::Failed(format!(
             "content-type「{other}」不在白名单内：fetch_url 只取 text/html、text/plain、application/json 三种格式"
         ))),
@@ -917,10 +945,17 @@ impl Tool for FetchTool {
         // R270：基地址用 `final_url`（实际取回内容那一跳），**不是**用户请求里那条：
         // 正文里的相对链接是相对于** Serving 这个内容的那个地址**的，按请求地址展开
         // 会指到另一台机器上的同类路径。
-        let text = render_markdown(&f.content_type, &f.body, &f.final_url)?;
+        // 标记句与正文**分开取**（为什么要有第二个入口，写在 `render_markdown_with_label`
+        // 的注释上）：分页只吃正文。标记句挂在 `slice_page` 之外、且只随第 1 页出现 ——
+        // 「以下 N 字」说的是正文的开头，续页再挂它就成了假话（那一页以下的字数与 N 无关）。
+        let (label, text) = render_markdown_with_label(&f.content_type, &f.body, &f.final_url)?;
         let mut out = String::new();
         for line in prefix_lines(&f) {
             out.push_str(&line);
+            out.push('\n');
+        }
+        if offset == 0 && !label.is_empty() {
+            out.push_str(&label);
             out.push('\n');
         }
         out.push_str(&slice_page(&text, offset, max_chars, true));
@@ -1990,6 +2025,135 @@ mod tests {
             "空正文的说法不对：{}",
             slice_page("", 0, 8_000, true)
         );
+    }
+
+    // ——————— R271 的标记句 × 分页：标记句不在被切的那一串里 ———————
+    //
+    // 缺陷形状（T28 Step 0 派发）：标记句和正文黏成一串后 `execute` 对整串分页，于是
+    // ①页开得比标记句还小时「别当正文引用」那半句被切掉、②`slice_page` 的 `total`
+    // 把标记句自己的字数也算进「原文 N 字符」（同一个 n 在两句里报出两个数）、
+    // ③第 1 页替标记句吃掉了字符 ⇒ 模型按「offset = 上次 offset + max_chars」续页会读到重叠。
+
+    /// 低于 `MIN_ARTICLE_CHARS`、但**长到能被 20 字的页切成好几页**的门户页夹具
+    /// （ithome 那 187 字样板的同一种形状）：只有「页比标记句短」这个形状才看得见上面三条，
+    /// 所以这里刻意把夹具做成「非空 + 低于下限 + 多页」。
+    const SUB_FLOOR_PORTAL_HTML: &str = "<!doctype html><html><head><title>软媒网｜某科技门户</title>\
+                    <meta name=\"description\" content=\"软媒旗下科技门户网站\"></head>\
+                    <body><div class=\"wrap\">\
+                    <p>软媒旗下科技门户网站，速享科技每一刻。</p>\
+                    <p>本站收录前沿科技新闻、新品资讯、手机评测与智能设备导购，是数码爱好者每天要逛的科技站。</p>\
+                    <p>© 2026 软媒 版权所有｜违法和不良信息举报电话 010-00000000｜京公网安备 11010802035028 号</p>\
+                    </div></body></html>";
+
+    /// 正文基线：从 `render_markdown` 那句**对外形状不变**的「标记行 + 换行 + 正文」里剥出正文。
+    /// 不写死字数，是为了让「`原文 N` 数的到底是正文还是正文+标记句」这条判据在夹具被改动后
+    /// 依然成立（写死的数字只会跟着缺陷一起被改错）。
+    fn sub_floor_body() -> String {
+        let glued = render_markdown("text/html", SUB_FLOOR_PORTAL_HTML.as_bytes(), PAGE).unwrap();
+        let (label_line, body) = glued.split_once('\n').unwrap_or_else(|| {
+            panic!("夹具必须走「非空但低于下限」那一支（第一行是标记句），实得：{glued}")
+        });
+        assert!(
+            label_line.starts_with("[未能定界出正文，以下 ")
+                && label_line.ends_with("，别当正文引用]"),
+            "夹具的标记行形状不对，后面几条断言都失去意义：{label_line}"
+        );
+        let n = body.chars().count();
+        assert!(
+            n > 60 && n < MIN_ARTICLE_CHARS,
+            "夹具必须**同时**低于正文下限、又能被 20 字的页切成两页以上，否则这几条什么都没钉住：{n} 字"
+        );
+        body.to_string()
+    }
+
+    /// 判据 ①+②：`max_chars` 小于标记句长度时，标记句必须**整句**留在第 1 页，
+    /// 且它下面那一页必须逐字等于「只切正文」的 `slice_page` 结果 —— 这一条等式同时钉住
+    /// 「N 只数正文」（`total` 里没混进标记句）和「第 1 页给满 max_chars 个正文字」。
+    #[tokio::test]
+    async fn a_page_smaller_than_the_label_still_carries_the_whole_label() {
+        let body = sub_floor_body();
+        let out = fetch_tool_with(ScriptedTransport::new(vec![ok200(
+            PAGE,
+            "text/html",
+            SUB_FLOOR_PORTAL_HTML.as_bytes(),
+        )]))
+        .execute(json!({"url": PAGE, "max_chars": 20}), &test_ctx())
+        .await
+        .unwrap();
+        let ToolOutput::Text { text: first } = out else {
+            panic!("fetch_url 只交文本");
+        };
+        let (label, page) = first.split_once('\n').unwrap_or_else(|| {
+            panic!("标记句要独立成一行、正文跟在它下面；整行都凑不齐说明它被切了：{first}")
+        });
+        assert_eq!(
+            label,
+            sub_floor_label(body.chars().count()),
+            "第 1 页的标记句必须逐字完整（页再小也不能切它），实得：{first}"
+        );
+        assert_eq!(
+            page,
+            slice_page(&body, 0, 20, true),
+            "标记句之外的那一页必须等于「只切正文」的结果：黏在一起切时正文少给 20 个标记句\
+             的字符，末尾那句「原文 N 字符」也多算了标记句自己的字数"
+        );
+    }
+
+    /// 判据 ③：按工具描述教的「offset = 上次 offset + max_chars」续页时，续页必须是**正文的
+    /// 下一段**（不重叠），而「以下 N 字」那句只属于第 1 页 —— 续页再挂它就是假话（那一页以下
+    /// 的字数和 N 没关系）。
+    #[tokio::test]
+    async fn the_next_page_starts_where_the_body_page_stopped_and_repeats_no_label() {
+        let body = sub_floor_body();
+        let steps = || vec![ok200(PAGE, "text/html", SUB_FLOOR_PORTAL_HTML.as_bytes())];
+        let second = fetch_tool_with(ScriptedTransport::new(steps()))
+            .execute(
+                json!({"url": PAGE, "offset": 20, "max_chars": 20}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text { text: second } = second else {
+            panic!("fetch_url 只交文本");
+        };
+        assert_eq!(
+            second,
+            slice_page(&body, 20, 20, true),
+            "第 2 页必须从正文第 20 字接着切（第 1 页没替标记句吃字符 ⇒ 不重叠）"
+        );
+        assert!(
+            !second.contains("未能定界出正文"),
+            "标记句只在第 1 页出现一次，续页重复挂它等于对同一篇正文报两遍：{second}"
+        );
+    }
+
+    /// 判据 ②的另一半 + 不回归：默认页（一页装得整篇）下标记句**只出现一次**，
+    /// 输出逐字等于 `render_markdown` 的对外形状，也不挂截断标记。
+    #[tokio::test]
+    async fn the_default_page_carries_the_label_exactly_once() {
+        let body = sub_floor_body();
+        let glued = render_markdown("text/html", SUB_FLOOR_PORTAL_HTML.as_bytes(), PAGE).unwrap();
+        let out = fetch_with_transport(ScriptedTransport::new(vec![ok200(
+            PAGE,
+            "text/html",
+            SUB_FLOOR_PORTAL_HTML.as_bytes(),
+        )]))
+        .await
+        .unwrap();
+        assert!(
+            body.chars().count() < DEFAULT_MAX_CHARS,
+            "夹具必须一页装得下，否则这条测的不是默认页"
+        );
+        assert_eq!(
+            out, glued,
+            "默认页（一页装得下）的输出必须还是 `render_markdown` 那一串"
+        );
+        assert_eq!(
+            out.matches("别当正文引用").count(),
+            1,
+            "标记句只能出现一次：{out}"
+        );
+        assert!(!out.contains("已截断"), "一页装得下就不许挂截断标记：{out}");
     }
 
     // ————————————————————— Step 3：跨主提示与状态提示 —————————————————————
