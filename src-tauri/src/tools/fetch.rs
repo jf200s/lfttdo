@@ -1893,13 +1893,8 @@ mod tests {
     async fn a_sub_floor_extraction_is_labelled_instead_of_dropped() {
         // 一份 readability 定界不出来的门户页：正文位置只剩站点 slogan、站点简介
         // 与版权/举报/备案页脚，合计一百来字 —— 真网上打到的是 ithome 的 187 字。
-        let html = "<!doctype html><html><head><title>软媒网｜某科技门户</title>\
-                    <meta name=\"description\" content=\"软媒旗下科技门户网站\"></head>\
-                    <body><div class=\"wrap\">\
-                    <p>软媒旗下科技门户网站，速享科技每一刻。</p>\
-                    <p>本站收录前沿科技新闻、新品资讯、手机评测与智能设备导购，是数码爱好者每天要逛的科技站。</p>\
-                    <p>© 2026 软媒 版权所有｜违法和不良信息举报电话 010-00000000｜京公网安备 11010802035028 号</p>\
-                    </div></body></html>";
+        // 同一份夹具被下面「标记句 × 分页」那三条测试复用（夹具一改，四条判据一起动）。
+        let html = SUB_FLOOR_PORTAL_HTML;
         let out = render_markdown("text/html", html.as_bytes(), PAGE).unwrap();
         let (label_line, body) = out
             .split_once('\n')
@@ -2059,9 +2054,16 @@ mod tests {
             "夹具的标记行形状不对，后面几条断言都失去意义：{label_line}"
         );
         let n = body.chars().count();
+        // 夹具的两条前置，各自对应一条判据；写成裸魔数（原来那个 `n > 60`）看不出谁在承重：
+        // ①页必须比标记句**短**（`20 < label`），否则「页切到标记句」这个形状根本不出现；
+        // ②正文必须容得下 `offset=20` 再加一整页（`n > 40`），否则第二条测试的左右两边
+        // 同为「超出范围」那一串 ⇒ 等式在比两个相同的错误文案，判据 ③ 空转。
+        let label_chars = label_line.chars().count();
         assert!(
-            n > 60 && n < MIN_ARTICLE_CHARS,
-            "夹具必须**同时**低于正文下限、又能被 20 字的页切成两页以上，否则这几条什么都没钉住：{n} 字"
+            20 < label_chars && n > 40 && n < MIN_ARTICLE_CHARS,
+            "夹具不成立（标记句 {label_chars} 字 / 正文 {n} 字）：需要页 20 字**短于**标记句、\
+             正文**长过** 40 字（offset=20 之后还有一整页）、且正文低于下限 {MIN_ARTICLE_CHARS} 字，\
+             否则那三条断言各自失去对象"
         );
         body.to_string()
     }

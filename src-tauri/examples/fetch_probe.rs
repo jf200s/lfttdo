@@ -35,7 +35,8 @@
 //!
 //! HTML 那一支另有一列**对照**：同一份 HTML 再用「不经过 readability 定界」的
 //! `htmd::convert(整页)` 抽一遍 —— 它量的是「readability 这次定界到底替模型挡掉了
-//! 多少字符」。对照列**不是**生产路径，生产路径始终只有 `render_markdown` 那一趟。
+//! 多少字符」。对照列**不是**生产路径：生产那一趟是 `render_markdown_with_label`
+//! （`render_markdown` 是它的对外包装），两者都不含上面那句未经 readability 定界的整页转换。
 use std::sync::Arc;
 use std::time::Instant;
 
