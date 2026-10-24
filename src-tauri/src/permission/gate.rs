@@ -9,11 +9,25 @@ use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+/// 每台 MCP server 的信任档位（T33）。**不进线格式**（没有 serde），它只在 Rust 侧策略里活。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// 静默放行：用户明确信任这台 server。
+    Auto,
+    /// 每次问人（spec 5.2 的默认档）。
+    Ask,
+    /// 不问、直接拒：理由里会点名 server。
+    Block,
+}
+
 /// 会话级放行攒下来的作用域令牌集。键是 `PermissionGate::rule_key` 的产物 ——
 /// **不是裸工具名**，裸工具名会把「本会话允许写一次」变成「本会话可写任意路径」。
 #[derive(Default)]
 pub struct RuleTable {
     auto_keys: RwLock<HashSet<String>>,
+    /// server 名 ⇒ 信任档位（T33）。按 server 作用域而不是工具名：一台 server 的工具是它自己
+    /// 声明的，逐个授权等于让用户去追一个随时会变的清单。
+    server_trust: RwLock<HashMap<String, Verdict>>,
 }
 
 impl RuleTable {
@@ -30,6 +44,55 @@ impl RuleTable {
     pub fn remember_session(&self, key: &str) {
         crate::lock::write(&self.auto_keys).insert(key.to_string());
     }
+
+    /// 设定一台 server 的信任档位（T35 的 `mcp_set_trust` 是唯一写入者）。
+    pub fn set_server_trust(&self, server: &str, verdict: Verdict) {
+        crate::lock::write(&self.server_trust).insert(server.to_string(), verdict);
+    }
+
+    /// 读回当前档位（T35 的界面要显示它）。
+    pub fn server_trust(&self, server: &str) -> Option<Verdict> {
+        crate::lock::read(&self.server_trust).get(server).copied()
+    }
+
+    /// 只回答「有没有 override」（R45：默认策略不许搬进来，否则同一条策略住两处）：
+    /// 先精确 `{name}|{scope}`（今天还没有生产者，留着是因为它是最窄的一档），再按 server 作用域。
+    pub fn verdict_for(&self, name: &str, scope: &str) -> Option<Verdict> {
+        let trust = crate::lock::read(&self.server_trust);
+        if let Some(v) = trust.get(&format!("{name}|{scope}")) {
+            return Some(*v);
+        }
+        trust.get(scope).copied()
+    }
+}
+
+/// 一次调用实际覆盖的作用域令牌（R212：住在 gate，不住注册表）。
+///
+/// - `mcp__{server}__{tool}` ⇒ `server`。**注意这是有损的**：T30 的兜底命名把 server 段截到
+///   8 个 char，长名字还原不出真名 —— 所以 `check` 里「没查到信任就默认 Ask」是必需的
+///   （R321），否则长 server 名会绕过 Ask。
+/// - `fetch_url` ⇒ `input.url` 的小写主机名（去端口；解析失败退回 `"read"`，绝不 panic）。
+/// - 其余 ⇒ `"read"`（内置 Read 的既有行为，一个字不改）。
+pub(crate) fn scope_of(name: &str, input: &serde_json::Value) -> String {
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        return match rest.split_once("__") {
+            Some((server, _tool)) => server.to_string(),
+            // 形状不对也不许 panic：宁可给一个不会命中信任表的令牌，让 check 走 Ask。
+            None => "mcp".to_string(),
+        };
+    }
+    if name == "fetch_url"
+        && let Some(url) = input.get("url").and_then(|v| v.as_str())
+        && let Ok(parsed) = url::Url::parse(url)
+        && let Some(host) = parsed.host_str()
+    {
+        return host.to_ascii_lowercase();
+    }
+    "read".to_string()
+}
+
+fn is_mcp_tool(name: &str) -> bool {
+    name.starts_with("mcp__")
 }
 
 #[derive(Clone, Default)]
@@ -95,7 +158,7 @@ impl PermissionGate {
     /// - 缺字段：`?` 占位，让「没有 path 的 Write」和任何真实作用域都不撞键。
     pub fn rule_key(&self, call: &ToolCallView) -> String {
         let scope_token = match call.risk {
-            Risk::Read => "read".to_string(),
+            Risk::Read => scope_of(&call.name, &call.input),
             Risk::Write => call
                 .input
                 .get("path")
@@ -124,12 +187,26 @@ impl PermissionGate {
     /// `biased` 保证取消臂先于应答臂被轮询：停止按钮按下后不该再采纳任何应答。
     pub async fn check(&self, call: &ToolCallView, cancel: &CancellationToken) -> Decision {
         let key = self.rule_key(call);
-        // MVP 策略只写在这一个地方：Read 级一律 Auto（Plan A 的生产工具全为 Read → 零弹窗）。
-        if matches!(call.risk, Risk::Read) {
-            return Decision::allow(Scope::Once);
-        }
+        let scope = scope_of(&call.name, &call.input);
+        // 优先级 1：会话级放行（用户已经在本会话里答过「都行」）。
         if let Some(d) = self.rules.lookup(&key) {
             return d; // 命中会话规则：静默放行，不发弹窗事件
+        }
+        // 优先级 2：per-server 信任档（T33）。必须压在下面那记 Read 自动放行**之前**，
+        // 否则 MCP 的 Ask/Block 永远轮不到 —— 这正是本任务要修的那个矛盾。
+        match self.rules.verdict_for(&call.name, &scope) {
+            Some(Verdict::Auto) => return Decision::allow(Scope::Once),
+            Some(Verdict::Block) => {
+                return Decision::deny(format!("server `{scope}` 被设为 Block，调用被拒绝"));
+            }
+            Some(Verdict::Ask) => {}
+            None => {}
+        }
+        // 优先级 3：MVP 默认「Read 一律 Auto」。**MCP 除外**（R321）：T30 的兜底命名把
+        // server 段截到 8 个 char，信任表按名字查不到 ⇒ 落到 Auto 就等于「名字越长的 server
+        // 越能绕过 Ask」。没登记的 MCP 工具默认问人（spec 5.2「添加 server 时默认 Ask」）。
+        if matches!(call.risk, Risk::Read) && !is_mcp_tool(&call.name) {
+            return Decision::allow(Scope::Once);
         }
 
         // 先 clone Arc、立刻释放锁：下面每一个 await 都不得持有 sink 的 Mutex（R42）。
@@ -658,5 +735,156 @@ mod tests {
         assert_send_sync::<PermissionGate>();
         assert_send_sync::<RuleTable>();
         assert_send_sync::<Arc<dyn EventSink>>();
+    }
+
+    // ───────────────────────── T33：per-server 信任压在 Read 自动放行之前 ─────────────────────────
+
+    #[tokio::test]
+    async fn a_server_defaulted_to_ask_pops_exactly_one_request() {
+        let sink = Arc::new(VecSink::default());
+        let rules = Arc::new(RuleTable::default());
+        rules.set_server_trust("search", Verdict::Ask);
+        let gate = PermissionGate::new()
+            .with_sink(sink.clone())
+            .with_rules(rules);
+        let cancel = CancellationToken::new();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "mcp__search__web_search".into(),
+            risk: Risk::Read,
+            input: json!({"q": "x"}),
+        };
+
+        // `check` 在 Ask 路径上是**等人应答才返回**的，直接 await 会挂住测试进程。
+        let (h, id) = pending_request(&gate, &c, &cancel, &sink, 1).await;
+
+        assert_eq!(
+            gate.rule_key(&c),
+            "mcp__search__web_search|search",
+            "键必须带 server 作用域；仍是 `read` 就说明 MCP 工具共用一个键，问一次买断所有 server"
+        );
+        assert_eq!(gate.pending_len(), 1, "Ask 的真相是挂在待答表里");
+
+        gate.resolve(&id, Decision::allow(Scope::Once));
+        let d = tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("resolve 之后 check 仍不返回：应答臂断了")
+            .expect("check 任务不该 panic");
+        assert!(d.allowed(), "答了 Allow 就该放行");
+        assert_eq!(
+            sink.request_ids().len(),
+            1,
+            "一次调用只发一条 permission_request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_server_denies_without_waiting() {
+        let sink = Arc::new(VecSink::default());
+        let rules = Arc::new(RuleTable::default());
+        rules.set_server_trust("evil", Verdict::Block);
+        let gate = PermissionGate::new()
+            .with_sink(sink.clone())
+            .with_rules(rules);
+        let cancel = CancellationToken::new();
+
+        // Block **不 await**：判据是「它在 2 秒内自己收了场」，而不是「看起来返回了 Deny」。
+        let d = tokio::time::timeout(
+            Duration::from_secs(2),
+            gate.check(&call("mcp__evil__x", Risk::Read), &cancel),
+        )
+        .await
+        .expect("Block 走成了等人应答：Block 的整个意义就是不问");
+
+        assert!(
+            matches!(&d, Decision::Deny { reason } if reason.contains("evil")),
+            "拒绝理由必须指名是哪个 server：{d:?}"
+        );
+        assert!(
+            sink.events().is_empty(),
+            "Block 不许产生任何 permission_request"
+        );
+        assert_eq!(gate.pending_len(), 0, "Block 不该在待答表里留下条目");
+    }
+
+    #[test]
+    fn scope_of_takes_the_server_for_mcp_and_the_host_for_fetch() {
+        assert_eq!(
+            scope_of("fetch_url", &json!({"url": "https://News.Example:443/a"})),
+            "news.example",
+            "域名要小写、去端口"
+        );
+        assert_eq!(
+            scope_of("fetch_url", &json!({"url": "not a url"})),
+            "read",
+            "解析失败退回默认令牌，不许 panic"
+        );
+        assert_eq!(scope_of("mcp__search__web_search", &json!({})), "search");
+        assert_eq!(
+            scope_of("read_file", &json!({"path": "/tmp/x"})),
+            "read",
+            "内置 Read 的既有行为一个字不许变"
+        );
+
+        let gate = PermissionGate::new();
+        let fetch = ToolCallView {
+            id: "c1".into(),
+            name: "fetch_url".into(),
+            risk: Risk::Read,
+            input: json!({"url": "https://News.Example:443/a"}),
+        };
+        assert_eq!(gate.rule_key(&fetch), "fetch_url|news.example");
+        assert_eq!(
+            gate.rule_key(&ToolCallView {
+                id: "c2".into(),
+                name: "mcp__search__web_search".into(),
+                risk: Risk::Read,
+                input: json!({}),
+            }),
+            "mcp__search__web_search|search"
+        );
+    }
+
+    /// R321：**没有信任记录**的 MCP 工具也必须问人，不许落到 Read 自动放行。
+    /// 这一条针对 T30 的兜底命名：server 段被截到 8 个 char，gate 无法从名字还原真名，
+    /// 于是信任表按名字查不到 —— 若默认是 Auto，就是「越长的 server 名越能绕过 Ask」。
+    /// 名字取的是真实的兜底形状（T30 的 `mcp__a-very-l__…_<7 hex>`）。
+    #[tokio::test]
+    async fn an_unknown_mcp_tool_is_asked_not_auto_allowed() {
+        let sink = Arc::new(VecSink::default());
+        let gate = PermissionGate::new().with_sink(sink.clone());
+        let cancel = CancellationToken::new();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "mcp__a-very-l__get_the_current_weather_39a9f58".into(),
+            risk: Risk::Read,
+            input: json!({}),
+        };
+        let (h, id) = pending_request(&gate, &c, &cancel, &sink, 1).await;
+        assert_eq!(gate.pending_len(), 1, "未登记的 MCP 工具必须弹窗");
+        gate.resolve(&id, Decision::deny("测试收尾"));
+        let _ = tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("resolve 之后 check 仍不返回");
+    }
+
+    /// 反方向的钉子：已登记 `Auto` 的 server 静默放行、`read_file` 仍然零弹窗。
+    #[tokio::test]
+    async fn a_trusted_mcp_server_is_silent_while_builtin_reads_stay_auto() {
+        let sink = Arc::new(VecSink::default());
+        let rules = Arc::new(RuleTable::default());
+        rules.set_server_trust("search", Verdict::Auto);
+        let gate = PermissionGate::new()
+            .with_sink(sink.clone())
+            .with_rules(rules);
+        let cancel = CancellationToken::new();
+        let d = gate
+            .check(&call("mcp__search__web_search", Risk::Read), &cancel)
+            .await;
+        assert!(d.allowed(), "登记 Auto 的 server 必须静默放行：{d:?}");
+        let d = gate.check(&call("read_file", Risk::Read), &cancel).await;
+        assert!(d.allowed(), "内置 Read 的零弹窗不许被本任务改坏：{d:?}");
+        assert!(sink.events().is_empty(), "两条都不该产生弹窗事件");
+        assert_eq!(gate.pending_len(), 0);
     }
 }

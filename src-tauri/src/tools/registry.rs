@@ -178,6 +178,22 @@ impl ToolRegistry {
         crate::lock::read(&self.tools).get(name).cloned()
     }
 
+    /// 摘掉所有以 `prefix` 开头的工具，返回被摘掉的名字（`BTreeMap` 序 ⇒ 字典序）。
+    /// T33/T35 用它撤掉一台 MCP server 的全部工具；前缀必须精确到 `mcp__{server}__`，
+    /// 少一个尾部 `__` 会把 `mcp__search_v2__*` 一起带走（测试钉着这个区别）。
+    pub fn remove_prefix(&self, prefix: &str) -> Vec<String> {
+        let mut tools = crate::lock::write(&self.tools);
+        let doomed: Vec<String> = tools
+            .keys()
+            .filter(|name| name.starts_with(prefix))
+            .cloned()
+            .collect();
+        for name in &doomed {
+            tools.remove(name);
+        }
+        doomed
+    }
+
     /// 未知工具按 `Risk::Exec`：这是唯一安全的默认值，因为 `Exec` 在权限门里必定弹窗，
     /// 而 `Read` 会被静默自动放行（MCP 工具名形如 `mcp__server__tool`，Plan A 不注册）。
     pub fn risk_of(&self, name: &str) -> Risk {
@@ -630,5 +646,68 @@ mod tests {
         assert_send_sync::<ToolCtx>();
         assert_send_sync::<Arc<dyn Tool>>();
         assert_send_sync::<EchoTool>();
+    }
+
+    // ───────────────────────── T33：`remove_prefix` 只摘一台 server ─────────────────────────
+
+    /// 只活在 `mod tests` 里：`RiskOverrideTool` 的名字钉死是 `"guarded"`，造不出
+    /// `mcp__{server}__{tool}` 形状的名字。**不许**放进 `tools/echo.rs` 变成生产可见。
+    struct NamedTool(&'static str);
+
+    #[async_trait]
+    impl Tool for NamedTool {
+        fn meta(&self) -> ToolMeta {
+            ToolMeta {
+                name: self.0.to_string(),
+                description: "命名测试工具".into(),
+                risk: Risk::Read,
+                input_schema: json!({"type": "object"}),
+            }
+        }
+        async fn execute(&self, input: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text(input.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_prefix_drops_the_whole_server_and_nothing_else() {
+        let r = ToolRegistry::new();
+        for n in [
+            "mcp__search__a",
+            "mcp__search__b",
+            "mcp__other__c",
+            "fetch_url",
+        ] {
+            r.register(Arc::new(NamedTool(n)));
+        }
+        let removed = r.remove_prefix("mcp__search__");
+        // `defs()` 是字典序（`BTreeMap`）⇒ 这个字面顺序不是巧合。
+        assert_eq!(
+            removed,
+            vec!["mcp__search__a", "mcp__search__b"],
+            "返回摘掉的名字，T35 的日志/界面要知道掉了哪些"
+        );
+        assert_eq!(r.defs().len(), 2, "别的 server 与内置工具一条不许掉");
+        assert!(r.get("mcp__other__c").is_some() && r.get("fetch_url").is_some());
+
+        // 前缀**必须带尾部的 `__`**：真正的风险不是重复注册（`register` 同名是覆盖语义），
+        // 而是**过收** —— server 叫 `search_v2` 时用 `"mcp__search"` 去摘会把别人整台带走。
+        let r2 = ToolRegistry::new();
+        for n in ["mcp__search__a", "mcp__search_v2__b"] {
+            r2.register(Arc::new(NamedTool(n)));
+        }
+        assert_eq!(
+            r2.remove_prefix("mcp__search__"),
+            vec!["mcp__search__a"],
+            "按 server 摘必须精确到 `mcp__{{server}}__`"
+        );
+        assert!(
+            r2.get("mcp__search_v2__b").is_some(),
+            "被连坐的那台必须还在"
+        );
+
+        // 空摘必须无害
+        r2.remove_prefix("mcp__never_existed__");
+        assert_eq!(r2.defs().len(), 1);
     }
 }
