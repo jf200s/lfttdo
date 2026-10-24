@@ -26,6 +26,11 @@ pub enum ToolError {
     BadInput(String),
     #[error("工具执行失败: {0}")]
     Failed(String),
+    /// MCP server 自己报的错（`isError: true`）：Display **就是 server 的原话**，
+    /// 不套任何前缀（R316）。与 [`Self::Failed`] 分开是因为后者的前缀属于本地工具的诊断语境，
+    /// 套到上游消息上模型读到的是一句我们编的转述。
+    #[error("{0}")]
+    Server(String),
     #[error("已取消")]
     Cancelled,
 }

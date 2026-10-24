@@ -916,6 +916,16 @@ mod tests {
                     let text = match output {
                         ToolOutput::Text { text } => text.clone(),
                         ToolOutput::Image { .. } => "<image>".into(),
+                        // R317：多块结果按块摊平，测试辅助只关心「模型看见了什么文本」。
+                        ToolOutput::Multi { parts } => parts
+                            .iter()
+                            .map(|part| match part {
+                                ToolOutput::Text { text } => text.clone(),
+                                ToolOutput::Image { .. } => "<image>".into(),
+                                ToolOutput::Multi { .. } => "<multi>".into(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
                     };
                     out.push((call_id.clone(), *is_error, text));
                 }

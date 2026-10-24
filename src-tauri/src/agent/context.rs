@@ -188,11 +188,24 @@ pub fn estimate_tokens(msgs: &[Message]) -> usize {
                 ContentBlock::ToolResult { output, .. } => match output {
                     super::types::ToolOutput::Text { text } => text_tokens(text),
                     super::types::ToolOutput::Image { .. } => TOOL_IMAGE_TOKENS,
+                    // R317：多块结果按块累加（图片按张收钱，文本按字）。递归处理是为了将来
+                    // 谁真嵌了一层也不静默算成 0 —— `map_result` 今天不产生嵌套。
+                    super::types::ToolOutput::Multi { parts } => {
+                        parts.iter().map(tokens_of_tool_output).sum()
+                    }
                 },
             };
         }
     }
     n
+}
+
+fn tokens_of_tool_output(output: &super::types::ToolOutput) -> usize {
+    match output {
+        super::types::ToolOutput::Text { text } => text_tokens(text),
+        super::types::ToolOutput::Image { .. } => TOOL_IMAGE_TOKENS,
+        super::types::ToolOutput::Multi { parts } => parts.iter().map(tokens_of_tool_output).sum(),
+    }
 }
 
 /// CJK 约 1 字 = 1 token；其余约 4 字符 = 1 token。混排时按字符类型分段累加。

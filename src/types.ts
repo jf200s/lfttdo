@@ -55,10 +55,11 @@ export interface ToolCallView {
   input: unknown;
 }
 
-/** `ToolOutput`（types.rs:33-38）：tag 字段是 `kind`。 */
+/** `ToolOutput`（types.rs:33-44）：tag 字段是 `kind`。`multi` 是 MCP 的混合内容块（R317）。 */
 export type ToolOutput =
   | { kind: "text"; text: string }
-  | { kind: "image"; data: string; mime: ImageMime };
+  | { kind: "image"; data: string; mime: ImageMime }
+  | { kind: "multi"; parts: ToolOutput[] };
 
 /** `ContentBlock`（types.rs:4-24）：tag 字段是 `type`（不是 `t`），字段 snake_case。 */
 export type ContentBlock =

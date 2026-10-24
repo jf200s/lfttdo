@@ -33,8 +33,19 @@ pub enum ImageMime {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolOutput {
-    Text { text: String },
-    Image { data: String, mime: ImageMime },
+    Text {
+        text: String,
+    },
+    Image {
+        data: String,
+        mime: ImageMime,
+    },
+    /// 多块结果（R317）：MCP 会回 text+image 的混合数组，**保持每块的形状**。
+    /// 摊平成文本会把图丢掉（spec 5.2 第 2 点），所以新增这一支而不是降级。
+    /// 生产里由 `mcp::bridge::map_result` 产生；`parts` 不嵌套（只有 0/1 块时直接返回那一块）。
+    Multi {
+        parts: Vec<ToolOutput>,
+    },
 }
 
 impl ToolOutput {
@@ -57,14 +68,24 @@ impl ToolOutput {
             // 图片不进事件流：前端要的是一张已经落盘的图的引用，而那是切片 2 的事，
             // 这里先给一行可归因的占位描述，不把 base64 搬过 IPC 边界。
             // mime 用小写线上名（与 `ImageMime` 的 serde 表示一致），不是 Debug 的 `Png`。
-            ToolOutput::Image { mime, .. } => format!(
-                "[图片 {}]",
-                match mime {
-                    ImageMime::Png => "png",
-                    ImageMime::Jpeg => "jpeg",
-                }
-            ),
+            ToolOutput::Image { mime, .. } => format!("[图片 {}]", mime_word(mime)),
+            // R317：多块结果先逐块取预览、再整体截断一次 —— 只此一份实现（R77）。
+            ToolOutput::Multi { parts } => {
+                let joined = parts
+                    .iter()
+                    .map(ToolOutput::preview)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                crate::text::truncate_display(&joined, PREVIEW_CHARS)
+            }
         }
+    }
+}
+
+fn mime_word(mime: &ImageMime) -> &'static str {
+    match mime {
+        ImageMime::Png => "png",
+        ImageMime::Jpeg => "jpeg",
     }
 }
 

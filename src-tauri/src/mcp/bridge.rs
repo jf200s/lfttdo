@@ -17,7 +17,9 @@ use rmcp::service::RunningService;
 use rmcp::transport::{IntoTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 
+use crate::agent::types::ToolOutput;
 use crate::mcp::config::ServerDef;
+use crate::tools::registry::ToolError;
 
 /// 一条 stdio server 的连接超时（R308）。真 npx 第一次要下载包，30s 级，所以这条给到 60。
 pub const CONNECT_TIMEOUT_SECS: u64 = 60;
@@ -309,6 +311,165 @@ fn trim_reason(raw: String) -> String {
     kept
 }
 
+// ───────────────────────────── 结果映射（T32，R314–R319） ─────────────────────────────
+
+/// 把 MCP 的 `CallToolResult` 映射成本项目的 [`ToolOutput`]（T32 / spec 5.2 第 2 点）。
+///
+/// 三条不变量：
+/// 1. **混合数组不摊平**（R317）：≥2 块 ⇒ `ToolOutput::Multi`，1 块 ⇒ 直接是那一块，
+///    0 块 ⇒ 一句可读的占位（下一条 tool 消息不能是空的）。
+/// 2. **图片走同一条归一化**（R318）：base64 解码后交给 `image_prep::normalize_image`，
+///    与贴图侧完全同一个入口；解不开就变成一句「图片无法读取」的文本，**不许静默丢掉**。
+///    gif/webp 因此被收窄成 png/jpeg —— 这也是本轮**不扩 `ImageMime`** 的理由（R314）。
+/// 3. **server 说 isError ⇒ `ToolError::Server`**（R316）：Display 就是 server 的原话，
+///    不套「工具执行失败: 」（R59 的同一个理由：模型该读到上游给的那句话）。
+pub fn map_result(result: rmcp::model::CallToolResult) -> Result<ToolOutput, ToolError> {
+    let mut parts: Vec<ToolOutput> = Vec::with_capacity(result.content.len());
+    for block in result.content {
+        parts.push(map_block(block));
+    }
+    if result.is_error == Some(true) {
+        let message = parts
+            .iter()
+            .map(flatten_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(ToolError::Server(if message.trim().is_empty() {
+            "（工具报错但没有给出内容）".to_string()
+        } else {
+            message
+        }));
+    }
+    Ok(match parts.len() {
+        0 => ToolOutput::text("（工具返回了空结果）"),
+        1 => parts.pop().expect("刚判过 len == 1"),
+        _ => ToolOutput::Multi { parts },
+    })
+}
+
+fn map_block(block: rmcp::model::ContentBlock) -> ToolOutput {
+    use rmcp::model::ContentBlock as Mcp;
+    match block {
+        Mcp::Text(t) => ToolOutput::Text { text: t.text },
+        Mcp::Image(img) => image_part(&img.data),
+        Mcp::Audio(_) => ToolOutput::text("工具返回了音频，当前不播放（本版本只处理文本与图片）。"),
+        Mcp::Resource(res) => ToolOutput::text(resource_text(&res.resource)),
+        // resource_link 只渲染，不自动抓取：抓取是 `fetch_url` 的活，自动抓等于替模型做 SSRF 决定。
+        Mcp::ResourceLink(link) => ToolOutput::text(format!("[链接] {} {}", link.name, link.uri)),
+        // rmcp 的 `ContentBlock` 是 `#[non_exhaustive]`：上游加一种新块时不许 panic，也不许静默吞。
+        _ => ToolOutput::text("工具返回了本版本不认识的内容块（已保留一句说明以免静默丢失）。"),
+    }
+}
+
+/// base64 → 字节 → 与贴图同一条归一化（R318）。每一支失败都给一句能归因的文本。
+fn image_part(base64_data: &str) -> ToolOutput {
+    use base64::Engine as _;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(base64_data.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(e) => return ToolOutput::text(format!("图片无法读取：base64 解码失败（{e}）")),
+    };
+    match crate::image_prep::normalize_image(&bytes) {
+        Ok(crate::agent::types::ContentBlock::Image { data, mime }) => {
+            ToolOutput::Image { data, mime }
+        }
+        Ok(_) => ToolOutput::text("图片无法读取：归一化没有给出图片"),
+        Err(e) => ToolOutput::text(format!("图片无法读取：{e}")),
+    }
+}
+
+fn resource_text(resource: &rmcp::model::ResourceContents) -> String {
+    match resource {
+        rmcp::model::ResourceContents::TextResourceContents { uri, text, .. } => {
+            format!("[{uri}]\n{text}")
+        }
+        rmcp::model::ResourceContents::BlobResourceContents { uri, mime_type, .. } => format!(
+            "[{uri}] 二进制资源（{}），未展开",
+            mime_type.as_deref().unwrap_or("未知类型")
+        ),
+        // `ResourceContents` 同样是 `#[non_exhaustive]`。
+        _ => "资源内容（本版本不认识的内容类型），未展开".to_string(),
+    }
+}
+
+/// 把多块输出摊平成文本：事件流预览之外的**协议层**用途（例如把 isError 的内容变成错误消息）。
+pub(crate) fn flatten_text(output: &ToolOutput) -> String {
+    match output {
+        ToolOutput::Text { text } => text.clone(),
+        ToolOutput::Image { mime, .. } => format!("[图片 {mime:?}]"),
+        ToolOutput::Multi { parts } => parts
+            .iter()
+            .map(flatten_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+// ───────────────────────────── 工具适配（T32 / R315） ─────────────────────────────
+
+/// 把一条 MCP 工具声明包成注册表认得的 [`Tool`]。
+///
+/// 三件事只在这里做一次：命名走 T30 的 [`crate::mcp::naming::namespaced`]（模型端看到的是
+/// `mcp__{server}__{tool}`）；风险恒为 [`Risk::Read`]（R315——「添加 server 默认 Ask」是
+/// `gate` 的信任策略，是 T33 的事，不是工具自己的风险等级）；参数对象原样转交 server。
+pub struct McpTool {
+    server: String,
+    original_name: String,
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+    bridge: std::sync::Arc<McpBridge>,
+}
+
+impl McpTool {
+    pub fn from_decl(
+        server: &str,
+        tool: &rmcp::model::Tool,
+        bridge: std::sync::Arc<McpBridge>,
+    ) -> Self {
+        Self {
+            server: server.to_string(),
+            original_name: tool.name.to_string(),
+            name: crate::mcp::naming::namespaced(server, &tool.name),
+            description: tool.description.as_deref().unwrap_or_default().to_string(),
+            input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
+            bridge,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tools::registry::Tool for McpTool {
+    fn meta(&self) -> crate::tools::registry::ToolMeta {
+        crate::tools::registry::ToolMeta {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            input_schema: self.input_schema.clone(),
+            risk: crate::agent::types::Risk::Read,
+        }
+    }
+
+    async fn execute(
+        &self,
+        input: serde_json::Value,
+        ctx: &crate::tools::registry::ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
+        let arguments = match input {
+            serde_json::Value::Object(map) => map,
+            other => {
+                return Err(ToolError::BadInput(format!(
+                    "MCP 工具的参数必须是 JSON 对象，收到 {other}"
+                )));
+            }
+        };
+        // 取消臂：`call_tool` 可能在等一个慢 server，而用户按了停止（R43 的同一条纪律）。
+        let result = tokio::select! {
+            _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+            r = self.bridge.call_tool(&self.server, &self.original_name, arguments) => r?,
+        };
+        map_result(result)
+    }
+}
+
 // ───────────────────────────── 状态台账与连接（R308/R309/R310） ─────────────────────────────
 
 /// 一条 server 在桥里的状态（plan :847 的接口）。`Debug` 手写：`reason` 直接打、别的臂只打臂名
@@ -482,6 +643,30 @@ impl McpBridge {
         out
     }
 
+    /// 调一次远端工具（T32）。peer 从锁里克隆出来后就放锁：std `Mutex` 的 guard 不许跨 await。
+    pub async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<rmcp::model::CallToolResult, ToolError> {
+        let peer = {
+            let slots = crate::lock::guard(&self.slots);
+            slots
+                .get(server)
+                .and_then(|slot| slot.conn.as_ref())
+                .map(|conn| conn.service.peer().clone())
+        }
+        .ok_or_else(|| {
+            ToolError::Failed(format!("server `{server}` 当前没有连接，先连接再调用工具"))
+        })?;
+        let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
+        params.arguments = Some(arguments);
+        peer.call_tool(params)
+            .await
+            .map_err(|e| ToolError::Failed(format!("调用 `{tool}` 失败：{e}")))
+    }
+
     /// 主动关闭：把 service 从台账里取出来再 `cancel()`（R309：桥是持有者），
     /// 每条给 5 秒上限——`graceful_shutdown` 内部已经会等 stdin EOF，不许在这里无限等。
     /// **本次不做进程树回收**：`cancel()` 只打直接子进程，孙进程靠 stdin EOF 退出，
@@ -562,6 +747,33 @@ mod tests {
         ServerJsonRpcMessage, ServerResult, Tool,
     };
     use rmcp::transport::{IntoTransport, Transport};
+
+    use crate::agent::types::ToolOutput;
+
+    /// 1×1 透明 PNG（合法可解码，`normalize_image` 会原样保留 png）。
+    const ONE_PX_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    /// 1×1 GIF（走 `normalize_image` 的「gif 取首帧 → 收窄成 jpeg」那一支）。
+    const ONE_PX_GIF_B64: &str = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+
+    fn call_result(content: Vec<rmcp::model::ContentBlock>) -> rmcp::model::CallToolResult {
+        // `CallToolResult` 是 `#[non_exhaustive]`：不能结构体字面量，只能先 Default 再赋值。
+        let mut result = rmcp::model::CallToolResult::default();
+        result.content = content;
+        result
+    }
+
+    /// 把任意形状的 `ToolOutput` 摊平成文本：只有断言用，不参与生产。
+    fn render_for_assert(out: &ToolOutput) -> String {
+        match out {
+            ToolOutput::Text { text } => text.clone(),
+            ToolOutput::Image { mime, .. } => format!("[图片 {mime:?}]"),
+            ToolOutput::Multi { parts } => parts
+                .iter()
+                .map(render_for_assert)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
 
     /// 造一条 stdio 的 `ServerDef`（plan :855 的 `stdio(…)` 夹具形状，字段按 T29 R291 的**直接**构造）。
     fn stdio(name: &str, command: &str, args: &[&str]) -> ServerDef {
@@ -893,6 +1105,166 @@ mod tests {
         );
     }
 
+    // —— T32：`map_result` 的内容映射（R314–R319） ——
+    #[test]
+    fn mixed_text_and_image_content_keeps_both_parts() {
+        let out = map_result(call_result(vec![
+            rmcp::model::ContentBlock::text("看这张"),
+            rmcp::model::ContentBlock::image(ONE_PX_PNG_B64, "image/png"),
+        ]))
+        .unwrap();
+        let ToolOutput::Multi { parts } = out else {
+            panic!(
+                "混合结果需要 `ToolOutput::Multi`，否则 vision 模型看不见图（spec 5.2 第 2 点）：{out:?}"
+            )
+        };
+        assert_eq!(parts.len(), 2, "只取 text 会把图丢掉：{parts:?}");
+        assert!(matches!(parts[0], ToolOutput::Text { .. }));
+        assert!(matches!(parts[1], ToolOutput::Image { .. }));
+    }
+
+    #[test]
+    fn a_gif_result_is_reencoded_via_the_same_normalizer() {
+        // R314：**不扩 `ImageMime`**——`normalize_image` 会把 gif/webp 收窄成 jpeg/png
+        // （`image_prep.rs:74-81`，gif 取首帧）。所以端点永远只见到这两种，扩枚举是零收益的跨语言改动。
+        let out = map_result(call_result(vec![rmcp::model::ContentBlock::image(
+            ONE_PX_GIF_B64,
+            "image/gif",
+        )]))
+        .unwrap();
+        match out {
+            ToolOutput::Image { mime, data } => {
+                assert!(
+                    matches!(
+                        mime,
+                        crate::agent::types::ImageMime::Png | crate::agent::types::ImageMime::Jpeg
+                    ),
+                    "gif 必须被重编码成端点收得下的形状：{mime:?}"
+                );
+                assert!(!data.is_empty(), "重编码后要有内容");
+            }
+            other => panic!("单张图应该原样是一块 Image：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_image_becomes_text_that_says_so_instead_of_silently_disappearing() {
+        let out = map_result(call_result(vec![rmcp::model::ContentBlock::image(
+            "not-base64-at-all",
+            "image/png",
+        )]))
+        .unwrap();
+        assert!(
+            format!("{out:?}").contains("图片无法读取"),
+            "静默丢掉内容块会让模型说瞎话：{out:?}"
+        );
+    }
+
+    #[test]
+    fn non_text_content_is_rendered_as_its_own_part() {
+        let out = map_result(call_result(vec![
+            rmcp::model::ContentBlock::resource(
+                rmcp::model::ResourceContents::TextResourceContents {
+                    uri: "file:///notes/a.txt".into(),
+                    mime_type: Some("text/plain".into()),
+                    text: "正文".into(),
+                    meta: None,
+                },
+            ),
+            rmcp::model::ContentBlock::ResourceLink(rmcp::model::Resource::new(
+                "https://example.test/a",
+                "示例",
+            )),
+            rmcp::model::ContentBlock::audio("AAA", "audio/wav"),
+        ]))
+        .unwrap();
+        let text = render_for_assert(&out);
+        assert!(
+            text.contains("file:///notes/a.txt"),
+            "resource 要带 uri 前缀：{text}"
+        );
+        assert!(text.contains("正文"), "resource 的文本要留下来：{text}");
+        assert!(
+            text.contains("https://example.test/a"),
+            "resource_link 要渲染成链接：{text}"
+        );
+        assert!(
+            text.contains("音频"),
+            "audio 当前不播放，但必须有一句占位而不是静默：{text}"
+        );
+    }
+
+    #[test]
+    fn tool_error_flag_becomes_is_error_true_with_the_servers_message() {
+        let mut r = call_result(vec![rmcp::model::ContentBlock::text("上游炸了")]);
+        r.is_error = Some(true);
+        let e = map_result(r).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "上游炸了",
+            "模型看到的必须是 server 给的话，不是我们的包装句（R59 的同一个理由）"
+        );
+    }
+
+    #[test]
+    fn an_empty_result_still_produces_something_the_model_can_read() {
+        let out = map_result(call_result(vec![])).unwrap();
+        let text = render_for_assert(&out);
+        assert!(
+            !text.trim().is_empty(),
+            "空结果也要有一句可读的话，否则下一轮模型收到一条空 tool 消息：{text:?}"
+        );
+    }
+
+    // —— T32：`McpTool` 适配（R315） ——
+    #[test]
+    fn mcp_tool_exposes_the_namespaced_name_and_read_risk() {
+        use crate::tools::registry::Tool as _;
+        let bridge = std::sync::Arc::new(McpBridge::new());
+        let decl = Tool::new("search", "查一查", serde_json::Map::new());
+        let tool = McpTool::from_decl("web", &decl, bridge);
+        let meta = tool.meta();
+        assert_eq!(
+            meta.name, "mcp__web__search",
+            "模型端必须是 T30 的命名（端点字符集那条红线）"
+        );
+        assert_eq!(
+            meta.risk,
+            crate::agent::types::Risk::Read,
+            "R315：可靠性由 gate 的信任档位管，不靠把 risk 调严"
+        );
+        assert_eq!(meta.description, "查一查");
+        assert!(matches!(meta.input_schema, serde_json::Value::Object(_)));
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_execute_reaches_the_server_and_maps_the_result() {
+        use crate::tools::registry::Tool as _;
+        let bridge = std::sync::Arc::new(McpBridge::new());
+        let out = bridge
+            .connect_all_with(&["web".to_string()], Duration::from_secs(5), &|_| {
+                Box::pin(fake_handshake(2))
+            })
+            .await;
+        assert_eq!(out[0].1, Ok(2));
+        let decl = Tool::new("search", "查一查", serde_json::Map::new());
+        let tool = McpTool::from_decl("web", &decl, bridge);
+        let ctx = crate::tools::registry::ToolCtx {
+            http: reqwest::Client::new(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            roots: vec![],
+        };
+        let output = tool
+            .execute(serde_json::json!({"q": "x"}), &ctx)
+            .await
+            .expect("假对端会回一条 text");
+        assert_eq!(
+            render_for_assert(&output),
+            "echo:search",
+            "server 的原话要原样到模型；同时证明参数走的是原始工具名"
+        );
+    }
+
     // —— 假对端（R310）：裸 `Transport<RoleServer>` 手搓 JSON-RPC，不实现 Handler ——
     // 配方取自 rmcp 自己的 tests/test_cancelled_response.rs:210-245：
     // duplex 两半 ⇒ `IntoTransport::<RoleServer,_,_>::into_transport(server_half)`
@@ -945,6 +1317,19 @@ mod tests {
                                 tools,
                                 ..Default::default()
                             }),
+                            request.id,
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    ClientRequest::CallToolRequest(call) => {
+                        let mut result = rmcp::model::CallToolResult::default();
+                        result.content = vec![rmcp::model::ContentBlock::text(format!(
+                            "echo:{}",
+                            call.params.name
+                        ))];
+                        peer.send(ServerJsonRpcMessage::response(
+                            ServerResult::CallToolResult(result),
                             request.id,
                         ))
                         .await

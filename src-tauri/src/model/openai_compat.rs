@@ -401,6 +401,20 @@ fn tool_msg(
             "[工具返回了一张 {} 图片，未随 tool 消息发送：该角色只支持文本]",
             mime_url(mime)
         ),
+        // R317：多块结果在这一层按块摊平成文本（tool 角色只吃文本，见本函数文档）。
+        // 图片依旧只留一行说明；顺序保持 server 给的顺序。
+        ToolOutput::Multi { parts } => parts
+            .iter()
+            .map(|part| match part {
+                ToolOutput::Text { text } => text.clone(),
+                ToolOutput::Image { mime, .. } => format!(
+                    "[工具返回了一张 {} 图片，未随 tool 消息发送：该角色只支持文本]",
+                    mime_url(mime)
+                ),
+                ToolOutput::Multi { .. } => "[嵌套的多块结果，未展开]".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     };
     let content = if is_error {
         format!("[tool error] {body}")
