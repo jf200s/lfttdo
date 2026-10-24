@@ -82,7 +82,16 @@ htmd = "0.5.6"
 # 所以这是一个真·新增包（自身零依赖，代价见报告，已按 brief 的要求在报告里提请裁定）。
 # R268：本轮**保留原样**，不动。
 encoding_rs = "0.8.42"
-
+# T31 / R312：`rmcp` 从 `[dev-dependencies]` 挪进 `[dependencies]`。挪的理由不是顺手：
+# 桥（`src/mcp/bridge.rs`）是**产品代码**（MCP 是功能），而 R138 把它放在 dev 位是 T4 探针
+# 时代的临时安排，原注释写的「Plan B 把它移回 `[dependencies]` 的那天，它才有生产用户」
+# 兑现的就是今天。
+# **代价（这一行就是记账本身）**：rmcp 的 client + child-process 传输链从此进 app 二进制，
+# T46/T47 那份安装包体积与冷启动读数**全部过期**（它们是在**没有** rmcp 的产物上测的），
+# 复测归 T37 的门禁；本轮不重测安装包（构建一次几分钟且与本轮判断无关）。
+# feature 照旧三条，**不加** `which-command`（R305：路径解析自己写、解析器可注入，
+# 单测才不依赖本机装没装 node —— 与「单测不碰网络」同一条纪律）。
+rmcp = { version = "3.5.1", features = ["client", "transport-io", "transport-child-process"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
@@ -99,12 +108,7 @@ tempfile = "3.27.0"
 # R138：`rand` 不是本 crate 的直接依赖，Cargo.lock 里的 0.9.5 / 0.10.3 **都是传递依赖**，
 # 传递依赖不能 `use rand::`。Step 1 的噪声图夹具用 `rand::rng()`（0.9 API），必须显式加。
 rand = "0.9"
-# T4 探针（`examples/mcp_probe.rs`，Plan A 切片 0 的风险验证）是 `rmcp` 在本 crate 里
-# 唯一的用户，而 `src/` 零引用 —— MCP 客户端是 Plan B 的活。留在 `[dependencies]`
-# 就等于把一整套 client + child-process 传输链编进发布产物，直接顶到 <15MB 那条验收线
-# 上（评审 #29 规格轴：Plan B 依赖提前进产物）。`examples/` 用得到 `[dev-dependencies]`，
-# 所以探针照旧可跑；Plan B 把它移回 `[dependencies]` 的那天，它才有生产用户。
-rmcp = { version = "3.5.1", features = ["client", "transport-io", "transport-child-process"] }
+# `rmcp` 不在这儿了：T31 / R312 把它挪进 `[dependencies]`（代价与理由记在那一条的注释里）。
 
 [target."cfg(windows)".dependencies]
 keyring-core = "1.0.1"

@@ -1,0 +1,983 @@
+// T31：stdio 桥 —— Windows spawn 选型、`-y` 注入、`CREATE_NO_WINDOW`、并行连接。
+//
+// 边界（R310，简报 §二）：这一层做到「**握手 + 数工具 + 状态**」为止。
+// **不**实现 `tools::registry::Tool`、**不**调 `ToolRegistry::register`、**不**碰 `ipc.rs`：
+// 注册是 T32 的活，桥的第一个消费者是 T35 的 `mcp_connect` 命令。`Connection::tools` 之所以
+// 把 `rmcp::model::Tool` 的原值存下来，就是为了让 T32 不必为同一批工具重连一次（真 npx 的
+// 一次握手是 30s 量级，那是实打实的浪费）。
+// 也**不**做进程树回收（T34 的 JobObject）：`shutdown()` 只走 rmcp 自己的
+// `close()` → `graceful_shutdown()` 那条链，见那里的注释。
+//
+// spawn 的两条红线：R311（永不拼命令行、永不包一层 shell）与 R306（`-y` 的注入条件与位置）。
+
+use std::path::{Path, PathBuf};
+
+use futures::future::BoxFuture;
+use rmcp::service::RunningService;
+use rmcp::transport::{IntoTransport, TokioChildProcess};
+use rmcp::{RoleClient, ServiceExt};
+
+use crate::mcp::config::ServerDef;
+
+/// 一条 stdio server 的连接超时（R308）。真 npx 第一次要下载包，30s 级，所以这条给到 60。
+pub const CONNECT_TIMEOUT_SECS: u64 = 60;
+
+/// Windows 的 `CREATE_NO_WINDOW`（R307）。
+///
+/// **诚实边界**：这个标志给**直接子进程**一个「有控制台但无窗口」的状态，孙进程按
+/// 控制台继承规则共用它 —— 这句是**判读不是实测**（实测路径在简报 R307，取不到就标未实测，
+/// 不许把判读写成实测）。
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// R294 那颗打码常数在本文件的副本（`config.rs` 里的那颗是私有的）：`Debug` 里 env 的值
+/// 一律打这个，绝不打「前 4 + … + 后 4」—— 那 8 个字符对第三方令牌是真泄露。
+const MASKED: &str = "***";
+
+/// `reason` 的长度上限，按 `chars()` 计（R308：不许按字节切，中文错误消息会让 `&s[..200]`
+/// 在字符中间炸 —— T30 的 R301 同款教训）。plan Step 2 那句 `err.len() < 400` 保留为
+/// **下限更严**的断言（200 ⇒ 一定 < 400），不反过来放宽。
+const REASON_LIMIT: usize = 200;
+
+/// 会被注入 `-y` 的 program **基名**（R306，小写比较）。给 `python`/`uvx` 加 `-y` 会把人家打歪，
+/// 所以这张表是白名单而不是「见 args 就加」。
+const YES_INJECTING_BINARIES: &[&str] = &["npx", "bunx"];
+
+/// `PATHEXT` 未设时的缺省串（R305，逐字取 Windows 文档那四条）。
+#[cfg(windows)]
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+// ───────────────────────────── spawn 选型（纯函数，可注入） ─────────────────────────────
+
+/// 选型结果（R304）。**不是** `tokio::process::Command`：plan :864 自己承认
+/// `get_creation_flags()` 不是 tokio Command 的公开方法 ⇒ 返回 `Command` 就没法断言。
+/// 这个结构是「选型**决定**了什么」的载体，真 spawn 的唯一出口是 `into_command()`。
+pub struct SpawnPlan {
+    program: PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    creation_flags: u32,
+}
+
+impl SpawnPlan {
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// 返回 `Vec<&str>`，与 T29 `ServerDef::args()` 同一套访问器形状（R291 的理由在这儿同样成立：
+    /// 测试写 `assert_eq!(plan.args(), vec!["-y", …])` 靠的是 `Vec<&str> == Vec<&str>`）。
+    pub fn args(&self) -> Vec<&str> {
+        self.args.iter().map(String::as_str).collect()
+    }
+
+    /// **只交键名，永远不交值**（R304）：env 的值不给外部，`Debug` 里同样只出键名。
+    pub fn env_keys(&self) -> Vec<&str> {
+        self.env.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    pub fn creation_flags(&self) -> u32 {
+        self.creation_flags
+    }
+
+    /// 真 spawn 的唯一出口（R304）。Windows 上在这里、也只有在这里把 `creation_flags`
+    /// 交出去 —— 单测断言的是上面那个结构，这一句是它唯一的消费者。
+    pub(crate) fn into_command(self) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.program);
+        // R311：argv **逐段** `.arg()`。不拼命令行、不 `join` 成一个字符串、
+        // 也不 `cmd` 加斜杠开关包一层 —— T4 findings :635 钉死：绝对路径的 `.cmd`
+        // **并不免掉** `cmd.exe`（`CreateProcess` 会为 `.cmd` 另起一个 `cmd.exe` 宿主，
+        // 三层树与显式包装同形），C 相对 B 的唯一真实优势就是「整条命令行不是我们手搓拼接的」。
+        // 所以本轮连那唯一一点优势也不放弃：任何 shell 包装都算违规。
+        for arg in &self.args {
+            cmd.arg(arg);
+        }
+        // env 只**增补**配置里那几条，不清空继承的环境（子进程还要 `PATH` 才能找到自己的运行时）。
+        for (key, value) in &self.env {
+            cmd.env(key, value);
+        }
+        #[cfg(windows)]
+        {
+            // 不需要 `CommandExt`：tokio 的 `Command` 自带固有方法 `creation_flags`。
+            cmd.creation_flags(self.creation_flags);
+        }
+        cmd
+    }
+}
+
+/// 手写 `Debug`（R304，沿用 T29 R294 的教训）：env 的值一律打 `***`、只打键名。
+/// `program`/`args` 原样 —— 它们在 T29 就是刻意不脱敏的（R295），遮它们只会让排查变难。
+impl std::fmt::Debug for SpawnPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut masked: Vec<String> = Vec::with_capacity(self.env.len());
+        for (key, _value) in &self.env {
+            masked.push(format!("{key}: \"{MASKED}\""));
+        }
+        f.debug_struct("SpawnPlan")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("env", &masked)
+            .field("creation_flags", &self.creation_flags)
+            .finish()
+    }
+}
+
+/// 把一条 `ServerDef` 选成一份 `SpawnPlan`：**纯函数**，不 spawn、不碰全局状态。
+///
+/// 第二个参数是解析器的注入点（R305）：生产传 `resolve_program_in_path`（读 `PATH` 与
+/// `PATHEXT`、用 `Path::is_file()` 落判），测试传一张假表 ⇒ 选型逻辑可测，且**单测不依赖
+/// 本机装没装 node**（与「单测不碰网络」同一条纪律）。不启用 rmcp 的 `which-command`：
+/// 它是 feature 门控的（`transport.rs:86`），三条 feature 里没有它，而把它打开等于把
+/// 「本机 PATH 里有什么」变成单测的前提。
+pub fn spawn_command(
+    def: &ServerDef,
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Result<SpawnPlan, String> {
+    let Some(command) = def.command() else {
+        // 本层只做 stdio（HTTP 传输归 T36）；这条不是「坏了」，是「不归这里」，文案要认得出来。
+        return Err(format!(
+            "{} 没有 command：stdio 桥只接 stdio server，HTTP 传输归 T36",
+            def.name()
+        ));
+    };
+    // 所有出口都过 `trim_reason`（R308）：`reason` 会原样进状态台账、再从 T35 的界面出去，
+    // 这里尤其要过——错误文案里嵌着用户给的 `command`，它可以任意长。
+    let program = select_program(command, resolve).map_err(trim_reason)?;
+    let mut args: Vec<String> = def.args().into_iter().map(String::from).collect();
+    inject_yes_if_wanted(&program, &mut args);
+    // env 按键名排序 ⇒ `SpawnPlan` 的 `Debug` 与 `into_command` 的增补序都是确定的
+    // （`HashMap` 的迭代序不定，不排序的话同一条配置两次 `{:?}` 会长得不一样）。
+    let mut env: Vec<(String, String)> = match def {
+        ServerDef::Stdio { env, .. } => env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        ServerDef::Http { .. } => Vec::new(),
+    };
+    env.sort();
+    Ok(SpawnPlan {
+        program,
+        args,
+        env,
+        creation_flags: CREATE_NO_WINDOW,
+    })
+}
+
+/// 走查还是直接用（R305）：`def.command` 本身已含路径分隔符、或已带可执行扩展名 ⇒
+/// 调用方已经把「起哪个文件」说清楚了，直接用、不走查。
+fn select_program(
+    command: &str,
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    if is_already_addressed(command) {
+        return Ok(PathBuf::from(command));
+    }
+    match resolve(command) {
+        Some(program) => Ok(program),
+        // 错误里带**程序名**：程序名不是秘密，`command`/`args` 在 T29 就是刻意不脱敏的（R295）。
+        None => Err(format!(
+            "找不到可执行文件 `{command}`：PATH 走查里没有带扩展名的候选"
+        )),
+    }
+}
+
+/// 「已经说清楚了」的两种形态（R305）。分隔符按 Windows 与 unix 两边都算，
+/// 因为配置是用户手抄的，`./x`、`C:\\tools\\x.cmd`、`/usr/local/bin/x` 都真实存在。
+fn is_already_addressed(command: &str) -> bool {
+    command.contains('/') || command.contains('\\') || has_executable_extension(command)
+}
+
+/// 只看「扩展名是不是一个可执行扩展名」，不看有没有路径分隔符（后者由 `is_already_addressed`
+/// 自己判）。unix 上恒 `false`：那里的可执行位不在扩展名上，一律交给走查。
+fn has_executable_extension(command: &str) -> bool {
+    let Some(extension) = Path::new(command).extension() else {
+        return false;
+    };
+    let extension = extension.to_string_lossy().to_ascii_lowercase();
+    #[cfg(windows)]
+    {
+        pathext()
+            .iter()
+            .any(|candidate| candidate == &format!(".{extension}"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = extension;
+        false
+    }
+}
+
+/// PATH 走查的**纯内核**（R305）：候选 = `dirs` 每个目录 × `exts` 每个扩展名，
+/// 取第一个 `is_file()` 的。生产用 `PATH`/`PATHEXT`（见 `resolve_program_in_path`），
+/// 测试传假表 —— 目录表与扩展名表都是参数，不是环境变量。
+///
+/// **只接受带扩展名的候选**（Windows 支）：T4 实测 `where npx` 给出 `…\npx` 与 `…\npx.cmd`
+/// 两条，起得来的是后者；无扩展名那条是个 sh 脚本，`CreateProcess` 不认
+/// （A 支原文 `NotFound … program not found`）。这一条判据写在循环**里面**，
+/// 所以就算调用方把空扩展名塞进表里也不会退化成 A 支。
+///
+/// unix 支只走 `PATH` + `is_file()`（`exts` 给一格空串就是「裸名」）：**注释明写**
+/// 「本项目发布目标只有 Windows，unix 这支是为了让 `cargo test` 在开发机上不骗人」。
+fn walk_path(command: &str, dirs: &[PathBuf], exts: &[String]) -> Option<PathBuf> {
+    for dir in dirs {
+        for ext in exts {
+            if ext.is_empty() && cfg!(windows) {
+                continue;
+            }
+            let candidate = dir.join(format!("{command}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// 生产解析器：读 `PATH`（未设 ⇒ 无候选）与 `PATHEXT`（未设 ⇒ `DEFAULT_PATHEXT`）。
+pub fn resolve_program_in_path(command: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect();
+    walk_path(command, &dirs, &pathext())
+}
+
+/// 候选扩展名表，全部**小写、带点**，供 `walk_path` 直接拼名字。
+/// Windows 读 `PATHEXT`，未设时用 `.COM;.EXE;.BAT;.CMD`（R305）；unix 返回一格空串 = 裸名。
+fn pathext() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let raw = std::env::var_os("PATHEXT")
+            .unwrap_or_else(|| std::ffi::OsString::from(DEFAULT_PATHEXT));
+        let mut out: Vec<String> = raw
+            .to_string_lossy()
+            .split(';')
+            .map(|e| e.trim())
+            .filter(|e| !e.is_empty())
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                if e.starts_with('.') {
+                    e
+                } else {
+                    format!(".{e}")
+                }
+            })
+            .collect();
+        out.dedup();
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        vec![String::new()]
+    }
+}
+
+/// R306：`-y` 的注入条件与位置。
+///
+/// 条件：只对解析后 **program 的基名**是 `npx`/`bunx` 的条目注入 —— 给 `python`/`uvx`
+/// 加 `-y` 会把人家打歪（它们各自的 `-y` 是别的或不存在的意思）。
+/// 位置：**插在 args 最前面**，紧贴 program —— `npx -y pkg` 与 `npx pkg -y` **不等价**，
+/// 后者那个 `-y` 是传给包自己的。
+/// 去重：用户已经写了 `-y` 或 `--yes` ⇒ 不重复注入（也不搬家 —— 他写在哪就是哪，
+/// 那是显式意图，桥不替用户改语义）。
+///
+/// 为什么要注入：不带 `-y` 时 npx 会在 stdin 上弹「要装吗?」的交互确认，而 stdio 传输里
+/// 那个 stdin 归 MCP 服务器用 ⇒ **卡死**（T4 findings「`-y` 是必须的」那条实测）。
+/// 桌面端弹一个安装确认等同于弹窗，而零弹窗是验收线。
+fn inject_yes_if_wanted(program: &Path, args: &mut Vec<String>) {
+    if !wants_yes(program) {
+        return;
+    }
+    if args.iter().any(|a| a == "-y" || a == "--yes") {
+        return;
+    }
+    args.insert(0, "-y".to_string());
+}
+
+/// 基名（去扩展名）在白名单上吗（R306）。`npx.cmd`/`Npx.EXE` 都算，`npxpy` 不算。
+fn wants_yes(program: &Path) -> bool {
+    let Some(stem) = program.file_stem() else {
+        return false;
+    };
+    let stem = stem.to_string_lossy().to_ascii_lowercase();
+    YES_INJECTING_BINARIES.contains(&stem.as_str())
+}
+
+/// `reason` 的唯一出口（R308）：按 `chars()` 截到 [`REASON_LIMIT`]，**不许**按字节切。
+/// 截断时留一格给省略号 ⇒ 结果**含省略号**也不超过 200（199 + '…'），这才是「上限 200」的字面意思。
+fn trim_reason(raw: String) -> String {
+    if raw.chars().count() <= REASON_LIMIT {
+        return raw;
+    }
+    let mut kept: String = raw.chars().take(REASON_LIMIT - 1).collect();
+    kept.push('…');
+    kept
+}
+
+// ───────────────────────────── 状态台账与连接（R308/R309/R310） ─────────────────────────────
+
+/// 一条 server 在桥里的状态（plan :847 的接口）。`Debug` 手写：`reason` 直接打、别的臂只打臂名
+/// （R308：`reason` 已经是可上 UI 的成品，包一层没有信息量）。
+#[derive(Clone, PartialEq)]
+pub enum ServerStatus {
+    Connecting,
+    Ready { tools: usize },
+    Disconnected { reason: String },
+}
+
+impl std::fmt::Debug for ServerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerStatus::Connecting => f.write_str("Connecting"),
+            ServerStatus::Ready { tools } => write!(f, "Ready {{ tools: {tools} }}"),
+            ServerStatus::Disconnected { reason } => {
+                write!(f, "Disconnected {{ reason: {reason:?} }}")
+            }
+        }
+    }
+}
+
+/// 一次成功握手的产物（R310）：pid（内存管道没有）、原始工具声明（T32 直接拿去注册）、
+/// 以及**必须被存住**的 service（drop 掉就等于关掉传输）。
+pub struct Handshake {
+    pub pid: Option<u32>,
+    pub tools: Vec<rmcp::model::Tool>,
+    pub service: RunningService<RoleClient, ()>,
+}
+
+struct Connection {
+    pid: Option<u32>,
+    tools: Vec<rmcp::model::Tool>,
+    service: RunningService<RoleClient, ()>,
+}
+
+struct Slot {
+    status: ServerStatus,
+    conn: Option<Connection>,
+}
+
+/// MCP 连接的持有者（R309）。容器是 `BTreeMap`：状态列表与 `pids()` 的迭代序稳定，
+/// 与 T29 的字典序、T30 R302 的「稳定喂入序」同一条链。
+pub struct McpBridge {
+    slots: std::sync::Mutex<std::collections::BTreeMap<String, Slot>>,
+}
+
+impl Default for McpBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl McpBridge {
+    pub fn new() -> Self {
+        Self {
+            slots: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    fn set_status(&self, name: &str, status: ServerStatus) {
+        let mut slots = crate::lock::guard(&self.slots);
+        slots
+            .entry(name.to_string())
+            .or_insert_with(|| Slot {
+                status: ServerStatus::Connecting,
+                conn: None,
+            })
+            .status = status;
+    }
+
+    pub fn status_of(&self, server: &str) -> Option<ServerStatus> {
+        crate::lock::guard(&self.slots)
+            .get(server)
+            .map(|slot| slot.status.clone())
+    }
+
+    /// 真子进程的连接才有 pid（R309）。内存管道的腿**不许**造假 pid。
+    pub fn pids(&self) -> Vec<(String, u32)> {
+        crate::lock::guard(&self.slots)
+            .iter()
+            .filter_map(|(name, slot)| {
+                slot.conn
+                    .as_ref()
+                    .and_then(|conn| conn.pid)
+                    .map(|pid| (name.clone(), pid))
+            })
+            .collect()
+    }
+
+    /// T32 注册用的原始工具名（字典序，`BTreeMap` + `list_tools` 原序之外不再排序——
+    /// 这里排一下只是为了让界面与日志可复现）。
+    pub fn tool_names(&self, server: &str) -> Vec<String> {
+        let mut names: Vec<String> = crate::lock::guard(&self.slots)
+            .get(server)
+            .and_then(|slot| slot.conn.as_ref())
+            .map(|conn| conn.tools.iter().map(|t| t.name.to_string()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// 并行连接（R308）：结果顺序 = 输入顺序；一条失败不影响其余。
+    pub async fn connect_all(&self, servers: &[ServerDef]) -> Vec<(String, Result<usize, String>)> {
+        let names: Vec<String> = servers.iter().map(|s| s.name().to_string()).collect();
+        let make = |name: &str| -> BoxFuture<'_, Result<Handshake, String>> {
+            match servers.iter().find(|def| def.name() == name) {
+                Some(def) => Box::pin(connect_stdio(def)),
+                None => Box::pin(async { Err("配置里没有这条 server".to_string()) }),
+            }
+        };
+        self.connect_all_with(
+            &names,
+            std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            &make,
+        )
+        .await
+    }
+
+    /// `connect_all` 的可注入内核（R308/R305）：超时与「怎么建一条连接」都是参数。
+    /// T36 的 HTTP 传输只需要换掉 `make`，状态台账与并行/隔离语义原样复用。
+    pub async fn connect_all_with<'a>(
+        &'a self,
+        names: &[String],
+        timeout: std::time::Duration,
+        make: &(dyn Fn(&str) -> BoxFuture<'a, Result<Handshake, String>> + Sync + 'a),
+    ) -> Vec<(String, Result<usize, String>)> {
+        for name in names {
+            self.set_status(name, ServerStatus::Connecting);
+        }
+        let attempts = futures::future::join_all(names.iter().map(|name| async move {
+            match tokio::time::timeout(timeout, make(name)).await {
+                Err(_) => Err(trim_reason(format!(
+                    "连接 `{name}` 超时：{} 秒内没有完成握手",
+                    timeout.as_secs_f32()
+                ))),
+                Ok(Err(reason)) => Err(trim_reason(reason)),
+                Ok(Ok(handshake)) => Ok(handshake),
+            }
+        }))
+        .await;
+
+        let mut out = Vec::with_capacity(names.len());
+        for (name, attempt) in names.iter().zip(attempts) {
+            match attempt {
+                Ok(handshake) => {
+                    let tools = handshake.tools.len();
+                    self.set_status(name, ServerStatus::Ready { tools });
+                    let mut slots = crate::lock::guard(&self.slots);
+                    if let Some(slot) = slots.get_mut(name) {
+                        slot.conn = Some(Connection {
+                            pid: handshake.pid,
+                            tools: handshake.tools,
+                            service: handshake.service,
+                        });
+                    }
+                    out.push((name.clone(), Ok(tools)));
+                }
+                Err(reason) => {
+                    self.set_status(
+                        name,
+                        ServerStatus::Disconnected {
+                            reason: reason.clone(),
+                        },
+                    );
+                    out.push((name.clone(), Err(reason)));
+                }
+            }
+        }
+        out
+    }
+
+    /// 主动关闭：把 service 从台账里取出来再 `cancel()`（R309：桥是持有者），
+    /// 每条给 5 秒上限——`graceful_shutdown` 内部已经会等 stdin EOF，不许在这里无限等。
+    /// **本次不做进程树回收**：`cancel()` 只打直接子进程，孙进程靠 stdin EOF 退出，
+    /// 彻底回收是 T34 的 JobObject。
+    pub async fn shutdown(&self) {
+        let drained: Vec<(String, Connection)> = {
+            let mut slots = crate::lock::guard(&self.slots);
+            let mut out = Vec::new();
+            for (name, slot) in slots.iter_mut() {
+                if let Some(conn) = slot.conn.take() {
+                    out.push((name.clone(), conn));
+                }
+            }
+            out
+        };
+        for (name, conn) in drained {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.service.cancel())
+                .await;
+            self.set_status(
+                &name,
+                ServerStatus::Disconnected {
+                    reason: "已关闭".to_string(),
+                },
+            );
+        }
+    }
+}
+
+/// 真 stdio 连接（R309）：pid 必须在 `.serve()` **消费** transport 之前取出来
+/// （`TokioChildProcess::id()`，rmcp `transport/child_process.rs:72`；3.5.1 没有 `process_handle()`）。
+async fn connect_stdio(def: &ServerDef) -> Result<Handshake, String> {
+    let plan = spawn_command(def, &resolve_program_in_path)?;
+    let child = TokioChildProcess::new(plan.into_command())
+        .map_err(|e| trim_reason(format!("启动 `{}` 失败：{e}", def.name())))?;
+    let pid = child.id();
+    let (tools, service) = handshake(child).await?;
+    Ok(Handshake {
+        pid,
+        tools,
+        service,
+    })
+}
+
+/// 握手 + 列出工具（R310）。泛型是为了让它同时服务两条腿：
+/// 真子进程（`TokioChildProcess`）与测试里的内存管道（任意 `AsyncRead + AsyncWrite`，
+/// 由 rmcp 的 `IntoTransport` 兜底实现接住）——**真假两条腿走同一段握手代码**，
+/// 差别只在 transport 是谁。
+async fn handshake<T, E, A>(
+    transport: T,
+) -> Result<(Vec<rmcp::model::Tool>, RunningService<RoleClient, ()>), String>
+where
+    T: IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let service = ().serve(transport).await.map_err(|e| trim_reason(format!("MCP 握手失败：{e}")))?;
+    let listed = service
+        .peer()
+        .list_tools(Default::default())
+        .await
+        .map_err(|e| trim_reason(format!("列出工具失败：{e}")))?;
+    Ok((listed.tools, service))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tempfile::tempdir;
+
+    use futures::future::BoxFuture;
+    use rmcp::RoleServer;
+    use rmcp::model::{
+        ClientJsonRpcMessage, ClientRequest, InitializeResult, ListToolsResult, ServerCapabilities,
+        ServerJsonRpcMessage, ServerResult, Tool,
+    };
+    use rmcp::transport::{IntoTransport, Transport};
+
+    /// 造一条 stdio 的 `ServerDef`（plan :855 的 `stdio(…)` 夹具形状，字段按 T29 R291 的**直接**构造）。
+    fn stdio(name: &str, command: &str, args: &[&str]) -> ServerDef {
+        ServerDef::Stdio {
+            name: name.into(),
+            command: command.into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            env: HashMap::new(),
+        }
+    }
+
+    /// 在 `dir` 里造一个**真实存在**的空文件并返回其绝对路径：`is_file()` 只认真文件，
+    /// 假表里的候选也要能在磁盘上被 `is_file()` 点到（R305 的走查内核不猜路径）。
+    fn fixture_exec(dir: &std::path::Path, file_name: &str) -> PathBuf {
+        let path = dir.join(file_name);
+        std::fs::write(&path, b"@echo off\r\n").unwrap();
+        path
+    }
+
+    // —— Step 1（plan :853-861 的形状，断言对象按 R304 换成 `SpawnPlan`）——
+    #[test]
+    fn npx_is_resolved_to_its_absolute_cmd_path_and_always_carries_y() {
+        let dir = tempdir().unwrap();
+        // 注入的假表（R305）：本机装没装 node 都不影响这条，单测也不碰网络。
+        let cmd = fixture_exec(dir.path(), "npx.cmd");
+        let table: BTreeMap<String, PathBuf> = BTreeMap::from([("npx".to_string(), cmd.clone())]);
+        let resolve = |name: &str| table.get(name).cloned();
+
+        // ① plan :855 逐字那条：用户已经写了 `-y`，位置也在最前面。
+        let def = stdio("x", "npx", &["-y", "@modelcontextprotocol/server-memory"]);
+        let plan = spawn_command(&def, &resolve).expect("注入表里有 npx.cmd，选型不该失败");
+        assert!(
+            plan.program().is_absolute(),
+            "解析结果必须是绝对路径，裸 `npx` 在本机实测直接 program not found：{:?}",
+            plan.program()
+        );
+        assert!(
+            plan.program().to_string_lossy().ends_with(".cmd"),
+            "`npx` 要解析到 `.cmd` 那条 shim（T4 实测 `where npx` 给两条，起得来的是 `.cmd`）：{:?}",
+            plan.program()
+        );
+        assert_eq!(
+            plan.args(),
+            vec!["-y", "@modelcontextprotocol/server-memory"],
+            "用户写了 -y ⇒ 不重复注入，且顺序原样"
+        );
+
+        // ② 用户**没**写 `-y` ⇒ 注入，且注入在**第一段**（R306：`npx pkg -y` 里那个 `-y`
+        // 是传给包自己的，与 `npx -y pkg` 不等价）。
+        let def = stdio("x", "npx", &["@modelcontextprotocol/server-memory"]);
+        let plan = spawn_command(&def, &resolve).unwrap();
+        assert_eq!(
+            plan.args().first().copied(),
+            Some("-y"),
+            "`-y` 必须紧贴 program：{:?}",
+            plan.args()
+        );
+        assert_eq!(
+            plan.args(),
+            vec!["-y", "@modelcontextprotocol/server-memory"],
+            "注入只加一段，不许复制：{:?}",
+            plan.args()
+        );
+
+        // ③ `--yes` 同义，也算「用户已经写了」。
+        let def = stdio("x", "npx", &["--yes", "pkg"]);
+        let plan = spawn_command(&def, &resolve).unwrap();
+        assert_eq!(
+            plan.args(),
+            vec!["--yes", "pkg"],
+            "--yes 不该再被 -y 顶一遍"
+        );
+
+        // ④ 零弹窗的另一半：`CREATE_NO_WINDOW` 恒置位（R307）。
+        let def = stdio("x", "npx", &["pkg"]);
+        let plan = spawn_command(&def, &resolve).unwrap();
+        assert_eq!(
+            plan.creation_flags() & CREATE_NO_WINDOW,
+            CREATE_NO_WINDOW,
+            "CREATE_NO_WINDOW 必须显式打开"
+        );
+    }
+
+    // —— Step 3（R305/R306/R311）：走查优先级、不注入 `-y` 的条目、argv 逐段 ——
+    #[test]
+    fn path_walk_prefers_the_cmd_shim_and_never_wraps_a_shell() {
+        let dir = tempdir().unwrap();
+        // 同目录同时放「无扩展名的 npx」与「npx.cmd」：T4 实测 `where npx` 就是这个形状，
+        // 起得来的是 `.cmd`；无扩展名那条是 sh 脚本，`CreateProcess` 不认（A 支 `NotFound`）。
+        let bare = fixture_exec(dir.path(), "npx");
+        let shim = fixture_exec(dir.path(), "npx.cmd");
+        let dirs = vec![dir.path().to_path_buf()];
+        let exts: Vec<String> = vec![".exe".into(), ".cmd".into()];
+        assert_eq!(
+            walk_path("npx", &dirs, &exts),
+            Some(shim),
+            "必须选 `.cmd` 那条，不许退回无扩展名的 `{bare:?}`"
+        );
+
+        // 不在白名单上的 program：`-y` 一个都不许加（给 python 加 `-y` 会把它打歪）。
+        let python = fixture_exec(dir.path(), "python.exe");
+        let table: BTreeMap<String, PathBuf> = BTreeMap::from([("python".to_string(), python)]);
+        let resolve = |name: &str| table.get(name).cloned();
+        let def = ServerDef::Stdio {
+            name: "py".into(),
+            command: "python".into(),
+            args: vec!["-m".into(), "a package".into(), "he said \"hi\"".into()],
+            env: HashMap::new(),
+        };
+        let plan = spawn_command(&def, &resolve).expect("假表里有 python.exe");
+        assert_eq!(
+            plan.args(),
+            vec!["-m", "a package", "he said \"hi\""],
+            "含空格与引号的 arg 必须依旧是一个 argv 元素（R311：不许 join 成一个字符串）：{:?}",
+            plan.args()
+        );
+        assert_ne!(
+            plan.program(),
+            Path::new("cmd"),
+            "R311：任何 `cmd /C` 包装都算违规"
+        );
+        assert!(
+            !plan.args().iter().any(|a| *a == "/C" || *a == "/c"),
+            "argv 里不许出现 shell 开关：{:?}",
+            plan.args()
+        );
+
+        // 已经是绝对路径 ⇒ 不走查（用户把「起哪个文件」说清楚了）。
+        let explicit = fixture_exec(dir.path(), "x.cmd");
+        let never = |_: &str| -> Option<PathBuf> { panic!("绝对路径不该再查 PATH") };
+        let def = stdio("x", &explicit.to_string_lossy(), &["--flag"]);
+        let plan = spawn_command(&def, &never).expect("绝对路径直接用，不该调用解析器");
+        assert_eq!(plan.program(), explicit.as_path());
+    }
+
+    // —— Step 2（plan :869-876）与 Step 4（R308）：一条腿死/不回，别的照活 ——
+    #[tokio::test]
+    async fn one_dead_server_does_not_take_down_the_others() {
+        let bridge = McpBridge::new();
+        let dead = "dead".to_string();
+        let ok = "ok".to_string();
+        let make = |name: &str| -> BoxFuture<'_, Result<Handshake, String>> {
+            if name == "dead" {
+                Box::pin(async { Err("起不来的 server".to_string()) })
+            } else {
+                Box::pin(fake_handshake(2))
+            }
+        };
+        let out = bridge
+            .connect_all_with(&[dead.clone(), ok.clone()], Duration::from_secs(5), &make)
+            .await;
+        assert!(out[0].1.is_err(), "起不来的必须报 Disconnected：{out:?}");
+        assert_eq!(out[1].1, Ok(2), "别的 server 不许被连累：{out:?}");
+        assert_eq!(
+            bridge.status_of("dead"),
+            Some(ServerStatus::Disconnected {
+                reason: "起不来的 server".into()
+            })
+        );
+        assert_eq!(
+            bridge.status_of("ok"),
+            Some(ServerStatus::Ready { tools: 2 })
+        );
+        let reason = out[0].1.as_ref().unwrap_err();
+        assert!(
+            reason.chars().count() < 400,
+            "错误文案要能上 UI，不能把整个 stderr 尾巴糊上去：{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_times_out_without_harming_its_neighbours() {
+        let bridge = McpBridge::new();
+        let make = |name: &str| -> BoxFuture<'_, Result<Handshake, String>> {
+            if name == "silent" {
+                // 对端**收下** initialize 但不回 ⇒ 只有超时能救。
+                Box::pin(fake_handshake_never_answers())
+            } else {
+                Box::pin(fake_handshake(2))
+            }
+        };
+        let started = std::time::Instant::now();
+        let out = bridge
+            .connect_all_with(
+                &["silent".to_string(), "ok".to_string()],
+                Duration::from_millis(300),
+                &make,
+            )
+            .await;
+        assert!(out[0].1.is_err(), "不回话的必须因为超时变成 Disconnected");
+        assert_eq!(out[1].1, Ok(2), "超时不许传染给邻居");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "注入的 300ms 超时必须真的生效，不能等满 CONNECT_TIMEOUT_SECS：{:?}",
+            started.elapsed()
+        );
+        let reason = out[0].1.as_ref().unwrap_err();
+        assert!(reason.contains("超时"), "超时文案要认得出来：{reason}");
+    }
+
+    // —— Step 5（R308）：脱敏红线 —— 失败文案与 Debug 都不许带 env 的值 ——
+    #[test]
+    fn a_failure_reason_never_carries_an_env_value() {
+        let secret = "sk-REAL-LOOKING-SECRET";
+        let mut env = HashMap::new();
+        env.insert("TOKEN".to_string(), secret.to_string());
+        let def = ServerDef::Stdio {
+            name: "leaky".into(),
+            command: "definitely-not-a-real-binary-xyz".into(),
+            args: vec![],
+            env: env.clone(),
+        };
+        // ① 选型成功时：`SpawnPlan` 的 Debug 只出键名。
+        let dir = tempdir().unwrap();
+        let exe = fixture_exec(dir.path(), "definitely-not-a-real-binary-xyz.cmd");
+        let plan = spawn_command(&def, &|_: &str| Some(exe.clone())).unwrap();
+        let debug = format!("{plan:?}");
+        assert!(
+            debug.contains("TOKEN"),
+            "键名要留着（排查时要知道配了哪把）：{debug}"
+        );
+        assert!(
+            !debug.contains(secret),
+            "Debug 里出现了 env 的明文值：{debug}"
+        );
+        assert_eq!(plan.env_keys(), vec!["TOKEN"], "对外只给键名");
+
+        // ② 解析失败时：reason 里不许出现值，且按 char 截到 REASON_LIMIT。
+        let reason = spawn_command(&def, &|_: &str| None).expect_err("解析失败必须报错");
+        assert!(
+            !reason.contains(secret),
+            "失败文案里出现了 env 的明文值：{reason}"
+        );
+
+        // ③ 超长失败文案也要截断（按 char，不许按字节切）。
+        let long = ServerDef::Stdio {
+            name: "long".into(),
+            command: "x".repeat(500),
+            args: vec![],
+            env: HashMap::new(),
+        };
+        let reason = spawn_command(&long, &|_: &str| None).expect_err("解析失败");
+        assert!(
+            reason.chars().count() <= 200,
+            "reason 上限 200 个 char：{}",
+            reason.chars().count()
+        );
+    }
+
+    // —— Step 6（R309/R310）：桥要存住 service、报工具名、如实报 pid ——
+    #[tokio::test]
+    async fn the_bridge_keeps_the_service_alive_and_reports_the_pid() {
+        let bridge = McpBridge::new();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let peer_done = Arc::new(AtomicBool::new(false));
+        let (seen2, done2) = (seen.clone(), peer_done.clone());
+        let make = move |_: &str| -> BoxFuture<'_, Result<Handshake, String>> {
+            let (seen, done) = (seen2.clone(), done2.clone());
+            Box::pin(async move { fake_handshake_counting(2, seen, done).await })
+        };
+        let out = bridge
+            .connect_all_with(&["ok".to_string()], Duration::from_secs(5), &make)
+            .await;
+        assert_eq!(out[0].1, Ok(2));
+        assert_eq!(
+            bridge.status_of("ok"),
+            Some(ServerStatus::Ready { tools: 2 })
+        );
+        assert_eq!(
+            bridge.tool_names("ok"),
+            vec!["tool_0".to_string(), "tool_1".to_string()],
+            "T32 要拿这两条去注册，桥必须把它们留住"
+        );
+        assert!(
+            bridge.pids().is_empty(),
+            "内存管道没有进程，不许为了过测试给 duplex 腿造假 pid"
+        );
+        assert!(
+            seen.load(Ordering::SeqCst) >= 3,
+            "握手 + initialized + tools/list 至少三条消息，实际 {}",
+            seen.load(Ordering::SeqCst)
+        );
+
+        bridge.shutdown().await;
+        assert!(
+            matches!(
+                bridge.status_of("ok"),
+                Some(ServerStatus::Disconnected { .. })
+            ),
+            "shutdown 之后状态要变成 Disconnected"
+        );
+        // service 被桥存着的证据：shutdown 关掉传输之后，对端真的走到了 EOF。
+        for _ in 0..100 {
+            if peer_done.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            peer_done.load(Ordering::SeqCst),
+            "shutdown 之后对端没看到 EOF：service 早已被 drop，桥并没有真的持有连接"
+        );
+    }
+
+    /// 真解析器那条路的失败形态（`connect_all`，不注入）：一条解析不到的 server ⇒
+    /// `Disconnected`，且原因被 trim 到上限内。这条测试**不 spawn 任何进程**。
+    #[tokio::test]
+    async fn a_command_that_cannot_be_resolved_is_a_bounded_reason() {
+        let bridge = McpBridge::new();
+        let def = ServerDef::Stdio {
+            name: "ghost".into(),
+            command: "definitely-not-a-real-binary-xyz".into(),
+            args: vec![],
+            env: HashMap::new(),
+        };
+        let out = bridge.connect_all(&[def]).await;
+        assert_eq!(out.len(), 1);
+        let reason = out[0].1.as_ref().expect_err("解析不到就必须 Err");
+        assert!(
+            reason.chars().count() <= 200,
+            "reason 上限 200 char：{reason}"
+        );
+        assert!(
+            matches!(
+                bridge.status_of("ghost"),
+                Some(ServerStatus::Disconnected { .. })
+            ),
+            "失败也要落进状态台账"
+        );
+    }
+
+    // —— 假对端（R310）：裸 `Transport<RoleServer>` 手搓 JSON-RPC，不实现 Handler ——
+    // 配方取自 rmcp 自己的 tests/test_cancelled_response.rs:210-245：
+    // duplex 两半 ⇒ `IntoTransport::<RoleServer,_,_>::into_transport(server_half)`
+    // ⇒ `receive()` 读请求 ⇒ `ServerJsonRpcMessage::response(..)` 回包。
+    async fn fake_handshake(tool_count: usize) -> Result<Handshake, String> {
+        fake_handshake_counting(
+            tool_count,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    async fn fake_handshake_counting(
+        tool_count: usize,
+        seen: Arc<AtomicUsize>,
+        done: Arc<AtomicBool>,
+    ) -> Result<Handshake, String> {
+        let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            // 泛型值不装箱（`Transport` 不是 dyn-safe）：`into_transport` 的返回类型由编译器推出来。
+            let mut peer = IntoTransport::<RoleServer, _, _>::into_transport(server_half);
+            while let Some(msg) = peer.receive().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let ClientJsonRpcMessage::Request(request) = msg else {
+                    continue;
+                };
+                match request.request {
+                    ClientRequest::InitializeRequest(_) => {
+                        let info = InitializeResult::new(ServerCapabilities::default());
+                        peer.send(ServerJsonRpcMessage::response(
+                            ServerResult::InitializeResult(info),
+                            request.id,
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    ClientRequest::ListToolsRequest(_) => {
+                        let tools = (0..tool_count)
+                            .map(|i| {
+                                Tool::new(
+                                    format!("tool_{i}"),
+                                    "假对端的工具",
+                                    serde_json::Map::new(),
+                                )
+                            })
+                            .collect();
+                        peer.send(ServerJsonRpcMessage::response(
+                            ServerResult::ListToolsResult(ListToolsResult {
+                                tools,
+                                ..Default::default()
+                            }),
+                            request.id,
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                    // 其它请求（ping 等）一律不回：本轮没人会发。
+                    _ => {}
+                }
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        let (tools, service) = handshake(client_half).await?;
+        Ok(Handshake {
+            pid: None,
+            tools,
+            service,
+        })
+    }
+
+    /// 收下 initialize 但**永远不回**：只用来测超时那条支路。
+    async fn fake_handshake_never_answers() -> Result<Handshake, String> {
+        let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut peer = IntoTransport::<RoleServer, _, _>::into_transport(server_half);
+            while peer.receive().await.is_some() {
+                // 收到也不回：超时是唯一出口。
+            }
+        });
+        let (tools, service) = handshake(client_half).await?;
+        Ok(Handshake {
+            pid: None,
+            tools,
+            service,
+        })
+    }
+}
