@@ -81,13 +81,31 @@ fn images_of(output: &ToolOutput) -> Vec<ContentBlock> {
 /// 工具返回过图片时，给模型补一条 **user** 轮消息（R319）。没有图片 ⇒ `None`，
 /// 纯文本工具的输出一个字节都不多加。
 fn image_followup(images: &[ContentBlock]) -> Option<Message> {
-    if images.is_empty() {
+    // 同一张图只送一次：模型一轮里重复调用同一把工具时，`Multi` 会把同一份 base64
+    // 出现两次，而图片是按张计费的（context.rs 的 TOKEN 估算也是按张）。
+    let mut unique: Vec<&ContentBlock> = Vec::new();
+    for image in images {
+        let ContentBlock::Image { data, mime } = image else {
+            continue;
+        };
+        if unique.iter().any(|kept| match kept {
+            ContentBlock::Image {
+                data: kept_data,
+                mime: kept_mime,
+            } => kept_data == data && kept_mime == mime,
+            _ => false,
+        }) {
+            continue;
+        }
+        unique.push(image);
+    }
+    if unique.is_empty() {
         return None;
     }
     let mut blocks = vec![ContentBlock::Text {
         text: "上面的工具返回了图片，请结合图片回答用户刚才的问题。".to_string(),
     }];
-    blocks.extend(images.iter().cloned());
+    blocks.extend(unique.into_iter().cloned());
     Some(Message::user(blocks))
 }
 
@@ -1004,6 +1022,14 @@ mod tests {
         };
         assert_eq!(images_of(&multi).len(), 1);
         assert!(images_of(&ToolOutput::text("无图")).is_empty());
+
+        // 同一张图出现两次 ⇒ 只送一次（图片按张计费）。
+        let same = ContentBlock::Image {
+            data: "QUJD".into(),
+            mime: ImageMime::Png,
+        };
+        let deduped = image_followup(&[same.clone(), same]).expect("仍有图");
+        assert_eq!(deduped.blocks.len(), 2, "一句说明 + 一张（去重后的）图");
     }
 
     // ---- R57 的不变量：模型看到的每个请求都得配对 ----
