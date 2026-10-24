@@ -11,6 +11,7 @@ pub mod agent;
 pub mod image_prep;
 pub mod ipc;
 pub mod lock;
+pub mod mcp;
 pub mod model;
 pub mod permission;
 pub mod settings;
