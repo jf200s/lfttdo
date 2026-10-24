@@ -66,6 +66,31 @@ pub struct AgentSession {
     last_est_input: u32,
 }
 
+/// 从工具输出里摘出图片块（R319）：`Text` 不要，`Image` 原样，`Multi` 递归摊平。
+fn images_of(output: &ToolOutput) -> Vec<ContentBlock> {
+    match output {
+        ToolOutput::Image { data, mime } => vec![ContentBlock::Image {
+            data: data.clone(),
+            mime: mime.clone(),
+        }],
+        ToolOutput::Multi { parts } => parts.iter().flat_map(images_of).collect(),
+        ToolOutput::Text { .. } => Vec::new(),
+    }
+}
+
+/// 工具返回过图片时，给模型补一条 **user** 轮消息（R319）。没有图片 ⇒ `None`，
+/// 纯文本工具的输出一个字节都不多加。
+fn image_followup(images: &[ContentBlock]) -> Option<Message> {
+    if images.is_empty() {
+        return None;
+    }
+    let mut blocks = vec![ContentBlock::Text {
+        text: "上面的工具返回了图片，请结合图片回答用户刚才的问题。".to_string(),
+    }];
+    blocks.extend(images.iter().cloned());
+    Some(Message::user(blocks))
+}
+
 impl AgentSession {
     pub fn new(deps: SessionDeps) -> Self {
         Self {
@@ -223,6 +248,7 @@ impl AgentSession {
 
             // 工具**顺序**执行，不并行（spec 4.6 的刻意取舍：并行难追踪「哪个写操作改了
             // 哪个文件」，也和分级确认的交互顺序冲突）。
+            let mut tool_images: Vec<ContentBlock> = Vec::new();
             for (id, name, input) in calls {
                 // risk 只从注册表查（`ToolCallView` 的注释就是这条）：模型或前端递来的
                 // 任何「我是 Read」都不作数 —— `ToolDef` 里压根没有 risk 字段。
@@ -276,7 +302,15 @@ impl AgentSession {
                     ms: started.elapsed().as_millis() as u64,
                     preview,
                 });
+                tool_images.extend(images_of(&output));
                 self.history.push(Message::tool(&id, output, is_error));
+            }
+            // R319：工具回的图片对**模型**不可见（`role:"tool"` 只能带文本，
+            // openai_compat.rs:387-392）。要让 vision 模型真的看到，只能在 tool 消息之后
+            // 补一条 **user** 轮的 Image 块。放在同一轮末尾、所有 tool_result 之后：
+            // R57 的配对不变量（N 个调用紧跟 N 条结果）因此不受影响。
+            if let Some(followup) = image_followup(&tool_images) {
+                self.history.push(followup);
             }
         }
         self.finish(StopReason::MaxTurns)
@@ -348,7 +382,7 @@ mod tests {
     use super::*;
     use crate::agent::context::ContextConfig;
     use crate::agent::events::{Decision, ErrorWhere, Scope, StopReason};
-    use crate::agent::types::{ContentBlock, Message, Risk, Role, ToolOutput};
+    use crate::agent::types::{ContentBlock, ImageMime, Message, Risk, Role, ToolOutput};
     use crate::model::provider::{ChatRequest, ModelDelta, ModelError, ModelProvider};
     use crate::permission::gate::PermissionGate;
     use crate::tools::echo::{EchoTool, RiskOverrideTool};
@@ -932,6 +966,44 @@ mod tests {
             }
         }
         out
+    }
+
+    // ---- R319：工具返回的图片要作为 user 轮送进模型 ----
+
+    #[test]
+    fn tool_images_become_exactly_one_user_turn_and_text_only_adds_nothing() {
+        let img = ContentBlock::Image {
+            data: "QUJD".into(),
+            mime: ImageMime::Png,
+        };
+        assert!(
+            image_followup(&[]).is_none(),
+            "纯文本工具的输出不许平白多一条 user 消息"
+        );
+        let m = image_followup(&[img]).expect("有图就要补一条");
+        assert_eq!(m.role, Role::User, "必须是 user 轮：tool 角色只吃文本");
+        assert!(
+            matches!(m.blocks[0], ContentBlock::Text { .. }),
+            "先有一句说明，模型才知道这条消息是工具图片"
+        );
+        assert!(
+            matches!(m.blocks[1], ContentBlock::Image { .. }),
+            "图必须是真正的 Image 块，而不是一句 [图片]"
+        );
+        assert_eq!(m.blocks.len(), 2, "一句说明 + 一张图，不加别的");
+
+        // Multi 递归摊平：text 丢掉、image 留下。
+        let multi = ToolOutput::Multi {
+            parts: vec![
+                ToolOutput::text("x"),
+                ToolOutput::Image {
+                    data: "QkNE".into(),
+                    mime: ImageMime::Png,
+                },
+            ],
+        };
+        assert_eq!(images_of(&multi).len(), 1);
+        assert!(images_of(&ToolOutput::text("无图")).is_empty());
     }
 
     // ---- R57 的不变量：模型看到的每个请求都得配对 ----
