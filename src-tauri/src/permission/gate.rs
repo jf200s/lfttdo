@@ -20,6 +20,27 @@ pub enum Verdict {
     Block,
 }
 
+impl Verdict {
+    /// 线格式 / 落盘用的词（`mcp_trust.json` 与 `mcp_set_trust` 共用这一份映射）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Auto => "auto",
+            Verdict::Ask => "ask",
+            Verdict::Block => "block",
+        }
+    }
+
+    /// 未知词 ⇒ `None`（调用方决定是报错还是丢弃）。
+    pub fn parse(word: &str) -> Option<Verdict> {
+        match word {
+            "auto" => Some(Verdict::Auto),
+            "ask" => Some(Verdict::Ask),
+            "block" => Some(Verdict::Block),
+            _ => None,
+        }
+    }
+}
+
 /// 会话级放行攒下来的作用域令牌集。键是 `PermissionGate::rule_key` 的产物 ——
 /// **不是裸工具名**，裸工具名会把「本会话允许写一次」变成「本会话可写任意路径」。
 #[derive(Default)]
@@ -53,6 +74,14 @@ impl RuleTable {
     /// 读回当前档位（T35 的界面要显示它）。
     pub fn server_trust(&self, server: &str) -> Option<Verdict> {
         crate::lock::read(&self.server_trust).get(server).copied()
+    }
+
+    /// 整张信任表的快照（R329：落盘用；`BTreeMap` ⇒ 写盘可复现）。
+    pub fn trust_snapshot(&self) -> std::collections::BTreeMap<String, Verdict> {
+        crate::lock::read(&self.server_trust)
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     }
 
     /// 只回答「有没有 override」（R45：默认策略不许搬进来，否则同一条策略住两处）：

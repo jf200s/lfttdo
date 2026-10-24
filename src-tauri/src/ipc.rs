@@ -632,21 +632,25 @@ pub struct McpServerView {
 }
 
 fn trust_word(verdict: Verdict) -> &'static str {
-    match verdict {
-        Verdict::Auto => "auto",
-        Verdict::Ask => "ask",
-        Verdict::Block => "block",
-    }
+    verdict.as_str()
 }
 
 /// 线格式 → 信任档位。命令层自己映射（`Verdict` 没有 serde：它不进线格式）。
 pub fn parse_trust(trust: &str) -> Result<Verdict, String> {
-    match trust {
-        "auto" => Ok(Verdict::Auto),
-        "ask" => Ok(Verdict::Ask),
-        "block" => Ok(Verdict::Block),
-        other => Err(format!("未知的信任档位 `{other}`（只认 auto/ask/block）")),
-    }
+    Verdict::parse(trust).ok_or_else(|| format!("未知的信任档位 `{trust}`（只认 auto/ask/block）"))
+}
+
+/// 设置信任并**落盘**（R329：不落盘的话每次启动都要重新授权一遍）。
+/// 写盘失败要把错误交回命令层——静默吞掉等于「用户以为记住了、下次又问」。
+pub fn mcp_set_trust_of(
+    gate: &PermissionGate,
+    dir: &Path,
+    name: &str,
+    trust: &str,
+) -> Result<(), String> {
+    let verdict = parse_trust(trust)?;
+    gate.rules().set_server_trust(name, verdict);
+    crate::mcp::trust::save(dir, &gate.rules().trust_snapshot())
 }
 
 /// 可测的核心（`#[tauri::command]` 在单测里调不动，同 R103）。
@@ -731,9 +735,7 @@ pub fn mcp_set_trust(
     name: String,
     trust: String,
 ) -> Result<(), String> {
-    let verdict = parse_trust(&trust)?;
-    state.gate.rules().set_server_trust(&name, verdict);
-    Ok(())
+    mcp_set_trust_of(&state.gate, &state.mcp_dir, &name, &trust)
 }
 
 #[tauri::command]
@@ -1105,6 +1107,11 @@ pub fn run() {
             // 20~30/48 次。所以这里 `manage` 一次，命令一律经 `State<AppState>` 取，
             // 绝不在命令里现构。
             let settings = Arc::new(SettingsStore::new(&dir));
+            // R329：信任档位在建 gate 之后、manage 之前回灌（文件坏了就是空表 ⇒ 回到 Ask）。
+            let gate = Arc::new(PermissionGate::new());
+            for (server, verdict) in crate::mcp::trust::load(&dir) {
+                gate.rules().set_server_trust(&server, verdict);
+            }
             // R105：装配期还没有 session_id，所以 gate 先不带 sink，由 `run_turn` 每轮开头
             // `set_sink(emitter)`（`gate.rs:77` 的可换内核就是为这一刻准备的）。
             // 这里**不留** brief Step 3 的 `NoopSink`：空 sink 意味着 Plan B 的弹窗静默不发事件。
@@ -1115,7 +1122,7 @@ pub fn run() {
                 db,
                 settings,
                 registry: build_production_registry(),
-                gate: Arc::new(PermissionGate::new()),
+                gate,
                 cancel: Arc::new(Mutex::new(None)),
                 running: Arc::new(Mutex::new(None)),
                 log_path,
@@ -2788,6 +2795,22 @@ mod tests {
         assert_eq!(
             v[0].reason.as_deref(),
             Some("spawn 失败：program not found")
+        );
+    }
+
+    #[test]
+    fn trust_is_written_to_disk_and_read_back_on_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = PermissionGate::new();
+        mcp_set_trust_of(&gate, dir.path(), "search", "auto").expect("写盘");
+        assert_eq!(
+            crate::mcp::trust::load(dir.path()).get("search"),
+            Some(&Verdict::Auto),
+            "R329：下次启动必须读回同一档位"
+        );
+        assert!(
+            mcp_set_trust_of(&gate, dir.path(), "x", "yes").is_err(),
+            "未知档位不许写盘"
         );
     }
 
