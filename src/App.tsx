@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Composer } from "./components/Composer";
 import { MessageList } from "./components/MessageList";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { McpPanel } from "./components/McpPanel";
 import { Sidebar } from "./components/Sidebar";
 import * as api from "./ipc/commands";
 import { useTextBuffer } from "./ipc/batching";
@@ -36,6 +37,7 @@ export default function App() {
    * （开着但拿的是上次那份），而这里要的恰恰是**打开那一次读到的**那份。
    */
   const [settingsView, setSettingsView] = useState<SettingsView | null>(null);
+  const [mcpOpen, setMcpOpen] = useState(false);
   /**
    * 当前会话的**同步**影子。事件回调是 tauri 那边推进来的，读 `activeId` 这个 state
    * 会拿到旧值；这一支只有一处写（`openSession` / 启动那次），所以它是可审的。
@@ -385,6 +387,9 @@ export default function App() {
           <button type="button" onClick={openSettings}>
             设置
           </button>
+          <button type="button" onClick={() => setMcpOpen(true)}>
+            MCP
+          </button>
         </div>
       </main>
       {/* 面板是**视图**，不是另一份状态：它开着的时候 `ui`、订阅、会话列表全都照旧跑
@@ -399,6 +404,7 @@ export default function App() {
           onClose={closeSettings}
         />
       ) : null}
+      {mcpOpen ? <McpPanel onClose={() => setMcpOpen(false)} /> : null}
     </div>
   );
 }

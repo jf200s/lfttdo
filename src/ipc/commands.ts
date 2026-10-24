@@ -9,6 +9,8 @@ import type {
   AgentPayload,
   ContentBlock,
   Decision,
+  McpServerView,
+  McpTrust,
   SendBlock,
   SessionRow,
   Settings,
@@ -104,4 +106,25 @@ export function subscribeAgent(
       () => {},
     );
   };
+}
+
+/**
+ * MCP 服务器的四条命令（T35）。进程执行全在 Rust 侧 —— 前端没有、也不该有
+ * `plugin-shell` 的能力（`capabilities/default.json` 的说明与守卫测试一起钉着这条）。
+ */
+export function mcpServers(): Promise<McpServerView[]> {
+  return invoke<McpServerView[]>("mcp_servers");
+}
+
+export function mcpSetTrust(name: string, trust: McpTrust): Promise<void> {
+  return invoke<void>("mcp_set_trust", { name, trust });
+}
+
+/** 返回这台 server 声明的工具数（连不上 ⇒ reject，文案已脱敏、可直接上界面）。 */
+export function mcpReconnect(name: string): Promise<number> {
+  return invoke<number>("mcp_reconnect", { name });
+}
+
+export function mcpDisconnect(name: string): Promise<void> {
+  return invoke<void>("mcp_disconnect", { name });
 }

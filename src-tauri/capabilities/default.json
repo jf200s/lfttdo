@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "前端只允许事件与自定义命令；无 shell、无文件系统、无窗口尺寸/拖拽权限",
+  "description": "前端只允许事件与自定义命令；无 shell、无文件系统、无窗口尺寸/拖拽权限。MCP 的进程执行全在 Rust（T35 起有四条 mcp_* 自定义命令），前端拿不到任何 spawn/fs 能力",
   "windows": ["main"],
   "permissions": ["core:default", "core:event:default"]
 }

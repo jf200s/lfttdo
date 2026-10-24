@@ -61,6 +61,19 @@ export type ToolOutput =
   | { kind: "image"; data: string; mime: ImageMime }
   | { kind: "multi"; parts: ToolOutput[] };
 
+/** MCP 信任档位（Rust `permission/gate.rs::Verdict`，命令层映射成这三个词）。 */
+export type McpTrust = "auto" | "ask" | "block";
+
+/** MCP server 视图（ipc.rs::McpServerView）：camelCase 层沿用 `AgentPayload` 的先例。
+ *  只有状态、数量与脱敏后的失败原因——env/headers 一个字都不带出来。 */
+export interface McpServerView {
+  name: string;
+  status: "connecting" | "ready" | "disconnected";
+  tools: number;
+  trust: McpTrust;
+  reason: string | null;
+}
+
 /** `ContentBlock`（types.rs:4-24）：tag 字段是 `type`（不是 `t`），字段 snake_case。 */
 export type ContentBlock =
   | { type: "text"; text: string }

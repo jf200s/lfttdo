@@ -534,7 +534,7 @@ impl McpBridge {
         }
     }
 
-    fn set_status(&self, name: &str, status: ServerStatus) {
+    pub(crate) fn set_status(&self, name: &str, status: ServerStatus) {
         let mut slots = crate::lock::guard(&self.slots);
         slots
             .entry(name.to_string())
@@ -592,7 +592,10 @@ impl McpBridge {
                         },
                     );
                 }
-                return names.into_iter().map(|name| (name, Err(reason.clone()))).collect();
+                return names
+                    .into_iter()
+                    .map(|name| (name, Err(reason.clone())))
+                    .collect();
             }
         };
         *crate::lock::guard(&self.job) = Some(job.clone());
@@ -695,6 +698,33 @@ impl McpBridge {
         peer.call_tool(params)
             .await
             .map_err(|e| ToolError::Failed(format!("调用 `{tool}` 失败：{e}")))
+    }
+
+    /// T32 注册用的原始声明（克隆出来的 `rmcp::model::Tool`，含 description/inputSchema）。
+    pub fn decls_of(&self, server: &str) -> Vec<rmcp::model::Tool> {
+        crate::lock::guard(&self.slots)
+            .get(server)
+            .and_then(|slot| slot.conn.as_ref())
+            .map(|conn| conn.tools.clone())
+            .unwrap_or_default()
+    }
+
+    /// 断开一台 server（T35 的 `mcp_disconnect`）：先摘连接再优雅关停，状态落成 `Disconnected`。
+    pub async fn disconnect(&self, server: &str) {
+        let conn = {
+            let mut slots = crate::lock::guard(&self.slots);
+            slots.get_mut(server).and_then(|slot| slot.conn.take())
+        };
+        if let Some(conn) = conn {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.service.cancel())
+                .await;
+        }
+        self.set_status(
+            server,
+            ServerStatus::Disconnected {
+                reason: "已断开".to_string(),
+            },
+        );
     }
 
     /// 主动关闭：把 service 从台账里取出来再 `cancel()`（R309：桥是持有者），

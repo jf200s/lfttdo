@@ -178,6 +178,12 @@ impl ToolRegistry {
         crate::lock::read(&self.tools).get(name).cloned()
     }
 
+    /// 摘掉一把工具，返回它是否在场（T35：MCP 按**精确名字**撤销注册，
+    /// 因为 T30 的兜底命名会把 server 段截断，`remove_prefix("mcp__{server}__")` 摘不到它们）。
+    pub fn remove(&self, name: &str) -> bool {
+        crate::lock::write(&self.tools).remove(name).is_some()
+    }
+
     /// 摘掉所有以 `prefix` 开头的工具，返回被摘掉的名字（`BTreeMap` 序 ⇒ 字典序）。
     /// T33/T35 用它撤掉一台 MCP server 的全部工具；前缀必须精确到 `mcp__{server}__`，
     /// 少一个尾部 `__` 会把 `mcp__search_v2__*` 一起带走（测试钉着这个区别）。

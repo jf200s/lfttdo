@@ -9,9 +9,11 @@ use crate::agent::events::{AgentEvent, Decision, EventSink, StopReason};
 use crate::agent::session::{AgentSession, SessionDeps};
 use crate::agent::summarize::{SUMMARY_OMITTED, collect_summary, summary_note, summary_request};
 use crate::agent::types::{ContentBlock, Message};
+use crate::mcp::bridge::{McpBridge, McpTool, ServerStatus};
+use crate::mcp::config::ServerDef;
 use crate::model::openai_compat::{OpenAiCompat, is_loopback_endpoint};
 use crate::model::provider::ModelProvider;
-use crate::permission::gate::PermissionGate;
+use crate::permission::gate::{PermissionGate, Verdict};
 use crate::settings::{Settings, SettingsStore, effective_roots};
 use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::tools::fetch::FetchTool;
@@ -201,6 +203,9 @@ pub struct AppState {
     /// 日志文件路径（R107：GUI 没有控制台，路径看不见等于日志不存在）。
     /// 装配期才知道 app data 目录，所以是 `Option`；建不出日志文件时给 `None` 而不是失败。
     pub log_path: Option<PathBuf>,
+    /// MCP 的 stdio 桥与配置目录（T35）。桥是进程级单例：工具注册与信任档位都挂在它上面。
+    pub mcp: Arc<McpBridge>,
+    pub mcp_dir: PathBuf,
 }
 
 /// 单轮并发闸门。guard 一析构就释放槽位，所以 `?` 的每条早退路径（读设置失败、
@@ -609,6 +614,147 @@ pub async fn session_list(state: State<'_, AppState>) -> Result<Vec<SessionRow>,
     blocking(move || db.list_sessions().map_err(|e| e.to_string())).await
 }
 
+// ───────────────────────── T35：MCP server 管理（四条命令） ─────────────────────────
+
+/// 面向界面的 server 视图。字段**只有**这些：`env`/`headers` 一个字都不带出去
+/// （命令返回值会进 DevTools 与日志，与 T29 R294 的脱敏是同一条红线）。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerView {
+    pub name: String,
+    /// `connecting` | `ready` | `disconnected`
+    pub status: String,
+    pub tools: usize,
+    /// `auto` | `ask` | `block`
+    pub trust: String,
+    /// 只有 `disconnected` 才可能有；已经脱敏、可直接上界面（T31 R308 的 200 char 上限）。
+    pub reason: Option<String>,
+}
+
+fn trust_word(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Auto => "auto",
+        Verdict::Ask => "ask",
+        Verdict::Block => "block",
+    }
+}
+
+/// 线格式 → 信任档位。命令层自己映射（`Verdict` 没有 serde：它不进线格式）。
+pub fn parse_trust(trust: &str) -> Result<Verdict, String> {
+    match trust {
+        "auto" => Ok(Verdict::Auto),
+        "ask" => Ok(Verdict::Ask),
+        "block" => Ok(Verdict::Block),
+        other => Err(format!("未知的信任档位 `{other}`（只认 auto/ask/block）")),
+    }
+}
+
+/// 可测的核心（`#[tauri::command]` 在单测里调不动，同 R103）。
+pub fn mcp_servers_of(
+    defs: &[ServerDef],
+    bridge: &McpBridge,
+    gate: &PermissionGate,
+) -> Vec<McpServerView> {
+    let rules = gate.rules();
+    defs.iter()
+        .map(|def| {
+            let name = def.name();
+            let (status, tools, reason) = match bridge.status_of(name) {
+                Some(ServerStatus::Connecting) => ("connecting".to_string(), 0, None),
+                Some(ServerStatus::Ready { tools }) => ("ready".to_string(), tools, None),
+                Some(ServerStatus::Disconnected { reason }) => {
+                    ("disconnected".to_string(), 0, Some(reason))
+                }
+                None => ("disconnected".to_string(), 0, None),
+            };
+            // 没登记过的 MCP server 在 gate 眼里就是 Ask（R321），界面必须照实显示，
+            // 不能显示成「auto」让用户误以为已经信任。
+            let trust = rules.server_trust(name).unwrap_or(Verdict::Ask);
+            McpServerView {
+                name: name.to_string(),
+                status,
+                tools,
+                trust: trust_word(trust).to_string(),
+                reason,
+            }
+        })
+        .collect()
+}
+
+/// 按**精确名字**撤销一台 server 的全部工具（T30 的兜底命名可能截断 server 段，
+/// 前缀法摘不到它们）。返回真正被摘掉的名字。
+pub fn mcp_clear_tools(
+    registry: &ToolRegistry,
+    server: &str,
+    decls: &[rmcp::model::Tool],
+) -> Vec<String> {
+    decls
+        .iter()
+        .filter_map(|decl| {
+            let name = crate::mcp::naming::namespaced(server, &decl.name);
+            registry.remove(&name).then_some(name)
+        })
+        .collect()
+}
+
+/// 重连一台 server 并把它声明的工具注册进生产表（T35 的 `mcp_reconnect` 的核心）。
+/// **先连、后换**：连不上就保持原来那批工具不动（失败不会让可用工具表缩水）。
+pub async fn mcp_reconnect_of(
+    bridge: &Arc<McpBridge>,
+    registry: &ToolRegistry,
+    def: ServerDef,
+) -> Result<usize, String> {
+    let name = def.name().to_string();
+    let old = bridge.decls_of(&name);
+    let out = bridge.connect_all(&[def]).await;
+    let count = match out.into_iter().next() {
+        Some((_, Ok(count))) => count,
+        Some((_, Err(reason))) => return Err(reason),
+        None => return Err("连接没有返回结果".to_string()),
+    };
+    mcp_clear_tools(registry, &name, &old);
+    for decl in bridge.decls_of(&name) {
+        registry.register(Arc::new(McpTool::from_decl(&name, &decl, bridge.clone())));
+    }
+    Ok(count)
+}
+
+#[tauri::command]
+pub fn mcp_servers(state: State<'_, AppState>) -> Result<Vec<McpServerView>, String> {
+    let cfg = crate::mcp::config::load(&state.mcp_dir);
+    Ok(mcp_servers_of(&cfg.servers, &state.mcp, &state.gate))
+}
+
+#[tauri::command]
+pub fn mcp_set_trust(
+    state: State<'_, AppState>,
+    name: String,
+    trust: String,
+) -> Result<(), String> {
+    let verdict = parse_trust(&trust)?;
+    state.gate.rules().set_server_trust(&name, verdict);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn mcp_reconnect(state: State<'_, AppState>, name: String) -> Result<usize, String> {
+    let cfg = crate::mcp::config::load(&state.mcp_dir);
+    let def = cfg
+        .servers
+        .into_iter()
+        .find(|def| def.name() == name)
+        .ok_or_else(|| format!("配置里没有 `{name}`"))?;
+    mcp_reconnect_of(&state.mcp, &state.registry, def).await
+}
+
+#[tauri::command]
+pub async fn mcp_disconnect(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    let decls = state.mcp.decls_of(&name);
+    state.mcp.disconnect(&name).await;
+    mcp_clear_tools(&state.registry, &name, &decls);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn session_create(state: State<'_, AppState>) -> Result<String, String> {
     let db = state.db.clone();
@@ -973,6 +1119,10 @@ pub fn run() {
                 cancel: Arc::new(Mutex::new(None)),
                 running: Arc::new(Mutex::new(None)),
                 log_path,
+                // T35：桥在装配期建好（此时不 spawn 任何进程，`connect_all` 才连）；
+                // `mcp_dir` 就是 `mcp.json` 所在的 app data 目录。
+                mcp: Arc::new(McpBridge::new()),
+                mcp_dir: dir.clone(),
             });
             // T46b：几何恢复放在 `manage` 之后、`Ok(())` 之前——`app_data_dir()` 与
             // `create_dir_all` 已经在前头跑过，存档目录这时一定存在。
@@ -1012,6 +1162,10 @@ pub fn run() {
             settings_set_api_key,
             normalize_image,
             runtime_summary,
+            mcp_servers,
+            mcp_set_trust,
+            mcp_reconnect,
+            mcp_disconnect,
         ])
         // R108 / T18 m2 —— `tauri.conf.json` 里那句 `"label": "main"` 的理由（R108 要求每处
         // conf 改动写清理由，而这份 conf 里放不下理由，原因写在下面）：
@@ -2572,5 +2726,103 @@ mod tests {
              实得 {:?}",
             empty_constructions[0]
         );
+    }
+
+    // ───────────────────────── T35：MCP 视图与工具注册 ─────────────────────────
+
+    fn stdio_def(name: &str) -> ServerDef {
+        ServerDef::Stdio {
+            name: name.to_string(),
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "@x/y".to_string()],
+            env: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn mcp_servers_view_never_leaks_env_or_headers() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("TOKEN".to_string(), "sk-REAL-SECRET".to_string());
+        let def = ServerDef::Stdio {
+            name: "search".to_string(),
+            command: "npx".to_string(),
+            args: vec![],
+            env,
+        };
+        let bridge = McpBridge::new();
+        let gate = PermissionGate::new();
+        let v = mcp_servers_of(&[def], &bridge, &gate);
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(
+            !s.contains("sk-REAL-SECRET"),
+            "命令返回值会进 DevTools 与日志：{s}"
+        );
+        assert!(s.contains("\"tools\":0"), "视图只要状态与数量：{s}");
+        assert!(
+            s.contains("\"trust\":\"ask\""),
+            "没登记过的 server 在 gate 眼里就是 Ask（R321），界面不许显示成 auto：{s}"
+        );
+    }
+
+    #[test]
+    fn a_ready_server_reports_its_tools_and_its_trust_word() {
+        let bridge = McpBridge::new();
+        bridge.set_status("search", ServerStatus::Ready { tools: 4 });
+        let gate = PermissionGate::new();
+        gate.rules().set_server_trust("search", Verdict::Auto);
+        let v = mcp_servers_of(&[stdio_def("search")], &bridge, &gate);
+        assert_eq!(v[0].status, "ready");
+        assert_eq!(v[0].tools, 4);
+        assert_eq!(v[0].trust, "auto");
+        assert!(v[0].reason.is_none());
+
+        let bridge = McpBridge::new();
+        bridge.set_status(
+            "dead",
+            ServerStatus::Disconnected {
+                reason: "spawn 失败：program not found".to_string(),
+            },
+        );
+        let v = mcp_servers_of(&[stdio_def("dead")], &bridge, &PermissionGate::new());
+        assert_eq!(v[0].status, "disconnected");
+        assert_eq!(
+            v[0].reason.as_deref(),
+            Some("spawn 失败：program not found")
+        );
+    }
+
+    #[test]
+    fn trust_words_round_trip_and_reject_junk() {
+        for word in ["auto", "ask", "block"] {
+            let v = parse_trust(word).expect("三个合法档位都要认");
+            assert_eq!(trust_word(v), word);
+        }
+        assert!(
+            parse_trust("yes").is_err(),
+            "未知档位必须报错，不许静默当成 ask"
+        );
+    }
+
+    #[test]
+    fn registered_mcp_tools_are_removed_by_exact_name_even_when_truncated() {
+        let bridge = Arc::new(McpBridge::new());
+        let registry = ToolRegistry::new();
+        let decl = rmcp::model::Tool::new(
+            "get_the_current_weather_forecast_for_a_location",
+            "查天气",
+            serde_json::Map::new(),
+        );
+        // 长 server 名 ⇒ T30 的兜底命名（server 段被截断）⇒ 前缀法摘不到，必须按精确名摘。
+        let server = "a-very-long-community-server-name-that-goes-on";
+        registry.register(Arc::new(McpTool::from_decl(server, &decl, bridge.clone())));
+        let registered = registry.defs();
+        assert_eq!(registered.len(), 1);
+        assert!(
+            !registered[0].name.starts_with(&format!("mcp__{server}__")),
+            "前提：这条工具名确实是兜底形状（截断的 server 段）"
+        );
+        let removed = mcp_clear_tools(&registry, server, std::slice::from_ref(&decl));
+        assert_eq!(removed, vec![registered[0].name.clone()]);
+        assert!(registry.get(&registered[0].name).is_none());
     }
 }
