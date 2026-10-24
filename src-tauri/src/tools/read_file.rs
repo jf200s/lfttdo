@@ -1,7 +1,8 @@
 // Plan B 的第二把生产工具：`read_file` —— 只在用户配置的 roots 内做只读文本读取。
 //
-// 本任务**不注册进生产**（`ipc.rs` 那张空 `ToolRegistry` 一字不动，注册与 UI 卡片
-// 是 Task 27 的活）；交付的是工具本体 + 测试。
+// Task 27 起它**已进生产**（`ipc.rs::build_production_registry` 注册，UI 卡片早在 Plan A T16
+// 就有了）；本文件交付的是工具本体 + 测试，外加 `NAME` / `usable_with_roots` 这一对
+// 「这一轮能不能把它交给模型」的判据（R286，见下面 `ReadFileTool` 上方那段）。
 //
 // # containment 归闸门，不归本文件（R279）
 //
@@ -44,7 +45,7 @@ use crate::agent::types::{Risk, ToolOutput};
 use crate::tools::registry::{Tool, ToolCtx, ToolError, ToolMeta};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// 单次交付的字节上限：**这一页交出去的字节总数**（正文 + 末尾的提示行）不得超过它。
 /// 它管的不是「文件有多大」—— 文件可以比它大得多，那是分页要解决的事（R278）。
@@ -249,6 +250,22 @@ fn optional_line(input: &Value, key: &str) -> Result<Option<usize>, ToolError> {
     }
 }
 
+/// 注册名。**规则住在工具自己家**：`meta()` 与 `agent/session.rs` 的声明表过滤都引用它，
+/// 不留第二份 `"read_file"` 字面量 —— 两份字面量迟早分叉，而分叉的方向是「过滤静默失效」。
+pub const NAME: &str = "read_file";
+
+/// 这一轮能不能把本工具交给模型。空 roots ⇒ 闸门规则 1 对任何路径都拒，
+/// 所以「可用」严格等价于「有效表非空」。
+///
+/// 这只管**声明表**（模型看得见什么），不管闸门（模型喊了之后能不能读）：
+/// 隐藏只是不邀请一次注定失败的调用、省一轮 token 和一张必然红色的卡，
+/// **不是**授权 —— 模型凭空喊 `read_file` 照样走到 `resolve_within_roots` 被拒。
+/// 之所以由 session 而不是注册表来问：roots 是「这一轮」的状态，
+/// 而 `ToolRegistry::defs()` 是全进程共享的一次性快照。
+pub fn usable_with_roots(roots: &[PathBuf]) -> bool {
+    !roots.is_empty()
+}
+
 /// `read_file`：只读 roots 内的 UTF-8 文本文件。`Risk::Read` —— spec 5.1「内置工具全为 Read
 /// ⇒ 全程零弹窗」对这把工具成立的前提是 containment 门**关得住 reparse point 逃逸**
 /// （`registry.rs::resolve_within_roots` 规则 2 + 规则 5），而**不是**「root 里没有别的东西」：
@@ -259,7 +276,7 @@ pub struct ReadFileTool;
 impl Tool for ReadFileTool {
     fn meta(&self) -> ToolMeta {
         ToolMeta {
-            name: "read_file".to_string(),
+            name: NAME.to_string(),
             description: "读取用户配置的根目录（roots）内的 UTF-8 文本文件，只读、只接受绝对\
                           路径；roots 之外、经符号链接/junction 解析后落到 roots 之外的路径一律\
                           拒绝。分页按【行】计，不是字符、不是字节：`offset` 是起始行号（从 0 \

@@ -113,6 +113,73 @@ describe("MessageList", () => {
     expect(screen.getByText(/123\s*ms/)).toBeInTheDocument();
   });
 
+  // T27（更正 2）：卡片本体 Plan A T16 就交付了，这里只补**没人钉过**的那一半 ——
+  // 失败态。需求本身（「marks an errored result without hiding the message」）是对的，
+  // 组件也早就做对了，缺的只是证据。
+  it("labels an errored tool card 失败 and keeps the error message visible", () => {
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "tool",
+              callId: "c1",
+              name: "fetch_url",
+              risk: "read",
+              input: { url: "https://a.test" },
+              status: "error",
+              preview: "上游返回 403，内容可能受限",
+              ms: 812,
+            },
+          ],
+        },
+      ],
+    });
+    render(<MessageList state={s} onRespond={() => {}} />);
+    expect(screen.getByText(/fetch_url/)).toBeInTheDocument();
+    expect(screen.getByText("失败")).toBeInTheDocument();
+    // 这条的重点在后半句：错误态最容易被人顺手写成 `!isError && preview`，把「红在哪儿」
+    // 一起藏掉 —— 一张说不出原因的红卡比不显示更糟。逐字断整句，不放宽成 /403/。
+    expect(screen.getByText("上游返回 403，内容可能受限")).toBeInTheDocument();
+    // 「完成」不许同时出现：状态标签只有一支，出现两支就是状态投影错了。
+    expect(screen.queryByText("完成")).toBeNull();
+  });
+
+  // 第 9 条（R161）在**失败卡**这一头：重放路径的 `ms` 恒为 0（`db.rs:370` 没记这一列），
+  // 而用户最常看到失败卡的时刻恰恰是重放 —— 上一轮炸了、重开会话来查看结果。
+  // 上面 `renders an unknown duration as a dash instead of inventing zero milliseconds`
+  // 钉的是**成功**卡，这一条钉的是「失败 + 没有测量」这个真实组合。
+  // 账面要写清（报告 §6）：`fmtMs` 的主变异（改成 `${ms} ms`）会让两条**一起**红，
+  // 所以这一条的增量在那个组合，而不是「破折号」这条判据第一次被钉住。
+  it("shows a replayed failed card with a dash instead of 0 ms", () => {
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "tool",
+              callId: "c2",
+              name: "read_file",
+              risk: "read",
+              input: { path: "D:\\notes\\a.md" },
+              status: "error",
+              preview: "只接受绝对路径",
+              ms: 0,
+            },
+          ],
+        },
+      ],
+    });
+    const { container } = render(<MessageList state={s} onRespond={() => {}} />);
+    expect(screen.getByText("失败")).toBeInTheDocument();
+    expect(container.textContent).toContain("—");
+    expect(container.textContent).not.toMatch(/0\s*ms/);
+  });
+
   it("offers allow / allow-for-session / deny on a pending permission card", () => {
     const calls: unknown[] = [];
     const s = state({

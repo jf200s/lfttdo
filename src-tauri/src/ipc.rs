@@ -14,6 +14,8 @@ use crate::model::provider::ModelProvider;
 use crate::permission::gate::PermissionGate;
 use crate::settings::{Settings, SettingsStore, effective_roots};
 use crate::store::db::{Db, SessionRow, events_from_messages};
+use crate::tools::fetch::FetchTool;
+use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
 use serde::Serialize;
@@ -918,6 +920,28 @@ fn persist_window_geometry(window: &tauri::Window) {
     }
 }
 
+/// 生产工具表的**唯一**装配点（Task 27）。
+///
+/// 零参是刻意的：两把工具都不需要 `AppState`，运行期要的东西（`http`、`cancel`、`roots`）
+/// 由会话每轮现构的 `ToolCtx` 给（R276 的单一入口）。一旦它开始收参数，「全进程装配一次」
+/// 就退化成「每个调用点各装配一次」，而 `R101` 那条「一个目录只许一个 `SettingsStore`」
+/// 的教训说的正是这种重复。
+///
+/// 名字序由 `ToolRegistry` 里的 `BTreeMap` 决定（字典序），**不是**这里的注册顺序；
+/// `production_registry_ships_fetch_url_and_read_file` 钉的是那份字面名单。
+///
+/// 两把都是 `Risk::Read`，spec 5.1「内置工具全为 Read ⇒ 全程零弹窗」到这一轮仍然成立。
+///
+/// 与 R286 的分工：这里**只管注册**，roots 为空时 `read_file` 照样在表里 —— 模型真喊它
+/// 就走闸门被拒。要不要把它的**声明**交给模型，由 `agent/session.rs::request()` 按
+/// `read_file::usable_with_roots` 决定（那是省 token 的事，不是授权的事）。
+pub fn build_production_registry() -> Arc<ToolRegistry> {
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register(Arc::new(FetchTool::new()));
+    registry.register(Arc::new(ReadFileTool));
+    registry
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -938,12 +962,13 @@ pub fn run() {
             // R105：装配期还没有 session_id，所以 gate 先不带 sink，由 `run_turn` 每轮开头
             // `set_sink(emitter)`（`gate.rs:77` 的可换内核就是为这一刻准备的）。
             // 这里**不留** brief Step 3 的 `NoopSink`：空 sink 意味着 Plan B 的弹窗静默不发事件。
-            // Plan A 的生产工具表是空的（plan:1854，`echo` 不注册），所以本轮既没有工具也没有
-            // 弹窗；而 sink 还没换上的窗口里 `check` 给的是 deny（R44：headless ≠ 全授权）。
+            // Task 27 起生产表里有两把工具（见 `build_production_registry`），两把都是
+            // `Risk::Read` ⇒ 自动放行仍然成立、用户侧仍然零弹窗；而 sink 还没换上的窗口里
+            // `check` 给的是 deny（R44：headless ≠ 全授权）。
             app.manage(AppState {
                 db,
                 settings,
-                registry: Arc::new(ToolRegistry::new()),
+                registry: build_production_registry(),
                 gate: Arc::new(PermissionGate::new()),
                 cancel: Arc::new(Mutex::new(None)),
                 running: Arc::new(Mutex::new(None)),
@@ -1586,7 +1611,8 @@ mod tests {
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
         let spy = Arc::new(RootsSpy::default());
         // 注册在**夹具的** registry 上（`Fixture::new` 每轮现构一只空表），
-        // 生产那只在 :915 的 `ToolRegistry::new()` 一行不动 —— 注册是 Task 27 的事。
+        // 生产那只在 `build_production_registry` 函数体里装配、由 `app.manage` 那一行接管
+        // —— 夹具**不**改用它：这里的测试只量自己注册的那把替身工具。
         f.registry.register(spy.clone());
 
         // 两条真目录 + 一条**不存在**的路径 + 一条**相对**路径，原样塞进 `TurnDeps.roots` ——
@@ -1709,6 +1735,41 @@ mod tests {
             seen[0].is_empty(),
             "roots 为空时执行点却拿到了 {:?} —— 那是装配层替用户做的决定",
             seen[0]
+        );
+    }
+
+    // ---- Task 27：生产 registry 的装配判据 ----
+
+    /// 生产工具表**就是这份名单**：多一把、少一把都算装配错，而这一条是它唯一的钉子
+    /// （Plan A 交的是空表，Plan B 到此才开始有真工具进生产）。
+    /// `echo` / `guarded` 这类替身只该活在 `#[cfg(test)]` 里 —— 它们的名字一旦进生产，
+    /// 请求体里就多出一条用户看不懂、实现也不是给用户的工具。
+    #[test]
+    fn production_registry_ships_fetch_url_and_read_file() {
+        let r = build_production_registry();
+        let names: Vec<String> = r.defs().into_iter().map(|d| d.name).collect();
+        // 这个字面顺序由 `ToolRegistry` 的 `BTreeMap`（字典序）决定，**不是**注册顺序。
+        // 刻意不加 `.sort()`、也不换成集合比较：T33 的 MCP 工具重挂之后仍然靠「名字序不变」
+        // 保证界面与模型侧的工具列表不因重连而抖动，把这条性质藏起来就没法发现它被改坏。
+        assert_eq!(
+            names,
+            vec!["fetch_url", "read_file"],
+            "模型看到的工具集必须是这份名单；echo/guarded 这类测试工具绝不能进生产（它们只活在 #[cfg(test)]）"
+        );
+        assert_eq!(
+            r.risk_of("fetch_url"),
+            Risk::Read,
+            "内置工具全为 Read ⇒ 才谈得上零弹窗"
+        );
+        assert_eq!(
+            r.risk_of("read_file"),
+            Risk::Read,
+            "read_file 进生产的前提就是它仍是只读档（spec 5.1）；它变成 Write 就会开始弹窗"
+        );
+        assert_eq!(
+            r.risk_of("delete_everything"),
+            Risk::Exec,
+            "未知工具按最严一档（R158）"
         );
     }
 

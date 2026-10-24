@@ -11,6 +11,7 @@ use super::types::*;
 use crate::model::assistant_acc::AssistantAcc;
 use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider};
 use crate::permission::gate::PermissionGate;
+use crate::tools::read_file;
 use crate::tools::registry::{ToolCtx, ToolRegistry};
 use futures::StreamExt;
 use std::path::PathBuf;
@@ -316,11 +317,21 @@ impl AgentSession {
         self.last_est_input = built.est_input_tokens;
         // `built.dropped` 在 Plan A 没有消费者：`ContextCompacted` 属切片 5，
         // `context.rs:44` 明确要求 Task 10 不为它造事件。
+        // R286：声明表按「这一轮到底能不能用」过滤。roots 为空时 `read_file` 对**任何**路径
+        // 都会被闸门规则 1 拒，把它挂在请求里等于邀请模型多烧一轮 token、界面上多一张必然
+        // 红色的卡；判据住在工具自己家（`read_file::usable_with_roots`），这里只问一次。
+        // 边界要说清：这**只影响声明表，不影响闸门** —— 模型凭空喊 `read_file` 照样走到
+        // `resolve_within_roots` 被拒（`hiding_a_tool_does_not_weaken_the_gate` 钉的就是这条）。
+        // 隐藏是省 token，不是授权，越权那道墙永远在闸门里。
+        let mut tools = self.deps.registry.defs();
+        if !read_file::usable_with_roots(&self.roots) {
+            tools.retain(|d| d.name != read_file::NAME);
+        }
         ChatRequest {
             messages: built.messages,
             // R66：`defs()` 已经是 `Vec<model::provider::ToolDef>`（registry.rs:143），
             // 这里没有跨层转换要做，逐字段搬运只会让人以为 risk 能在这里被加工。
-            tools: self.deps.registry.defs(),
+            tools,
             // T39：Plan A 这里硬写 `None`，于是设置里的温度到 `ModelConfig` 就断了线
             // （`openai_compat.rs` 的发送侧一直在等这个 `Some`）。
             temperature: self.deps.temperature,
@@ -692,6 +703,41 @@ mod tests {
             }
         }
 
+        /// R286 的夹具：注册表里**只有**传进来的那些工具（`parts()` 会附带 `echo` 与
+        /// `guarded`，那是给权限门路径用的替身）。
+        /// 这三条量的是「模型在生产工具集下看到的声明名单」，名单要能写成字面值，
+        /// 夹具自己塞进去的替身就会把这件事变成猜测。roots 与 `parts()` 同一条入口
+        /// （`AgentSession::with_roots`，R276），不在 `SessionDeps` 上另开第二个字段。
+        fn with_only(
+            rounds: Vec<Vec<ModelDelta>>,
+            roots: Vec<PathBuf>,
+            tools: Vec<Arc<dyn Tool>>,
+        ) -> Rig {
+            let model = ScriptedModel::new(rounds);
+            let recorder = model.recorder.clone();
+            let sink = Arc::new(VecSink::default());
+            let registry = Arc::new(ToolRegistry::new());
+            for t in tools {
+                registry.register(t);
+            }
+            let gate = Arc::new(PermissionGate::new().with_sink(sink.clone()));
+            let session = AgentSession::new(SessionDeps {
+                model,
+                registry,
+                gate: gate.clone(),
+                sink: sink.clone(),
+                context: ContextBuilder::new(ContextConfig::default()),
+                temperature: None,
+            })
+            .with_roots(roots);
+            Rig {
+                session,
+                sink,
+                gate,
+                recorder,
+            }
+        }
+
         /// 挂住的模型：`ready` 置位 = head 已全部抵达累加器。
         fn hanging(head: Vec<ModelDelta>) -> (Rig, Arc<AtomicBool>) {
             let ready = Arc::new(AtomicBool::new(false));
@@ -802,6 +848,26 @@ mod tests {
             });
         }
         out
+    }
+
+    /// 生产那两把工具**本体**（不是替身）：R286 钉的是交给模型的声明表形状，
+    /// 用替身的话名字和 `meta()` 都得由夹具自己编，那就变成夹具在测自己。
+    /// 与 `ipc::build_production_registry` 是同一批类型，但这里不直接调它 ——
+    /// `tools/` 与 `agent/` 整棵子树都不许依赖装配层（`lib.rs` 的边界约束），
+    /// 测试里反向够一次 `crate::ipc` 同样是那条约束的破口。
+    fn production_tools() -> Vec<Arc<dyn Tool>> {
+        vec![
+            Arc::new(crate::tools::fetch::FetchTool::new()),
+            Arc::new(crate::tools::read_file::ReadFileTool),
+        ]
+    }
+
+    /// **每一次**请求里的工具名（按注册表的字典序原样交出，不排序：顺序本身就是被测物）。
+    /// 取全部请求而不是只看第一次：工具循环里的第二次请求同样不许把藏起来的工具再端出去。
+    fn declared_names(reqs: &[ChatRequest]) -> Vec<Vec<String>> {
+        reqs.iter()
+            .map(|r| r.tools.iter().map(|d| d.name.clone()).collect())
+            .collect()
     }
 
     /// 轮询等第 n 条 `PermissionRequest` 落地。用 sleep 而不是 `yield_now`：
@@ -1870,6 +1936,124 @@ mod tests {
         assert!(
             preview.contains("越界"),
             "拒绝要归因到 containment 门（「越界」），而不是碰巧的 IO 失败：{preview}"
+        );
+    }
+
+    // ---- R286：声明表按可用性过滤（只省 token，不是安全措施） ----
+
+    /// roots 为空时**不许**把 `read_file` 的声明交给模型。
+    /// 危害是具体的而不是抽象的：`Settings.roots` 默认空（R276 明令不许替用户决定），
+    /// 这一片又还没有 roots 界面（R282），所以今天每一轮的 `effective_roots` 都是空表，
+    /// 而闸门规则 1 对空表**任何**路径都拒 —— 把这把注定失败的工具挂在请求里，
+    /// 症状是模型每被邀请读一次文件就多烧一轮 token、界面上多一张必然红色的卡，
+    /// 用户读到的是「这个助手读不了我的东西」，真话却是「还没配置可读目录」。
+    #[tokio::test]
+    async fn read_file_is_not_offered_when_no_root_is_configured() {
+        let mut rig = Rig::with_only(
+            vec![deltas(&["还没有可读的目录"])],
+            Vec::new(),
+            production_tools(),
+        );
+        assert_eq!(rig.run("读一下我的笔记").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert_eq!(
+            reqs.len(),
+            1,
+            "夹具只安排了一次请求，取证点就得恰好记下一条；0 条说明这条什么都没量到"
+        );
+        // 断**名单**而不是长度：长度对、名字错（比如把 `fetch_url` 藏了留下 `read_file`）
+        // 是同一个 bug 的另一半，只比长度就放得过。
+        assert_eq!(
+            declared_names(&reqs),
+            vec![vec!["fetch_url".to_string()]],
+            "空 roots 这一轮的声明表里不该有 read_file（R286）"
+        );
+    }
+
+    /// 同一条线的**另一头**：配了一 root，`read_file` 就必须回来。
+    /// 少了这一条，「藏工具」的实现可以退化成「永远藏住」，上面那条照样绿 ——
+    /// 而用户配好目录之后会发现工具从此不再出现，症状和没修之前一样难查。
+    /// 名单是 `["fetch_url", "read_file"]` 这个字面顺序：注册表按名字典序交（BTreeMap），
+    /// 不是注册顺序，所以这里不加 `.sort()`。
+    #[tokio::test]
+    async fn read_file_is_offered_once_a_root_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rig = Rig::with_only(
+            vec![deltas(&["读到啦"])],
+            vec![dir.path().to_path_buf()],
+            production_tools(),
+        );
+        assert_eq!(rig.run("读一下我的笔记").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert_eq!(
+            declared_names(&reqs),
+            vec![vec!["fetch_url".to_string(), "read_file".to_string()]],
+            "有一条可用 root ⇒ 声明表必须带上 read_file，否则这条工具对用户永久隐形"
+        );
+    }
+
+    /// R286 的**安全半边**：隐藏只省 token，**不是**授权。
+    /// 声明表里没有 `read_file`，而模型凭空喊它（历史里有过、换个大小写猜过、或者干脆幻觉）
+    /// 照样要走到 `resolve_within_roots` 并被拒。把这条写出来是为了钉住一个具体的错法：
+    /// 谁把「不在声明表里」当成「不可调用」去 registry 里提前返回 NotFound，或者反过来
+    /// 因为「已经藏了」就顺手放宽闸门，这两边都得在这里当场红。
+    /// 与 `an_unconfigured_session_reaches_the_tool_ctx_with_no_roots_and_read_file_refuses`
+    /// 的分工：那条钉的是**没藏**时的拒绝，这条钉的是**藏了之后**的拒绝。
+    #[tokio::test]
+    async fn hiding_a_tool_does_not_weaken_the_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret.txt");
+        std::fs::write(&file, "不该被读到的正文").unwrap();
+        // 参数走 `json!`：路径里的反斜杠要按 JSON 规则转义，手抄那份转义是随机器漂移的暗雷。
+        let args = json!({ "path": file }).to_string();
+
+        let mut rig = Rig::with_only(
+            vec![
+                tool_round(0, &[("read_file", args.as_str())]),
+                deltas(&["被拒了"]),
+            ],
+            Vec::new(),
+            production_tools(),
+        );
+        assert_eq!(rig.run("读那个文件").await, StopReason::EndTurn);
+
+        // 夹具前提：这一轮**真的**把 read_file 藏掉了。不钉这一句，下面的拒绝就只是
+        // 那条早就存在的闸门测试的重复，「藏了还拒」这件事根本没被量到。
+        let reqs = rig.reqs();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "工具循环该跑两次请求，夹具的轮数对不上时这里先红"
+        );
+        for (i, names) in declared_names(&reqs).iter().enumerate() {
+            assert!(
+                !names.iter().any(|n| n == "read_file"),
+                "第 {i} 次请求的声明表里混进了 read_file（空 roots 该藏起来）：{names:?}"
+            );
+        }
+
+        let results = rig.sink.tool_results();
+        assert_eq!(
+            results.len(),
+            1,
+            "工具没跑 ⇒ 什么都没量到：{:?}",
+            rig.sink.kinds()
+        );
+        let (id, is_error, preview) = &results[0];
+        assert_eq!(id, "r0c0");
+        assert!(
+            is_error,
+            "声明表里没有 read_file 不等于可以读：拒读必须还是错误，实得 preview {preview}"
+        );
+        assert!(
+            preview.contains("越界"),
+            "拒绝要归因到 containment 门（「越界」），不是碰巧的 IO 失败，也不是「工具没注册」：{preview}"
+        );
+        assert!(
+            !preview.contains("不该被读到的正文"),
+            "读到内容了 —— 隐藏声明表被当成了授权：{preview}"
         );
     }
 
