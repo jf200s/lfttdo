@@ -54,14 +54,20 @@ fn sanitize(s: &str) -> String {
 }
 
 /// 兜底形状：`mcp__` + `server` 前 [`SERVER_KEEP`] 个 char + `__` + `tool` 前 [`TOOL_KEEP`] 个 char，
-/// 再接 `#` + `fnv1a64(原始全名)` 十六进制的前 [`HASH_HEX`] 位。
+/// 再接 `_` + `fnv1a64(原始全名)` 十六进制的前 [`HASH_HEX`] 位。
 /// 恒长 `5 + 8 + 2 + 24 + 1 + 7 = 47`（`mcp__` 是 5 个字符，不是 plan :808 算的 8+1）⇒
-/// 给 `-N` 序号留 64 − 47 = 17 个字符的余量。
+/// 给 `-N` 序号留 64 − 47 = 17 个字符的余量。分隔符换字符**不换长度**，所以 47 这条算术原样成立。
 ///
-/// **为什么分隔符是 `#`**：plan :808 与简报 R300 第 4 条都把形状钉成 `…#{7 位 hex}`，本轮照钉。
-/// 注意 `#` 本身**不在** `^[a-zA-Z0-9_-]{1,64}$` 那个字符集里 ⇒ 兜底名对严格校验的端点仍可能 400；
-/// 这一层的承诺只有「永不 panic + 前缀段永不产生非法字符 + 恒在预算内」，
-/// 端点 400 之后怎么提示用户归 T31/T37（简报 R301 要求明写的残余风险）。
+/// **为什么分隔符是 `_` 而不是 `#`**（R303 改掉 R300 第 4 条的钉法）：`#` 不在兼容端点的字符集
+/// `^[a-zA-Z0-9_-]{1,64}$` 里，而「走兜底」不是边角情况——社区 MCP server 的工具名带 `.`、`/`、`:`
+/// 很常见 ⇒ 旧形状让这一层在自己的主分支上违反「永不产生非法字符」，后果是那**一整轮请求一起 400**。
+/// 选 `_` 不选 `-`：`-` 已经是 [`dedup`] 的序号字符（`-2`、`-3`），同时用作哈希分隔符会让日志里
+/// 「这是哈希尾巴」和「这是第 N 号同名」看起来是同一类东西；`_` 与 `mcp__` 前缀风格同源。
+///
+/// **残余风险换了位置，没有消失**：字符集这一维两条分支现在都过关，但兜底名是**有损**的——
+/// `SERVER_KEEP` 只留 8 个 char，下游**无法**从名字反推 (server, tool)；7 位 hex（约 2^28）也仍可能
+/// 让两条不同的原始全名落成同一个串，那时只靠 [`dedup`] 的 `-N` 分开，而 `-N` 依赖喂入顺序（R302）。
+/// 端点在这套字符集之外若还有别的命名规则，拒绝之后怎么提示用户归 T31/T37。
 fn fallback(raw: &str, server: &str, tool: &str) -> String {
     // 哈希对象永远是**原始全名**（`raw`），不是截断后的前缀、也不是洗过的名字：
     // 两条只差非法字符的名字洗完是同一个串，只有哈希能把它们分开。
@@ -69,13 +75,14 @@ fn fallback(raw: &str, server: &str, tool: &str) -> String {
     // 顺序反了（先 `{:x}` 再补零）会让「前 7 位」变成「低位的 7 位」，稳定性判据在某些输入上会漂。
     let hex = format!("{:016x}", fnv1a64(raw));
     let tag: String = hex.chars().take(HASH_HEX).collect();
-    // 前缀段同样过一遍字符替换（R300 第 4 条）：`#` 是唯一的非 `[A-Za-z0-9_-]` 字符。
+    // 非法字符只可能来自 `server`/`tool` 两段（R303 之后分隔符 `_` 本身就在字符集里，
+    // 哈希尾巴是纯 hex）⇒ 洗过前缀段，整条名字就只剩 `[A-Za-z0-9_-]`。
     let head = sanitize(&format!(
         "mcp__{}__{}",
         take_chars(server, SERVER_KEEP),
         take_chars(tool, TOOL_KEEP)
     ));
-    format!("{head}#{tag}")
+    format!("{head}_{tag}")
 }
 
 /// 把 (server, tool) 拼成喂给模型端的工具名。
@@ -83,9 +90,14 @@ fn fallback(raw: &str, server: &str, tool: &str) -> String {
 /// 四条分支（R300）：拼原始全名 ⇒ 洗非法字符 ⇒ 「没超预算**且**一个字符都没动过」才直接返回 ⇒
 /// 否则走 [`fallback`]。
 ///
-/// 本层保证的是「**永不 panic + 永不产生 `[A-Za-z0-9_-]` 之外的前缀字符 + 恒在预算内**」。
-/// 「兼容端点接不接受非 ASCII / `#` 的工具名」不是本层能保证的（残余风险见 [`fallback`] 的注释），
-/// 端点 400 之后怎么提示用户归 T31/T37。
+/// 本层保证的是「**永不 panic + 整名字只含 `[A-Za-z0-9_-]`（两条分支都是）+ 恒在预算内**」。
+/// R303 之前这句只覆盖「前缀段」——兜底那支的尾巴带着一个字符集外的 `#`，等于承诺在主分支上是反的；
+/// 现在两条分支的输出都能过 `^[a-zA-Z0-9_-]{1,64}$`。
+/// **但残余风险没有消失，只是换了位置**（见 [`fallback`] 的注释）：名字是有损的、不可反推的，
+/// 所以**别靠解析工具名反推 (server, tool)**——`SERVER_KEEP` 只留 8 个 char，server 段本来就无法唯一还原；
+/// 哈希尾巴虽然可以按位取（[`HASH_HEX`] 是 `pub`，从尾部数 7 个 char），它的职责只是「同前缀、
+/// 不同原始全名要分开」。正确做法是桥那边自己存下 `namespaced` 的**输入输出映射**。
+/// 端点若因字符集之外的别的规则拒绝，怎么提示用户仍归 T31/T37。
 pub fn namespaced(server: &str, tool: &str) -> String {
     let raw = format!("mcp__{server}__{tool}");
     let sanitized = sanitize(&raw);
@@ -215,33 +227,43 @@ mod tests {
         assert_eq!(fnv1a64("foobar"), 0x8594_4171_f739_67e8);
     }
 
-    /// 形状的共用断言：兜底那支是「`[A-Za-z0-9_-]` 前缀段 + 唯一一个 `#` + [`HASH_HEX`] 位小写 hex」，
-    /// 直通那支是纯 `[A-Za-z0-9_-]`。
+    /// 形状的共用断言（R303）：**整名字**每一个字符都必须过 `is_allowed`——两条分支都成立，
+    /// 强度比旧版「只查前缀段」更严。
+    /// 这里**不**再试图用某个分隔符把名字劈成两段：`mcp__` 前缀里有 `_`，`tool` 段截断洗完
+    /// 也可能以 `_` 结尾 ⇒「最后一个 `_` 之后就是哈希」在直通分支上是假读数
+    /// （`mcp__web__search` 会被切成 `mcp__web__` + `search`）。兜底尾巴的形状单独由
+    /// [`assert_fallback_hash_tail`] 按 char 数钉。
     fn assert_allowed_shape(name: &str, ctx: &str) {
-        let head = match name.split_once('#') {
-            Some((head, tag)) => {
-                assert_eq!(
-                    name.matches('#').count(),
-                    1,
-                    "只许一个分隔符 `#`：{ctx} {name}"
-                );
-                assert_eq!(
-                    tag.chars().count(),
-                    HASH_HEX,
-                    "hash 段恒 {HASH_HEX} 位：{ctx} {name}"
-                );
-                assert!(
-                    tag.chars()
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-                    "hash 段是 7 位小写 hex、不带 `0x`：{ctx} {name}"
-                );
-                head
-            }
-            None => name,
-        };
         assert!(
-            head.chars().all(is_allowed),
-            "前缀段只许 [A-Za-z0-9_-]：{ctx} {name}"
+            name.chars().all(is_allowed),
+            "整名字只许 [A-Za-z0-9_-]：{ctx} {name}"
+        );
+    }
+
+    /// 兜底分支的证明 + 尾巴形状断言（R303）：从**尾部**数固定 [`HASH_HEX`] 个 char 必须是
+    /// 小写 hex，且它**前面那一个 char** 必须是分隔符 `_`。
+    /// 恒用 `Vec<char>` 按 char 数，绝不 `&name[len - HASH_HEX..]` 这种按字节切（R301）。
+    fn assert_fallback_hash_tail(name: &str, ctx: &str) {
+        let chars: Vec<char> = name.chars().collect();
+        assert!(
+            chars.len() > HASH_HEX,
+            "兜底名必须比 {HASH_HEX} 位哈希尾巴长：{ctx} {name}"
+        );
+        let (head, tail) = chars.split_at(chars.len() - HASH_HEX);
+        assert_eq!(
+            head[head.len() - 1],
+            '_',
+            "走兜底那支才该有 `_` + {HASH_HEX} 位 hex 的尾巴：{ctx} {name}"
+        );
+        assert_eq!(
+            tail.len(),
+            HASH_HEX,
+            "hash 段恒 {HASH_HEX} 位：{ctx} {name}"
+        );
+        assert!(
+            tail.iter()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "hash 段是 {HASH_HEX} 位小写 hex、不带 `0x`：{ctx} {name}"
         );
     }
 
@@ -249,19 +271,19 @@ mod tests {
     fn illegal_characters_and_non_ascii_names_are_safe() {
         // ① 名字够短**但**发生过替换 ⇒ 必须走兜底那支（R300 第 3 条：只要动过字符就不许直接返回，
         // 因为 `a.b` 与 `a_b` 洗之后是同一个串，只有哈希能把它们分开）。
+        // 「走的是兜底」不再靠 `contains('#')` 证明（R303 换了分隔符），改由哈希尾巴的形状证明。
+        // 注意这一支的恒长**不是** 47：server 只有 3 个 char、tool 只有 16 个 char，
+        // 只有 `SERVER_KEEP`/`TOOL_KEEP` 都被填满时才 47 ⇒ 这里不许加 47 的断言。
         let short_dotted = namespaced("srv", "server.tool:name");
-        assert!(
-            short_dotted.contains('#'),
-            "发生过替换还直接返回，`a.b` 与 `a_b` 就会撞名：{short_dotted}"
-        );
+        assert_fallback_hash_tail(&short_dotted, "① 带 . 和 : 的名字");
         assert!(
             !short_dotted.contains('.') && !short_dotted.contains(':'),
             "结果里不许有非法字符：{short_dotted}"
         );
         assert_allowed_shape(&short_dotted, "① 带 . 和 : 的名字");
         assert!(
-            !short_dotted.ends_with('#'),
-            "结果以 `#` + {HASH_HEX} 位 hex 收尾，不许以 `#` 结尾：{short_dotted}"
+            !short_dotted.ends_with('_'),
+            "结果以 `_` + {HASH_HEX} 位 hex 收尾，不许以分隔符结尾：{short_dotted}"
         );
 
         // ② 非 ASCII（用户真会把服务起名成中文）⇒ 不 panic、只含合法字符、在预算内。
@@ -271,6 +293,7 @@ mod tests {
             "CJK 名字也要在预算内：{cjk}"
         );
         assert_allowed_shape(&cjk, "② CJK 名字");
+        assert_fallback_hash_tail(&cjk, "② CJK 名字");
 
         // ③ 两条只在**非法字符**上不同的长名字：截断后的前缀段一样、洗完整名也一样，
         //    只有「哈希对象 = 原始全名」能把它们分开（这一条就是控制器那个头条变异的靶子）。
@@ -284,8 +307,11 @@ mod tests {
         );
         assert_allowed_shape(&dotted, "③-a 只在非法字符上不同（点号）");
         assert_allowed_shape(&underlined, "③-b 只在非法字符上不同（下划线）");
+        assert_fallback_hash_tail(&dotted, "③-a 只在非法字符上不同（点号）");
+        assert_fallback_hash_tail(&underlined, "③-b 只在非法字符上不同（下划线）");
 
-        // ④ 恒长断言：server/tool 都超过各自的保留位数时，兜底结果恒 47 个 char。
+        // ④ 恒长断言：server/tool 都超过各自的保留位数时，兜底结果恒 47 个 char
+        //（换分隔符 `#`→`_` 不动长度：5 + 8 + 2 + 24 + 1 + 7）。
         let fat_server = "s".repeat(SERVER_KEEP + 40);
         let fat_tool = "t".repeat(TOOL_KEEP + 60);
         let n = namespaced(&fat_server, &fat_tool);
@@ -300,6 +326,7 @@ mod tests {
             "把 47 这个数钉死，注释和代码不许各说各话：{n}"
         );
         assert_allowed_shape(&n, "④ 恒长形状");
+        assert_fallback_hash_tail(&n, "④ 恒长形状");
     }
 
     #[test]
@@ -360,16 +387,16 @@ mod tests {
             namespaced(long, "get_the_current_weather_forecast_for_a_location"),
             "同一输入两次要逐字相同"
         );
-        assert!(n.ends_with("#39a9f58"), "要高位在前那 7 位：{n}");
-        assert!(!n.ends_with("#9fca488"), "低位那 7 位是顺序写反的形态：{n}");
+        assert!(n.ends_with("_39a9f58"), "要高位在前那 7 位：{n}");
+        assert!(!n.ends_with("_9fca488"), "低位那 7 位是顺序写反的形态：{n}");
 
         let padded = namespaced(long, "get_the_current_weather_forecast_for_a_locationjaa");
         assert!(
-            padded.ends_with("#062893d"),
+            padded.ends_with("_062893d"),
             "高位为 0 时也必须补足 {HASH_HEX} 位：{padded}"
         );
         assert!(
-            !padded.ends_with("#62893d1"),
+            !padded.ends_with("_62893d1"),
             "不补零就 take 的写法会给出这个：{padded}"
         );
         assert_eq!(padded.chars().count(), 47, "补零那颗也是恒长 47：{padded}");
