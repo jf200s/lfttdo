@@ -927,6 +927,14 @@ fn mixed_text_and_image_content_keeps_both_and_renames_nothing() {
 `ToolOutput::Image` 的 `mime` 只有 `"png"|"jpeg"`（`agent/types.rs:26`），而 MCP server 会回 `image/gif`。
 **裁定：扩 `ImageMime` 而不是加一条「非 png/jpeg 就丢成文本」的降级** —— 丢成文本等于把 spec 5.2 第 2 点写的那条通路废掉；扩枚举则同时改 Rust 枚举、TS 镜像 `types.ts`、`reducer.ts` 与 Plan A T14 那条跨语言名单守卫测试（`reducer.test.ts` 里读 `events.rs`/`types.rs` 切片比集合的那条）—— 四处一起改，正是那条测试存在的意义。
 
+> **勘误（T32 落地时实测，裁定 R314）—— 这一段的前提不成立，扩 `ImageMime` 是零收益改动：**
+> `image_prep.rs` 的归一化**本来就接受** png / jpeg / **webp / gif**，并把 webp/gif 重编码成 JPEG
+> （gif 取首帧，文件头 :5 与 `:74-81` 都写着）。也就是说 MCP 回来的 gif/webp 经同一条归一化之后
+> 到达端点时**只会是 png 或 jpeg**，`ImageMime` 不需要第三种取值。
+> 落地做法：`map_result` 把图片块交给 `image_prep::normalize_image`，解不开就变成一句
+> 「图片无法读取：…」的文本（不静默丢）。`types.ts` 只多了 `ToolOutput` 的 `multi` 一支（R317），
+> `reducer.ts` / `reducer.test.ts` **没有改动**（reducer 只按 `block.kind === "text"` 分流）。
+
 ```rust
 #[test]
 fn a_gif_result_is_reencoded_to_png_via_the_same_normalizer() {
