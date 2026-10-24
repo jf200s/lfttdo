@@ -567,4 +567,41 @@ mod tests {
         let e = c.parse_error.expect("读失败要有摘要，不许静默");
         assert!(!e.is_empty(), "摘要不许是空串：{e:?}");
     }
+
+    // R296 把 `parse_error` 的职责收窄成「整份文件坏」，那这三种文件级形态就要各有各的判据
+    // （条目级坏已经由 `one_bad_field_type_does_not_sink_the_other_servers` 钉住了）。
+    // 断言只钉「不 panic + servers 空 + parse_error 非空 + 不进 skipped」四件事，不比文案：
+    // 根为数组时 serde 会把我们 `expecting()` 那句一起带进摘要，文案不是接口。
+    #[test]
+    fn a_non_object_root_is_a_file_level_error_not_a_panic() {
+        let c = load_raw(r#"[ "mcpServers", { "ok": {"command":"x"} } ]"#);
+        assert!(c.servers.is_empty(), "根不是对象 ⇒ 一条都不该留下");
+        assert!(c.skipped.is_empty(), "文件级坏不该伪装成条目级");
+        let e = c.parse_error.expect("根不是对象要有摘要，不许静默");
+        assert!(!e.is_empty(), "摘要不许是空串：{e:?}");
+    }
+
+    // `"mcpServers": 5` 与 `"mcpServers": null` 走同一支（visitor 只实现 `visit_map`，
+    // `deserialize_with` + `default` 只对**缺字段**生效，显式 `null` 仍然是类型错误）——
+    // 也就是说用户写 `null` 会得到一条可见的摘要而不是一份静默的空配置。这是有意的形状。
+    #[test]
+    fn a_non_object_mcp_servers_is_a_file_level_error_not_a_panic() {
+        for raw in [
+            r#"{ "mcpServers": 5 }"#,
+            r#"{ "mcpServers": null }"#,
+            r#"{ "mcpServers": [ {"command":"x"} ] }"#,
+        ] {
+            let c = load_raw(raw);
+            assert!(c.servers.is_empty(), "{raw} ⇒ servers 必须空");
+            assert!(
+                c.skipped.is_empty(),
+                "{raw} 是文件级坏，不许伪装成条目级：{:?}",
+                c.skipped
+            );
+            let e = c
+                .parse_error
+                .unwrap_or_else(|| panic!("{raw} 要有摘要，不许静默"));
+            assert!(!e.is_empty(), "{raw} ⇒ 摘要不许是空串：{e:?}");
+        }
+    }
 }
