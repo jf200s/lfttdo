@@ -3167,6 +3167,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows",
  "windows-native-keyring-store",
 ]
 
