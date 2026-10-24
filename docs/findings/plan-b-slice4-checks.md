@@ -123,6 +123,41 @@ The image above is the MCP logo.
   沿用切片 3 的证据，本轮不重跑。
 - 冷启动第三档「输入框真的吃到一次按键」（spec :534 的口径）：本轮只量了句柄与 Responding 两档。
 - HTTP MCP 传输：R325 显式降级，本构建不可用。
-- 信任档位在**重启应用之后**是否保持：`server_trust` 住在内存的 `RuleTable` 里，**不落盘**
-  （本轮没有测，也没有设计持久化）——要么 T35 之后补一个设置项，要么明确「每次启动重新授权」。
-  这一条记成待办，不算通过。
+- 信任档位在**重启应用之后**是否保持：本文件首次写成时**不落盘**；同日已修（R329），
+  复验见 §7。
+
+## 7. 修复后复验（同日 22:35–22:50，同一位用户在场）
+
+### 7.1 R329 信任档位落盘
+
+- `mcp_set_trust(everything,"auto")` 后 `%APPDATA%\com.qwa.do\mcp_trust.json` 内容：
+  `{"everything": "auto"}`。
+- `taskkill /IM qwen-do.exe /F` → 重新 `npm run tauri dev` → 页面内
+  `invoke("mcp_servers")` 原文：
+  `[{"name":"everything","status":"disconnected","tools":0,"trust":"auto","reason":null}]`
+  ⇒ **重启后档位仍是 auto**（status 是 disconnected 属正常：桥不自动连）。
+
+### 7.2 R319 工具图片进模型（请求体抓包，决定性证据）
+
+模型措辞不足以证明「它真的看见了图」，所以在 Ollama 前面放了一个**只在本机、只活一轮**的
+日志代理（`127.0.0.1:11435 → 11434`，用完即删），把应用发出的请求体原样抓下来：
+
+```text
+messages=6
+0 role=system  parts=str
+1 role=user    parts=text
+2 role=assistant parts=str            <- 带 tool_calls
+3 role=tool    parts=str              <- 仍然只有文本（协议约束）
+4 role=tool    parts=str              <- 模型重复调用了同一把工具
+5 role=user    parts=text+image_url(img 1266B)+image_url(img 1266B)
+```
+
+- 最后一条是**我们的注入**：一句说明 + 真正的 `image_url`（base64 data URL），
+  位置在全部 tool 消息之后 ⇒ 模型这一轮确实收到了图。
+- 模型这一轮调用两次同一工具，所以出现两张图；**复验之后已加去重**（同一份 base64+mime 只送一次，
+  测试 `tool_images_become_exactly_one_user_turn_and_text_only_adds_nothing` 钉着）。
+- 换 `qwen3-vl:8b` 后的回答：「图片颜色为黑白，图中包含字母 M、C、P（MCP 标志）」；
+  纯文本 14b 在修复前只能说「蓝色和白色」（纯先验）。**模型措辞只作为旁证，判据是上面那段抓包。**
+- 抓包环境已全部还原：`settings.json` 从 `%USERPROFILE%\settings.json.pre-r319` 复回
+  （`base_url=http://127.0.0.1:11434/v1`、`model=huihui_ai/qwen3-abliterated:14b-q4_K_M`），
+  代理进程与日志已删除，`node.exe` 回到连接前的基线 6 个。
