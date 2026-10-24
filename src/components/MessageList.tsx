@@ -1,6 +1,9 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { MessageBubble } from "./MessageBubble";
 import type { Decision, ErrorWhere, UiState } from "../types";
+
+/** 距底多少像素以内算「还想跟着看」：太高会误粘、太低会在一次小增量后脱落。 */
+const NEAR_BOTTOM_PX = 40;
 
 /** `ErrorWhere`（types.rs 镜像 events.rs:103-111）只用来把「哪儿炸了」说成人话。 */
 const WHERE_LABEL: Record<ErrorWhere, string> = {
@@ -81,8 +84,33 @@ export function MessageList({
   onRespond: (id: string, d: Decision) => void;
 }) {
   const lastTurn = state.turns.length - 1;
+
+  /**
+   * 自动滚底：贴底时随新内容走，用户上翻之后**不再抢**滚动位置；
+   * 回到底部附近（`NEAR_BOTTOM_PX` 内）重新黏住。
+   * 判据用「距底距离」而不是「scrollTop 等于某值」：流式时内容高度一直在变。
+   */
+  const listRef = useRef<HTMLDivElement>(null);
+  const stickRef = useRef(true);
+  const onScroll = () => {
+    const el = listRef.current;
+    if (!el) return;
+    stickRef.current =
+      el.scrollHeight - el.scrollTop - el.clientHeight < NEAR_BOTTOM_PX;
+  };
+  // 无依赖：每次渲染（含流式增量）之后都检查一次；不贴底就什么都不做。
+  useEffect(() => {
+    const el = listRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
+  });
+
   return (
-    <div className="message-list" data-testid="message-list">
+    <div
+      className="message-list"
+      data-testid="message-list"
+      ref={listRef}
+      onScroll={onScroll}
+    >
       {/* 致命横幅排在所有东西之前：用户先看见「这一轮已经废了」，再读气泡。 */}
       {state.fatal ? (
         <div className="fatal" role="alert">

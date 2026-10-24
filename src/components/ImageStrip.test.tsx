@@ -435,3 +435,44 @@ describe("Composer 图片入口", () => {
     expect(screen.getByTestId("thumb-0")).toHaveAccessibleName("第1张.png");
   });
 });
+
+describe("Composer 键盘与整窗拖放", () => {
+  it("Enter 发送、Shift+Enter 换行、输入法组合期不发送", async () => {
+    const onSend = okSend();
+    render(
+      <Composer
+        streaming={false}
+        onSend={onSend}
+        onStop={() => {}}
+        onNormalize={okNormalize()}
+      />,
+    );
+    const ta = screen.getByLabelText("输入消息");
+    fireEvent.change(ta, { target: { value: "你好" } });
+    // 换行与输入法选词都不许触发发送（中文用户按 Enter 选词是日常）。
+    fireEvent.keyDown(ta, { key: "Enter", shiftKey: true });
+    fireEvent.keyDown(ta, { key: "Enter", isComposing: true });
+    expect(onSend).not.toHaveBeenCalled();
+    fireEvent.keyDown(ta, { key: "Enter" });
+    await waitFor(() =>
+      expect(onSend).toHaveBeenCalledWith([{ type: "text", text: "你好" }]),
+    );
+  });
+
+  it("把图片拖到窗口任意位置也进待发区", async () => {
+    const normalize = okNormalize();
+    render(
+      <Composer
+        streaming={false}
+        onSend={okSend()}
+        onStop={() => {}}
+        onNormalize={normalize}
+      />,
+    );
+    // 不在 `drop-zone` 上：整窗兜底才算「拖进窗里就有用」。
+    fireEvent.drop(document, {
+      dataTransfer: { files: [png(9, "全窗.png")] } as unknown as DataTransfer,
+    });
+    await waitFor(() => expect(normalize).toHaveBeenCalledTimes(1));
+  });
+});

@@ -144,6 +144,37 @@ export function Composer({
    * 这里的 `catch` 有意不显示任何东西：发送失败的原文由调用方（`App` 的 notice）上屏，
    * 在这一层再抄一遍就是同一件事两个来源。
    */
+  /**
+   * 整窗拖放：drop 只挂在输入框那一小块时，用户把图拖到气泡区或侧栏会直接被浏览器
+   * 当成「打开文件」——在 Tauri 里等于把图丢给 WebView，界面什么都不发生。
+   * 这里在 `document` 上兜住所有文件拖放；输入框自己的 handler 会 `stopPropagation`，
+   * 所以两条路不会重复添加。
+   * `addFiles` 每次渲染都是新函数，监听器只装一次 ⇒ 用 ref 取最新的那一份。
+   */
+  const addFilesRef = useRef(addFiles);
+  useEffect(() => {
+    addFilesRef.current = addFiles;
+  });
+  useEffect(() => {
+    const hasFiles = (e: DragEvent) =>
+      Array.from(e.dataTransfer?.types ?? []).includes("Files") ||
+      (e.dataTransfer?.files?.length ?? 0) > 0;
+    const onDragOver = (e: DragEvent) => {
+      if (hasFiles(e)) e.preventDefault();
+    };
+    const onDrop = (e: DragEvent) => {
+      if (e.defaultPrevented || !hasFiles(e)) return;
+      e.preventDefault();
+      addFilesRef.current(Array.from(e.dataTransfer?.files ?? []));
+    };
+    document.addEventListener("dragover", onDragOver);
+    document.addEventListener("drop", onDrop);
+    return () => {
+      document.removeEventListener("dragover", onDragOver);
+      document.removeEventListener("drop", onDrop);
+    };
+  }, []);
+
   const submit = async () => {
     const t = text.trim();
     // R216④：「有图无字」必须放行 —— 只贴一张图不打字是日常主用法，
@@ -193,7 +224,9 @@ export function Composer({
         className="composer-main"
         data-testid="drop-zone"
         onDrop={(e) => {
+          // 自己处理掉，别让下面那个「整窗可拖」的文档监听再收一遍（否则同一批图进两次）。
           e.preventDefault();
+          e.stopPropagation();
           void addFiles(Array.from(e.dataTransfer.files ?? []));
         }}
         // 不拦 dragover 的话浏览器根本不把这次拖放交给 drop。
@@ -214,8 +247,16 @@ export function Composer({
             value={text}
             disabled={streaming}
             rows={3}
-            placeholder="说点什么…"
+            placeholder="说点什么…（Enter 发送，Shift+Enter 换行）"
             onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              // 中文输入法的候选框里按 Enter 是**选词**，不是发送：`isComposing`
+              // （以及老 WebView 的 keyCode 229）必须放过，否则打「你好」按回车就发出去半个词。
+              if (e.key !== "Enter" || e.shiftKey) return;
+              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+              e.preventDefault();
+              void submit();
+            }}
           />
           {streaming ? (
             <button

@@ -450,3 +450,31 @@ describe("MessageList", () => {
     expect(() => w.prompt()).toThrow(/零弹窗|不许/);
   });
 });
+
+describe("MessageList 自动滚底", () => {
+  const withTurn = (id: number) =>
+    state({ turns: [{ id, role: "assistant", blocks: [] }] });
+
+  it("贴底时跟随新内容，用户上翻后不再抢滚动，回到底部又黏住", () => {
+    const { rerender } = render(<MessageList state={withTurn(1)} onRespond={() => {}} />);
+    const list = screen.getByTestId("message-list");
+    Object.defineProperty(list, "scrollHeight", { value: 1000, configurable: true });
+    Object.defineProperty(list, "clientHeight", { value: 400, configurable: true });
+
+    // 首次渲染之后的那次检查把它带到最底（jsdom 不做布局，这里是纯赋值判据）。
+    rerender(<MessageList state={withTurn(1)} onRespond={() => {}} />);
+    expect(list.scrollTop).toBe(1000);
+
+    // 用户往上翻到距底 500px：再来内容也不许把他拽回去。
+    list.scrollTop = 100;
+    fireEvent.scroll(list);
+    rerender(<MessageList state={withTurn(2)} onRespond={() => {}} />);
+    expect(list.scrollTop).toBe(100);
+
+    // 自己回到底部（距底 -300 < 40 ⇒ 算贴底）之后恢复跟随。
+    list.scrollTop = 900;
+    fireEvent.scroll(list);
+    rerender(<MessageList state={withTurn(3)} onRespond={() => {}} />);
+    expect(list.scrollTop).toBe(1000);
+  });
+});
