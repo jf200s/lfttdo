@@ -43,7 +43,7 @@ html[data-theme][data-mode] {
   --text-muted: #b8c4e0;
   --border: rgb(255 255 255 / 20%);
   --bg-input: rgb(255 255 255 / 12%);
-  --bg-raised: rgb(255 255 255 / 14%);
+  --bg-raised: #1a2033;
   --bg-surface: rgb(255 255 255 / 8%);
   --code-bg: rgb(0 0 0 / 38%);
   --accent: #7c8cff;
