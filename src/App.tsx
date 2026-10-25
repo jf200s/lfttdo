@@ -38,6 +38,7 @@ export default function App() {
    */
   const [settingsView, setSettingsView] = useState<SettingsView | null>(null);
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   /**
    * 当前会话的**同步**影子。事件回调是 tauri 那边推进来的，读 `activeId` 这个 state
    * 会拿到旧值；这一支只有一处写（`openSession` / 启动那次），所以它是可审的。
@@ -313,8 +314,20 @@ export default function App() {
       ? "本轮 token：尚未回报"
       : `本轮 token：输入 ${ui.usage.input} · 输出 ${ui.usage.output}`;
 
+  const createSession = () => {
+    void (async () => {
+      try {
+        const id = await api.createSession();
+        await refresh();
+        void openSession(id, true);
+      } catch (e) {
+        notice(`新建会话失败：${String(e)}`);
+      }
+    })();
+  };
+
   return (
-    <div className="app">
+    <div className="app" data-sidebar={sidebarOpen ? "open" : "closed"}>
       <Sidebar
         rows={rows}
         activeId={activeId}
@@ -322,17 +335,7 @@ export default function App() {
           if (id === activeRef.current) return;
           void openSession(id, true);
         }}
-        onCreate={() => {
-          void (async () => {
-            try {
-              const id = await api.createSession();
-              await refresh();
-              void openSession(id, true);
-            } catch (e) {
-              notice(`新建会话失败：${String(e)}`);
-            }
-          })();
-        }}
+        onCreate={createSession}
         onDelete={(id) => {
           void (async () => {
             try {
@@ -387,6 +390,18 @@ export default function App() {
           {usageText}
         </div>
         <div className="pane-actions">
+          <button
+            type="button"
+            aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"}
+            onClick={() => setSidebarOpen((v) => !v)}
+          >
+            ☰
+          </button>
+          {sidebarOpen ? null : (
+            <button type="button" aria-label="新建对话" onClick={createSession}>
+              ＋
+            </button>
+          )}
           <button type="button" onClick={openSettings}>
             设置
           </button>
