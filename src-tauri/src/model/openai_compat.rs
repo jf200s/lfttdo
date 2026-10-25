@@ -29,7 +29,7 @@ use async_openai::{
         ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
         ChatCompletionRequestUserMessageContentPart, ChatCompletionStreamOptions,
         ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionStreamResponse, FunctionCall,
+        CreateChatCompletionRequestArgs, FunctionCall,
         FunctionObject,
     },
 };
@@ -553,27 +553,133 @@ impl ModelProvider for OpenAiCompat {
         let url = self.base_url_resolved();
         let client = self.client.clone();
         Box::pin(async_stream::stream! {
-            match client.chat().create_stream(request).await {
-                // R28：这里**不能**无条件 `Transport`。`create_stream` 对任何非 2xx 都返回
+            match client.chat().create_stream_byot::<_, RawChunk>(request).await {
+                // R28：这里**不能**无条件 `Transport`。`create_stream_byot` 对任何非 2xx 都返回
                 // `ApiError`（`client.rs:629-631` → `error.rs:18`），把 401/429/模型不存在
                 // 说成「无法连接模型端点」就是本条 finding 要消灭的误导。
                 Err(e) => yield Err(classify_openai_error(e, url.clone())),
-                Ok(mut s) => while let Some(item) = s.next().await {
-                    match item {
-                        // 同一个分类函数、同一个方向：SSE 中途断流 → Transport，
-                        // 端点错误 → Api，chunk 解不出来 → Decode。
-                        Err(e) => yield Err(classify_openai_error(e, url.clone())),
-                        Ok(chunk) => for d in chunk_to_deltas(&chunk) { yield Ok(d); }
+                Ok(mut s) => {
+                    // R334：思考增量包成一对 `<think>…</think>` 再交给上层 —— 前端据此折叠，
+                    // 历史里也留下与 14B 内联思考同样的形状。`in_reasoning` 保证只开一次。
+                    let mut in_reasoning = false;
+                    while let Some(item) = s.next().await {
+                        match item {
+                            // 同一个分类函数、同一个方向：SSE 中途断流 → Transport，
+                            // 端点错误 → Api，chunk 解不出来 → Decode。
+                            Err(e) => yield Err(classify_openai_error(e, url.clone())),
+                            Ok(chunk) => {
+                                for d in raw_chunk_to_deltas(&chunk, &mut in_reasoning) {
+                                    yield Ok(d);
+                                }
+                            }
+                        }
                     }
-                },
+                    if in_reasoning {
+                        yield Ok(ModelDelta::Text("</think>".into()));
+                    }
+                }
             }
         })
     }
 }
 
+/// 自有的流式分片（R334）：`async-openai` 的 delta 类型没有 `reasoning_content`，
+/// 且不 `flatten` 未知字段 ⇒ Ollama/Qwen3 的思考增量在反序列化时被丢掉。
+/// `byot` 让我们用自己的宽松类型收流，纯文本/工具调用的形状与原来逐字段一致。
+#[derive(serde::Deserialize)]
+struct RawChunk {
+    #[serde(default)]
+    choices: Vec<RawChoice>,
+    usage: Option<RawUsage>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RawUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    #[serde(default)]
+    completion_tokens: u32,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RawChoice {
+    #[serde(default)]
+    delta: RawDelta,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RawDelta {
+    content: Option<String>,
+    /// Ollama 走 OpenAI 兼容层时叫 `reasoning_content`；别的网关可能叫 `reasoning`/`thinking`。
+    #[serde(default, alias = "reasoning", alias = "thinking")]
+    reasoning_content: Option<String>,
+    tool_calls: Option<Vec<RawToolCall>>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RawToolCall {
+    #[serde(default)]
+    index: u32,
+    id: Option<String>,
+    function: Option<RawFunction>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RawFunction {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
+/// 原始分片 → 增量（R334）：思考增量自动包成一对 `<think>…</think>`；`in_reasoning`
+/// 跨分片保存状态，保证只开一次、正文到来时先闭合。纯文本与工具调用的顺序与旧实现一致。
+fn raw_chunk_to_deltas(chunk: &RawChunk, in_reasoning: &mut bool) -> Vec<ModelDelta> {
+    let mut v = Vec::new();
+    if let Some(u) = &chunk.usage {
+        v.push(ModelDelta::Usage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+        });
+    }
+    for ch in &chunk.choices {
+        if let Some(r) = ch.delta.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
+            if !*in_reasoning {
+                *in_reasoning = true;
+                v.push(ModelDelta::Text("<think>".into()));
+            }
+            v.push(ModelDelta::Text(r.to_string()));
+        }
+        if let Some(t) = ch.delta.content.as_deref().filter(|s| !s.is_empty()) {
+            if *in_reasoning {
+                *in_reasoning = false;
+                v.push(ModelDelta::Text("</think>".into()));
+            }
+            v.push(ModelDelta::Text(t.to_string()));
+        }
+        for f in ch.delta.tool_calls.iter().flatten() {
+            let name = f.function.as_ref().and_then(|x| x.name.clone());
+            let args = f.function.as_ref().and_then(|x| x.arguments.clone());
+            if name.is_some() || f.id.is_some() {
+                v.push(ModelDelta::ToolCallStart {
+                    index: f.index,
+                    id: f.id.clone(),
+                    name,
+                });
+            }
+            if let Some(a) = args {
+                v.push(ModelDelta::ToolCallArgs {
+                    index: f.index,
+                    fragment: a,
+                });
+            }
+        }
+    }
+    v
+}
+
 /// 一个 SSE chunk → 0..n 个 `ModelDelta`。顺序：usage 先于文本与工具（usage 只在
 /// 最后一个分片出现，且那一轮 `choices` 通常是空数组）。
-fn chunk_to_deltas(c: &CreateChatCompletionStreamResponse) -> Vec<ModelDelta> {
+#[cfg(test)]
+fn chunk_to_deltas(c: &async_openai::types::chat::CreateChatCompletionStreamResponse) -> Vec<ModelDelta> {
     let mut v = Vec::new();
     if let Some(u) = &c.usage {
         v.push(ModelDelta::Usage {
@@ -614,7 +720,7 @@ fn chunk_to_deltas(c: &CreateChatCompletionStreamResponse) -> Vec<ModelDelta> {
 #[cfg(test)]
 mod tests {
     // `use super::*` 已经带进 ChatRequest / ModelError / ModelProvider / ToolDef /
-    // OpenAIError / CreateChatCompletionStreamResponse / futures::StreamExt /
+    // OpenAIError / async_openai::types::chat::CreateChatCompletionStreamResponse / futures::StreamExt /
     // Message / ContentBlock / Role / ToolOutput / normalize_base_url /
     // classify_openai_error / require_slots；这里只补 `super` 没有引到的名字。
     // （取文本不在此列：`text_of` 自 R40 起是 `agent::types::Message` 的方法，写作 `m.text_of()`。）
@@ -1328,7 +1434,39 @@ mod tests {
 
     // ---- chunk → ModelDelta（R21 的 index 形态在这里被钉住）----
 
-    fn chunk(json_text: &str) -> CreateChatCompletionStreamResponse {
+    #[test]
+    fn reasoning_is_wrapped_once_and_closed_before_the_answer() {
+        let texts = |ds: Vec<ModelDelta>| -> Vec<String> {
+            ds.into_iter()
+                .filter_map(|d| if let ModelDelta::Text(t) = d { Some(t) } else { None })
+                .collect()
+        };
+        let raw = |j: &str| serde_json::from_str::<RawChunk>(j).unwrap();
+        let mut in_r = false;
+        assert_eq!(
+            texts(raw_chunk_to_deltas(&raw(r#"{"choices":[{"delta":{"reasoning_content":"想"}}]}"#), &mut in_r)),
+            vec!["<think>", "想"]
+        );
+        assert!(in_r);
+        assert_eq!(
+            texts(raw_chunk_to_deltas(&raw(r#"{"choices":[{"delta":{"reasoning_content":"考"}}]}"#), &mut in_r)),
+            vec!["考"],
+            "同一段思考只开一次 <think>"
+        );
+        assert_eq!(
+            texts(raw_chunk_to_deltas(&raw(r#"{"choices":[{"delta":{"content":"答案"}}]}"#), &mut in_r)),
+            vec!["</think>", "答案"],
+            "正文到来前必须闭合思考"
+        );
+        assert!(!in_r);
+        assert_eq!(
+            texts(raw_chunk_to_deltas(&raw(r#"{"choices":[{"delta":{"content":"纯文本"}}]}"#), &mut in_r)),
+            vec!["纯文本"],
+            "没有思考的分片不许凭空加标签"
+        );
+    }
+
+    fn chunk(json_text: &str) -> async_openai::types::chat::CreateChatCompletionStreamResponse {
         serde_json::from_str(json_text).unwrap()
     }
 
@@ -1410,7 +1548,7 @@ mod tests {
         let raw = r#"{"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
                       "choices":[{"index":0,"delta":{"tool_calls":[
                         {"id":"call_1","type":"function","function":{"name":"fs.read"}}]}}]}"#;
-        let err = serde_json::from_str::<CreateChatCompletionStreamResponse>(raw)
+        let err = serde_json::from_str::<async_openai::types::chat::CreateChatCompletionStreamResponse>(raw)
             .expect_err("缺 index 的分片在 0.42.2 上必须解不出来");
         assert!(
             err.to_string().contains("index"),
