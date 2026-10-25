@@ -2,6 +2,9 @@ import { useState } from "react";
 import type { SessionRow } from "../types";
 
 interface SidebarProps {
+  /** 收起态：只留一条 56px 窄栏（R337）。 */
+  collapsed?: boolean;
+  onToggleCollapsed?: () => void;
   rows: SessionRow[];
   activeId: string | null;
   onSelect: (id: string) => void;
@@ -21,6 +24,8 @@ interface SidebarProps {
  * `updated_at` 是毫秒（R72），前端只拿它排序，不格式化、不显示 —— 没有消费者就不许编一份本地时间。
  */
 export function Sidebar({
+  collapsed = false,
+  onToggleCollapsed,
   rows,
   activeId,
   onSelect,
@@ -41,10 +46,36 @@ export function Sidebar({
   };
 
   return (
-    <nav className="sidebar" aria-label="会话列表">
-      <button type="button" className="new-session" onClick={onCreate}>
-        新建对话
-      </button>
+    <nav
+      className="sidebar"
+      aria-label="会话列表"
+      data-collapsed={collapsed}
+    >
+      <div className="sidebar-head">
+        <button
+          type="button"
+          className="sidebar-toggle"
+          aria-label={collapsed ? "展开侧栏" : "收起侧栏"}
+          onClick={onToggleCollapsed}
+        >
+          ☰
+        </button>
+        {collapsed ? (
+          <button
+            type="button"
+            className="sidebar-plus"
+            aria-label="新建对话"
+            onClick={onCreate}
+          >
+            ＋
+          </button>
+        ) : null}
+      </div>
+      {collapsed ? null : (
+        <button type="button" className="new-session" onClick={onCreate}>
+          新建对话
+        </button>
+      )}
       <ul className="session-list">
         {sorted.map((r) => (
           <li

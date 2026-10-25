@@ -329,6 +329,8 @@ export default function App() {
   return (
     <div className="app" data-sidebar={sidebarOpen ? "open" : "closed"}>
       <Sidebar
+        collapsed={!sidebarOpen}
+        onToggleCollapsed={() => setSidebarOpen((v) => !v)}
         rows={rows}
         activeId={activeId}
         onSelect={(id) => {
@@ -390,18 +392,6 @@ export default function App() {
           {usageText}
         </div>
         <div className="pane-actions">
-          <button
-            type="button"
-            aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"}
-            onClick={() => setSidebarOpen((v) => !v)}
-          >
-            ☰
-          </button>
-          {sidebarOpen ? null : (
-            <button type="button" aria-label="新建对话" onClick={createSession}>
-              ＋
-            </button>
-          )}
           <button type="button" onClick={openSettings}>
             设置
           </button>

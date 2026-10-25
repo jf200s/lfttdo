@@ -198,17 +198,49 @@ html[data-theme][data-mode] .session-title {
   text-align: left;
 }
 
-/* 可收缩侧栏（R336）：收起时整列归零，右侧保留 ☰ 与 ＋，操作不丢。 */
+/* 可收缩侧栏（R337）：收起时保留 56px 窄栏，主区域只平移、不重排。 */
+html[data-theme][data-mode] .app {
+  grid-template-columns: 240px minmax(0, 1fr);
+  transition: grid-template-columns 160ms ease;
+}
+
 html[data-theme][data-mode] .app[data-sidebar="closed"] {
-  grid-template-columns: 0 minmax(0, 1fr);
+  grid-template-columns: 56px minmax(0, 1fr);
+}
+
+html[data-theme][data-mode] .sidebar {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+html[data-theme][data-mode] .sidebar-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
 }
 
 html[data-theme][data-mode] .app[data-sidebar="closed"] .sidebar {
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+/* 收起态只留两个按钮：列表必须真正消失，否则行按钮会溢出到窄栏外面（R337 的现场）。 */
+html[data-theme][data-mode] .app[data-sidebar="closed"] .session-list,
+html[data-theme][data-mode] .app[data-sidebar="closed"] .new-session {
   display: none;
 }
 
-html[data-theme][data-mode] .pane-actions button[aria-label="收起侧栏"],
-html[data-theme][data-mode] .pane-actions button[aria-label="展开侧栏"] {
-  min-width: 40px;
+html[data-theme][data-mode] .app[data-sidebar="closed"] .sidebar-head {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+html[data-theme][data-mode] .sidebar-toggle,
+html[data-theme][data-mode] .sidebar-plus {
+  min-width: 36px;
+  padding: 4px 0;
   font-size: 1.05em;
 }
