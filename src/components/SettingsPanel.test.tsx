@@ -71,11 +71,11 @@ const setup = (over: Partial<SettingsView> = {}, props: Partial<PanelProps> = {}
 };
 
 describe("SettingsPanel", () => {
-  it("carries the custom system prompt into the save payload", async () => {
-    const p = setup({});
-    fireEvent.change(screen.getByLabelText(/系统提示词/), {
-      target: { value: "你是小宋祺。" },
-    });
+  it("does not render a system prompt field but must not wipe the externally set one", async () => {
+    // 人设由 U 盘上的 `人设.txt` 在启动时注入 settings.json；面板**不再渲染**这一栏。
+    // 但它保存的是整张表：漏带这个键 = 用户点一次保存就把人设抹成空。
+    expect(screen.queryByLabelText(/系统提示词/)).toBeNull();
+    const p = setup({ system_prompt: "你是小宋祺。" });
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
     await waitFor(() => expect(p.onSave).toHaveBeenCalled());
     expect(p.onSave.mock.calls[0][0].system_prompt).toBe("你是小宋祺。");

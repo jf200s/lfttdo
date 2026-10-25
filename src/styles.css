@@ -672,17 +672,9 @@ a:hover {
 }
 
 .panel-row input,
-.panel-row select,
-.panel-row textarea {
+.panel-row select {
   min-width: 0;
   background-color: var(--bg-input);
-}
-
-/* 系统提示词是多行文本：和单行 input 同一格宽，但内容左对齐、可纵向拉伸。 */
-.panel-row textarea {
-  resize: vertical;
-  font: inherit;
-  line-height: 1.4;
 }
 
 /* 强调色那一行（任务 #64）：复选框 + 取色器 + 色块 chip 挤在同一格（160px）里，整组横向排、
