@@ -4,6 +4,7 @@
 import "./theme/tokens.css";
 import "./theme/presets.css";
 import "./styles.css";
+import "./theme/glass.css";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";

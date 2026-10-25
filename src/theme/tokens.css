@@ -18,3 +18,35 @@
   --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --bubble-max-w: 72ch;
 }
+
+/* 玻璃拟态层（R330）：颜色只能住在这里 —— styles.css 被两道闸盯着（stylelint 禁 hex、
+   tokens.test 禁 rgb/hsl），所以带透明度的颜色值统一在本文件声明，组件只引用 var()。
+   只按 mode 分档（与具体预设无关）：预设管的是色相，玻璃管的是「透多少、糊多厚」。 */
+
+/* 玻璃层变量（R330）：由 glass.css 消费；放在这里是因为组件样式禁止颜色字面量。 */
+html[data-theme][data-mode] {
+  --glass-bg: rgb(255 255 255 / 10%);
+  --glass-bg-strong: rgb(255 255 255 / 15%);
+  --glass-border: rgb(255 255 255 / 28%);
+  --glass-sheen: rgb(255 255 255 / 35%);
+  --glass-sheen-weak: rgb(255 255 255 / 8%);
+  --glass-shadow: rgb(3 6 18 / 45%);
+  --glass-blur: 22px;
+  --glass-saturate: 160%;
+  --glass-radius: 20px;
+  --glass-scrim: rgb(2 4 12 / 55%);
+  --glass-hover: rgb(255 255 255 / 22%);
+  --app-base: #0a0d1c;
+  --app-glow-a: rgb(79 70 229 / 60%);
+  --app-glow-b: rgb(6 182 212 / 45%);
+  --text-primary: #f2f5ff;
+  --text-muted: #b8c4e0;
+  --border: rgb(255 255 255 / 20%);
+  --bg-input: rgb(255 255 255 / 12%);
+  --bg-raised: rgb(255 255 255 / 14%);
+  --bg-surface: rgb(255 255 255 / 8%);
+  --code-bg: rgb(0 0 0 / 38%);
+  --accent: #7c8cff;
+  --accent-hover: #9aa7ff;
+  --accent-text: #0a0d1c;
+}
