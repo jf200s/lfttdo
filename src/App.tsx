@@ -331,6 +331,8 @@ export default function App() {
       <Sidebar
         collapsed={!sidebarOpen}
         onToggleCollapsed={() => setSidebarOpen((v) => !v)}
+        onOpenSettings={openSettings}
+        onOpenMcp={() => setMcpOpen(true)}
         rows={rows}
         activeId={activeId}
         onSelect={(id) => {
@@ -390,14 +392,6 @@ export default function App() {
         />
         <div className="statusbar" data-testid="usage">
           {usageText}
-        </div>
-        <div className="pane-actions">
-          <button type="button" onClick={openSettings}>
-            设置
-          </button>
-          <button type="button" onClick={() => setMcpOpen(true)}>
-            MCP
-          </button>
         </div>
       </main>
       {/* 面板是**视图**，不是另一份状态：它开着的时候 `ui`、订阅、会话列表全都照旧跑

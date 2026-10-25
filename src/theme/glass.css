@@ -212,6 +212,39 @@ html[data-theme][data-mode] .sidebar {
   width: 100%;
   min-width: 0;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+html[data-theme][data-mode] .sidebar .session-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+html[data-theme][data-mode] .sidebar-foot {
+  display: flex;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--glass-border);
+  /* 收起态列表被隐藏后，靠这行把底栏钉在侧栏底部（子代理验收指出的跳动）。 */
+  margin-top: auto;
+}
+
+html[data-theme][data-mode] .sidebar-foot .sidebar-action {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+html[data-theme][data-mode] .app[data-sidebar="closed"] .sidebar-foot {
+  flex-direction: column;
+  border-top: none;
+}
+
+html[data-theme][data-mode] .app[data-sidebar="closed"] .sidebar-foot .sidebar-action {
+  font-size: 0.85em;
+  min-height: 34px;
+  padding: 4px 2px;
 }
 
 html[data-theme][data-mode] .sidebar-head {
@@ -219,6 +252,23 @@ html[data-theme][data-mode] .sidebar-head {
   align-items: center;
   gap: 6px;
   margin-bottom: 8px;
+}
+
+html[data-theme][data-mode] .sidebar-head .new-session {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* 行内动作与标题同色系，删除单独用危险色：先认出「哪一行」，再认「删除」。 */
+html[data-theme][data-mode] .session-rename,
+html[data-theme][data-mode] .session-delete {
+  background-color: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+html[data-theme][data-mode] .session-delete {
+  color: var(--danger);
 }
 
 html[data-theme][data-mode] .app[data-sidebar="closed"] .sidebar {

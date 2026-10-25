@@ -5,6 +5,8 @@ interface SidebarProps {
   /** 收起态：只留一条 56px 窄栏（R337）。 */
   collapsed?: boolean;
   onToggleCollapsed?: () => void;
+  onOpenSettings?: () => void;
+  onOpenMcp?: () => void;
   rows: SessionRow[];
   activeId: string | null;
   onSelect: (id: string) => void;
@@ -26,6 +28,8 @@ interface SidebarProps {
 export function Sidebar({
   collapsed = false,
   onToggleCollapsed,
+  onOpenSettings,
+  onOpenMcp,
   rows,
   activeId,
   onSelect,
@@ -69,13 +73,12 @@ export function Sidebar({
           >
             ＋
           </button>
-        ) : null}
+        ) : (
+          <button type="button" className="new-session" onClick={onCreate}>
+            新建对话
+          </button>
+        )}
       </div>
-      {collapsed ? null : (
-        <button type="button" className="new-session" onClick={onCreate}>
-          新建对话
-        </button>
-      )}
       <ul className="session-list">
         {sorted.map((r) => (
           <li
@@ -127,6 +130,24 @@ export function Sidebar({
           </li>
         ))}
       </ul>
+      <div className="sidebar-foot">
+        <button
+          type="button"
+          className="sidebar-action"
+          aria-label="设置"
+          onClick={onOpenSettings}
+        >
+          ⚙{collapsed ? null : " 设置"}
+        </button>
+        <button
+          type="button"
+          className="sidebar-action"
+          aria-label="MCP"
+          onClick={onOpenMcp}
+        >
+          MCP
+        </button>
+      </div>
     </nav>
   );
 }
