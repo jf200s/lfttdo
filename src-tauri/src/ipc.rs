@@ -1029,7 +1029,7 @@ fn restore_window_geometry(handle: &AppHandle) {
     let Some(window) = handle.get_webview_window("main") else {
         return;
     };
-    let Ok(dir) = handle.path().app_data_dir() else {
+    let Some(dir) = resolve_data_dir(handle) else {
         return;
     };
     let Some(saved) = window_state::load(&dir.join(window_state::STATE_FILE)) else {
@@ -1061,7 +1061,7 @@ fn persist_window_geometry(window: &tauri::Window) {
     if window.label() != "main" {
         return;
     }
-    let Ok(dir) = window.path().app_data_dir() else {
+    let Some(dir) = resolve_data_dir(window.app_handle()) else {
         return;
     };
     // `Destroyed` 这一臂很可能已经取不到几何了，那是「不写」而不是「写 (0,0,0,0)」：
@@ -1110,6 +1110,29 @@ pub fn build_production_registry() -> Arc<ToolRegistry> {
     registry
 }
 
+/// 便携模式的数据目录（U 盘场景）：exe 同目录有 `portable.txt` ⇒ `<exe 目录>/data`。
+/// 纯函数，便于单测；目录建不出来时当作「没有便携标记」，回落常规路径。
+fn portable_data_dir(exe_dir: &Path) -> Option<PathBuf> {
+    if !exe_dir.join("portable.txt").is_file() {
+        return None;
+    }
+    let data = exe_dir.join("data");
+    std::fs::create_dir_all(&data).ok()?;
+    Some(data)
+}
+
+/// 数据目录的唯一解析点：便携标记优先，否则 `%APPDATA%\<identifier>`。
+/// 配置、会话库、日志、MCP 信任表、窗口几何都跟着它走 —— 一处判定，处处一致。
+fn resolve_data_dir(handle: &AppHandle) -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+        && let Some(portable) = portable_data_dir(exe_dir)
+    {
+        return Some(portable);
+    }
+    handle.path().app_data_dir().ok()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1118,7 +1141,7 @@ pub fn run() {
         // 与 capabilities 里的 `dialog:allow-open` 一起在评审 #29 摘掉，理由写在
         // `Cargo.toml` 与 `capabilities/default.json` 里。
         .setup(|app| {
-            let dir = app.path().app_data_dir()?;
+            let dir = resolve_data_dir(app.handle()).ok_or("无法确定数据目录")?;
             std::fs::create_dir_all(&dir)?;
             let log_path = init_logging(&dir);
             let db = Arc::new(Db::open(&dir.join("qwen-do.db"))?);
@@ -2833,6 +2856,24 @@ mod tests {
             v[0].reason.as_deref(),
             Some("spawn 失败：program not found")
         );
+    }
+
+    #[test]
+    fn portable_marker_switches_the_data_dir_to_the_exe_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            portable_data_dir(dir.path()).is_none(),
+            "没有 portable.txt 就不能进便携模式（否则每个安装版都会把数据写进 Program 目录）"
+        );
+        std::fs::write(
+            dir.path().join("portable.txt"),
+            "portable
+",
+        )
+        .unwrap();
+        let data = portable_data_dir(dir.path()).expect("有标记就该用 exe 同目录的 data");
+        assert_eq!(data, dir.path().join("data"));
+        assert!(data.is_dir(), "目录必须被建出来");
     }
 
     #[tokio::test]
