@@ -18,7 +18,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::GenericImageView;
 use image::ImageDecoder;
 use image::metadata::Orientation;
-use qwen_do_lib::image_prep::{MAX_BASE64_BYTES, MAX_EDGE_PX, normalize_image};
+use lfttdo_lib::image_prep::{MAX_BASE64_BYTES, MAX_EDGE_PX, normalize_image};
 use std::time::Instant;
 
 fn main() {
@@ -68,7 +68,7 @@ fn report(path: &str) {
     match outcome {
         Ok(block) => {
             let (data, mime) = match block {
-                qwen_do_lib::agent::types::ContentBlock::Image { data, mime } => {
+                lfttdo_lib::agent::types::ContentBlock::Image { data, mime } => {
                     (data, format!("{mime:?}"))
                 }
                 _ => ("(不是图片块)".to_string(), "?".to_string()),

@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use qwen_do_lib::mcp::process::create_kill_job;
+use lfttdo_lib::mcp::process::create_kill_job;
 
 fn main() {
     let job = match create_kill_job() {

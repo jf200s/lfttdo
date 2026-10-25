@@ -9,12 +9,12 @@
 // 一片只写测试与文档：`src-tauri/src/` 一行没改。压出来的数字若指向语义问题（见 §4 的
 // `stuck_rounds`），那是新的产品决策，写进 `docs/findings/plan-c-long-session.md`，不在这里顺手改。
 
-use qwen_do_lib::agent::context::{
+use lfttdo_lib::agent::context::{
     ContextBuilder, ContextConfig, KEEP_IMAGE_RECENT, SYSTEM_PROMPT, estimate_tokens,
 };
-use qwen_do_lib::agent::summarize::{SUMMARY_PREFIX, summary_note};
-use qwen_do_lib::agent::types::{ContentBlock, ImageMime, Message, Risk, Role, ToolOutput};
-use qwen_do_lib::store::db::Db;
+use lfttdo_lib::agent::summarize::{SUMMARY_PREFIX, summary_note};
+use lfttdo_lib::agent::types::{ContentBlock, ImageMime, Message, Risk, Role, ToolOutput};
+use lfttdo_lib::store::db::Db;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -455,7 +455,7 @@ fn report_bytes(label: &str, path: &PathBuf) -> (u64, u64) {
 /// findings 第 3 项：重放一次读出的条数（R69 的实测 —— 它必须**不含**备注行）。
 fn report_replay(label: &str, db: &Db, sid: &str) -> (usize, usize) {
     let history = db.messages(sid).unwrap();
-    let events = qwen_do_lib::store::db::events_from_messages(&history, &|_name| Risk::Read);
+    let events = lfttdo_lib::store::db::events_from_messages(&history, &|_name| Risk::Read);
     let notes = history.iter().filter(|m| m.role == Role::System).count();
     // 备注行不许出现在重放里：用户看到的应当是原话，不是给模型读的备忘。
     let leaked = events

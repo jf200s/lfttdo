@@ -889,7 +889,7 @@ pub fn runtime_summary(state: State<'_, AppState>) -> String {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "日志文件未能创建".into());
     format!(
-        "qwen-do {} · plan A · 日志：{log}",
+        "LFTTDO {} · plan A · 日志：{log}",
         env!("CARGO_PKG_VERSION")
     )
 }

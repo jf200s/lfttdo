@@ -21,10 +21,10 @@ use std::collections::HashMap;
 use std::process::Command as StdCommand;
 use std::time::Instant;
 
-use qwen_do_lib::mcp::bridge::{
+use lfttdo_lib::mcp::bridge::{
     CONNECT_TIMEOUT_SECS, McpBridge, resolve_program_in_path, spawn_command,
 };
-use qwen_do_lib::mcp::config::ServerDef;
+use lfttdo_lib::mcp::config::ServerDef;
 
 #[tokio::main]
 async fn main() {

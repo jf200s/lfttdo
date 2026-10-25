@@ -25,7 +25,7 @@
 //! **本探针永不打印条目的值**，只在拒绝时打印长度：库里那条可能就是用户的真 key，
 //! 而 stdout 会进终端滚动缓冲、也可能进 CI 日志。
 
-use qwen_do_lib::settings::{KeyringSecretStore, SecretStore};
+use lfttdo_lib::settings::{KeyringSecretStore, SecretStore};
 
 /// 一眼可辨的假 key：真 key 不会长这样，`cleanup` 靠它判断这条是不是本探针写的。
 const CANARY: &str = "sk-QWEN-DO-SELFTEST-CANARY-DELETE-ME";

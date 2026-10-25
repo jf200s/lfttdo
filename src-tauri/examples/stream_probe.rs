@@ -144,7 +144,7 @@ fn api_key() -> Result<(String, &'static str), Box<dyn std::error::Error>> {
     }
     #[cfg(windows)]
     {
-        use qwen_do_lib::settings::{KeyringSecretStore, SecretStore};
+        use lfttdo_lib::settings::{KeyringSecretStore, SecretStore};
         let store = KeyringSecretStore::new()?;
         match store.get()? {
             Some(k) => Ok((k, "keyring")),

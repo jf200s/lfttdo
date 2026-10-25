@@ -117,7 +117,7 @@ impl AgentSession {
             cfg: SessionConfig::default(),
             cancel: CancellationToken::new(),
             http: reqwest::Client::builder()
-                .user_agent("qwen-do/0.1")
+                .user_agent("lfttdo/0.1")
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             roots: Vec::new(),

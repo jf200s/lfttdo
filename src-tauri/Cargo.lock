@@ -2126,6 +2126,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "lfttdo"
+version = "0.1.0"
+dependencies = [
+ "async-openai",
+ "async-stream",
+ "async-trait",
+ "base64 0.23.1",
+ "encoding_rs",
+ "futures",
+ "htmd",
+ "image",
+ "ipnet",
+ "keyring-core",
+ "rand 0.9.5",
+ "readability",
+ "reqwest",
+ "rmcp",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "windows",
+ "windows-native-keyring-store",
+]
+
+[[package]]
 name = "libappindicator"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3134,41 +3169,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
-]
-
-[[package]]
-name = "qwen-do"
-version = "0.1.0"
-dependencies = [
- "async-openai",
- "async-stream",
- "async-trait",
- "base64 0.23.1",
- "encoding_rs",
- "futures",
- "htmd",
- "image",
- "ipnet",
- "keyring-core",
- "rand 0.9.5",
- "readability",
- "reqwest",
- "rmcp",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "windows",
- "windows-native-keyring-store",
 ]
 
 [[package]]

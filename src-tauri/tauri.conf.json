@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "qwen-do",
+  "productName": "LFTTDO",
   "version": "0.1.0",
   "identifier": "com.qwa.do",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "qwen-do",
+        "title": "LFTTDO",
         "width": 800,
         "height": 600
       }

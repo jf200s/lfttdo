@@ -8,7 +8,7 @@ use super::types::{ContentBlock, ImageMime, Message, Role};
 /// 会漂成假绿，而这里每一项都是确定的整数。
 pub const MSG_TOKEN_OVERHEAD: usize = 4;
 
-pub const SYSTEM_PROMPT: &str = "你是 Qwen Do，一个运行在桌面端的轻量助手。回答简洁、直接，中文优先。可用工具时优先使用工具获取事实，不要凭记忆编造；不确定就说不确定。";
+pub const SYSTEM_PROMPT: &str = "你是 LFTTDO，一个运行在桌面端的轻量助手。回答简洁、直接，中文优先。可用工具时优先使用工具获取事实，不要凭记忆编造；不确定就说不确定。";
 
 /// 单图计价：视觉 token 与 base64 字符数无关，按格式给固定权重。
 /// 刻意不按 `data.len()` 估 —— base64 长度 ≈ 4/3 字节数，用它判断预算会完全失真，

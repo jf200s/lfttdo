@@ -40,8 +40,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use qwen_do_lib::text::head_chars;
-use qwen_do_lib::tools::fetch::{
+use lfttdo_lib::text::head_chars;
+use lfttdo_lib::tools::fetch::{
     DEFAULT_MAX_BYTES, RedirectWalker, ReqwestTransport, SystemResolver, USER_AGENT,
     render_markdown,
 };

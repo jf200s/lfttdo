@@ -26,16 +26,16 @@
 //! 凭据管理器不是探针该碰的东西（R164）。
 
 use futures::StreamExt;
-use qwen_do_lib::agent::context::ContextBuilder;
-use qwen_do_lib::agent::events::{AgentEvent, EventSink};
-use qwen_do_lib::agent::types::{ContentBlock, Message};
-use qwen_do_lib::ipc::{TurnDeps, build_production_registry, run_turn};
-use qwen_do_lib::model::openai_compat::{OpenAiCompat, is_loopback_endpoint};
-use qwen_do_lib::model::provider::{ChatRequest, ModelDelta, ModelError, ModelProvider};
-use qwen_do_lib::permission::gate::PermissionGate;
-use qwen_do_lib::settings::{SettingsStore, effective_roots};
-use qwen_do_lib::store::db::Db;
-use qwen_do_lib::tools::registry::ToolCtx;
+use lfttdo_lib::agent::context::ContextBuilder;
+use lfttdo_lib::agent::events::{AgentEvent, EventSink};
+use lfttdo_lib::agent::types::{ContentBlock, Message};
+use lfttdo_lib::ipc::{TurnDeps, build_production_registry, run_turn};
+use lfttdo_lib::model::openai_compat::{OpenAiCompat, is_loopback_endpoint};
+use lfttdo_lib::model::provider::{ChatRequest, ModelDelta, ModelError, ModelProvider};
+use lfttdo_lib::permission::gate::PermissionGate;
+use lfttdo_lib::settings::{SettingsStore, effective_roots};
+use lfttdo_lib::store::db::Db;
+use lfttdo_lib::tools::registry::ToolCtx;
 use serde_json::{json, value::Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

@@ -45,7 +45,7 @@ use crate::tools::registry::{Tool, ToolCtx, ToolError, ToolMeta};
 
 /// spec 5.4「明确 UA」：写死的常量，`ReqwestTransport` 的每一条请求都带着它。
 /// 改动这个值等同于改动对外承诺，要在计划层面被看见，所以它是 `const` 而不是配置项。
-pub const USER_AGENT: &str = "qwen-do/0.1 (desktop agent; read-only fetch)";
+pub const USER_AGENT: &str = "lfttdo/0.1 (desktop agent; read-only fetch)";
 
 /// 重定向跳数上限（spec 5.4「重定向 ≤5 跳」）。`0` 是合法值：只取首跳、一条都不跟。
 pub const DEFAULT_MAX_HOPS: usize = 5;
