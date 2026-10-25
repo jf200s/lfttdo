@@ -46,6 +46,7 @@ const row = (id: string, updated_at: number): SessionRow => ({
 const view = (over: Partial<SettingsView> = {}): SettingsView => ({
   base_url: "https://example.invalid/v1",
   model: "qwen-plus",
+  system_prompt: "",
   reserve_output: 4096,
   budget_tokens: 32_000,
   window_messages: 40,

@@ -129,6 +129,8 @@ export interface SessionRow {
 export interface Settings {
   base_url: string;
   model: string;
+  /** 自定义系统提示词：`""` = 用内置的 LFTTDO 提示词；非空则整段替换（人设模型靠它）。 */
+  system_prompt: string;
   reserve_output: number;
   budget_tokens: number;
   window_messages: number;

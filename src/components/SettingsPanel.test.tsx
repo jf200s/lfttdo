@@ -22,6 +22,7 @@ const stripComments = (css: string): string => css.replace(/\/\*[\s\S]*?\*\//g, 
 const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   base_url: "https://example.invalid/v1",
   model: "qwen-plus",
+  system_prompt: "",
   reserve_output: 4096,
   budget_tokens: 32_000,
   window_messages: 40,
@@ -70,6 +71,16 @@ const setup = (over: Partial<SettingsView> = {}, props: Partial<PanelProps> = {}
 };
 
 describe("SettingsPanel", () => {
+  it("carries the custom system prompt into the save payload", async () => {
+    const p = setup({});
+    fireEvent.change(screen.getByLabelText(/系统提示词/), {
+      target: { value: "你是小宋祺。" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].system_prompt).toBe("你是小宋祺。");
+  });
+
   it("saves the whole settings table with only the edited field changed", async () => {
     const p = setup({ model: "qwen-plus", budget_tokens: 32_000, reserve_output: 4096 });
     fireEvent.change(screen.getByLabelText(/模型名/), { target: { value: "qwen-turbo" } });
@@ -78,6 +89,7 @@ describe("SettingsPanel", () => {
     expect(p.onSave.mock.calls[0][0]).toEqual({
       base_url: "https://example.invalid/v1",
       model: "qwen-turbo",
+      system_prompt: "",
       reserve_output: 4096,
       budget_tokens: 32_000,
       window_messages: 40,

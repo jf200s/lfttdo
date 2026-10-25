@@ -155,6 +155,16 @@ export function SettingsPanel({
               onChange={(e) => setField("model", e.target.value)}
             />
           </label>
+          <label className="panel-row">
+            <span>
+              系统提示词（留空 = 内置的 LFTTDO 提示词；填了会整段替换，人设模型把设定贴这里）
+            </span>
+            <textarea
+              rows={4}
+              value={form.system_prompt}
+              onChange={(e) => setField("system_prompt", e.target.value)}
+            />
+          </label>
           {NUMERIC_FIELDS.map(({ key, label }) => (
             <label className="panel-row" key={key}>
               <span>{label}</span>

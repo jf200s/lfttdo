@@ -31,6 +31,9 @@ pub struct ContextConfig {
     /// 发起摘要与落库的是 T41。
     /// `build()` 今天不读它 —— 滑窗用的仍是全额预算。
     pub compact_threshold: f32,
+    /// 用户自定义的系统提示词（设置里那一栏）。空串 ⇒ 用 [`SYSTEM_PROMPT`]。
+    /// 有值时**整段替换**默认提示词：人设模型（如 U 盘上的 `xiaosongqi`）靠它生效。
+    pub system_prompt: String,
     /// 压缩时保留原文的最近轮数 K（spec 5.3 默认 10）。K=0 意味着连刚说完的那轮
     /// 都被摘要掉 ⇒ 当场失忆，所以 `Settings::normalize` 夹 `1..=50`。
     /// 「一轮」的定义只写在 [`ContextBuilder::compaction_plan`] 的文档注释里。
@@ -45,6 +48,7 @@ impl Default for ContextConfig {
             window_messages: 40,
             compact_threshold: 0.85,
             keep_turns: 10,
+            system_prompt: String::new(),
         }
     }
 }
@@ -97,12 +101,17 @@ impl ContextBuilder {
     pub fn build(&self, history: &[Message]) -> Built {
         // 请求头部 = 本机 SYSTEM_PROMPT + 历史里已有的 system 备注（Plan C 的摘要消息走
         // 这一路），但去掉与 SYSTEM_PROMPT 重复的那条，避免同一提示词进两次。
-        let mut head: Vec<Message> = vec![Message::system_note(SYSTEM_PROMPT)];
+        let prompt = if self.cfg.system_prompt.trim().is_empty() {
+            SYSTEM_PROMPT
+        } else {
+            self.cfg.system_prompt.as_str()
+        };
+        let mut head: Vec<Message> = vec![Message::system_note(prompt)];
         head.extend(
             history
                 .iter()
                 .filter(|m| m.role == Role::System)
-                .filter(|m| m.text_of() != SYSTEM_PROMPT)
+                .filter(|m| m.text_of() != prompt)
                 .cloned(),
         );
         // 头部只估一次就够，靠的是 `estimate_tokens` 的**逐消息相加**性质（见该函数：
@@ -1702,5 +1711,17 @@ mod compaction_planning {
                  正是 `set_calibration` 文档注释写明禁止的那个后果"
             );
         }
+    }
+
+    #[test]
+    fn a_custom_system_prompt_replaces_the_builtin_one() {
+        let custom = ContextBuilder::new(ContextConfig {
+            system_prompt: "你是小宋祺。".into(),
+            ..Default::default()
+        });
+        let built = custom.build(&[]);
+        assert_eq!(built.messages[0].text_of(), "你是小宋祺。");
+        let default = ContextBuilder::new(ContextConfig::default()).build(&[]);
+        assert_eq!(default.messages[0].text_of(), SYSTEM_PROMPT);
     }
 }

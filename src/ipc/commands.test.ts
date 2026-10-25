@@ -52,13 +52,14 @@ describe("ipc commands", () => {
   it("asks for the flat settings view and writes the whole table back untouched", async () => {
     // 键数不是这条的判据（`SettingsPanel.test.tsx` 里那条才管「少带一键」），
     // 这里钉的是**信封形状**：`settings_set` 收 `{ settings: … }`，且 body 原样透传、
-    // 不掺进 `api_key_masked` 那两只只读键。写满 13 键是因为 `Settings` 现在就是 13 键
+    // 不掺进 `api_key_masked` 那两只只读键。写满 14 键是因为 `Settings` 现在就是 14 键（新增 `system_prompt`）
     // （T26 加了 `roots`：Rust 侧 `Vec<PathBuf>` 的线上形状是字符串数组，由
     // `ipc.rs::tests::the_settings_view_carries_roots_at_the_top_level_as_strings` 钉着）。
     await api.getSettings();
     await api.setSettings({
       base_url: "u",
       model: "m",
+      system_prompt: "",
       reserve_output: 1,
       budget_tokens: 2,
       window_messages: 3,
@@ -76,6 +77,7 @@ describe("ipc commands", () => {
       settings: {
         base_url: "u",
         model: "m",
+        system_prompt: "",
         reserve_output: 1,
         budget_tokens: 2,
         window_messages: 3,

@@ -263,6 +263,8 @@ pub struct Settings {
     /// 用户粘贴的那一行端点。空串是合法值（还没配），由 T13 的守卫去拦（R90）。
     pub base_url: String,
     pub model: String,
+    /// 自定义系统提示词（空串 = 用内置的 `SYSTEM_PROMPT`）。人设模型靠它生效。
+    pub system_prompt: String,
     pub reserve_output: u32,
     pub budget_tokens: u32,
     pub window_messages: usize,
@@ -305,6 +307,7 @@ impl Default for Settings {
         Self {
             base_url: String::new(),
             model: "qwen-plus".into(),
+            system_prompt: String::new(),
             reserve_output: 4096,
             budget_tokens: 32_000,
             window_messages: 40,
@@ -537,6 +540,7 @@ impl Settings {
             // 只有界面能看见的装饰品（T41 读的是 `ContextConfig`，不是 `Settings`）。
             compact_threshold: c.compact_threshold,
             keep_turns: c.keep_turns as usize,
+            system_prompt: c.system_prompt.clone(),
         }
     }
 
@@ -1579,6 +1583,16 @@ mod tests {
         assert_eq!(cc.reserve_output, 2_000);
         assert_eq!(cc.budget_tokens, 3_024);
         assert_eq!(cc.window_messages, 1);
+        assert_eq!(
+            Settings {
+                system_prompt: "你是小宋祺。".into(),
+                ..Default::default()
+            }
+            .to_context_config()
+            .system_prompt,
+            "你是小宋祺。",
+            "自定义提示词必须经 to_context_config 到达 ContextConfig（否则设置面板那栏是装饰）"
+        );
         let d = Settings::default().to_context_config();
         assert_eq!(
             (d.reserve_output, d.budget_tokens, d.window_messages),

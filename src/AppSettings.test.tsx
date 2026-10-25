@@ -61,6 +61,7 @@ const row = (id: string, updated_at: number): SessionRow => ({
 const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   base_url: "https://example.invalid/v1",
   model: "qwen-plus",
+  system_prompt: "",
   reserve_output: 4096,
   budget_tokens: 32_000,
   window_messages: 40,
@@ -159,6 +160,7 @@ describe("App 设置接线", () => {
       expect(h.setSettings).toHaveBeenCalledWith({
         base_url: "https://example.invalid/v1",
         model: "qwen-turbo",
+        system_prompt: "",
         reserve_output: 4096,
         budget_tokens: 32_000,
         window_messages: 40,
