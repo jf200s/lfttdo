@@ -75,3 +75,44 @@ html[data-theme][data-mode] button.stop {
   color: var(--accent-text);
   border-color: transparent;
 }
+
+/* 聊天优先的版面（R331）：对齐主流 agent 的阅读节奏 ——
+   正文一列居中（上限 860px，行长可控）、输入区与正文同轴且更宽一点、气泡更松。
+   空会话时给一句引导，避免一块空玻璃。 */
+html[data-theme][data-mode] .message-list {
+  padding: 28px 32px 12px;
+}
+
+html[data-theme][data-mode] .turns {
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+}
+
+html[data-theme][data-mode] .turns:empty::after {
+  content: "有什么都可以聊，也能拖张图进来。";
+  display: block;
+  margin: 16vh auto 0;
+  max-width: 420px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: calc(var(--font-size) * 1.1);
+  letter-spacing: 0.02em;
+}
+
+html[data-theme][data-mode] .composer {
+  width: 100%;
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 0 20px 10px;
+}
+
+html[data-theme][data-mode] .composer-main {
+  border-radius: 24px;
+  padding: 12px 14px;
+}
+
+html[data-theme][data-mode] .bubble {
+  padding: 12px 16px;
+  line-height: 1.7;
+}
