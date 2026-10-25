@@ -6,3 +6,9 @@
 *.db-wal
 *.db-shm
 .DS_Store
+
+# 发布前补充：构建产物/本地记录/环境文件不进制品库
+*.zip
+*.log
+.superpowers/
+.env
