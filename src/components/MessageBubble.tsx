@@ -19,6 +19,20 @@ const STATUS_LABEL: Record<ToolCard["status"], string> = {
  */
 const fmtMs = (ms: number): string => (ms === 0 ? "—" : `${ms} ms`);
 
+/**
+ * 预览里那行「未能定界出正文…」是**给模型**的护栏（防止它把样板当正文引用），
+ * 不是给用户看的报错。界面只显示正文：把这一行从展示文本里摘掉；
+ * 如果整段预览就只有这行提示，预览区直接不渲染。
+ */
+export function readablePreview(text: string): string {
+  const NL = String.fromCharCode(10);
+  return text
+    .split(NL)
+    .filter((line) => !line.trimStart().startsWith("[未能定界出正文"))
+    .join(NL)
+    .trim();
+}
+
 function ToolCardView({ card }: { card: ToolCard }) {
   return (
     <div
@@ -35,7 +49,10 @@ function ToolCardView({ card }: { card: ToolCard }) {
       <pre className="io">
         {JSON.stringify(card.input ?? {}, null, 2)}
       </pre>
-      {card.preview ? <pre className="io preview">{card.preview}</pre> : null}
+      {(() => {
+        const shown = card.preview ? readablePreview(card.preview) : "";
+        return shown !== "" ? <pre className="io preview">{shown}</pre> : null;
+      })()}
     </div>
   );
 }

@@ -1,6 +1,7 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { MessageList } from "./MessageList";
+import { readablePreview } from "./MessageBubble";
 import type { UiState } from "../types";
 
 function state(partial: Partial<UiState>): UiState {
@@ -476,5 +477,19 @@ describe("MessageList 自动滚底", () => {
     fireEvent.scroll(list);
     rerender(<MessageList state={withTurn(3)} onRespond={() => {}} />);
     expect(list.scrollTop).toBe(1000);
+  });
+});
+
+describe("工具卡预览（R339）", () => {
+  it("hides the extraction notice from the UI but keeps the body text", () => {
+    const NL = String.fromCharCode(10);
+    const raw = [
+      "[未能定界出正文，以下 156 字可能是站点样板或反爬提示，别当正文引用]",
+      "This domain is for use in documentation examples.",
+    ].join(NL);
+    expect(readablePreview(raw)).toBe("This domain is for use in documentation examples.");
+    expect(
+      readablePreview("[未能定界出正文，以下 0 字可能是站点样板或反爬提示，别当正文引用]"),
+    ).toBe("");
   });
 });
