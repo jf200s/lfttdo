@@ -488,6 +488,7 @@ fn one_hundred_text_rounds_stay_inside_the_budget_with_a_covering_summary() {
         window_messages: 40,
         compact_threshold: 0.85,
         keep_turns: 10,
+        system_prompt: String::new(),
     };
     let (_dir, db, path, sid, d) = drive(
         "A/100 轮文本",
@@ -604,6 +605,7 @@ fn no_orphan_tool_result_at_either_end_of_the_request() {
         window_messages: 40,
         compact_threshold: 0.85,
         keep_turns: 10,
+        system_prompt: String::new(),
     };
     let (_dir, db, path, sid, d) = drive(
         "C/60 轮带工具",

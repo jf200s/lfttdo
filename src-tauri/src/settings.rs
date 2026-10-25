@@ -2003,7 +2003,7 @@ mod tests {
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_thirteen_settings_fields() {
+    fn serialized_field_names_are_exactly_the_fourteen_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -2025,6 +2025,7 @@ mod tests {
                 "model",
                 "reserve_output",
                 "roots",
+                "system_prompt",
                 "temperature",
                 "theme",
                 "window_messages"
