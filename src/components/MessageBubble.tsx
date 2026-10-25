@@ -130,6 +130,30 @@ function PermCardView({
   );
 }
 
+/**
+ * 把 `<think>…</think>` 从正文里拆出来（R333）：Qwen3 系列把思考过程直接写在
+ * content 里，原样渲染会在气泡里露出一大段 `<think>` + 推理文字，回答反而看不见。
+ * 未闭合（流式进行中）时，余下全部算思考；结论先出、思考后到的模型也不会误判。
+ */
+export function splitThinking(text: string): { thinking: string | null; answer: string } {
+  const open = text.indexOf("<think>");
+  if (open < 0) return { thinking: null, answer: text };
+  const rest = text.slice(open + "<think>".length);
+  const close = rest.indexOf("</think>");
+  const thinking = close < 0 ? rest : rest.slice(0, close);
+  const after = close < 0 ? "" : rest.slice(close + "</think>".length);
+  return { thinking, answer: (text.slice(0, open) + after).trim() };
+}
+
+function Thinking({ text, answer }: { text: string; answer: string }) {
+  return (
+    <details className="thinking" open={answer.trim() === ""}>
+      <summary>思考过程</summary>
+      <div className="thinking-body">{text}</div>
+    </details>
+  );
+}
+
 function BlockView({
   block,
   plain,
@@ -140,17 +164,27 @@ function BlockView({
   onRespond: (id: string, d: Decision) => void;
 }) {
   switch (block.kind) {
-    case "text":
+    case "text": {
       // 要求 2：正在流式的那一块按纯文本渲染 —— 反复解析半截语法就是闪烁的来源。
-      return plain ? (
-        <pre className="plain">{block.text}</pre>
-      ) : (
-        <div className="md">
-          <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-            {block.text}
-          </Markdown>
-        </div>
+      // R333：思考过程单独收进可折叠区，正文只留回答。
+      const { thinking, answer } = splitThinking(block.text);
+      return (
+        <>
+          {thinking !== null && thinking.trim() !== "" ? (
+            <Thinking text={thinking} answer={answer} />
+          ) : null}
+          {plain ? (
+            <pre className="plain">{answer}</pre>
+          ) : (
+            <div className="md">
+              <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+                {answer}
+              </Markdown>
+            </div>
+          )}
+        </>
       );
+    }
     case "image":
       return (
         <img
