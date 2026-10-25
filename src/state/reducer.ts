@@ -139,6 +139,17 @@ function userBlocks(blocks: ContentBlock[]): UiBlock[] {
  * 注意它**不动 `streaming`**：R112 把 streaming 的归属写死为
  * `turn_start`/`text_delta`/`tool_call` 置真、`done` 置假。
  */
+/**
+ * 发送失败时撤掉刚乐观插入的那条用户消息（401 / 网络 / 模型侧报错都可能）。
+ * 只认**最后一条、内容逐字相同**的那条：并发下第二次调用是 no-op，不会误删别的消息。
+ */
+export function dropUserTurn(state: UiState, blocks: ContentBlock[]): UiState {
+  const last = state.turns[state.turns.length - 1];
+  if (!last || last.role !== "user") return state;
+  if (JSON.stringify(last.blocks) !== JSON.stringify(userBlocks(blocks))) return state;
+  return { ...state, turns: state.turns.slice(0, -1) };
+}
+
 export function appendUserTurn(state: UiState, blocks: ContentBlock[]): UiState {
   const { state: opened, index } = startTurn(state, "user");
   return mapTurn(opened, index, (t) => ({ ...t, blocks: userBlocks(blocks) }));

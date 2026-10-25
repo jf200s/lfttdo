@@ -6,7 +6,7 @@ import { McpPanel } from "./components/McpPanel";
 import { Sidebar } from "./components/Sidebar";
 import * as api from "./ipc/commands";
 import { useTextBuffer } from "./ipc/batching";
-import { appendUserTurn, initialState, reduce, replay } from "./state/reducer";
+import { appendUserTurn, dropUserTurn, initialState, reduce, replay } from "./state/reducer";
 import { writeThemeCache } from "./theme/cache";
 import { applyTheme, resolveTheme } from "./theme/theme";
 import type {
@@ -220,6 +220,9 @@ export default function App() {
       try {
         await api.sendMessage(sid, blocks);
       } catch (e) {
+        // R332：乐观气泡必须跟着回滚 —— 否则屏幕上有一条「已发送」的消息，库里没有，
+        // 切会话或重启后它凭空消失；用户当场重发还会多一条。
+        setUi((s) => dropUserTurn(s, blocks));
         notice(`发送失败：${String(e)}`);
         throw e;
       }

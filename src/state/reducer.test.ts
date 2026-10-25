@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { AGENT_CHANNEL } from "../types";
 import {
   appendUserTurn,
+  dropUserTurn,
   initialState,
   reduce,
   replay,
@@ -180,6 +181,24 @@ const contentProbe: Record<ContentBlock["type"], ContentBlock> = {
   },
 };
 const CONTENT_TAGS = Object.keys(contentProbe) as ContentBlock["type"][];
+
+describe("dropUserTurn（R332）", () => {
+  const blocks = [{ type: "text", text: "你好" }] as ContentBlock[];
+
+  it("removes the optimistic bubble when the matching send fails", () => {
+    const s1 = appendUserTurn(initialState(), blocks);
+    expect(s1.turns).toHaveLength(1);
+    const s2 = dropUserTurn(s1, blocks);
+    expect(s2.turns).toHaveLength(0);
+  });
+
+  it("is a no-op when the last turn is not the same message", () => {
+    const s1 = appendUserTurn(initialState(), blocks);
+    const other = [{ type: "text", text: "另一句" }] as ContentBlock[];
+    expect(dropUserTurn(s1, other).turns).toHaveLength(1);
+    expect(dropUserTurn(dropUserTurn(s1, blocks), blocks).turns).toHaveLength(0);
+  });
+});
 
 describe("reducer", () => {
   // ==== brief Step 1 的 11 条 ====
