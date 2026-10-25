@@ -1,5 +1,9 @@
 // LFTTDO 便携启动器（R335）：一个无窗口 exe 负责整条生命周期。
 //
+// **bin 名故意是 `lfttdo-launcher`**：Windows 文件名不区分大小写，若这里叫 `LFTTDO`，
+// 输出的 `LFTTDO.exe` 会与主程序 `lfttdo.exe` 撞成同一个文件（实测把 14MB 的应用覆盖成
+// 350KB 的启动器）。部署到 U 盘时再把它改名为 `LFTTDO.exe`。
+//
 // 它做四件事，全部只依赖标准库 + serde_json：
 //   1) 把人设.txt 注入 LFTTDO\data\settings.json 的 system_prompt；
 //   2) 若 127.0.0.1:11435 没有服务，就用 U 盘的 ollama.exe 起一个（模型目录指向 U 盘）；
