@@ -100,10 +100,6 @@ html[data-theme][data-mode] textarea::placeholder {
   opacity: 1;
 }
 
-html[data-theme][data-mode] .composer {
-  border-top: none;
-}
-
 html[data-theme][data-mode] .statusbar {
   width: 100%;
   max-width: 920px;
@@ -139,6 +135,7 @@ html[data-theme][data-mode] .composer {
   max-width: 920px;
   margin: 0 auto;
   padding: 0 20px 10px;
+  border-top: none;
 }
 
 html[data-theme][data-mode] .composer-main {
