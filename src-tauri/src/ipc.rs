@@ -15,6 +15,7 @@ use crate::agent::summarize::{SUMMARY_OMITTED, collect_summary, summary_note, su
 use crate::agent::types::{ContentBlock, Message, Role};
 use crate::mcp::bridge::{McpBridge, McpTool, ServerStatus};
 use crate::mcp::config::ServerDef;
+use crate::mcp::editor;
 use crate::model::embed::{EmbedEndpoint, EmbedProvider};
 use crate::model::openai_compat::{OpenAiCompat, is_loopback_endpoint};
 use crate::model::provider::ModelProvider;
@@ -1681,6 +1682,35 @@ pub struct McpServerView {
     pub reason: Option<String>,
 }
 
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConfigIssue {
+    pub name: String,
+    pub reason: String,
+}
+
+/// 面板常规加载的配置状态：**不含正文与密钥**。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConfigStatusView {
+    pub path: String,
+    pub exists: bool,
+    pub parse_error: Option<String>,
+    pub skipped: Vec<McpConfigIssue>,
+}
+
+/// 编辑器打开时的快照：**只有这条命令**会把配置正文（含 env/headers）带到前端。
+/// 故意不实现 `Debug`：避免正文误入日志。
+#[derive(Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConfigTextView {
+    pub path: String,
+    pub exists: bool,
+    pub text: String,
+    pub parse_error: Option<String>,
+    pub skipped: Vec<McpConfigIssue>,
+}
+
 fn trust_word(verdict: Verdict) -> &'static str {
     verdict.as_str()
 }
@@ -1828,6 +1858,59 @@ pub async fn mcp_disconnect(state: State<'_, AppState>, name: String) -> Result<
     state.mcp.disconnect(&name).await;
     mcp_clear_tools(&state.registry, &name, &decls);
     Ok(())
+}
+
+fn config_issues(skipped: Vec<crate::mcp::config::Skipped>) -> Vec<McpConfigIssue> {
+    skipped
+        .into_iter()
+        .map(|s| McpConfigIssue {
+            name: s.name,
+            reason: s.reason.to_string(),
+        })
+        .collect()
+}
+
+/// 可测核心：配置状态（不含正文）。
+pub fn mcp_config_status_of(dir: &Path) -> Result<McpConfigStatusView, String> {
+    let st = editor::status(dir);
+    Ok(McpConfigStatusView {
+        path: st.path.display().to_string(),
+        exists: st.exists,
+        parse_error: st.parse_error,
+        skipped: config_issues(st.skipped),
+    })
+}
+
+/// 可测核心：编辑器快照（含正文）。只有显式打开编辑器时才会被调用。
+pub fn mcp_config_read_of(dir: &Path) -> Result<McpConfigTextView, String> {
+    let snap = editor::read(dir)?;
+    Ok(McpConfigTextView {
+        path: snap.path.display().to_string(),
+        exists: snap.exists,
+        text: snap.text,
+        parse_error: snap.parse_error,
+        skipped: config_issues(snap.skipped),
+    })
+}
+
+/// 可测核心：严格校验后原子写盘。
+pub fn mcp_config_save_of(dir: &Path, text: &str) -> Result<(), String> {
+    editor::save(dir, text)
+}
+
+#[tauri::command]
+pub fn mcp_config_status(state: State<'_, AppState>) -> Result<McpConfigStatusView, String> {
+    mcp_config_status_of(&state.mcp_dir)
+}
+
+#[tauri::command]
+pub fn mcp_config_read(state: State<'_, AppState>) -> Result<McpConfigTextView, String> {
+    mcp_config_read_of(&state.mcp_dir)
+}
+
+#[tauri::command]
+pub fn mcp_config_save(state: State<'_, AppState>, text: String) -> Result<(), String> {
+    mcp_config_save_of(&state.mcp_dir, &text)
 }
 
 /// 技能面板的一行。只用来**看**：技能没有开关，模型按描述自动调用。
@@ -2839,6 +2922,9 @@ pub fn run() {
             mcp_set_trust,
             mcp_reconnect,
             mcp_disconnect,
+            mcp_config_status,
+            mcp_config_read,
+            mcp_config_save,
             skills_list,
             skills_open_folder,
             skills_set_enabled,
@@ -7318,6 +7404,52 @@ mod tests {
             parse_trust("yes").is_err(),
             "未知档位必须报错，不许静默当成 ask"
         );
+    }
+
+    // ───────────────────────── T4：MCP 配置编辑命令 ─────────────────────────
+
+    #[test]
+    fn mcp_config_status_never_carries_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mcp.json"),
+            r#"{ "mcpServers": { "x": { "command": "npx", "env": { "TOKEN": "sk-REAL-SECRET" } } } }"#,
+        )
+        .unwrap();
+
+        let v = mcp_config_status_of(dir.path()).unwrap();
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(!s.contains("sk-REAL-SECRET"), "{s}");
+        assert!(s.contains("\"parseError\":null"), "{s}");
+        assert!(s.contains("mcp.json"), "{s}");
+    }
+
+    #[test]
+    fn mcp_config_read_carries_the_text_only_for_the_explicit_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mcp.json"),
+            r#"{ "mcpServers": { "x": { "command": "npx", "env": { "TOKEN": "sk-REAL-SECRET" } } } }"#,
+        )
+        .unwrap();
+
+        let v = mcp_config_read_of(dir.path()).unwrap();
+        assert!(
+            v.text.contains("sk-REAL-SECRET"),
+            "编辑器必须能显示要编辑的原文"
+        );
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.contains("\"text\""), "{s}");
+    }
+
+    #[test]
+    fn mcp_config_save_of_rejects_invalid_text_and_writes_valid_text() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(mcp_config_save_of(dir.path(), "{ nope").is_err());
+        assert!(!dir.path().join("mcp.json").exists());
+
+        mcp_config_save_of(dir.path(), r#"{ "mcpServers": {} }"#).unwrap();
+        assert!(dir.path().join("mcp.json").exists());
     }
 
     #[test]
