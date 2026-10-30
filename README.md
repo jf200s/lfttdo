@@ -96,7 +96,7 @@ npx tsc --noEmit
 npm run lint:css
 ```
 
-当前读数：Rust 669 passed / 1 ignored + 集成 3 passed；前端 247 passed；clippy 无新增。
+当前读数：Rust 687 passed / 1 ignored + 集成 3 passed；前端 262 passed；clippy 无新增。
 
 ## 目录结构
 
