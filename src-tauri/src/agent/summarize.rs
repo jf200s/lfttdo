@@ -9,7 +9,7 @@
 // `ipc.rs` 的 `compact_before_turn` 与 `store::db::compact_session` 里，
 // 这里只负责「把一批消息换成一句备注文本，或者诚实地报错」。
 
-use crate::agent::types::Message;
+use crate::agent::types::{ContentBlock, Message};
 use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -35,13 +35,43 @@ pub fn summary_note(body: &str) -> String {
     format!("{SUMMARY_PREFIX}{body}")
 }
 
+/// 摘要与记忆抽取共用的输入清洗：图片降级为占位文本，工具调用与工具结果整块丢弃。
+///
+/// 三条理由都是真实的失败路径：
+/// - 图片是 base64，正文端点遇到它直接 400；视觉端点也要为一段即将被删掉的历史付图片钱；
+/// - 工具输出是数据不是用户的陈述，喂给抽取会把网页正文/文件内容抽成「用户事实」；
+/// - 工具调用块对摘要没有信息量，留着只占 token。
+///
+/// 保留下来的只有文本块；一整条消息都不可用时整条丢掉（空消息会制造无意义的角色轮）。
+pub fn auxiliary_source(src: &[Message]) -> Vec<Message> {
+    src.iter()
+        .filter_map(|m| {
+            let mut blocks = Vec::with_capacity(m.blocks.len());
+            for b in &m.blocks {
+                match b {
+                    ContentBlock::Text { .. } => blocks.push(b.clone()),
+                    ContentBlock::Image { .. } => blocks.push(ContentBlock::Text {
+                        text: "[图片已移除以节省上下文]".to_string(),
+                    }),
+                    ContentBlock::ToolCall { .. } | ContentBlock::ToolResult { .. } => {}
+                }
+            }
+            (!blocks.is_empty()).then(|| Message {
+                role: m.role.clone(),
+                blocks,
+            })
+        })
+        .collect()
+}
+
 /// 组装摘要请求。§2b：**不带 `temperature` 入参**，一律 `None`。
 /// 理由是 `temperature` 是用户给聊天调的风格旋钮（0.0–2.0，默认 0.7），拿它去摘要
 /// 会把「编造」调浓，而 spec 对摘要的要求恰恰是**不许补充对话里没有的内容** ——
 /// 端点默认值 > 用户的创意值。
+/// 输入先过 [`auxiliary_source`]：图片降级、工具块丢弃。
 pub fn summary_request(src: &[Message]) -> ChatRequest {
     let mut msgs = vec![Message::system_note(SUMMARY_INSTRUCTION)];
-    msgs.extend(src.iter().cloned());
+    msgs.extend(auxiliary_source(src));
     ChatRequest {
         messages: msgs,
         // 空工具声明 = 模型不会去调工具（R43 的教训反过来用：未声明的工具它不可能调用）。
@@ -281,6 +311,50 @@ mod tests {
         assert_eq!(&req.messages[1..], src_messages().as_slice());
         // 空工具声明 = 模型不会去调工具（R43 的教训反过来用：未声明的工具它不可能调用）。
         assert!(req.tools.is_empty(), "摘要调用不许带任何工具声明");
+    }
+
+    /// 摘要输入里的图片必须降级、工具块必须丢弃：正文端点遇图 400，
+    /// 工具输出被当成对话内容会污染摘要。
+    #[test]
+    fn the_summary_request_degrades_images_and_drops_tool_blocks() {
+        let src = vec![
+            Message::user(vec![
+                ContentBlock::Text {
+                    text: "看看这张图".into(),
+                },
+                ContentBlock::Image {
+                    data: "QUJD".into(),
+                    mime: crate::agent::types::ImageMime::Png,
+                },
+            ]),
+            Message::tool(
+                "c1",
+                crate::agent::types::ToolOutput::text("网页正文不该进摘要"),
+                false,
+            ),
+        ];
+        let req = summary_request(&src);
+        assert_eq!(req.messages.len(), 2, "指令 + 一条清洗后的 user 消息");
+        let sent = &req.messages[1];
+        assert_eq!(sent.role, Role::User);
+        assert_eq!(sent.blocks.len(), 2, "文本 + 图片占位");
+        assert!(sent.text_of().contains("[图片已移除以节省上下文]"));
+        assert!(
+            !sent
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. })),
+            "图片块不许原样发出"
+        );
+        assert!(
+            req.messages
+                .iter()
+                .all(|m| m.blocks.iter().all(|b| !matches!(
+                    b,
+                    ContentBlock::ToolCall { .. } | ContentBlock::ToolResult { .. }
+                ))),
+            "工具块必须整块丢弃"
+        );
     }
 
     /// §2b：摘要调用**不继承**用户给聊天调的温度旋钮。

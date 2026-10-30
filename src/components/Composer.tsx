@@ -52,6 +52,11 @@ export function Composer({
 }) {
   const [text, setText] = useState("");
   const [stopRequested, setStopRequested] = useState(false);
+  /** 本地发送锁：从按下发送到 turn_start（或失败返回）之间，拦住第二次 Enter。 */
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
+  /** 这一次已经交给 `onSend` 的草稿快照：turn_start 时按它清空，失败时保留。 */
+  const sentRef = useRef<{ text: string; images: PendingImage[] } | null>(null);
   /** 已归一化、等着和这句话一起发出去的图。 */
   const [pending, setPending] = useState<PendingImage[]>([]);
   /** 逐文件失败：`<文件名>：<原文>`，绝不静默丢图（Step 2 第 5 条 / R195）。 */
@@ -65,10 +70,6 @@ export function Composer({
    */
   const pendingRef = useRef<PendingImage[]>([]);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
-
-  useEffect(() => {
-    if (!streaming) setStopRequested(false);
-  }, [streaming]);
 
   useEffect(() => {
     if (!seed) return;
@@ -97,6 +98,30 @@ export function Composer({
     pendingRef.current = pendingRef.current.filter((p) => !sent.includes(p));
     setPending(pendingRef.current);
   };
+
+  /**
+   * 回合被接受（turn_start / streaming=true）= 这份草稿已经交出去了，可以清空。
+   * 失败路径在 `streaming` 变真之前就返回，因此「发失败保留草稿」的合同不受影响。
+   * 比「等整个生成结束再清」早得多：那条路会让已发出去的句子在输入区挂几分钟。
+   */
+  useEffect(() => {
+    if (!streaming) {
+      setStopRequested(false);
+      return;
+    }
+    const sent = sentRef.current;
+    if (sent === null) return;
+    // 快照**留到 onSend 结算**：落库失败时它负责把草稿和图恢复回来。
+    sendingRef.current = false;
+    setSending(false);
+    setText((cur) => (cur === sent.text ? "" : cur));
+    dropSent(sent.images);
+    setErrors([]);
+    setIgnored(0);
+    // `dropSent` 每次渲染身份都新，但这里只在 streaming 翻转时执行一次；把它列进依赖
+    // 会让「生成中每一次打字」都重跑一遍清空逻辑（把用户新输入也清掉）。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [streaming]);
 
   /** 移除第 `index` 张：同时腾出额度（`pendingRef` 是额度的读数来源）。 */
   const removePending = (index: number) => {
@@ -193,20 +218,46 @@ export function Composer({
     const t = text.trim();
     // R216④：「有图无字」必须放行 —— 只贴一张图不打字是日常主用法，
     // 只判 `t === ""` 的可见症状是「贴图点发送没反应」。
-    if ((t === "" && pending.length === 0) || streaming) return;
+    if ((t === "" && pending.length === 0) || streaming || sendingRef.current) return;
+    sendingRef.current = true;
+    setSending(true);
     // Step 2 第 7 条：顺序固定图在前、文本在最后；文本为空时**不产出**空的 text 块
     // （`App.test.tsx` 那十三条钉的就是无图发送仍是 `[{type:"text",text}]`，R216②）。
     // 取 `pendingRef`（同步影子）而不是 `pending`：这份快照同时是 `dropSent` 的删除依据，
     // 两者必须是同一个列表，否则「按身份移除」会移除成另一批。
     const sent = pendingRef.current;
+    const draft = text;
     const blocks: SendBlock[] = sent.map((p) => p.block);
     if (t !== "") blocks.push({ type: "text", text: t });
+    sentRef.current = { text: draft, images: sent };
     try {
       await onSend(blocks);
     } catch {
+      // 失败：草稿与图留在输入区（Step 2 第 8 条），锁放开让用户重试。
+      // 如果失败发生在 turn_start 之后，草稿已经被上面那条 effect 清掉过 ——
+      // 这里按快照恢复；用户在这期间新敲的字/新贴的图优先，不覆盖。
+      const sentDraft = sentRef.current;
+      sentRef.current = null;
+      sendingRef.current = false;
+      setSending(false);
+      if (sentDraft !== null) {
+        setText((cur) => (cur === "" ? sentDraft.text : cur));
+        const missing = sentDraft.images.filter(
+          (img) => !pendingRef.current.includes(img),
+        );
+        if (missing.length > 0) {
+          pendingRef.current = [...missing, ...pendingRef.current];
+          setPending(pendingRef.current);
+        }
+      }
       return;
     }
-    setText("");
+    // 成功返回 = 这一轮已落库（含 turn_start 那条更早的清空）。只有内容还是同一条
+    // 草稿时才清，避免把用户在最后几毫秒里新敲的字一起抹掉。
+    sendingRef.current = false;
+    setSending(false);
+    sentRef.current = null;
+    setText((cur) => (cur === draft ? "" : cur));
     dropSent(sent);
     // 「已忽略 N 张」和逐文件错误描述的是**这份草稿**，草稿发出去了它们就该一起走。
     // 少这两行的症状是真的：某一次投了 5 张被挡掉 1 张，此后每一条消息都挂着那句
@@ -286,8 +337,8 @@ export function Composer({
               {stopRequested ? "停止中…" : "停止"}
             </button>
           ) : (
-            <button type="submit" className="send">
-              发送
+            <button type="submit" className="send" disabled={sending}>
+              {sending ? "发送中…" : "发送"}
             </button>
           )}
         </div>

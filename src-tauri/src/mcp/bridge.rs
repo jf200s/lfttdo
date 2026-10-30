@@ -502,12 +502,16 @@ pub struct Handshake {
     pub pid: Option<u32>,
     pub tools: Vec<rmcp::model::Tool>,
     pub service: RunningService<RoleClient, ()>,
+    /// 这条连接专属的进程回收 job。重连一台 server 只关闭**它自己**的 job，
+    /// 其余 server 的进程树不受影响（一个桥共用一个 job 时，换 job 会连带杀掉全部）。
+    pub job: Option<std::sync::Arc<crate::mcp::process::KillOnCloseJob>>,
 }
 
 struct Connection {
     pid: Option<u32>,
     tools: Vec<rmcp::model::Tool>,
     service: RunningService<RoleClient, ()>,
+    job: Option<std::sync::Arc<crate::mcp::process::KillOnCloseJob>>,
 }
 
 struct Slot {
@@ -519,8 +523,6 @@ struct Slot {
 /// 与 T29 的字典序、T30 R302 的「稳定喂入序」同一条链。
 pub struct McpBridge {
     slots: std::sync::Mutex<std::collections::BTreeMap<String, Slot>>,
-    /// 进程树回收的 job（T34）：一条桥一个，所有 MCP 子进程共享。`None` = 还没连过或建失败。
-    job: std::sync::Mutex<Option<std::sync::Arc<crate::mcp::process::KillOnCloseJob>>>,
 }
 
 impl Default for McpBridge {
@@ -533,7 +535,6 @@ impl McpBridge {
     pub fn new() -> Self {
         Self {
             slots: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-            job: std::sync::Mutex::new(None),
         }
     }
 
@@ -552,6 +553,17 @@ impl McpBridge {
         crate::lock::guard(&self.slots)
             .get(server)
             .map(|slot| slot.status.clone())
+    }
+
+    /// 测试用具：某台 server 当前连接持有的 job 身份。
+    /// 重连一台不许改变其他 server 的这个值 —— 换了 job 就等于回收了它们的进程树。
+    #[cfg(test)]
+    pub(crate) fn job_ptr_of(&self, server: &str) -> Option<usize> {
+        crate::lock::guard(&self.slots)
+            .get(server)
+            .and_then(|slot| slot.conn.as_ref())
+            .and_then(|conn| conn.job.as_ref())
+            .map(|job| std::sync::Arc::as_ptr(job) as usize)
     }
 
     /// 真子进程的连接才有 pid（R309）。内存管道的腿**不许**造假 pid。
@@ -582,39 +594,17 @@ impl McpBridge {
     /// 并行连接（R308）：结果顺序 = 输入顺序；一条失败不影响其余。
     pub async fn connect_all(&self, servers: &[ServerDef]) -> Vec<(String, Result<usize, String>)> {
         let names: Vec<String> = servers.iter().map(|s| s.name().to_string()).collect();
-        // T34：先建**一个** kill-on-close job，所有子进程共享；建不出来就整批 Disconnected，
-        // **绝不**退化成「不带 job 直接 spawn」（R323）。
-        let job = match crate::mcp::process::create_kill_job() {
-            Ok(job) => std::sync::Arc::new(job),
-            Err(reason) => {
-                for name in &names {
-                    self.set_status(
-                        name,
-                        ServerStatus::Disconnected {
-                            reason: reason.clone(),
-                        },
-                    );
-                }
-                return names
-                    .into_iter()
-                    .map(|name| (name, Err(reason.clone())))
-                    .collect();
-            }
-        };
-        *crate::lock::guard(&self.job) = Some(job.clone());
 
-        // `'static` future：闭包按名字 clone 一份配置、job 用 `Arc` 带进去 ⇒ 返回的 future
-        // 不借用任何局部变量（`ServerDef` 因此需要 `Clone`）。
+        // `'static` future：闭包按名字 clone 一份配置 ⇒ 返回的 future 不借用任何局部变量
+        // （`ServerDef` 因此需要 `Clone`）。job 由 `connect_stdio` 按 server 各建一个：
+        // 共享一个 job 时，任何一次「换 job」都会关闭旧句柄并杀掉所有 server 的进程树。
         let defs: std::collections::BTreeMap<String, ServerDef> = servers
             .iter()
             .map(|def| (def.name().to_string(), def.clone()))
             .collect();
         let make = move |name: &str| -> BoxFuture<'static, Result<Handshake, String>> {
             match defs.get(name).cloned() {
-                Some(def) => {
-                    let job = job.clone();
-                    Box::pin(async move { connect_stdio(&def, &job).await })
-                }
+                Some(def) => Box::pin(async move { connect_stdio(&def).await }),
                 None => Box::pin(async { Err("配置里没有这条 server".to_string()) }),
             }
         };
@@ -654,24 +644,49 @@ impl McpBridge {
             match attempt {
                 Ok(handshake) => {
                     let tools = handshake.tools.len();
-                    self.set_status(name, ServerStatus::Ready { tools });
-                    let mut slots = crate::lock::guard(&self.slots);
-                    if let Some(slot) = slots.get_mut(name) {
-                        slot.conn = Some(Connection {
-                            pid: handshake.pid,
-                            tools: handshake.tools,
-                            service: handshake.service,
+                    let conn = Connection {
+                        pid: handshake.pid,
+                        tools: handshake.tools,
+                        service: handshake.service,
+                        job: handshake.job,
+                    };
+                    // 成功重连 = **只**替换这一台的连接。旧连接在锁外优雅关停，随后
+                    // 连同它自己的 job 一起 drop ⇒ 旧进程树被回收，其他 server 不受影响。
+                    let old = {
+                        let mut slots = crate::lock::guard(&self.slots);
+                        let slot = slots.entry(name.clone()).or_insert_with(|| Slot {
+                            status: ServerStatus::Ready { tools },
+                            conn: None,
                         });
+                        slot.status = ServerStatus::Ready { tools };
+                        slot.conn.replace(conn)
+                    };
+                    if let Some(old) = old {
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            old.service.cancel(),
+                        )
+                        .await;
                     }
                     out.push((name.clone(), Ok(tools)));
                 }
                 Err(reason) => {
-                    self.set_status(
-                        name,
-                        ServerStatus::Disconnected {
-                            reason: reason.clone(),
-                        },
-                    );
+                    // 先连、后换：连不上时旧连接与它的工具表都还在，状态必须继续说
+                    // Ready。写成 Disconnected 会让界面谎报「这台 server 已经断开」，
+                    // 而实际上调用仍然走得通（旧进程还在自己的 job 里）。
+                    let kept_tools = crate::lock::guard(&self.slots)
+                        .get(name)
+                        .and_then(|slot| slot.conn.as_ref())
+                        .map(|conn| conn.tools.len());
+                    match kept_tools {
+                        Some(tools) => self.set_status(name, ServerStatus::Ready { tools }),
+                        None => self.set_status(
+                            name,
+                            ServerStatus::Disconnected {
+                                reason: reason.clone(),
+                            },
+                        ),
+                    }
                     out.push((name.clone(), Err(reason)));
                 }
             }
@@ -721,6 +736,9 @@ impl McpBridge {
         if let Some(conn) = conn {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.service.cancel())
                 .await;
+            // 显式关掉这一台 server 自己的 job：kill-on-close 带走整棵旧进程树。
+            // 不依赖「conn 在函数末尾自然 drop」的时序（读起来也更像一条生命周期规则）。
+            drop(conn.job);
         }
         self.set_status(
             server,
@@ -748,6 +766,7 @@ impl McpBridge {
         for (name, conn) in drained {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.service.cancel())
                 .await;
+            drop(conn.job);
             self.set_status(
                 &name,
                 ServerStatus::Disconnected {
@@ -760,10 +779,13 @@ impl McpBridge {
 
 /// 真 stdio 连接（R309）：pid 必须在 `.serve()` **消费** transport 之前取出来
 /// （`TokioChildProcess::id()`，rmcp `transport/child_process.rs:72`；3.5.1 没有 `process_handle()`）。
-async fn connect_stdio(
-    def: &ServerDef,
-    job: &crate::mcp::process::KillOnCloseJob,
-) -> Result<Handshake, String> {
+async fn connect_stdio(def: &ServerDef) -> Result<Handshake, String> {
+    // 每台 server 一个 kill-on-close job：重连时换掉的是它自己的 job，不会连带
+    // 关闭其他 server 共享的旧句柄（那会杀掉整片进程树）。建不出来 ⇒ 这条不连，
+    // **绝不**退化成「不带 job 直接 spawn」（R323）。
+    let job = std::sync::Arc::new(
+        crate::mcp::process::create_kill_job().map_err(trim_reason)?,
+    );
     let plan = spawn_command(def, &resolve_program_in_path)?;
     let child = TokioChildProcess::new(plan.into_command())
         .map_err(|e| trim_reason(format!("启动 `{}` 失败：{e}", def.name())))?;
@@ -778,6 +800,7 @@ async fn connect_stdio(
         pid,
         tools,
         service,
+        job: Some(job),
     })
 }
 
@@ -1439,6 +1462,7 @@ mod tests {
             pid: None,
             tools,
             service,
+            job: None,
         })
     }
 
@@ -1456,6 +1480,84 @@ mod tests {
             pid: None,
             tools,
             service,
+            job: None,
         })
+    }
+
+    /// 失败的重连不许把「还活着的旧连接」谎报成 Disconnected，也不许换掉它的 job。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_failed_reconnect_keeps_the_old_connection_and_its_status() {
+        let bridge = McpBridge::new();
+        let good = |_: &str| -> BoxFuture<'_, Result<Handshake, String>> {
+            Box::pin(async {
+                let mut h = fake_handshake(2).await?;
+                h.job = Some(std::sync::Arc::new(
+                    crate::mcp::process::create_kill_job()?,
+                ));
+                Ok(h)
+            })
+        };
+        let bad = |_: &str| -> BoxFuture<'_, Result<Handshake, String>> {
+            Box::pin(async { Err("重连握手失败".to_string()) })
+        };
+        let first = bridge
+            .connect_all_with(&["a".to_string()], Duration::from_secs(5), &good)
+            .await;
+        assert!(first[0].1.is_ok(), "{first:?}");
+        let job = bridge.job_ptr_of("a").expect("旧 job");
+
+        let again = bridge
+            .connect_all_with(&["a".to_string()], Duration::from_secs(5), &bad)
+            .await;
+        assert!(again[0].1.is_err(), "重连本身必须报错：{again:?}");
+        assert_eq!(
+            bridge.status_of("a"),
+            Some(ServerStatus::Ready { tools: 2 }),
+            "旧连接仍然可用时，状态不许写成 Disconnected"
+        );
+        assert_eq!(bridge.job_ptr_of("a"), Some(job), "失败重连不许动旧 job");
+    }
+
+    /// 回归：重连一台 server 只许换掉它自己的 job。曾经一个桥共用一个 job，
+    /// 重连时覆盖 `self.job` ⇒ 旧句柄关闭 ⇒ 其余所有 server 的进程树被连带杀掉。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn reconnecting_one_server_keeps_the_jobs_of_the_others() {
+        let bridge = McpBridge::new();
+        let make = |_: &str| -> BoxFuture<'_, Result<Handshake, String>> {
+            Box::pin(async {
+                let mut h = fake_handshake(1).await?;
+                h.job = Some(std::sync::Arc::new(
+                    crate::mcp::process::create_kill_job()?,
+                ));
+                Ok(h)
+            })
+        };
+        let names = vec!["a".to_string(), "b".to_string()];
+        let first = bridge
+            .connect_all_with(&names, Duration::from_secs(5), &make)
+            .await;
+        assert!(first.iter().all(|(_, r)| r.is_ok()), "{first:?}");
+        let (a0, b0) = (
+            bridge.job_ptr_of("a").expect("a 必须有 job"),
+            bridge.job_ptr_of("b").expect("b 必须有 job"),
+        );
+        assert_ne!(a0, b0, "每台 server 必须有自己的 job");
+
+        let again = bridge
+            .connect_all_with(&["a".to_string()], Duration::from_secs(5), &make)
+            .await;
+        assert!(again[0].1.is_ok(), "{again:?}");
+        assert_ne!(
+            bridge.job_ptr_of("a"),
+            Some(a0),
+            "重连 a 必须换掉它自己的 job，旧进程树才会被回收"
+        );
+        assert_eq!(
+            bridge.job_ptr_of("b"),
+            Some(b0),
+            "重连 a 不许碰 b 的 job（它的进程树与工具仍然可用）"
+        );
     }
 }

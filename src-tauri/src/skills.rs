@@ -318,9 +318,13 @@ fn skill_file_in(dir: &Path) -> Option<PathBuf> {
 }
 
 fn read_limited(path: &Path, cap: usize) -> std::io::Result<String> {
-    let bytes = std::fs::read(path)?;
-    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(cap)]);
-    Ok(text.into_owned())
+    // 只读到 cap 为止：`fs::read` 会把整份文件搬进内存，一个误放的巨大 SKILL.md
+    // 会在每轮发现阶段被完整读一遍。
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(cap as u64).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 struct Parsed {

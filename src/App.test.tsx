@@ -485,6 +485,59 @@ describe("App", () => {
     expect(screen.queryByText("A 的历史")).toBeNull();
   });
 
+  // A→B→A 快切时，第一次 A 的重放会迟到。只比 sessionId 的实现会把它当成
+  // 「当前会话的合法快照」，覆盖掉第二次 A 已经渲染好的内容。
+  it("drops a stale replay for the same session after a round trip", async () => {
+    h.sessions.mockResolvedValue([row("A", 1), row("B", 2)]);
+    const pendingA: Array<(events: AgentEvent[]) => void> = [];
+    h.replaySession.mockImplementation((id: string) => {
+      if (id === "B") return Promise.resolve([]);
+      return new Promise<AgentEvent[]>((resolve) => {
+        pendingA.push(resolve);
+      });
+    });
+
+    render(<App />);
+    await settled();
+    await waitFor(() => expect(h.replaySession).toHaveBeenCalledWith("B"));
+
+    const clickA = () =>
+      fireEvent.click(
+        within(screen.getByTestId("session-row-A")).getByRole("button", {
+          name: /会话 A/,
+        }),
+      );
+    const clickB = () =>
+      fireEvent.click(
+        within(screen.getByTestId("session-row-B")).getByRole("button", {
+          name: /会话 B/,
+        }),
+      );
+
+    clickA();
+    await waitFor(() => expect(h.replaySession).toHaveBeenCalledTimes(2));
+    clickB();
+    await waitFor(() => expect(h.replaySession).toHaveBeenCalledTimes(3));
+    clickA();
+    await waitFor(() => expect(h.replaySession).toHaveBeenCalledTimes(4));
+    expect(pendingA).toHaveLength(2);
+
+    // 后一次 A 先回来；先回来的那一份就是「迟到」的那一份。
+    act(() =>
+      pendingA[1]([
+        { t: "user_message", blocks: [{ type: "text", text: "新的 A" }] },
+      ]),
+    );
+    expect(await screen.findByText("新的 A")).toBeInTheDocument();
+    act(() =>
+      pendingA[0]([
+        { t: "user_message", blocks: [{ type: "text", text: "过期的 A" }] },
+      ]),
+    );
+    await waitFor(() => expect(screen.queryByText("过期的 A")).toBeNull());
+    expect(screen.getByText("新的 A")).toBeInTheDocument();
+  });
+
   it("shows the token usage the last usage event carried", async () => {
     render(<App />);
     await settled();

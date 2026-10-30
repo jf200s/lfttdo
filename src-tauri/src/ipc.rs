@@ -5,7 +5,7 @@
 // 一轮抽成 `run_turn`），因为 `AppHandle` 在测试里构造不出来 —— 不抽这两层，
 // 这段每次发送都要跑几百次的代码在生产里就永远没有测试。
 use crate::agent::context::{ContextBuilder, ContextConfig};
-use crate::agent::events::{AgentEvent, Decision, EventSink, StopReason};
+use crate::agent::events::{AgentEvent, Decision, ErrorWhere, EventSink, StopReason};
 use crate::agent::memory::{
     MemoryCandidate, MemoryDecision, PROFILE_CHAR_CAP, consolidate_memory, extract_memories,
     merge_profile,
@@ -34,7 +34,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::ipc::InvokeBody;
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WindowEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
+};
 use tokio_util::sync::CancellationToken;
 
 /// 事件通道的 payload（plan:2842 / spec:285 钉死 `{ sessionId, event }`）。
@@ -255,6 +258,8 @@ pub struct AppState {
     pub cancel: Arc<Mutex<Option<CancellationToken>>>,
     /// 正在运行的会话 id —— 单轮并发的唯一凭据。
     pub running: Arc<Mutex<Option<String>>>,
+    /// 上一轮进入过的会话 id：切会话时用它清空「本会话都允许」的授权。
+    pub last_session: Arc<Mutex<Option<String>>>,
     /// 日志文件路径（R107：GUI 没有控制台，路径看不见等于日志不存在）。
     /// 装配期才知道 app data 目录，所以是 `Option`；建不出日志文件时给 `None` 而不是失败。
     pub log_path: Option<PathBuf>,
@@ -295,6 +300,33 @@ fn claim_running(slot: &Arc<Mutex<Option<String>>>, want: &str) -> Result<Runnin
 impl Drop for RunningGuard {
     fn drop(&mut self) {
         *guard(&self.slot) = None;
+    }
+}
+
+/// 进入一轮之前对齐「会话作用域」：**真正开始另一条会话**时，把上一轮的
+/// 「本会话都允许」全部作废。
+///
+/// 语义边界（如实记录）：授权只在发送时被 gate 读取，所以「只点开 B、不在 B 发送」
+/// 不会触发清空 —— 那种情况下第一条会话并没有被另一轮对话取代。这避免了为一次纯浏览
+/// 多发一条 IPC 命令，代价是 A→B→A 且在 B 不发送时授权会保留到下一次发送。
+/// 安全上关键的那一半（server 改成 Block 必须压过旧授权）由 `check` 的优先级保证，
+/// 不依赖这里。
+fn enter_session_scope(
+    last: &Mutex<Option<String>>,
+    gate: &PermissionGate,
+    session_id: &str,
+) {
+    let switched = {
+        let mut slot = guard(last);
+        if slot.as_deref() == Some(session_id) {
+            false
+        } else {
+            *slot = Some(session_id.to_string());
+            true
+        }
+    };
+    if switched {
+        gate.rules().clear_session_rules();
     }
 }
 
@@ -479,6 +511,8 @@ async fn plan_memory_writes_from_candidates(
 ) -> Result<Vec<MemoryWrite>, String> {
     let mut writes: Vec<MemoryWrite> = Vec::new();
     let mut profile_adds: Vec<MemoryCandidate> = Vec::new();
+    // 不在计划层按 id 去重：同一批里「REINFORCE 之后又 INVALIDATE」必须让失效生效。
+    // 重复命中由写入层的宽松版本兜底（0 行只 warn，不回滚整批）。
     for c in candidates {
         // 取消 = 「这一段没有结论」:返回 Err 而不是半截 writes。空闲路径据此
         // 不推进游标;压缩路径在调用方还会再查一次令牌并整段放弃。
@@ -521,6 +555,15 @@ async fn plan_memory_writes_from_candidates(
                 c.into_new_memory(Some(session_id.to_string())),
             )),
             Ok(MemoryDecision::UpdateBody { id, body }) => {
+                // id 必须是本次同键对照集里的行。模型会编序号；放进去的后果是
+                // 改写到无关键的记忆（跨键污染），或者 0 行命中让整个压缩事务回滚。
+                // Reinforce 早就在查同一个判据，这里不能比它宽松。
+                if !existing.iter().any(|r| r.id == id) {
+                    tracing::warn!(
+                        "会话 {session_id} 的记忆合并返回了不属于当前同键集的 id={id},跳过该条候选"
+                    );
+                    continue;
+                }
                 if protected.contains(&id) {
                     // 用户权威优先于系统自洽:改写被降级成「并存」,用户自己决定删哪条。
                     tracing::info!(
@@ -534,6 +577,12 @@ async fn plan_memory_writes_from_candidates(
                 }
             }
             Ok(MemoryDecision::Invalidate { id }) => {
+                if !existing.iter().any(|r| r.id == id) {
+                    tracing::warn!(
+                        "会话 {session_id} 的记忆合并返回了不属于当前同键集的 id={id},跳过该条候选"
+                    );
+                    continue;
+                }
                 if protected.contains(&id) {
                     // 失效同样不动保护行:新候选入库,旧行保持有效。
                     tracing::info!(
@@ -553,13 +602,13 @@ async fn plan_memory_writes_from_candidates(
             // 查不到只 warn + 跳过该候选,压缩照常。
             // T16:指向保护行**允许** —— REINFORCE 不改正文,只加确认计数。
             Ok(MemoryDecision::Reinforce { id }) => {
-                if existing.iter().any(|r| r.id == id) {
-                    writes.push(MemoryWrite::Reinforce { id });
-                } else {
+                if !existing.iter().any(|r| r.id == id) {
                     tracing::warn!(
                         "会话 {session_id} 的记忆合并返回了不存在的 id={id},跳过该条候选"
                     );
+                    continue;
                 }
+                writes.push(MemoryWrite::Reinforce { id });
             }
             Err(reason) => {
                 tracing::warn!("会话 {session_id} 的记忆合并失败,跳过该条候选:{reason}");
@@ -787,21 +836,42 @@ pub(crate) async fn extract_session_memories(
     // 「读了游标、取了行」之间出现一段既不在行里也不在游标之前的空洞。
     let reader = db.clone();
     let read_sid = session_id.to_string();
-    let rows = blocking(move || {
+    let (rows, max_id) = blocking(move || {
         let cursor = reader
             .memory_cursor(&read_sid)
             .map_err(|e| format!("读取抽取游标失败:{e}"))?;
+        // 行集与 max(id) 必须同一把锁：分开读会让并发 append 落在两次读之间，
+        // 「全部处理完」的分支把游标推到含新消息的 max(id)，那条文本就永久漏抽。
         reader
-            .messages_for_extraction(&read_sid, cursor)
+            .extraction_batch(&read_sid, cursor)
             .map_err(|e| format!("读取待抽取消息失败:{e}"))
     })
     .await?;
     if rows.is_empty() {
+        // 尾部只剩工具结果 / system / 无文本行时，行集为空但 max(id) 仍然更大。
+        // 不推游标，`sessions_needing_extraction` 会每个 60s tick 都返回这条会话，
+        // 后台永远空转（还会每 tick 构造一次模型客户端去读 keyring）。
+        if max_id > 0 {
+            let writer = db.clone();
+            let write_sid = session_id.to_string();
+            blocking(move || {
+                writer
+                    .apply_memories_and_advance_cursor(&write_sid, &[], max_id)
+                    .map_err(|e| format!("推进抽取游标失败:{e}"))
+            })
+            .await?;
+        }
         return Ok(0);
     }
     // 上限之外的部分留给下一个 tick:游标只推进到**实际送进模型**的最后一条。
     let take = rows.len().min(MAX_IDLE_EXTRACT_MESSAGES);
-    let upto_id = rows[take - 1].0;
+    // 所有可抽取行都送进去了 ⇒ 游标推到 max(id)，把夹在中间的不可抽取行一起跨过；
+    // 否则只推到实际送出的最后一条，下一 tick 继续。
+    let upto_id = if take == rows.len() {
+        max_id
+    } else {
+        rows[take - 1].0
+    };
     let source: Vec<Message> = rows.into_iter().take(take).map(|(_, m)| m).collect();
 
     // 抽取失败 → `?` 冒泡,游标不动(见函数文档)。空 candidates 是**成功**的
@@ -1218,6 +1288,17 @@ pub async fn run_turn(
 
     // 构建器只在这里造一次（②），压缩段与本轮用的是同一个。
     let mut builder = ContextBuilder::new(context);
+    // 工具声明不进消息但进请求体：按**真正会发出去的那一批**估算（read_file 在
+    // roots 为空时、use_skill 在无启用技能时会被 request() 隐藏），与 request()
+    // 共用同一个过滤函数。否则估算虚高 → 校准系数偏低 → 预算越放越宽。
+    let roots_for_estimate = effective_roots(&roots);
+    let tool_defs = crate::agent::session::tool_defs_for_turn(
+        &registry,
+        &roots_for_estimate,
+        skills_dir.as_deref(),
+        &skills_disabled,
+    );
+    builder.set_tool_tokens(crate::agent::context::tool_defs_tokens(&tool_defs));
 
     // 摘要调用挂在流上的那几秒也必须能被「停止」打到，所以先把**这一只**令牌装进槽位。
     // `AgentSession::new` 自己造令牌（`session.rs:74`）且不接受外来的，只能先装这只、
@@ -1323,6 +1404,10 @@ pub async fn run_turn(
     // ①：这一行必须在压缩段之后，量的才是「restore 回来的那份历史」。
     let prior = history.len();
 
+    // `Done` 的发送权在这一轮归这里：会话进入 defer 模式，等落库成功后再发。
+    // 这样「界面显示完成、库里没有这一轮」的窗口不存在（messages 是唯一真相源）。
+    let finish_sink = sink.clone();
+
     // R105：装配期没有 session_id，所以 gate 的出口每轮换一次内核（`gate.rs:77`）。
     gate.set_sink(sink.clone());
 
@@ -1342,9 +1427,12 @@ pub async fn run_turn(
     // （R276 的「每轮从 `Settings` 现取、不缓存」因此更硬了：今天的答案只在今天有效）。
     // 过滤仍然**只此一处** —— `settings.rs::effective_roots` 是它的唯一实现，本行是它唯一的
     // 生产调用点；第二处过滤意味着两处答案可以不一致，那正是 R276 把它钉成一条线的原因。
+    // 闸门用的 roots 仍然在压缩之后现算（R276 的「每轮现取」语义不变）；
+    // 上面那份只是估算工具声明用的快照，不参与授权。
     .with_roots(effective_roots(&roots))
     .with_skills_dir(skills_dir)
     .with_skills_disabled(skills_disabled);
+    session.defer_done();
     let session_cancel = session.cancel_handle();
     token.install(session_cancel.clone());
     if compaction.is_cancelled() {
@@ -1360,21 +1448,45 @@ pub async fn run_turn(
     let fresh = session.history()[prior..].to_vec();
     let writer = db.clone();
     let write_sid = sid.clone();
-    blocking(move || append_rows(&writer, &write_sid, &fresh).map_err(|e| e.to_string())).await?;
+    match blocking(move || {
+        append_rows(&writer, &write_sid, &fresh).map_err(|e| e.to_string())
+    })
+    .await
+    {
+        Ok(()) => {}
+        Err(reason) => {
+            // 落库失败 = 这一轮没有真相。先把界面收口（fatal + Done），再把错误交给
+            // 调用方：不能先发 Done 再报错，否则 UI 已经宣称完成而库里什么都没有。
+            let message = format!("本轮写入数据库失败：{reason}");
+            finish_sink.emit(AgentEvent::Error {
+                at: ErrorWhere::Store,
+                message: message.clone(),
+                fatal: true,
+            });
+            finish_sink.emit(AgentEvent::Done {
+                stop_reason: StopReason::Error,
+            });
+            return Err(message);
+        }
+    }
 
+    // 自动改名是**附带**行为：它失败不能让一次已经落库的发送整体失败
+    // （否则前端会回滚用户气泡，而这一轮其实已经存下来了）。
     let typer = db.clone();
     let title_sid = sid.clone();
-    blocking(move || auto_title(&typer, &title_sid).map_err(|e| e.to_string())).await?;
+    if let Err(reason) = blocking(move || auto_title(&typer, &title_sid).map_err(|e| e.to_string())).await
+    {
+        tracing::warn!("会话 {sid} 自动改名失败（本轮已落库，不影响发送结果）：{reason}");
+    }
 
+    finish_sink.emit(AgentEvent::Done { stop_reason: reason });
     Ok(reason)
 }
 
 /// R103 落库的唯一入口（一轮的新行按顺序追加）。同步 SQLite，调用方负责 `spawn_blocking`。
+/// 事务在 `Db::append_messages` 里：中途失败不会留下半轮历史。
 fn append_rows(db: &Db, session_id: &str, rows: &[Message]) -> Result<(), rusqlite::Error> {
-    for m in rows {
-        db.append_message(session_id, m)?;
-    }
-    Ok(())
+    db.append_messages(session_id, rows)
 }
 
 /// R104：自动改名**只**在标题仍是默认「新对话」时发生。brief:161-163 的无条件
@@ -1468,6 +1580,9 @@ pub async fn send_message(
         Arc::new(AppPublisher { app }),
         session_id.clone(),
     ));
+    // 会话作用域在**真正开跑**之前对齐：配置/凭据失败的那次发送没有开跑，
+    // 不该顺手清掉上一轮用户答过的授权。
+    enter_session_scope(&state.last_session, &state.gate, &session_id);
     let out = run_turn(
         TurnDeps {
             db: state.db.clone(),
@@ -1521,6 +1636,13 @@ pub fn interrupt(state: State<'_, AppState>) -> Result<(), String> {
         token.cancel();
     }
     Ok(())
+}
+
+/// 打开外部链接。前端不直接导航 WebView（那会让应用页面被远程页替换）；
+/// 协议白名单与「不经过 shell」的落点都在 [`crate::external_link`]。
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), String> {
+    crate::external_link::open_external(&url)
 }
 
 /// 前端把权限决定递回来。`Decision` 的形状由 `events.rs` 里**手写**的 `impl Deserialize`
@@ -1578,6 +1700,9 @@ pub fn mcp_set_trust_of(
 ) -> Result<(), String> {
     let verdict = parse_trust(trust)?;
     gate.rules().set_server_trust(name, verdict);
+    // 信任档变了，这一台 server 的会话级旧授权不能继续作数（尤其是改成 Block 时）。
+    // 只清这一台：改 MCP 信任不该把内置工具的授权也一起收回。
+    gate.rules().clear_session_rules_for_server(name);
     crate::mcp::trust::save(dir, &gate.rules().trust_snapshot())
 }
 
@@ -2300,12 +2425,11 @@ fn work_area(monitor: &tauri::Monitor) -> (i32, i32, u32, u32) {
     )
 }
 
-/// T46b：按存档几何恢复窗口。**任何一步不成立就退回 conf 里的默认尺寸**，
+/// T46b：按存档几何恢复窗口。**任何一步不成立就退回创建时的默认尺寸**，
 /// 全程不许 panic —— 一个存坏的 `window.json` 不该有能力让应用打不开。
 fn restore_window_geometry(handle: &AppHandle) {
-    // conf 里的窗口是在 `setup` 钩子**之前**创建的（`tauri-2.12.4/src/app.rs:2692` 的
-    // `WebviewWindowBuilder::from_config`），所以到这里才拿得到 `main`。
-    // 这也是 Plan A 写死的那个 `"label": "main"` 第一次真的有消费者。
+    // 窗口在 `setup` 里由 `WebviewWindowBuilder` 创建（为了 `on_navigation`），
+    // 位置就在本函数调用之前；`label` 仍是 "main"，与 capabilities 对得上。
     let Some(window) = handle.get_webview_window("main") else {
         return;
     };
@@ -2652,6 +2776,7 @@ pub fn run() {
                 gate,
                 cancel: Arc::new(Mutex::new(None)),
                 running: Arc::new(Mutex::new(None)),
+                last_session: Arc::new(Mutex::new(None)),
                 log_path,
                 // T35：桥在装配期建好（此时不 spawn 任何进程，`connect_all` 才连）；
                 // `mcp_dir` 就是 `mcp.json` 所在的 app data 目录。
@@ -2690,6 +2815,15 @@ pub fn run() {
             );
             // T46b：几何恢复放在 `manage` 之后、`Ok(())` 之前——`app_data_dir()` 与
             // `create_dir_all` 已经在前头跑过，存档目录这时一定存在。
+            // 主窗口从 conf 搬到这里创建：只有 `WebviewWindowBuilder` 能挂
+            // `on_navigation`。白名单只放行应用自身来源与开发服务器；Markdown
+            // 链接、拖拽、右键菜单等任何想把顶层页面导航到外部站点的路径都会
+            // 在这里被拒，页面留在应用里。
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                .title("LFTTDO")
+                .inner_size(800.0, 600.0)
+                .on_navigation(crate::web_guard::navigation_allowed)
+                .build()?;
             restore_window_geometry(app.handle());
             Ok(())
         })
@@ -2716,6 +2850,7 @@ pub fn run() {
             send_message,
             respond,
             interrupt,
+            open_url,
             session_list,
             session_create,
             session_rename,
@@ -2741,19 +2876,13 @@ pub fn run() {
             skills_open_folder,
             skills_set_enabled,
         ])
-        // R108 / T18 m2 —— `tauri.conf.json` 里那句 `"label": "main"` 的理由（R108 要求每处
-        // conf 改动写清理由，而这份 conf 里放不下理由，原因写在下面）：
-        // 默认 label 本来就是 `main`，这行显式改动**冗余无害**，留着它的价值在于
-        // `capabilities/default.json` 的 `"windows": ["main"]` 是按 **label** 指名窗口的 ——
-        // label 写死在 conf 里，「主窗口叫什么」就只有一份答案，不用去赌某个依赖版本的默认值。
-        // 为什么理由落在 Rust 里而不是 conf 里（实测两次 `cargo check` 均 rc=101）：这份 conf 由
-        // `tauri-build` 的 build script 在编译期解析，`//` 注释得到 `key must be a string at
-        // line 15 column 9`，自由字段 `"_comment"` 得到 `unknown field _comment` —— JSON 里没有
-        // 任何合法的注释位。红线：交出去的 conf 必须能被解析（`cargo check` rc=0 为准）。
-        // T46b 之后 conf 里那两行 `"width": 800, "height": 600` **保留**，它的身份是
-        // 「没有存档时的尺寸」：删掉它换到的是 Tauri 自己的默认尺寸，那才是第三份真相
-        //（存档 / conf / 框架默认），而 `window_state::sane` 丢掉一份越界存档之后
-        // 落到的正是这一行。
+        // R108 / T18 m2 —— `capabilities/default.json` 的 `"windows": ["main"]` 按
+        // **label** 指名窗口。主窗口现在在 `setup` 里由 `WebviewWindowBuilder` 创建
+        // （为了挂 `on_navigation`），label 仍写死为 "main"；两处任一改名都会让权限表
+        // 对不上。默认尺寸 800×600 也跟着搬到了那里 —— 没有存档时
+        // `window_state::sane` 落到的就是这份默认值。
+        // 为什么说明落在 Rust 里而不是 conf 里：conf 由 tauri-build 在编译期解析，
+        // JSON 没有合法的注释位，任何注释/自由字段都会让 `cargo check` rc=101。
         .run(tauri::generate_context!())
         .expect("error while running qwen-do");
 }
@@ -2763,6 +2892,28 @@ mod tests {
     use super::*;
     use crate::agent::types::{Risk, ToolCallView};
     use serde_json::json;
+
+    /// 一个描述超大的只读工具：只为把工具声明推过预算，不参与调用。
+    struct BigSchemaTool;
+
+    #[async_trait]
+    impl Tool for BigSchemaTool {
+        fn meta(&self) -> ToolMeta {
+            ToolMeta {
+                name: "big_schema".to_string(),
+                description: "a".repeat(16_000),
+                input_schema: json!({"type": "object"}),
+                risk: Risk::Read,
+            }
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("ok"))
+        }
+    }
 
     /// 测试用的出口：把 payload 记在账上，不发往任何 tauri 对象。
     #[derive(Default)]
@@ -3638,6 +3789,10 @@ mod tests {
         extraction_fails: bool,
         /// 记忆合并那一支的回复(只有存在同键冲突的测试会配;默认空串=模型答非所问→跳过)。
         consolidation_parts: Vec<String>,
+        /// 多个候选时按调用顺序逐条取用；空队列回落到 `consolidation_parts`。
+        /// 两个合并调用共用一个 `consolidation_parts` 会把两段 JSON 拼在一起 ⇒ 都解析失败,
+        /// 多候选测试会假绿。
+        consolidation_queue: Mutex<VecDeque<String>>,
         /// 画像归并那一支的回复(只有抽取产出 profile 候选的测试会配;默认空串=Err→保持现状)。
         profile_parts: Vec<String>,
         /// 本轮回答的队列（只有走 `run_turn` 的那条测试用得到）
@@ -3657,6 +3812,7 @@ mod tests {
                 extraction_stalls: false,
                 extraction_fails: false,
                 consolidation_parts: vec![String::new()],
+                consolidation_queue: Mutex::new(VecDeque::new()),
                 profile_parts: vec![String::new()],
                 replies: Mutex::new(answers.iter().map(|s| s.to_string()).collect()),
                 calls: Mutex::new(vec![]),
@@ -3707,6 +3863,12 @@ mod tests {
         fn with_consolidation(mut raw: Arc<Self>, parts: &[&str]) -> Arc<Self> {
             Arc::get_mut(&mut raw).unwrap().consolidation_parts =
                 parts.iter().map(|s| s.to_string()).collect();
+            raw
+        }
+        /// 多候选场景：每次合并调用取队首的一条，而不是把整段拼给每一次调用。
+        fn with_consolidation_queue(mut raw: Arc<Self>, parts: &[&str]) -> Arc<Self> {
+            Arc::get_mut(&mut raw).unwrap().consolidation_queue =
+                Mutex::new(parts.iter().map(|s| s.to_string()).collect());
             raw
         }
         fn with_profile(mut raw: Arc<Self>, parts: &[&str]) -> Arc<Self> {
@@ -3815,7 +3977,11 @@ mod tests {
                     Box::pin(futures::stream::iter(one_shot(&self.extraction_parts)))
                 }
                 Some(CONSOLIDATE_INSTRUCTION) => {
-                    Box::pin(futures::stream::iter(one_shot(&self.consolidation_parts)))
+                    if let Some(next) = self.consolidation_queue.lock().unwrap().pop_front() {
+                        Box::pin(futures::stream::iter(vec![Ok(ModelDelta::Text(next))]))
+                    } else {
+                        Box::pin(futures::stream::iter(one_shot(&self.consolidation_parts)))
+                    }
                 }
                 Some(PROFILE_INSTRUCTION) => {
                     Box::pin(futures::stream::iter(one_shot(&self.profile_parts)))
@@ -4288,6 +4454,50 @@ mod tests {
             short,
             "不压时库里一个字都不动"
         );
+    }
+
+    /// 落库失败：整轮必须回滚、`Error{fatal}` 先于 `Done{Error}`、命令返回 Err。
+    /// 这就是 `defer_done` 的存在理由 —— 先发 Done 再报错会让界面宣称完成，
+    /// 而库里一行都没有。
+    #[tokio::test]
+    async fn a_failed_append_leaves_no_partial_rows_and_emits_error_before_done() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        // 第二个连接建触发器：只要 blocks_json 里出现标记就 ABORT 这次 INSERT。
+        let conn = rusqlite::Connection::open(f._dir.path().join("qwen-do.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON messages \
+             WHEN NEW.blocks_json LIKE '%落库失败标记%' \
+             BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        )
+        .unwrap();
+
+        let model = FakeModel::summarizing_and_replying(&[], &["落库失败标记"]);
+        let (result, frames) = f.turn(&sid, model, "这一轮不该留在库里").await;
+        assert!(result.is_err(), "落库失败必须让这一轮返回 Err");
+        assert!(
+            f.db.messages(&sid).unwrap().is_empty(),
+            "append 是单事务：user 行也必须跟着回滚"
+        );
+
+        let err_at = frames
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    AgentEvent::Error {
+                        at: ErrorWhere::Store,
+                        fatal: true,
+                        ..
+                    }
+                )
+            })
+            .expect("必须发一条 fatal 的 Store 错误");
+        let done_at = frames
+            .iter()
+            .rposition(|e| matches!(e, AgentEvent::Done { stop_reason: StopReason::Error }))
+            .expect("必须发 Done{Error} 收口");
+        assert!(err_at < done_at, "错误必须先于 Done：{frames:?}");
     }
 
     /// Step 6.3 的判据，也是本组**唯一**走 `run_turn` 的一条。
@@ -7184,6 +7394,76 @@ mod tests {
         assert!(registry.get(&registered[0].name).is_none());
     }
 
+    /// `run_turn` 必须把**工具声明的粗估**交给 ContextBuilder。删掉那行接线，
+    /// 带 tool 的请求会留下和不带 tool 时一样多的历史，这条就红。
+    /// 历史是连续 4 条 user（= 1 轮），所以压缩计划的 batch 够不到下限：
+    /// 测的纯粹是滑窗预算，不是压缩。
+    #[tokio::test]
+    async fn run_turn_counts_tool_declarations_against_the_budget() {
+        async fn last_request_len(with_tool: bool) -> usize {
+            let f = Fixture::new();
+            if with_tool {
+                f.registry.register(Arc::new(BigSchemaTool));
+            }
+            let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+            let hist: Vec<Message> = (0..4)
+                .map(|i| {
+                    Message::user(vec![ContentBlock::Text {
+                        text: format!("{}{i}", "测".repeat(1_000)),
+                    }])
+                })
+                .collect();
+            seed(&f.db, &sid, &hist);
+            let model = FakeModel::summarizing_and_replying(&[], &["ok"]);
+            let rec = Arc::new(Recorded::default());
+            let sink = Arc::new(TauriEmitter::new(rec, sid.clone()));
+            let reason = run_turn(
+                TurnDeps {
+                    db: f.db.clone(),
+                    registry: f.registry.clone(),
+                    gate: f.gate.clone(),
+                    model: model.clone(),
+                    sink: sink.clone(),
+                    context: ContextConfig {
+                        budget_tokens: 3_000,
+                        reserve_output: 0,
+                        window_messages: 40,
+                        ..Default::default()
+                    },
+                    temperature: None,
+                    roots: Vec::new(),
+                    skills_dir: None,
+                    skills_disabled: Vec::new(),
+                    memory: MemoryTurnCfg::default(),
+                    embed: None,
+                    extract_locks: ExtractLocks::default(),
+                    cancel: f.cancel.clone(),
+                },
+                &sid,
+                vec![ContentBlock::Text {
+                    text: "这一轮的问话".into(),
+                }],
+            )
+            .await
+            .expect("一轮必须成功");
+            sink.flush();
+            assert_eq!(reason, StopReason::EndTurn);
+            model
+                .calls()
+                .last()
+                .expect("模型必须收到请求")
+                .messages
+                .len()
+        }
+
+        let plain = last_request_len(false).await;
+        let tooled = last_request_len(true).await;
+        assert!(
+            tooled < plain,
+            "工具声明的 token 必须进预算：plain={plain} tooled={tooled}"
+        );
+    }
+
     // ==== T15(P0)：抽取触发（空闲 tick / 切换会话） ====
 
     /// 测试专用的一条用户消息。抽取源只认带文本的对话行。
@@ -7289,6 +7569,77 @@ mod tests {
         let all = extraction_requests(&model);
         assert_eq!(all.len(), 2);
         assert_eq!(all[1].messages.len(), 6, "指令 + 剩下的 5 条");
+    }
+
+    /// 可抽取行全部处理完后，游标要跨过尾部那些**不可抽取**的行（工具结果等）。
+    /// 只推到「最后一条可抽取行」会让 `max(id) > cursor` 永远成立，这条会话每个
+    /// 60s tick 都会被重新查一遍，后台永久空转。
+    #[tokio::test]
+    async fn an_unextractable_tail_advances_the_cursor_instead_of_rescanning_forever() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.append_message(&sid, &user_says("我住在北京")).unwrap();
+        f.db.append_message(
+            &sid,
+            &Message::tool(
+                "c1",
+                crate::agent::types::ToolOutput::text("工具输出不是对话"),
+                false,
+            ),
+        )
+        .unwrap();
+        let model = FakeModel::extracting(&["[]"], &[]);
+
+        let changed = extract_session_memories(
+            &f.db,
+            &sid,
+            &*model,
+            &MemoryTurnCfg::default(),
+            None,
+            &ExtractLocks::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("抽取成功");
+        assert_eq!(changed, 0, "空候选 = 这次没什么可记");
+        assert_eq!(
+            f.db.memory_cursor(&sid).unwrap(),
+            2,
+            "游标必须跨过尾部那条工具结果，推到 max(id)"
+        );
+        assert_eq!(model.calls().len(), 1, "可抽取的那一条仍然送模型");
+    }
+
+    /// 整段都不可抽取（例如会话只有工具结果）：不构造抽取调用，但游标也要推过去。
+    #[tokio::test]
+    async fn a_session_with_nothing_extractable_advances_the_cursor_without_a_model_call() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.append_message(
+            &sid,
+            &Message::tool(
+                "c1",
+                crate::agent::types::ToolOutput::text("只有工具结果"),
+                false,
+            ),
+        )
+        .unwrap();
+        let model = FakeModel::extracting(&["[]"], &[]);
+
+        let changed = extract_session_memories(
+            &f.db,
+            &sid,
+            &*model,
+            &MemoryTurnCfg::default(),
+            None,
+            &ExtractLocks::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("空行集是成功");
+        assert_eq!(changed, 0);
+        assert_eq!(f.db.memory_cursor(&sid).unwrap(), 1);
+        assert!(model.calls().is_empty(), "没有可抽取行时不许调用模型");
     }
 
     /// T15 与压缩路径**取向相反**的那条：抽取失败时游标不动，下一个 tick 重试。
@@ -7410,6 +7761,27 @@ mod tests {
         );
     }
 
+    /// 「本会话都允许」必须跟着会话走：同一会话的两次发送不清，切到另一条会话才清。
+    #[test]
+    fn session_scope_rules_are_cleared_when_the_session_changes() {
+        let gate = PermissionGate::new();
+        let last = Mutex::new(None);
+
+        enter_session_scope(&last, &gate, "A");
+        gate.rules().remember_session("read_file|read");
+        enter_session_scope(&last, &gate, "A");
+        assert!(
+            gate.rules().lookup("read_file|read").is_some(),
+            "同一会话内不许清掉用户答过的授权"
+        );
+
+        enter_session_scope(&last, &gate, "B");
+        assert!(
+            gate.rules().lookup("read_file|read").is_none(),
+            "切到另一条会话必须清掉上一会话的授权"
+        );
+    }
+
     // ==== T16(P0)：user_edited 保护 ====
 
     /// 种一条**用户改过**的记忆。先按模型路径落一行（必须有 subject+predicate，
@@ -7480,6 +7852,154 @@ mod tests {
         assert!(
             valid.iter().any(|r| r.body == "用户搬到上海"),
             "新候选必须并存入库：{valid:?}"
+        );
+    }
+
+    /// 模型返回的 id 属于**另一条键**的真实记忆：跳过候选，不写库，
+    /// 也不许把整个压缩事务拖回滚。用真实 id 而不是 999 —— 「只要 id 在库中存在」的
+    /// 弱实现能骗过伪造 id，但骗不过这一条。
+    #[tokio::test]
+    async fn a_consolidation_id_outside_the_same_key_set_is_skipped() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let add = |predicate: &str, object: &str, body: &str| NewMemory {
+            session_id: Some(sid.clone()),
+            kind: "fact".into(),
+            subject: Some("用户".into()),
+            predicate: Some(predicate.into()),
+            object: Some(object.into()),
+            body: body.into(),
+            confidence: 0.95,
+            due_at: None,
+        };
+        let beijing = f
+            .db
+            .apply_memories_and_advance_cursor(
+                &sid,
+                &[MemoryWrite::Add(add("住在", "北京", "用户住在北京"))],
+                0,
+            )
+            .unwrap()[0];
+        let other = f
+            .db
+            .apply_memories_and_advance_cursor(
+                &sid,
+                &[MemoryWrite::Add(add("喜欢", "咖啡", "用户喜欢咖啡"))],
+                0,
+            )
+            .unwrap()[0];
+        assert_ne!(beijing, other, "两条记忆必须是不同的行");
+
+        let model = FakeModel::with_consolidation_queue(
+            FakeModel::extracting(
+                // 两个候选必须在**同一个 JSON 数组**里；拆成两段会让抽取解析失败，
+                // 测试就会因为「零候选」而假绿。
+                &[&format!(
+                    "[{},{}]",
+                    fact_candidate("上海", "用户搬到上海"),
+                    fact_candidate("杭州", "用户搬到杭州")
+                )],
+                &[],
+            ),
+            &[
+                &format!(r#"{{"action":"UPDATE","id":{other},"body":"被跨键改写"}}"#),
+                &format!(r#"{{"action":"INVALIDATE","id":{other}}}"#),
+            ],
+        );
+        let writes = plan_memory_writes_for_source(
+            &f.db,
+            &sid,
+            &*model,
+            &[user_says("我搬家了")],
+            500,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("抽取与两次合并都必须成功（否则「零写入」可能只是夹具坏了）");
+        assert_eq!(
+            model.calls().len(),
+            3,
+            "一次抽取 + 两个候选各一次合并；少于三条说明管线根本没跑到合并"
+        );
+        assert!(
+            writes.is_empty(),
+            "不属于同键集的 id 必须被跳过，而不是写进事务：{writes:?}"
+        );
+        // 真正的回归点：这些写入交给事务时不许报错（0 行命中会回滚整次压缩）。
+        f.db.apply_memories_and_advance_cursor(&sid, &writes, 1)
+            .expect("被跳过的候选不许让事务失败");
+        let valid = f.db.valid_memories().unwrap();
+        assert_eq!(valid.len(), 2, "两条记忆都必须还在：{valid:?}");
+        let coffee = valid.iter().find(|r| r.id == other).expect("咖啡那条");
+        assert_eq!(coffee.body, "用户喜欢咖啡", "跨键行不许被改写");
+        let bj = valid.iter().find(|r| r.id == beijing).expect("北京那条");
+        assert_eq!(bj.body, "用户住在北京");
+    }
+
+    /// 两个同键候选都判同一行 INVALIDATE：两条决定都要保留（计划层不按 id 去重），
+    /// 但写入层必须把第二条的 0 行命中当幂等，而不是回滚整次压缩。
+    #[tokio::test]
+    async fn duplicate_invalidate_for_one_id_is_idempotent() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let id = f
+            .db
+            .apply_memories_and_advance_cursor(
+                &sid,
+                &[MemoryWrite::Add(NewMemory {
+                    session_id: Some(sid.clone()),
+                    kind: "fact".into(),
+                    subject: Some("用户".into()),
+                    predicate: Some("住在".into()),
+                    object: Some("北京".into()),
+                    body: "用户住在北京".into(),
+                    confidence: 0.95,
+                    due_at: None,
+                })],
+                0,
+            )
+            .unwrap()[0];
+        let model = FakeModel::with_consolidation_queue(
+            FakeModel::extracting(
+                &[&format!(
+                    "[{},{}]",
+                    fact_candidate("上海", "用户搬到上海"),
+                    fact_candidate("杭州", "用户搬到杭州")
+                )],
+                &[],
+            ),
+            &[
+                &format!(r#"{{"action":"INVALIDATE","id":{id}}}"#),
+                &format!(r#"{{"action":"INVALIDATE","id":{id}}}"#),
+            ],
+        );
+        let writes = plan_memory_writes_for_source(
+            &f.db,
+            &sid,
+            &*model,
+            &[user_says("我搬家了")],
+            500,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("抽取与两次合并都必须成功");
+        assert_eq!(model.calls().len(), 3, "一次抽取 + 两次合并");
+        assert_eq!(
+            writes.len(),
+            2,
+            "计划层不许吞掉第二条决定（否则 REINFORCE 之后的 INVALIDATE 会丢）：{writes:?}"
+        );
+        assert!(
+            writes
+                .iter()
+                .all(|w| matches!(w, MemoryWrite::Invalidate { id: got } if *got == id)),
+            "两条都必须是针对同一行的失效：{writes:?}"
+        );
+        f.db.apply_memories_and_advance_cursor(&sid, &writes, 1)
+            .expect("重复失效必须幂等：0 行命中不许回滚整批");
+        assert!(
+            f.db.valid_memories().unwrap().is_empty(),
+            "那一条必须已经失效"
         );
     }
 

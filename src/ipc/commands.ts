@@ -47,6 +47,9 @@ export const respond = (requestId: string, decision: Decision) =>
 /** 打断当前这一轮。令牌一次性（R63），打不到正在跑的轮次也是 Ok。 */
 export const interrupt = () => invoke("interrupt");
 
+/** 打开外部链接；协议白名单在 Rust 侧（只允许 http/https），前端不直接导航 WebView。 */
+export const openUrl = (url: string) => invoke("open_url", { url });
+
 /** 会话列表。线上键是 `updated_at`（db.rs:239-246 无 `rename_all`，R128）——写错不会报错，只会静默乱序。 */
 export const sessions = () => invoke<SessionRow[]>("session_list");
 export const createSession = () => invoke<string>("session_create");

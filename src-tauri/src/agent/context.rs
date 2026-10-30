@@ -88,6 +88,9 @@ pub struct ContextBuilder {
     /// `compaction_plan` **看不见**它们(压缩判定跑在备注装配之前,时序见 ipc.rs
     /// 的 run_turn)—— 有意的已知漂移:备注有独立上限,量级远小于阈值留的 15% 余量。
     memory_notes: Vec<String>,
+    /// 本轮工具声明的粗估 token（name + description + input_schema）。工具声明不进
+    /// `messages`，但**进请求体**：不计入就会系统性低估，MCP 工具多时压缩触发太晚。
+    tool_tokens: usize,
 }
 
 impl ContextBuilder {
@@ -96,6 +99,7 @@ impl ContextBuilder {
             cfg,
             calibration: 1.0,
             memory_notes: Vec::new(),
+            tool_tokens: 0,
         }
     }
 
@@ -103,6 +107,12 @@ impl ContextBuilder {
     /// 空表 = 无记忆,行为与从未调用过逐字节一致(有测试钉着)。
     pub fn set_memory_notes(&mut self, notes: Vec<String>) {
         self.memory_notes = notes;
+    }
+
+    /// 装入本轮工具声明的粗估 token（由装配点按同一份注册表算出）。
+    /// 默认 0 = 没有工具声明，行为与旧版本逐字节一致。
+    pub fn set_tool_tokens(&mut self, tokens: usize) {
+        self.tool_tokens = tokens;
     }
 
     /// 用真实 usage 校准粗估系数：**factor 的语义是 `真实 ÷ 粗估`**，
@@ -205,7 +215,9 @@ impl ContextBuilder {
             // 单张 base64 上限 5 MB（`image_prep.rs` 的 `MAX_BASE64_BYTES`）—— 最多 40 轮
             // × 十几 MB 就是几百 MB 级的纯 memcpy，还发生在第一个字节出门之前。
             // 两者数值相等（相加性，见上），所以出口只需 clone 一次。
-            let est = ((head_est + estimate_tokens(&conversational[start..])) as f64
+            // 工具声明与消息一起乘校准系数：它同样是真的会发出去的输入 token。
+            let est = ((head_est + estimate_tokens(&conversational[start..]) + self.tool_tokens)
+                as f64
                 * self.calibration) as usize;
             // `keep <= 1` 而非 `keep == 1`：keep 可以是 0（空历史、window_messages: 0、
             // 或 budget_tokens: 0），此时 `keep -= 1` 会 usize 下溢并在 debug 直接 panic。
@@ -223,6 +235,19 @@ impl ContextBuilder {
             keep -= 1;
         }
     }
+}
+
+/// 工具声明的粗估：每个声明按 name + description + 序列化后的 schema 计字，
+/// 再加一份消息级结构开销。工具不进 `messages`，但一定进请求体。
+pub fn tool_defs_tokens(defs: &[crate::model::provider::ToolDef]) -> usize {
+    defs.iter()
+        .map(|d| {
+            MSG_TOKEN_OVERHEAD
+                + text_tokens(&d.name)
+                + text_tokens(&d.description)
+                + text_tokens(&d.input_schema.to_string())
+        })
+        .sum()
 }
 
 pub fn estimate_tokens(msgs: &[Message]) -> usize {
@@ -418,6 +443,9 @@ impl ContextBuilder {
         let mut raw = estimate_tokens(&[Message::system_note(SYSTEM_PROMPT)]);
         raw += notes.iter().map(|m| estimate_one(m)).sum::<usize>();
         raw += conv.iter().map(|m| estimate_one(m)).sum::<usize>();
+        // 工具声明同样占输入预算；压缩判定必须看见它，否则大 schema 下「估算没超、
+        // 实际已经超」会一直拖到端点 400。
+        raw += self.tool_tokens;
         let calibration = if self.calibration.is_finite() {
             self.calibration
         } else {
@@ -926,6 +954,36 @@ mod tests {
             built.est_input_tokens,
             estimate_tokens(&built.messages) as u32,
             "est 与实际发出的消息对不上"
+        );
+    }
+
+    /// 工具声明要同时进「估算」和「裁剪判据」：只进估算不进判据的话，
+    /// 估算超线但一条消息都不裁，请求照样超预算。
+    #[test]
+    fn tool_declarations_count_against_the_budget_and_the_estimate() {
+        let cfg = || ContextConfig {
+            reserve_output: 100,
+            budget_tokens: 1_000,
+            window_messages: 40,
+            ..Default::default()
+        };
+        let hist: Vec<Message> = (0..8)
+            .map(|i| u(&("测".repeat(280) + &format!(" {i}"))))
+            .collect();
+        let plain = ContextBuilder::new(cfg()).build(&hist);
+        let mut with_tools = ContextBuilder::new(cfg());
+        with_tools.set_tool_tokens(400);
+        let tooled = with_tools.build(&hist);
+        assert!(
+            tooled.messages.len() < plain.messages.len(),
+            "400 token 的工具声明必须让裁剪提前：plain={} tooled={}",
+            plain.messages.len(),
+            tooled.messages.len()
+        );
+        assert_eq!(
+            tooled.est_input_tokens,
+            estimate_tokens(&tooled.messages) as u32 + 400,
+            "est 必须包含工具声明"
         );
     }
 

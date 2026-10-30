@@ -8,6 +8,7 @@
 // 整条被剥掉，不会解析 `tauri` 路径。
 
 pub mod agent;
+pub mod external_link;
 pub mod image_prep;
 pub mod ipc;
 pub mod lock;
@@ -19,6 +20,7 @@ pub mod skills;
 pub mod store;
 pub mod text;
 pub mod tools;
+pub mod web_guard;
 pub mod window_state;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

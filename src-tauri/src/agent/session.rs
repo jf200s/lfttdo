@@ -9,13 +9,13 @@ use super::context::{ContextBuilder, TOOL_POLICY};
 use super::events::{AgentEvent, Decision, ErrorWhere, EventSink, StopReason};
 use super::types::*;
 use crate::model::assistant_acc::AssistantAcc;
-use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider};
+use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider, ToolDef};
 use crate::permission::gate::PermissionGate;
 use crate::tools::read_file;
 use crate::tools::registry::{ToolCtx, ToolRegistry};
 use crate::tools::use_skill;
 use futures::StreamExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +25,9 @@ use tokio_util::sync::CancellationToken;
 /// 「被打断」当成「工具坏了」再试一遍。
 const INTERRUPTED_NOTE: &str = "本轮被打断，工具未执行";
 const MODEL_FAILURE_NOTE: &str = "本轮在模型流中断处失败，工具未执行";
+/// 工具**已经开始执行**之后被取消：不能断言它没执行完（副作用可能已经发生），
+/// 只能说这份结果没有被采用。
+const TOOL_CANCELLED_NOTE: &str = "本轮已中断，工具结果未采用";
 
 /// 循环的护栏。`max_turns` 是防模型自我循环的保险丝（spec 4.6）：日常对话 1 轮收尾，
 /// 带工具的多为 2–5 轮，25 是上限而不是目标；触顶时发 `Done{MaxTurns}` 让 UI 明确提示，
@@ -76,6 +79,9 @@ pub struct AgentSession {
     turn_user_text: String,
     /// 发出**当前这次请求**时 `build()` 报的粗估输入 token（切片 5 的校准分母）。
     last_est_input: u32,
+    /// 生产装配把它置真：`Done` 由调用方在**本轮落库成功之后**再发，
+    /// 这样「界面已显示完成、库里却没有这一轮」的窗口不存在。测试默认假（会话自己发）。
+    defer_done: bool,
 }
 
 /// 从工具输出里摘出图片块（R319）：`Text` 不要，`Image` 原样，`Multi` 递归摊平。
@@ -121,6 +127,43 @@ fn image_followup(images: &[ContentBlock]) -> Option<Message> {
     Some(Message::user(blocks))
 }
 
+/// 这一轮**真正**交给模型的工具声明：`read_file` 在 roots 为空时隐藏，
+/// `use_skill` 在没有任何启用技能时隐藏。
+///
+/// `request()` 与预算估算共用这一份，避免「算的是全量注册表、发的是过滤后的表」。
+/// 隐藏只影响声明表、省一轮注定失败的调用，**不是**授权：模型凭空喊这两个名字
+/// 照样会走到工具自己的拒绝路径。
+fn filtered_tool_defs(
+    registry: &ToolRegistry,
+    roots: &[PathBuf],
+    has_skills: bool,
+) -> Vec<ToolDef> {
+    let mut tools = registry.defs();
+    if !read_file::usable_with_roots(roots) {
+        tools.retain(|d| d.name != read_file::NAME);
+    }
+    if !has_skills {
+        tools.retain(|d| d.name != use_skill::NAME);
+    }
+    tools
+}
+
+/// 装配层在压缩判定之前要用的版本：扫描一次技能目录，判据与 `request()` 一致
+/// （只认启用中的技能）。这样预算里计的工具声明就是真正会发出去的那一批。
+pub fn tool_defs_for_turn(
+    registry: &ToolRegistry,
+    roots: &[PathBuf],
+    skills_dir: Option<&Path>,
+    skills_disabled: &[String],
+) -> Vec<ToolDef> {
+    let has_skills = skills_dir
+        .map(crate::skills::discover)
+        .unwrap_or_default()
+        .iter()
+        .any(|e| !skills_disabled.iter().any(|f| f == &e.folder));
+    filtered_tool_defs(registry, roots, has_skills)
+}
+
 impl AgentSession {
     pub fn new(deps: SessionDeps) -> Self {
         Self {
@@ -138,7 +181,14 @@ impl AgentSession {
             turn_skills: Vec::new(),
             turn_user_text: String::new(),
             last_est_input: 0,
+            defer_done: false,
         }
+    }
+
+    /// 把 `Done` 的发送权交给调用方（生产路径：落库成功后再发）。
+    /// 只影响 `finish()` 的那一条事件，循环的其余行为一个字不变。
+    pub fn defer_done(&mut self) {
+        self.defer_done = true;
     }
 
     /// 文件类工具的作用域根（Plan A 没有生产工具，所以默认是空表；
@@ -348,12 +398,25 @@ impl AgentSession {
                         let decision = self.deps.gate.check(&view, &ctx.cancel).await;
                         match decision {
                             Decision::Allow { .. } => {
-                                match self.deps.registry.execute(&name, input, &ctx).await {
-                                    // R64：工具失败只由 `ToolResult{is_error:true}` 承载，
-                                    // 不再补一条 `Error{at:Tool}` —— 同一个事实报两遍，
-                                    // 前端会长出两行（那条分支是 Plan B/C 的 MCP/循环错误用的）。
-                                    Ok(output) => (output, false),
-                                    Err(e) => (ToolOutput::text(e.to_string()), true),
+                                // 取消必须能打断**正在执行**的工具，而不只是打断模型流：
+                                // 一次抓取可能在一跳上停 20 秒，不 select 的话「停止」要等
+                                // 工具自己回来才生效（验收线要求 1 秒内）。
+                                // drop 掉执行中的 future 对只读工具是安全的（清理归各自的
+                                // RAII）；这也是 `ToolCtx.cancel` 存在的意义。
+                                tokio::select! {
+                                    biased;
+                                    _ = ctx.cancel.cancelled() => {
+                                        (ToolOutput::text(TOOL_CANCELLED_NOTE), true)
+                                    }
+                                    result = self.deps.registry.execute(&name, input, &ctx) => {
+                                        match result {
+                                            // R64：工具失败只由 `ToolResult{is_error:true}` 承载，
+                                            // 不再补一条 `Error{at:Tool}` —— 同一个事实报两遍，
+                                            // 前端会长出两行（那条分支是 Plan B/C 的 MCP/循环错误用的）。
+                                            Ok(output) => (output, false),
+                                            Err(e) => (ToolOutput::text(e.to_string()), true),
+                                        }
+                                    }
                                 }
                             }
                             // R59：内容就是拒绝理由本身。`ToolError::Failed` 的 Display 前缀是
@@ -399,8 +462,11 @@ impl AgentSession {
     }
 
     /// 每个出口都只经这里：`Done` 恰好一条，且带的就是返回值本身。
+    /// `defer_done` 模式下不发 —— 调用方在落库成功后用同一个 `r` 补发。
     fn finish(&self, r: StopReason) -> StopReason {
-        self.deps.sink.emit(AgentEvent::Done { stop_reason: r });
+        if !self.defer_done {
+            self.deps.sink.emit(AgentEvent::Done { stop_reason: r });
+        }
         r
     }
 
@@ -483,15 +549,10 @@ impl AgentSession {
         // 边界要说清：这**只影响声明表，不影响闸门** —— 模型凭空喊 `read_file` 照样走到
         // `resolve_within_roots` 被拒（`hiding_a_tool_does_not_weaken_the_gate` 钉的就是这条）。
         // 隐藏是省 token，不是授权，越权那道墙永远在闸门里。
-        let mut tools = self.deps.registry.defs();
-        if !read_file::usable_with_roots(&self.roots) {
-            tools.retain(|d| d.name != read_file::NAME);
-        }
-        // 与 read_file 同一条 R286：没有技能时隐藏声明，省一次注定失败的调用。
-        // 隐藏不是授权 —— 模型凭空喊 `use_skill` 会走到工具里的「没有技能目录」失败。
-        if skills.is_empty() {
-            tools.retain(|d| d.name != use_skill::NAME);
-        }
+        // R286：声明表按「这一轮到底能不能用」过滤，且与预算估算共用同一个函数
+        // —— 算的是全量、发的是过滤后，会让估算虚高、校准系数偏低。
+        // 隐藏不是授权：模型凭空喊这两个名字照样会走工具自己的拒绝路径。
+        let tools = filtered_tool_defs(&self.deps.registry, &self.roots, !skills.is_empty());
         ChatRequest {
             messages: built.messages,
             // R66：`defs()` 已经是 `Vec<model::provider::ToolDef>`（registry.rs:143），
@@ -751,6 +812,29 @@ mod tests {
     impl CountingTool {
         fn calls(&self) -> Vec<String> {
             self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// 永远不自己收尾的只读工具：取消必须能把它打断，而不是等它 30 秒后回来。
+    struct SlowTool;
+
+    #[async_trait]
+    impl Tool for SlowTool {
+        fn meta(&self) -> ToolMeta {
+            ToolMeta {
+                name: "slow".into(),
+                description: "睡 30 秒才返回".into(),
+                input_schema: json!({"type": "object"}),
+                risk: Risk::Read,
+            }
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(ToolOutput::text("slow done"))
         }
     }
 
@@ -2078,6 +2162,44 @@ mod tests {
         );
     }
 
+    /// `defer_done` 的唯一合同：会话自己不发明 `Done`，把最终事件留给调用方
+    /// （生产路径用它把「落库成功」排在「界面显示完成」之前）。
+    #[tokio::test]
+    async fn deferred_done_is_left_to_the_caller() {
+        let mut rig = Rig::new(vec![deltas(&["hi"])]);
+        rig.session.defer_done();
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        assert_eq!(rig.sink.done(), None, "defer 模式下会话自己不许发 Done");
+        assert!(rig.sink.texts().contains("hi"), "文字流不受影响");
+    }
+
+    /// 取消必须打断**正在执行**的工具：不 select 的话这一轮要等工具自己回来，
+    /// 「中断 1 秒内生效」的验收线不成立。
+    #[tokio::test]
+    async fn cancelling_during_a_tool_stops_without_waiting_for_it() {
+        let mut rig = Rig::with_roots(
+            vec![tool_round(1, &[("slow", "{}")]), deltas(&["done"])],
+            vec![],
+            vec![Arc::new(SlowTool)],
+        );
+        let cancel = rig.session.cancel_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel.cancel();
+        });
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(2), rig.run("跑慢工具"))
+            .await
+            .expect("取消必须打断正在执行的工具，而不是等它 30 秒");
+        assert_eq!(reason, StopReason::Interrupted);
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1, "被取消的那次调用必须有结果：{results:?}");
+        assert!(results[0].1, "被取消的调用必须标成错误：{results:?}");
+        assert!(
+            results[0].2.contains("中断"),
+            "预览必须说明是被中断的：{results:?}"
+        );
+    }
+
     // ---- T39：请求构造的最后一段线 ----
 
     /// 前置事实 3 说温度那条管线早就通了，缺的只有本文件那句 `temperature: None`。
@@ -2304,6 +2426,52 @@ mod tests {
             declared_names(&reqs),
             vec![vec!["fetch_url".to_string()]],
             "没有技能却把 use_skill 挂在请求里，等于邀请一次注定失败的调用"
+        );
+    }
+
+    /// 预算估算与 `request()` 必须用同一份**过滤后**的工具声明。
+    /// 两者分叉时估算会虚高（校准系数随之偏低），而真正的请求里根本没有那几把工具。
+    #[tokio::test]
+    async fn the_budgeting_tool_set_matches_the_declared_tool_set() {
+        let skills = skill_fixture("translate", "翻译助手", "中英互译", "先识别语言。");
+        let dir = tempfile::tempdir().unwrap();
+        let roots = vec![dir.path().to_path_buf()];
+        let mut rig = Rig::with_only(
+            vec![deltas(&["好的"])],
+            roots.clone(),
+            production_tools(),
+        );
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(skills.path().to_path_buf()));
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        let declared = declared_names(&reqs).remove(0);
+
+        // 重建一份同构注册表：`tool_defs_for_turn` 是装配层的输入，不偷 Rig 的内部状态。
+        let registry = ToolRegistry::new();
+        for t in production_tools() {
+            registry.register(t);
+        }
+        let expected: Vec<String> =
+            tool_defs_for_turn(&registry, &roots, Some(skills.path()), &[])
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
+        assert_eq!(
+            declared, expected,
+            "预算里算的工具声明必须就是请求里发出去的那一批"
+        );
+        assert!(declared.contains(&"read_file".to_string()));
+        assert!(declared.contains(&"use_skill".to_string()));
+
+        // 停用唯一那份技能 ⇒ use_skill 与预算里的声明同时消失。
+        let disabled =
+            tool_defs_for_turn(&registry, &roots, Some(skills.path()), &["translate".to_string()]);
+        assert!(
+            !disabled.iter().any(|d| d.name == "use_skill"),
+            "没有启用中的技能时，预算里也不许再算 use_skill"
         );
     }
 

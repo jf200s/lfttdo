@@ -112,7 +112,7 @@ npx tsc --noEmit
 npm run lint:css
 ```
 
-当前读数：Rust 498 passed / 1 ignored + 集成 3 passed；前端 197 passed；clippy 无新增。
+当前读数：Rust 671 passed / 1 ignored + 集成 3 passed；前端 247 passed；clippy 无新增。
 
 ## 目录结构
 
@@ -143,6 +143,8 @@ docs/               设计、计划与验证记录
 - 工具参数逐段传 argv，不拼 shell 命令行；MCP 子进程设置 `CREATE_NO_WINDOW`。
 - SSRF 判定在每一跳重定向上执行；内网与本机地址默认拒绝。
 - 前端无 shell / 文件系统权限，进程执行全部在 Rust 侧。
+- Markdown 链接经 `open_url` 交给系统默认浏览器（只允许 http/https），不导航 WebView；
+  WebView 顶层导航另有白名单（只放行应用自身来源与本机开发服务器）。
 
 ## 许可
 

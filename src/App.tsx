@@ -7,7 +7,13 @@ import { SkillsPanel } from "./components/SkillsPanel";
 import { Sidebar } from "./components/Sidebar";
 import * as api from "./ipc/commands";
 import { useTextBuffer } from "./ipc/batching";
-import { appendUserTurn, dropUserTurn, initialState, reduce, replay } from "./state/reducer";
+import {
+  appendUserTurn,
+  dropUserTurn,
+  initialState,
+  reduce,
+  replay,
+} from "./state/reducer";
 import { writeThemeCache } from "./theme/cache";
 import { applyTheme, resolveTheme } from "./theme/theme";
 import type {
@@ -70,6 +76,12 @@ export default function App() {
    * 会拿到旧值；这一支只有一处写（`openSession` / 启动那次），所以它是可审的。
    */
   const activeRef = useRef<string | null>(null);
+  /**
+   * 会话代际：每调一次 `openSession` +1。迟到的重放（A→B→A 时第一次 A 的那份）
+   * 必须按代际丢弃，而不是只比 sessionId —— 只比 id 时它会被当成「当前会话」的
+   * 合法快照，把更晚的那一次重放覆盖掉。
+   */
+  const genRef = useRef(0);
 
   /**
    * 界面自己的提示通道。和 `UiState.notices` 分开：那一支是** reducer 的事实**
@@ -214,6 +226,7 @@ export default function App() {
   /** 切会话：先打断正在跑的那一轮，再用 `replaySession` 重建界面（要求 5）。 */
   const openSession = useCallback(
     async (id: string, mustInterrupt: boolean) => {
+      const gen = ++genRef.current;
       const previous = activeRef.current;
       // P1：切走前给**旧**会话一次收尾抽取（spec §4.1：「会话收尾」与空闲 worker 同源）。
       // 三条纪律，缺一条都会把主路径弄糟：
@@ -235,17 +248,19 @@ export default function App() {
           notice(`打断当前这一轮失败：${String(e)}`);
         }
       }
+      // 等 interrupt 的这段时间里可能又切了一次：被取代的那次不许再改任何状态。
+      if (genRef.current !== gen) return;
       activeRef.current = id;
       setActiveId(id);
       bufRef.current.flushNow();
       setUi(initialState());
       try {
         const events = await api.replaySession(id);
-        // 竞态：慢回来的那次不许覆盖已经切过去的会话。
-        if (activeRef.current !== id) return;
+        // 竞态：慢回来的那次不许覆盖已经切过去的会话；A→B→A 靠代际拦下第一份 A。
+        if (genRef.current !== gen || activeRef.current !== id) return;
         setUi(replay(events));
       } catch (e) {
-        notice(`读取会话历史失败：${String(e)}`);
+        if (genRef.current === gen) notice(`读取会话历史失败：${String(e)}`);
       }
     },
     // 依赖里**不能有 `buf`**：见上面 `bufRef` 的注释 —— 它每次渲染都是新对象，
@@ -297,6 +312,7 @@ export default function App() {
   const send = useCallback(
     async (blocks: SendBlock[]) => {
       const sid = activeRef.current;
+      const gen = genRef.current;
       if (sid === null) {
         notice("还没有可用的会话，先新建一条");
         throw new Error("没有可用的会话");
@@ -309,7 +325,28 @@ export default function App() {
       } catch (e) {
         // R332：乐观气泡必须跟着回滚 —— 否则屏幕上有一条「已发送」的消息，库里没有，
         // 切会话或重启后它凭空消失；用户当场重发还会多一条。
-        setUi((s) => dropUserTurn(s, blocks));
+        // 但不能只删最后一个 user 气泡：失败可能发生在 turn_start 之后（落库失败），
+        // 那时 assistant 轮已经在屏幕上。用重放把界面拉回持久化真相，
+        // 与「messages 是唯一真相源」是同一条不变量。
+        // 只对**发起这次发送的会话**做，切走之后不许改动别的会话。
+        // 这里 `await` 掉这次重放：Composer 的发送锁要到下面 `throw` 才释放，
+        // 所以用户不可能在「重放还没回来」时重发第二条，也就没有旧快照覆盖新消息的窗口。
+        if (activeRef.current === sid && genRef.current === gen) {
+          try {
+            const events = await api.replaySession(sid);
+            if (activeRef.current === sid && genRef.current === gen) {
+              // 先冲刷 rAF 缓冲：迟到的增量不许在重建之后长出幽灵助手轮。
+              bufRef.current.flushNow();
+              setUi(replay(events));
+            }
+          } catch {
+            // 连历史都读不回来时，至少把乐观气泡撤回（回合已开始的那种情况，
+            // 这一步是 no-op，界面会停在 fatal 分支上，用户仍能从 notice 看到原文）。
+            if (activeRef.current === sid && genRef.current === gen) {
+              setUi((s) => dropUserTurn(s, blocks));
+            }
+          }
+        }
         notice(`发送失败：${String(e)}`);
         throw e;
       }
@@ -340,6 +377,17 @@ export default function App() {
     // 只打断，不改状态：`streaming` 的唯一出口是 `done`（R112），不做乐观恢复。
     api.interrupt().catch((e) => notice(`打断当前这一轮失败：${String(e)}`));
   }, [notice]);
+
+  /**
+   * Markdown 链接统一走这里：前端不直接导航 WebView（远程页会把应用页面替换掉），
+   * 协议白名单与「不经过 shell」的落点都在 Rust 的 `open_url`。
+   */
+  const openLink = useCallback(
+    (url: string) => {
+      api.openUrl(url).catch((e) => notice(`打开链接失败：${String(e)}`));
+    },
+    [notice],
+  );
 
   /**
    * T19：`Composer` 的归一化入口，接 `commands.ts` 平铺导出的 `normalize`（R206：不新造 `api` 对象）。
@@ -526,7 +574,11 @@ export default function App() {
             ))}
           </ul>
         ) : null}
-        <MessageList state={ui} onRespond={onRespond} />
+        <MessageList
+          state={ui}
+          onRespond={onRespond}
+          onOpenLink={openLink}
+        />
         <Composer
           streaming={ui.streaming}
           onSend={send}

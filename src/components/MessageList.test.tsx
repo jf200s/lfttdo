@@ -1,5 +1,5 @@
 import { render, screen, fireEvent } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MessageList } from "./MessageList";
 import { readablePreview } from "./MessageBubble";
 import type { UiState } from "../types";
@@ -32,6 +32,56 @@ describe("MessageList", () => {
     const bubble = screen.getByTestId("bubble-assistant");
     expect(bubble.textContent).toBe("");
     expect(bubble).toHaveAttribute("data-streaming", "true");
+  });
+
+  // 链接点击必须交给外部打开命令，而不是让 WebView 导航走（远程页会替换应用页面）。
+  it("routes markdown links through onOpenLink instead of navigating", () => {
+    const onOpenLink = vi.fn();
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            { kind: "text", text: "见 [链接](https://example.com/doc)" },
+          ],
+        },
+      ],
+    });
+    render(
+      <MessageList
+        state={s}
+        onRespond={() => {}}
+        onOpenLink={onOpenLink}
+      />,
+    );
+    const notPrevented = fireEvent.click(screen.getByText("链接"));
+    expect(notPrevented).toBe(false); // preventDefault 确实被调用：WebView 不会导航
+    expect(onOpenLink).toHaveBeenCalledWith("https://example.com/doc");
+  });
+
+  // 非 http(s) 链接不交给 Rust 的 open_url（那里只认 http/https）；
+  // 在这里就拦下，免得每点一次 `#锚点`/`mailto:` 都弹一条「打开链接失败」。
+  it("does not hand non-http links to the opener", () => {
+    const onOpenLink = vi.fn();
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [{ kind: "text", text: "写信：[邮件](mailto:a@b.c)" }],
+        },
+      ],
+    });
+    render(
+      <MessageList
+        state={s}
+        onRespond={() => {}}
+        onOpenLink={onOpenLink}
+      />,
+    );
+    fireEvent.click(screen.getByText("邮件"));
+    expect(onOpenLink).not.toHaveBeenCalled();
   });
 
   it("drops the streaming mark when the turn is no longer running", () => {

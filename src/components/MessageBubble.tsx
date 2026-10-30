@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import Markdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
@@ -175,10 +175,12 @@ function BlockView({
   block,
   plain,
   onRespond,
+  onOpenLink,
 }: {
   block: UiBlock;
   plain: boolean;
   onRespond: (id: string, d: Decision) => void;
+  onOpenLink?: (url: string) => void;
 }) {
   switch (block.kind) {
     case "text": {
@@ -194,7 +196,37 @@ function BlockView({
             <pre className="plain">{answer}</pre>
           ) : (
             <div className="md">
-              <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+              <Markdown
+                remarkPlugins={[remarkGfm]}
+                rehypePlugins={[rehypeHighlight]}
+                components={{
+                  a: ({ href, children }) => (
+                    <a
+                      href={href}
+                      rel="noreferrer noopener"
+                      draggable={false}
+                      onClick={(e) => {
+                        // 不让 WebView 导航离开应用；能不能打开由 Rust 的
+                        // `external_link::validate_external_url` 决定。
+                        e.preventDefault();
+                        if (href && /^https?:\/\//i.test(href)) {
+                          onOpenLink?.(href);
+                        }
+                      }}
+                      onAuxClick={(e) => {
+                        // 中键/aux 点击同样不许开新窗口绕过校验。
+                        e.preventDefault();
+                        if (href && /^https?:\/\//i.test(href)) {
+                          onOpenLink?.(href);
+                        }
+                      }}
+                      onDragStart={(e) => e.preventDefault()}
+                    >
+                      {children}
+                    </a>
+                  ),
+                }}
+              >
                 {answer}
               </Markdown>
             </div>
@@ -221,16 +253,18 @@ function BlockView({
   }
 }
 
-export function MessageBubble({
+function MessageBubbleView({
   turn,
   isLastTurn,
   streaming,
   onRespond,
+  onOpenLink,
 }: {
   turn: Turn;
   isLastTurn: boolean;
   streaming: boolean;
   onRespond: (id: string, d: Decision) => void;
+  onOpenLink?: (url: string) => void;
 }) {
   const lastIndexOf = turn.blocks.length - 1;
   // R234：空的助手气泡有两种来路 —— 等首字（该留着并看得出在等）与这一轮已结束
@@ -249,8 +283,14 @@ export function MessageBubble({
           block={b}
           plain={streaming && isLastTurn && i === lastIndexOf}
           onRespond={onRespond}
+          onOpenLink={onOpenLink}
         />
       ))}
     </article>
   );
 }
+
+/// 历史气泡不随流式帧重渲染：`turn` 对象在 reducer 里只有被改的那一轮才换身份，
+/// `onRespond` 是稳定的 `useCallback`。没有这一层，每个 rAF 都会把全部历史
+/// Markdown 重新解析一遍（长会话掉帧的主因）。
+export const MessageBubble = memo(MessageBubbleView);

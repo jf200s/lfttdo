@@ -3,7 +3,7 @@
 // 而 T19 的连带风险恰好都在 App 这一侧（载荷原样转发、失败要不要把 rejection 传回去、
 // 没有会话时待发图留不留），`Composer.test` 那一边只能证明 Composer 自己的合同。
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import App from "./App";
 import type { ContentBlock, SessionRow, SettingsView } from "./types";
 
@@ -140,6 +140,81 @@ describe("App 图片接线", () => {
     expect(thumb).toHaveAttribute("src", "data:image/png;base64,AAAA");
     // 发成功之后待发图清空（Step 2 第 8 条的上半场，在 App 这一层同样成立）。
     await waitFor(() => expect(screen.queryByTestId("thumb-0")).toBeNull());
+  });
+
+  // 草稿的清除时机：turn_start（回合被接受）而不是整轮生成结束。
+  // 等结束的话，用户已经发出去的句子会在输入区挂几分钟；这条同时钉住发送锁，
+  // 因为 send 的 promise 在这条用例里始终不 resolve。
+  it("clears the sent draft as soon as the turn starts", async () => {
+    let resolveSend!: () => void;
+    h.sendMessage.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveSend = resolve;
+        }),
+    );
+    render(<App />);
+    await settled();
+    const box = screen.getByRole("textbox", {
+      name: "输入消息",
+    }) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "已经发出去的句子" } });
+    dropPng(5);
+    await screen.findByTestId("thumb-0");
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled());
+    // 回合还没开始：草稿与图都还在，这跟「发失败保留草稿」是同一条合同。
+    expect(box.value).toBe("已经发出去的句子");
+
+    act(() =>
+      h.listeners[0]?.("B", { t: "turn_start", turn: 1 } as never),
+    );
+    await waitFor(() => expect(box.value).toBe(""));
+    expect(screen.queryByTestId("thumb-0")).toBeNull();
+
+    await act(async () => {
+      resolveSend();
+    });
+  });
+
+  // turn_start 之后才失败（例如落库失败）：草稿已被清掉，失败路径必须按快照恢复，
+  // 同时 App 用重放把界面拉回库里那份真相。
+  it("restores the draft and resyncs when the send fails after the turn started", async () => {
+    let rejectSend!: (reason?: unknown) => void;
+    h.sendMessage.mockImplementation(
+      () =>
+        new Promise<void>((_, reject) => {
+          rejectSend = reject;
+        }),
+    );
+    render(<App />);
+    await settled();
+    const box = screen.getByRole("textbox", {
+      name: "输入消息",
+    }) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "落库失败的句子" } });
+    dropPng(6);
+    await screen.findByTestId("thumb-0");
+    fireEvent.click(screen.getByRole("button", { name: /发送/ }));
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled());
+
+    act(() =>
+      h.listeners[0]?.("B", { t: "turn_start", turn: 1 } as never),
+    );
+    await waitFor(() => expect(box.value).toBe(""));
+    expect(screen.queryByTestId("thumb-0")).toBeNull();
+    const replaysBefore = h.replaySession.mock.calls.length;
+
+    await act(async () => {
+      rejectSend("本轮写入数据库失败");
+    });
+    await waitFor(() => expect(box.value).toBe("落库失败的句子"));
+    expect(await screen.findByTestId("thumb-0")).toHaveAccessibleName(
+      "截图.png",
+    );
+    await waitFor(() =>
+      expect(h.replaySession.mock.calls.length).toBe(replaysBefore + 1),
+    );
   });
 
   // 变异判据（交付判据 c）：删掉 `App.send` 的 `throw e` ⇒ 这条红。

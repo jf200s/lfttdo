@@ -7,8 +7,8 @@
 // 失败语义:每一段的 Err 都只意味着「这一段没有结论」,调用方降级(记日志、
 // 跳过该段),绝不允许拿半截结果当成功 —— 与「空摘要即 Err」同一条纪律。
 
-use crate::agent::summarize::drain_text_stream;
 use crate::agent::summarize::TextStreamOutcome;
+use crate::agent::summarize::{auxiliary_source, drain_text_stream};
 use crate::agent::types::{ContentBlock, Message};
 use crate::model::provider::{ChatRequest, ModelProvider};
 use crate::store::memory::{MemoryRow, NewMemory};
@@ -316,11 +316,15 @@ pub async fn extract_memories(
     source: &[Message],
     cancel: &CancellationToken,
 ) -> Result<Vec<MemoryCandidate>, String> {
-    // 空段不烧调用:压缩钩子只在真有 plan 时进来,这里挡的是「空 source 也调一次」的浪费。
+    // 与摘要同一套清洗：图片降级成占位、工具调用/结果丢弃。工具输出不是用户的陈述，
+    // 把它喂给抽取会抽出与用户无关的「事实」；图片 base64 更不该为一次抽取付费。
+    let source = auxiliary_source(source);
+    // 空段不烧调用:压缩钩子只在真有 plan 时进来,这里挡的是「空 source 也调一次」的浪费;
+    // 清洗之后空也一样（例如整段都是工具结果）。
     if source.is_empty() {
         return Ok(Vec::new());
     }
-    let req = extraction_request(source);
+    let req = extraction_request(&source);
     match drain_text_stream(model, req, cancel).await {
         TextStreamOutcome::Done(text) => parse_candidates(&text),
         TextStreamOutcome::Cancelled => Err("记忆抽取已取消".to_string()),
@@ -485,6 +489,9 @@ mod tests {
         }
         fn calls(&self) -> usize {
             self.0.lock().unwrap().len()
+        }
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.0.lock().unwrap().clone()
         }
     }
 
@@ -842,6 +849,52 @@ mod tests {
     }
 
     // ---- 模型侧 ----
+
+    /// 抽取请求与摘要同一条清洗规则：图片降级、工具块丢弃。
+    /// 用模型侧的记录取证，而不是从 source 反推（自证）。
+    #[tokio::test]
+    async fn extraction_input_degrades_images_and_drops_tool_blocks() {
+        let model = TextModel::one("[]");
+        let src = vec![
+            Message::user(vec![
+                ContentBlock::Text {
+                    text: "看图".into(),
+                },
+                crate::agent::types::ContentBlock::Image {
+                    data: "QUJD".into(),
+                    mime: crate::agent::types::ImageMime::Png,
+                },
+            ]),
+            Message::tool(
+                "c1",
+                crate::agent::types::ToolOutput::text("网页正文"),
+                false,
+            ),
+        ];
+        let got = extract_memories(&*model, &src, &never_cancelled())
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+        let reqs = model.recorder.requests();
+        assert_eq!(reqs.len(), 1, "清洗之后还剩一条可抽取消息");
+        let sent = &reqs[0].messages;
+        assert_eq!(sent.len(), 2, "指令 + 一条用户消息；工具行整条丢弃");
+        assert!(
+            !sent.iter().any(|m| m.text_of().contains("网页正文")),
+            "工具输出不许以任何形式进入抽取请求"
+        );
+        assert!(
+            sent.iter().any(|m| m.text_of().contains("[图片已移除以节省上下文]")),
+            "图片必须变成占位文本"
+        );
+        assert!(
+            sent.iter().all(|m| m.blocks.iter().all(|b| !matches!(
+                b,
+                ContentBlock::Image { .. } | ContentBlock::ToolCall { .. } | ContentBlock::ToolResult { .. }
+            ))),
+            "图片与工具块都不许出现在抽取请求里"
+        );
+    }
 
     #[tokio::test]
     async fn extract_memories_happy_path_parses_the_model_output() {

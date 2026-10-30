@@ -437,35 +437,7 @@ impl Db {
         after_id: i64,
     ) -> Result<Vec<(i64, Message)>, rusqlite::Error> {
         let c = self.lock();
-        let mut st = c.prepare(
-            "SELECT id, role, blocks_json FROM messages \
-             WHERE session_id=?1 AND id>?2 AND role<>?3 ORDER BY id",
-        )?;
-        let rows = st
-            .query_map(
-                params![session_id, after_id, crate::store::db::role_code(&Role::System)],
-                |r| {
-                    let id: i64 = r.get(0)?;
-                    let role = crate::store::db::role_from_code(&r.get::<_, String>(1)?, 1)?;
-                    let blocks = crate::store::db::decode_blocks(&r.get::<_, String>(2)?, 2)?;
-                    Ok((id, Message { role, blocks }))
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        // 工具结果行在解码之后才认得出(角色同为 User,只能看块种类)。
-        Ok(rows
-            .into_iter()
-            .filter(|(_, m)| {
-                !m.blocks
-                    .iter()
-                    .any(|b| matches!(b, crate::agent::types::ContentBlock::ToolResult { .. }))
-            })
-            .filter(|(_, m)| {
-                m.blocks
-                    .iter()
-                    .any(|b| matches!(b, crate::agent::types::ContentBlock::Text { .. }))
-            })
-            .collect())
+        messages_for_extraction_on(&c, session_id, after_id)
     }
 
     /// 会话的最后活动时刻(`sessions.updated_at`,每次追加消息都会刷新)。
@@ -481,11 +453,23 @@ impl Db {
     /// 该会话最大消息 id(空会话 0)。与 [`Self::memory_cursor`] 比较决定「有没有新东西」。
     pub fn max_message_id(&self, session_id: &str) -> Result<i64, rusqlite::Error> {
         let c = self.lock();
-        c.query_row(
-            "SELECT COALESCE(MAX(id),0) FROM messages WHERE session_id=?1",
-            params![session_id],
-            |r| r.get(0),
-        )
+        max_message_id_on(&c, session_id)
+    }
+
+    /// 抽取源与 max(id) 在**同一把锁**下读出。
+    ///
+    /// 分两次调用会在两次取锁之间夹进一条新消息：行集不含它、max(id) 却包含它，
+    /// 而「所有可抽取行都处理完」的分支会把游标直接推到 max(id) —— 刚追加的那条
+    /// 文本从此永久漏抽。生产里空闲 worker 与前台 append 可以并发，这条不是理论问题。
+    pub fn extraction_batch(
+        &self,
+        session_id: &str,
+        after_id: i64,
+    ) -> Result<(Vec<(i64, Message)>, i64), rusqlite::Error> {
+        let c = self.lock();
+        let rows = messages_for_extraction_on(&c, session_id, after_id)?;
+        let max_id = max_message_id_on(&c, session_id)?;
+        Ok((rows, max_id))
     }
 
     /// 空闲且有待抽取内容的会话:**只返回 id**,抽取本身归调用方(它要模型)。
@@ -668,6 +652,53 @@ impl Db {
 
 // ---- 自由函数:全部收 `&Connection`,事务内外共用(同 insert_message_row 的形状) ----
 
+/// [`Db::messages_for_extraction`] 的自由函数形态：调用方负责持锁
+/// （批读取要在同一把锁下把行集与 max(id) 一起读完）。
+fn messages_for_extraction_on(
+    c: &Connection,
+    session_id: &str,
+    after_id: i64,
+) -> Result<Vec<(i64, Message)>, rusqlite::Error> {
+    let mut st = c.prepare(
+        "SELECT id, role, blocks_json FROM messages \
+         WHERE session_id=?1 AND id>?2 AND role<>?3 ORDER BY id",
+    )?;
+    let rows = st
+        .query_map(
+            params![session_id, after_id, crate::store::db::role_code(&Role::System)],
+            |r| {
+                let id: i64 = r.get(0)?;
+                let role = crate::store::db::role_from_code(&r.get::<_, String>(1)?, 1)?;
+                let blocks = crate::store::db::decode_blocks(&r.get::<_, String>(2)?, 2)?;
+                Ok((id, Message { role, blocks }))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    // 工具结果行在解码之后才认得出(角色同为 User,只能看块种类)。
+    Ok(rows
+        .into_iter()
+        .filter(|(_, m)| {
+            !m.blocks
+                .iter()
+                .any(|b| matches!(b, crate::agent::types::ContentBlock::ToolResult { .. }))
+        })
+        .filter(|(_, m)| {
+            m.blocks
+                .iter()
+                .any(|b| matches!(b, crate::agent::types::ContentBlock::Text { .. }))
+        })
+        .collect())
+}
+
+/// [`Db::max_message_id`] 的自由函数形态（同上，调用方持锁）。
+fn max_message_id_on(c: &Connection, session_id: &str) -> Result<i64, rusqlite::Error> {
+    c.query_row(
+        "SELECT COALESCE(MAX(id),0) FROM messages WHERE session_id=?1",
+        params![session_id],
+        |r| r.get(0),
+    )
+}
+
 fn query_memories(c: &Connection, tail: &str) -> Result<Vec<MemoryRow>, rusqlite::Error> {
     let mut st = c.prepare(&format!("SELECT {MEMORY_COLS} FROM memories {tail}"))?;
     let rows = st
@@ -766,14 +797,17 @@ fn apply_memory_writes(c: &Connection, writes: &[MemoryWrite]) -> Result<Vec<i64
                 // 与调用方(includes ipc 写路径)的 Add body 按序对位。
                 added.push(insert_memory_row(c, m)?);
             }
+            // 模型侧的三类写入走**宽松**版本:计划到提交之间,行可能已被另一条
+            // 抽取路径失效、或已被用户删掉。0 行命中只 warn —— 一条过期候选
+            // 不该把整次压缩事务拖回滚。用户主动的编辑/删除仍走严格版本。
             MemoryWrite::UpdateBody { id, body } => {
-                update_memory_body(c, *id, body)?;
+                update_memory_body_lenient(c, *id, body)?;
             }
             MemoryWrite::Invalidate { id } => {
-                invalidate_memory_row(c, *id)?;
+                invalidate_memory_row_lenient(c, *id)?;
             }
             MemoryWrite::Reinforce { id } => {
-                reinforce_row(c, *id)?;
+                reinforce_row_lenient(c, *id)?;
             }
             MemoryWrite::SetProfile(body) => {
                 set_profile_row(c, body)?;
@@ -781,6 +815,54 @@ fn apply_memory_writes(c: &Connection, writes: &[MemoryWrite]) -> Result<Vec<i64
         }
     }
     Ok(added)
+}
+
+/// 模型 UPDATE 的宽松版本：只改**仍然有效**的行；0 行 = 已被别的路径失效/删除，
+/// 记一条日志继续，不返回错误。空正文同样跳过（不许用一次坏候选抹掉正文）。
+fn update_memory_body_lenient(
+    c: &Connection,
+    id: i64,
+    body: &str,
+) -> Result<(), rusqlite::Error> {
+    if body.trim().is_empty() {
+        tracing::warn!("记忆 id={id} 的模型更新正文为空,跳过（不覆盖原正文）");
+        return Ok(());
+    }
+    let n = c.execute(
+        "UPDATE memories SET body=?2, updated_at=?3 \
+         WHERE id=?1 AND invalid_at IS NULL",
+        params![id, body, Db::now_ms()],
+    )?;
+    if n == 0 {
+        tracing::warn!("记忆 id={id} 在模型更新前已失效或不存在,跳过该条写入");
+    }
+    Ok(())
+}
+
+/// 模型 INVALIDATE 的宽松版本：重复失效（0 行）是幂等成功，不是错误。
+fn invalidate_memory_row_lenient(c: &Connection, id: i64) -> Result<(), rusqlite::Error> {
+    let n = c.execute(
+        "UPDATE memories SET invalid_at=?2, updated_at=?2 \
+         WHERE id=?1 AND invalid_at IS NULL",
+        params![id, Db::now_ms()],
+    )?;
+    if n == 0 {
+        tracing::warn!("记忆 id={id} 在模型失效前已失效或不存在,跳过该条写入");
+    }
+    Ok(())
+}
+
+/// 模型 REINFORCE 的宽松版本：行不在了就没有可强化的事，跳过即可。
+fn reinforce_row_lenient(c: &Connection, id: i64) -> Result<(), rusqlite::Error> {
+    let n = c.execute(
+        "UPDATE memories SET reinforcements=reinforcements+1, updated_at=?2 \
+         WHERE id=?1 AND invalid_at IS NULL",
+        params![id, Db::now_ms()],
+    )?;
+    if n == 0 {
+        tracing::warn!("记忆 id={id} 在模型强化前已失效或不存在,跳过该条写入");
+    }
+    Ok(())
 }
 
 // ---- 嵌入 BLOB 编码(T6 裁定 1):唯一编码点 ----
@@ -1472,6 +1554,33 @@ mod tests {
         assert_eq!(hits.len(), 2, "零向量行不许因 NaN 被丢");
         assert_eq!(hits[0].body, "用户住在上海");
         assert_eq!(hits[1].body, "用户住在北京");
+    }
+
+    /// 过期的模型写入（id 已被删/失效）不许把整批写入回滚：
+    /// 一条垃圾候选的代价只能是「这一条没生效」，不是「整段记忆与游标都没写」。
+    #[test]
+    fn stale_model_writes_are_skipped_without_rolling_back_the_batch() {
+        let (_dir, db) = tmpdb();
+        let sid = db.create_session("新对话").unwrap();
+        let added = db
+            .apply_memories_and_advance_cursor(
+                &sid,
+                &[
+                    MemoryWrite::Add(fact("上海", "用户搬到上海")),
+                    MemoryWrite::UpdateBody {
+                        id: 999,
+                        body: "不存在的行".into(),
+                    },
+                    MemoryWrite::Invalidate { id: 999 },
+                    MemoryWrite::Reinforce { id: 999 },
+                ],
+                0,
+            )
+            .expect("0 行命中的模型写入不许让事务失败");
+        assert_eq!(added.len(), 1, "Add 仍然要落库：{added:?}");
+        let valid = db.valid_memories().unwrap();
+        assert_eq!(valid.len(), 1, "只有 Add 那条：{valid:?}");
+        assert_eq!(valid[0].body, "用户搬到上海");
     }
 
     #[test]

@@ -25,6 +25,15 @@ describe("ipc commands", () => {
     });
   });
 
+  // 链接出口的命令名与参数键必须一起钉住：Rust 侧按 `url` 取值，写成别的键
+  // 会变成一次无声的失败（协议白名单根本没机会跑）。
+  it("opens external links through the allowlisted command", async () => {
+    await api.openUrl("https://example.com/a?b=1");
+    expect(invoke).toHaveBeenCalledWith("open_url", {
+      url: "https://example.com/a?b=1",
+    });
+  });
+
   // R131：第二参名必须是 `requestId`（`ipc.rs:423-428`）。写成 `id` 的话 Rust 收不到参数，
   // 而前端拿到的是一个 rejected promise，权限门那一笔永远 pending。
   it("names the permission decision by requestId, not id", async () => {

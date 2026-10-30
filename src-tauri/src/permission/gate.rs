@@ -66,6 +66,21 @@ impl RuleTable {
         crate::lock::write(&self.auto_keys).insert(key.to_string());
     }
 
+    /// 会话结束 / 切换：把「本会话都允许」的授权全部作废。
+    /// 没有这一条，`Scope::Session` 实际是**应用生命周期** —— 换一个会话仍然静默放行。
+    pub fn clear_session_rules(&self) {
+        crate::lock::write(&self.auto_keys).clear();
+    }
+
+    /// 只作废**某一台 MCP server** 的会话授权（key 形如 `mcp__srv__tool|srv`）。
+    /// 改一台 server 的信任档不该把内置工具（`read_file|read`）的授权也一起清掉。
+    /// 长 server 名的令牌可能被截断到 8 字符（T30 的命名兜底），那时这里匹配不到；
+    /// 安全上仍由 `check` 的「Block 先判」兜底。
+    pub fn clear_session_rules_for_server(&self, server: &str) {
+        let suffix = format!("|{server}");
+        crate::lock::write(&self.auto_keys).retain(|key| !key.ends_with(&suffix));
+    }
+
     /// 设定一台 server 的信任档位（T35 的 `mcp_set_trust` 是唯一写入者）。
     pub fn set_server_trust(&self, server: &str, verdict: Verdict) {
         crate::lock::write(&self.server_trust).insert(server.to_string(), verdict);
@@ -217,12 +232,9 @@ impl PermissionGate {
     pub async fn check(&self, call: &ToolCallView, cancel: &CancellationToken) -> Decision {
         let key = self.rule_key(call);
         let scope = scope_of(&call.name, &call.input);
-        // 优先级 1：会话级放行（用户已经在本会话里答过「都行」）。
-        if let Some(d) = self.rules.lookup(&key) {
-            return d; // 命中会话规则：静默放行，不发弹窗事件
-        }
-        // 优先级 2：per-server 信任档（T33）。必须压在下面那记 Read 自动放行**之前**，
-        // 否则 MCP 的 Ask/Block 永远轮不到 —— 这正是本任务要修的那个矛盾。
+        // 优先级 1：per-server 信任档（T33）。**Block 必须压过会话级放行** ——
+        // 用户后来把整台 server 设为禁止，不该被之前一次「本会话都允许」静默推翻。
+        // 它同样必须压在下面那记 Read 自动放行之前，否则 MCP 的 Ask/Block 永远轮不到。
         match self.rules.verdict_for(&call.name, &scope) {
             Some(Verdict::Auto) => return Decision::allow(Scope::Once),
             Some(Verdict::Block) => {
@@ -230,6 +242,11 @@ impl PermissionGate {
             }
             Some(Verdict::Ask) => {}
             None => {}
+        }
+        // 优先级 2：会话级放行（用户已经在本会话里答过「都行」）。
+        // 「本会话」由 IPC 层在切会话时清空（`clear_session_rules`）。
+        if let Some(d) = self.rules.lookup(&key) {
+            return d; // 命中会话规则：静默放行，不发弹窗事件
         }
         // 优先级 3：MVP 默认「Read 一律 Auto」。**MCP 除外**（R321）：T30 的兜底命名把
         // server 段截到 8 个 char，信任表按名字查不到 ⇒ 落到 Auto 就等于「名字越长的 server
@@ -915,5 +932,52 @@ mod tests {
         assert!(d.allowed(), "内置 Read 的零弹窗不许被本任务改坏：{d:?}");
         assert!(sink.events().is_empty(), "两条都不该产生弹窗事件");
         assert_eq!(gate.pending_len(), 0);
+    }
+
+    /// 用户先点过「本会话都允许」，后来把整台 server 设为 Block：
+    /// Block 必须赢，否则「禁止」只是一个界面状态，拦不住任何调用。
+    #[tokio::test]
+    async fn a_blocked_server_overrides_an_existing_session_allow() {
+        let sink = Arc::new(VecSink::default());
+        let rules = Arc::new(RuleTable::default());
+        let c = call("mcp__search__web_search", Risk::Read);
+        rules.remember_session(&format!("{}|search", c.name));
+        rules.set_server_trust("search", Verdict::Block);
+        let gate = PermissionGate::new()
+            .with_sink(sink.clone())
+            .with_rules(rules);
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert!(!d.allowed(), "Block 必须压过会话级放行：{d:?}");
+        assert!(sink.events().is_empty(), "Block 不弹窗，直接拒");
+    }
+
+    /// 切会话时清空授权：`Scope::Session` 的「Session」不能是应用生命周期。
+    #[test]
+    fn clearing_session_rules_forgets_every_allow() {
+        let rules = RuleTable::default();
+        rules.remember_session("read_file|read");
+        assert!(rules.lookup("read_file|read").is_some());
+        rules.clear_session_rules();
+        assert!(
+            rules.lookup("read_file|read").is_none(),
+            "清空之后不许再命中"
+        );
+    }
+
+    /// 改一台 MCP server 的信任档只收回它自己的授权，内置工具的授权保留。
+    #[test]
+    fn clearing_one_servers_rules_keeps_builtin_allows() {
+        let rules = RuleTable::default();
+        rules.remember_session("read_file|read");
+        rules.remember_session("mcp__search__web_search|search");
+        rules.clear_session_rules_for_server("search");
+        assert!(
+            rules.lookup("mcp__search__web_search|search").is_none(),
+            "被改信任档的 server 授权要收回"
+        );
+        assert!(
+            rules.lookup("read_file|read").is_some(),
+            "无关的内置工具授权不许被一起清掉"
+        );
     }
 }

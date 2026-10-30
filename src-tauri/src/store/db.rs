@@ -243,6 +243,22 @@ impl Db {
         insert_message_row(&c, session_id, m)
     }
 
+    /// 一轮新增行的**原子**落库入口：要么整轮写进去，要么一行都不写。
+    /// 逐行调用 `append_message` 时，中途失败会留下「半轮」历史 —— 界面已经按完整一轮
+    /// 渲染，库里却只有前几行，重开后同一句话变成两半。
+    pub fn append_messages(
+        &self,
+        session_id: &str,
+        rows: &[Message],
+    ) -> Result<(), rusqlite::Error> {
+        let mut c = self.lock();
+        let tx = c.transaction()?;
+        for m in rows {
+            insert_message_row(&tx, session_id, m)?;
+        }
+        tx.commit()
+    }
+
     /// 把 [`CompactionPlan`](crate::agent::context::CompactionPlan) 圈定的最老一段对话行删掉，
     /// 并在**同一个事务**里落一条 `Role::System` 摘要备注。
     ///

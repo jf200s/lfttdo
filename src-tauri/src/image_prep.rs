@@ -19,6 +19,10 @@ const MAX_INPUT_BYTES: usize = 40_000_000;
 /// R183：解码缓冲的分配预算，取值照 `image::Limits::default()` 的 `max_alloc`，
 /// 也就是 `ImageReader::decode()` 里那道 `limits.reserve(total_bytes)` 的等价物。
 const MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
+/// 像素总数上限（与分配预算互补）：一张纯色 10000×10000 的 PNG 编码后可能不到 1MB，
+/// `total_bytes` 也只有 300MB（低于 512MB 分配预算），但解码出来仍是一张 1 亿像素的图。
+/// 缩放发生在解码**之后**，所以像素闸只能在这里、解码**之前**。
+const MAX_PIXELS: u64 = 40_000_000;
 /// jpeg 首发质量。png 首发不吃它（png 编码器没有质量旋钮，走 `encode_png`，F6-N1）；
 /// 两支各自只编这一次，超线才进阶梯。
 const FIRST_JPEG_QUALITY: u8 = 90;
@@ -43,6 +47,8 @@ pub enum ImageError {
     EncodeFailed,
     #[error("图片太大（当前 {actual} 字节），请先裁剪或缩小后再发送")]
     InputTooLarge { actual: usize },
+    #[error("图片像素过大（{width}×{height}，上限 4000 万像素），请先缩小后再发送")]
+    TooManyPixels { width: u32, height: u32 },
 }
 
 /// 生产入口：常量就是界面承诺的那两个数。
@@ -94,6 +100,15 @@ pub fn normalize_with(
     // 调用点在 `from_decoder` 之前，判定本身单独立成 `within_decode_budget`，原因见那条测试的注释。
     if !within_decode_budget(decoder.total_bytes()) {
         return Err(ImageError::Unreadable);
+    }
+    // 分配预算之后再过像素闸：超高像素但 total_bytes 不到 512MB 的图（纯色大图）
+    // 会走到这里；缩放发生在解码之后，拦不住一次 1 亿像素的解码。
+    let (pw, ph) = decoder.dimensions();
+    if u64::from(pw) * u64::from(ph) > MAX_PIXELS {
+        return Err(ImageError::TooManyPixels {
+            width: pw,
+            height: ph,
+        });
     }
     let mut img = DynamicImage::from_decoder(decoder).map_err(|_| ImageError::Unreadable)?;
     img.apply_orientation(orientation); // NoTransforms 是 no-op，不必加 if
@@ -658,6 +673,36 @@ mod tests {
         assert!(
             matches!(err, ImageError::Unreadable),
             "炸弹必须给出明确错误而不是放行/panic，得到 {err:?}"
+        );
+    }
+
+    /// 像素闸：10000×10000 的纯色 PNG 可以很小，`total_bytes` 也只有 300MB
+    /// （低于 512MB 分配预算），但解码仍是一次 1 亿像素的分配 —— 必须在解码之前拒。
+    #[test]
+    fn rejects_a_high_pixel_count_image_before_decoding_it() {
+        let bytes = bomb_png(10_000, 10_000);
+        // 前提从夹具本身量出来，而不是写一条常量比较：这张图必须**低于**分配预算，
+        // 否则测到的是另一道闸。
+        let probe = ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert!(
+            probe.total_bytes() < MAX_DECODE_ALLOC_BYTES,
+            "夹具前提：total_bytes={} 必须低于分配预算",
+            probe.total_bytes()
+        );
+        let err = normalize_image(&bytes).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ImageError::TooManyPixels {
+                    width: 10_000,
+                    height: 10_000
+                }
+            ),
+            "必须给出明确的像素过大错误，得到 {err:?}"
         );
     }
 
