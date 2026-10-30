@@ -1,8 +1,12 @@
 import { accentTriplet, normalizeHex } from "./accent";
 
-export const THEME_NAMES = ["noir", "paper", "ocean"] as const;
+export const THEME_NAMES = ["noir", "paper", "ocean", "dusk"] as const;
 export type ThemeName = (typeof THEME_NAMES)[number];
 export type Mode = "light" | "dark";
+
+/* 2026-10-25 追加 "dusk"（暮褐）：spec 443 原写「预设主题 3 套」，业主批准后加第 4 套 ——
+ * 明暗两块住在 presets.css，玻璃层的主题级覆盖住在 tokens.css 末尾（dusk 有自己的暖褐底，
+ * 不走 mode 级玻璃块那套统一深色）。tokens.test.ts 的块数闸跟着从 6 改成由名单推导。 */
 
 /** 预设块负责拥有的 token。`tokens.test.ts` 逐块断言「每个预设覆盖这 17 个、一个不漏」，
  *  所以这里少列一个就等于漏项测试少守一个（R124）。
