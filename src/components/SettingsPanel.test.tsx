@@ -145,7 +145,7 @@ const setup = async (over: Partial<SettingsView> = {}, props: Partial<PanelProps
 
 describe("SettingsPanel", () => {
   it("does not render a system prompt field but must not wipe the externally set one", async () => {
-    // 人设由 U 盘上的 `人设.txt` 在启动时注入 settings.json；面板**不再渲染**这一栏。
+    // 人设是 settings.json 里的 `system_prompt`；面板**不渲染**这一栏。
     // 但它保存的是整张表：漏带这个键 = 用户点一次保存就把人设抹成空。
     expect(screen.queryByLabelText(/系统提示词/)).toBeNull();
     const p = await setup({ system_prompt: "你是小宋祺。" });

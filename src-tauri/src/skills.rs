@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 pub const SKILL_FILE: &str = "SKILL.md";
 /// 选择表：只记「被停用的文件夹」。新加进来的技能默认启用，跟主流 agent 的取向一致。
-/// 它住在**数据目录**（便携版里就是 U 盘的 `LFTTDO\data`），不写回用户的技能文件夹。
+/// 它住在**数据目录**，不写回用户的技能文件夹。
 pub const SELECTION_FILE: &str = "skills.json";
 /// 交给模型的技能条数上限：再多也只是把系统提示撑长。
 pub const MAX_SKILLS: usize = 50;

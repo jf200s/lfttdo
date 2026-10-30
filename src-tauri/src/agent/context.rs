@@ -45,7 +45,7 @@ pub struct ContextConfig {
     /// `build()` 今天不读它 —— 滑窗用的仍是全额预算。
     pub compact_threshold: f32,
     /// 用户自定义的系统提示词（设置里那一栏）。空串 ⇒ 用 [`SYSTEM_PROMPT`]。
-    /// 有值时**整段替换**默认提示词：人设模型（如 U 盘上的 `xiaosongqi`）靠它生效。
+    /// 有值时**整段替换**默认提示词：人设模型（如 `xiaosongqi`）靠它生效。
     pub system_prompt: String,
     /// 压缩时保留原文的最近轮数 K（spec 5.3 默认 10）。K=0 意味着连刚说完的那轮
     /// 都被摘要掉 ⇒ 当场失忆，所以 `Settings::normalize` 夹 `1..=50`。

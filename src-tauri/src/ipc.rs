@@ -266,8 +266,8 @@ pub struct AppState {
     /// MCP 的 stdio 桥与配置目录（T35）。桥是进程级单例：工具注册与信任档位都挂在它上面。
     pub mcp: Arc<McpBridge>,
     pub mcp_dir: PathBuf,
-    /// 技能包目录。便携模式下在 exe 的上一级（U 盘上就是 `aidox\skills`，与人设同层），
-    /// 常规安装放数据目录下；装配期建出来，用户把 `SKILL.md` 丢进子目录即可。
+    /// 技能包目录：固定为数据目录下的 `skills/`；装配期建出来，用户把
+    /// `SKILL.md` 丢进子目录即可。
     pub skills_dir: PathBuf,
     /// 按会话的抽取互斥(spec §12.5 缺口 1)。空闲 worker 与切换回补都经它,
     /// 避免同一会话被两条路径同时抽取、堆出重复记忆。
@@ -1842,7 +1842,7 @@ pub struct SkillView {
 
 #[derive(Serialize)]
 pub struct SkillsView {
-    /// 技能目录（U 盘上就是 `aidox\skills`），面板原样显示给用户。
+    /// 技能目录（数据目录下的 `skills/`），面板原样显示给用户。
     pub root: String,
     pub skills: Vec<SkillView>,
 }
@@ -2518,40 +2518,10 @@ pub fn build_production_registry(db: Arc<Db>) -> Arc<ToolRegistry> {
     registry
 }
 
-/// 便携模式的数据目录（U 盘场景）：exe 同目录有 `portable.txt` ⇒ `<exe 目录>/data`。
-/// 纯函数，便于单测；目录建不出来时当作「没有便携标记」，回落常规路径。
-fn portable_data_dir(exe_dir: &Path) -> Option<PathBuf> {
-    if !exe_dir.join("portable.txt").is_file() {
-        return None;
-    }
-    let data = exe_dir.join("data");
-    std::fs::create_dir_all(&data).ok()?;
-    Some(data)
-}
-
-/// 数据目录的唯一解析点：便携标记优先，否则 `%APPDATA%\<identifier>`。
+/// 数据目录的唯一解析点：`%APPDATA%\<identifier>`。
 /// 配置、会话库、日志、MCP 信任表、窗口几何都跟着它走 —— 一处判定，处处一致。
 fn resolve_data_dir(handle: &AppHandle) -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-        && let Some(portable) = portable_data_dir(exe_dir)
-    {
-        return Some(portable);
-    }
     handle.path().app_data_dir().ok()
-}
-
-/// 技能目录：便携模式放在 exe 的**上一级** —— U 盘上就是 `aidox\skills`，与 `人设.txt`
-/// 同层，用户打开 U 盘就能看见；常规安装放数据目录下。
-/// 「是不是便携模式」沿用同一个 `portable.txt` 判据，不另造第二条真相。
-fn resolve_skills_dir(exe_dir: Option<&Path>, data_dir: &Path) -> PathBuf {
-    if let Some(exe_dir) = exe_dir
-        && exe_dir.join("portable.txt").is_file()
-        && let Some(root) = exe_dir.parent()
-    {
-        return root.join("skills");
-    }
-    data_dir.join("skills")
 }
 
 /// 一次空闲 tick 的**全部决策**。worker 只负责「每 60 秒调一次它」,因此这一层
@@ -2741,10 +2711,7 @@ pub fn run() {
         .setup(|app| {
             let dir = resolve_data_dir(app.handle()).ok_or("无法确定数据目录")?;
             std::fs::create_dir_all(&dir)?;
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf));
-            let skills_dir = resolve_skills_dir(exe_dir.as_deref(), &dir);
+            let skills_dir = dir.join("skills");
             // 建不出来不算失败：发现阶段对不存在的目录就是空表，`use_skill` 随之隐藏。
             let _ = std::fs::create_dir_all(&skills_dir);
             let log_path = init_logging(&dir);
@@ -7319,24 +7286,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn portable_marker_switches_the_data_dir_to_the_exe_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(
-            portable_data_dir(dir.path()).is_none(),
-            "没有 portable.txt 就不能进便携模式（否则每个安装版都会把数据写进 Program 目录）"
-        );
-        std::fs::write(
-            dir.path().join("portable.txt"),
-            "portable
-",
-        )
-        .unwrap();
-        let data = portable_data_dir(dir.path()).expect("有标记就该用 exe 同目录的 data");
-        assert_eq!(data, dir.path().join("data"));
-        assert!(data.is_dir(), "目录必须被建出来");
-    }
-
     #[tokio::test]
     async fn an_empty_mcp_config_bootstraps_to_nothing() {
         let out = mcp_bootstrap(&Arc::new(McpBridge::new()), &ToolRegistry::new(), vec![]).await;
@@ -8310,34 +8259,6 @@ mod tests {
         .unwrap();
         assert_eq!(got, 1);
         assert_eq!(f.db.valid_memories().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn the_skills_dir_sits_beside_the_persona_on_a_portable_stick() {
-        // U 盘布局：<根>\LFTTDO\lfttdo.exe + portable.txt ⇒ 技能在 <根>\skills
-        // （与人设.txt 同层，用户打开 U 盘就能看见，不用钻进应用目录）。
-        let stick = tempfile::tempdir().unwrap();
-        let app_dir = stick.path().join("LFTTDO");
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("portable.txt"), "portable\n").unwrap();
-        assert_eq!(
-            resolve_skills_dir(Some(&app_dir), &app_dir.join("data")),
-            stick.path().join("skills")
-        );
-
-        // 常规安装 / 没有便携标记：落在数据目录下。
-        let data = tempfile::tempdir().unwrap();
-        let exe_dir = data.path().join("Programs").join("LFTTDO");
-        std::fs::create_dir_all(&exe_dir).unwrap();
-        assert_eq!(
-            resolve_skills_dir(Some(&exe_dir), data.path()),
-            data.path().join("skills")
-        );
-        assert_eq!(
-            resolve_skills_dir(None, data.path()),
-            data.path().join("skills"),
-            "拿不到 exe 路径时也要有一个确定的兜底"
-        );
     }
 
     /// 压缩段同样认领:拿不到就跳过抽取、压缩照常(内容归另一条路径,不丢)。
