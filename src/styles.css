@@ -846,6 +846,40 @@ a:hover {
   padding: 0 16px 12px;
 }
 
+/* ==== MCP 配置编辑器 ==== */
+
+/* 面板默认 460px 对整份 JSON 太窄；只在编辑视图加宽。 */
+.panel-wide {
+  width: 720px;
+}
+
+.mcp-config-text {
+  width: 100%;
+  min-height: 280px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-input);
+  font-family: var(--font-code);
+  font-size: 0.85em;
+  line-height: 1.5;
+  tab-size: 2;
+  resize: vertical;
+}
+
+/* 保存失败的后端错误是多行清单（每条一行），必须保留换行。 */
+.mcp-config-editor .panel-error {
+  white-space: pre-wrap;
+}
+
+.panel-note > p {
+  margin: 0;
+}
+
+.panel-issues {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
 /* ==== 滚动条 ==== */
 
 /* 四个滚动容器各留一根 15px 宽的默认条，是「默认模板」第二显眼的痕迹（第一是没调过的间距）。

@@ -9,6 +9,8 @@ import type {
   AgentPayload,
   ContentBlock,
   Decision,
+  McpConfigStatus,
+  McpConfigText,
   McpServerView,
   McpTrust,
   MemoryView,
@@ -185,6 +187,23 @@ export function mcpReconnect(name: string): Promise<number> {
 
 export function mcpDisconnect(name: string): Promise<void> {
   return invoke<void>("mcp_disconnect", { name });
+}
+
+/**
+ * MCP 配置编辑器（应用内 JSON 编辑）。`mcpConfigStatus` 只给面板做提示，不含正文；
+ * 只有 `mcpConfigRead` 会把含 env/headers 的原文带到前端，且只在用户点「编辑配置」时调用。
+ * 保存的严格校验在 Rust；失败返回多行原因，不写盘。
+ */
+export function mcpConfigStatus(): Promise<McpConfigStatus> {
+  return invoke<McpConfigStatus>("mcp_config_status");
+}
+
+export function mcpConfigRead(): Promise<McpConfigText> {
+  return invoke<McpConfigText>("mcp_config_read");
+}
+
+export function mcpConfigSave(text: string): Promise<void> {
+  return invoke<void>("mcp_config_save", { text });
 }
 
 /** 技能面板：列表每次现扫磁盘，前端不另存一份。 */

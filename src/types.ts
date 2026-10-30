@@ -78,6 +78,25 @@ export interface McpServerView {
   reason: string | null;
 }
 
+/** 配置加载器的一条跳过记录：原因措辞来自 Rust 的固定五条。 */
+export interface McpConfigIssue {
+  name: string;
+  reason: string;
+}
+
+/** `mcp_config_status` 的返回：**不含正文与 env/headers 值**，面板常规加载只调它。 */
+export interface McpConfigStatus {
+  path: string;
+  exists: boolean;
+  parseError: string | null;
+  skipped: McpConfigIssue[];
+}
+
+/** `mcp_config_read` 的返回：**只有这条命令**会把配置原文（含密钥）带到前端。 */
+export interface McpConfigText extends McpConfigStatus {
+  text: string;
+}
+
 /** 技能面板的一行（ipc.rs::SkillView）。选择表按 folder 记，停用的技能仍列出来。 */
 export interface SkillView {
   name: string;
