@@ -10,6 +10,19 @@ pub const MSG_TOKEN_OVERHEAD: usize = 4;
 
 pub const SYSTEM_PROMPT: &str = "你是 LFTTDO，一个运行在桌面端的轻量助手。回答简洁、直接，中文优先。可用工具时优先使用工具获取事实，不要凭记忆编造；不确定就说不确定。";
 
+/// 固定追加在系统提示**末尾**的「工作方式」段。
+///
+/// 为什么必须独立于 `SYSTEM_PROMPT` / 人设：`ContextConfig::system_prompt` 非空时是
+/// **整段替换**内置提示词（人设模型靠它生效），于是「先调工具再回答」这条规矩会跟着
+/// 人设一起被抹掉 —— 实测症状就是本地 8B 明明有 `fetch_url` / `use_skill` 却直接凭记忆作答。
+/// 规矩属于外壳，不属于人设，所以它由会话追加、任何人设都替换不掉。
+pub const TOOL_POLICY: &str = "## 工作方式\n\
+ - 需要事实、最新信息、文件或网页内容时，**先调用工具**拿到结果再回答；没有依据就说不确定，不要凭记忆编造。\n\
+ - 技能：与技能列表描述相符时，先调用 use_skill 读出正文，再按正文步骤执行；正文已经给出来的不必重复读取。\n\
+ - 例：用户说“把这段润色一下”，技能列表里有「翻译润色」⇒ 先 use_skill(name=\"翻译润色\")，拿到正文后再照它回答。\n\
+ - MCP 工具与内置工具同等对待：能用就先用它核实，再根据返回结果作答。\n\
+ - 一次调用不够就继续调用，直到有依据可说。";
+
 /// 单图计价：视觉 token 与 base64 字符数无关，按格式给固定权重。
 /// 刻意不按 `data.len()` 估 —— base64 长度 ≈ 4/3 字节数，用它判断预算会完全失真，
 /// 模型侧计费也是按视觉 token 而非字符。Task 20 的图片降级规则与此配合。
@@ -99,13 +112,25 @@ impl ContextBuilder {
     /// 已知取舍：历史里的 system 备注一律排在保留 tail **之前**，与它们在历史中的位置无关
     /// （今天的摘要备注就该在最前）；切片 5 若引入需要按时序穿插的系统备注，要改这里。
     pub fn build(&self, history: &[Message]) -> Built {
+        self.build_with_extra(history, "")
+    }
+
+    /// 与 [`Self::build`] 相同，但在系统提示末尾追加 `extra_system`（技能索引、
+    /// 已加载正文、外壳工作方式）。追加段**参与**预算裁剪与 token 粗估：
+    /// 先 build 再往外贴，会让一条已经按预算裁好的请求凭空超线。
+    pub fn build_with_extra(&self, history: &[Message], extra_system: &str) -> Built {
         // 请求头部 = 本机 SYSTEM_PROMPT + 历史里已有的 system 备注（Plan C 的摘要消息走
         // 这一路），但去掉与 SYSTEM_PROMPT 重复的那条，避免同一提示词进两次。
-        let prompt = if self.cfg.system_prompt.trim().is_empty() {
-            SYSTEM_PROMPT
+        let mut prompt = if self.cfg.system_prompt.trim().is_empty() {
+            SYSTEM_PROMPT.to_string()
         } else {
-            self.cfg.system_prompt.as_str()
+            self.cfg.system_prompt.clone()
         };
+        if !extra_system.trim().is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(extra_system);
+        }
+        let prompt = prompt.as_str();
         let mut head: Vec<Message> = vec![Message::system_note(prompt)];
         head.extend(
             history
@@ -1711,6 +1736,44 @@ mod compaction_planning {
                  正是 `set_calibration` 文档注释写明禁止的那个后果"
             );
         }
+    }
+
+    #[test]
+    fn an_extra_system_tail_is_counted_in_the_estimate_and_the_budget() {
+        let hist: Vec<Message> = (0..12)
+            .map(|i| msg(Role::User, &("轮".repeat(120) + &format!("{i}"))))
+            .collect();
+        let cfg = ContextConfig {
+            reserve_output: 0,
+            budget_tokens: 1000,
+            ..Default::default()
+        };
+        let plain = ContextBuilder::new(cfg.clone()).build(&hist);
+        let tail = "## 技能\n- 翻译助手：中英互译\n\n## 本轮已加载的技能\n".to_string()
+            + &"步".repeat(400);
+        let with_tail = ContextBuilder::new(cfg).build_with_extra(&hist, &tail);
+
+        assert!(
+            with_tail.messages[0].text_of().ends_with(&tail),
+            "追加段必须原样落在系统提示末尾"
+        );
+        assert!(
+            with_tail.est_input_tokens > plain.est_input_tokens,
+            "追加段计入粗估，否则 usage 校准与预算都会偏"
+        );
+        assert!(
+            with_tail.messages.len() <= plain.messages.len(),
+            "追加段挤占预算时只能少留历史，不能多塞：{} vs {}",
+            with_tail.messages.len(),
+            plain.messages.len()
+        );
+        assert!(
+            with_tail
+                .messages
+                .iter()
+                .any(|m| m.text_of().contains("轮")),
+            "还有预算时不该把历史全部裁光"
+        );
     }
 
     #[test]

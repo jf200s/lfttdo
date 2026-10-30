@@ -15,6 +15,7 @@ import type {
   SessionRow,
   Settings,
   SettingsView,
+  SkillsView,
 } from "../types";
 
 /**
@@ -127,4 +128,22 @@ export function mcpReconnect(name: string): Promise<number> {
 
 export function mcpDisconnect(name: string): Promise<void> {
   return invoke<void>("mcp_disconnect", { name });
+}
+
+/** 技能面板：列表每次现扫磁盘，前端不另存一份。 */
+export function skillsList(): Promise<SkillsView> {
+  return invoke<SkillsView>("skills_list");
+}
+
+/** 在资源管理器里打开技能目录。路径由 Rust 侧 `AppState` 定死，前端不传任何参数。 */
+export function skillsOpenFolder(): Promise<void> {
+  return invoke<void>("skills_open_folder");
+}
+
+/** 启用/停用一个技能（按文件夹名）。选择表落在数据目录的 skills.json。 */
+export function skillsSetEnabled(
+  folder: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke<void>("skills_set_enabled", { folder, enabled });
 }

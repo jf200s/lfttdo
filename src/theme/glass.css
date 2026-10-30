@@ -227,6 +227,7 @@ html[data-theme][data-mode] .sidebar-foot {
   gap: 6px;
   padding-top: 8px;
   border-top: 1px solid var(--glass-border);
+
   /* 收起态列表被隐藏后，靠这行把底栏钉在侧栏底部（子代理验收指出的跳动）。 */
   margin-top: auto;
 }

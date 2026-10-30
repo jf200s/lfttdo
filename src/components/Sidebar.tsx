@@ -7,6 +7,7 @@ interface SidebarProps {
   onToggleCollapsed?: () => void;
   onOpenSettings?: () => void;
   onOpenMcp?: () => void;
+  onOpenSkills?: () => void;
   rows: SessionRow[];
   activeId: string | null;
   onSelect: (id: string) => void;
@@ -30,6 +31,7 @@ export function Sidebar({
   onToggleCollapsed,
   onOpenSettings,
   onOpenMcp,
+  onOpenSkills,
   rows,
   activeId,
   onSelect,
@@ -138,6 +140,14 @@ export function Sidebar({
           onClick={onOpenSettings}
         >
           ⚙{collapsed ? null : " 设置"}
+        </button>
+        <button
+          type="button"
+          className="sidebar-action"
+          aria-label="技能"
+          onClick={onOpenSkills}
+        >
+          技能
         </button>
         <button
           type="button"

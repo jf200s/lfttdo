@@ -1324,6 +1324,8 @@ mod tests {
             http: reqwest::Client::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             roots: vec![],
+            skills_dir: None,
+            skills_disabled: Vec::new(),
         };
         let output = tool
             .execute(serde_json::json!({"q": "x"}), &ctx)

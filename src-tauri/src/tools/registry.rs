@@ -2,7 +2,7 @@
 //
 // Plan A 的生产工具表是**空的**（plan:1854：`echo` 仅测试与循环验证用、不注册进生产），
 // 于是 spec 5.1「MVP 内置工具全为 Read，因此全程零弹窗」为真。Task 27 起生产表里有
-// `fetch_url` + `read_file`（`ipc.rs::build_production_registry`，两把都是 `Risk::Read`，
+// `fetch_url` + `read_file` + `use_skill`（`ipc.rs::build_production_registry`，三把都是 `Risk::Read`，
 // 所以那句话**仍然**为真），本文件的机制一行没改 —— 这句是它当初的承诺，现在是事实。
 //
 // 风险的唯一真相源是 `risk_of`（= 注册表里那份 `ToolMeta.risk`）。`ToolDef` 里没有 risk
@@ -40,6 +40,11 @@ pub struct ToolCtx {
     pub http: reqwest::Client,
     pub cancel: CancellationToken,
     pub roots: Vec<PathBuf>,
+    /// `use_skill` 读技能包用的目录；`None` = 当前没有技能目录（该工具会明确失败）。
+    /// 与 `roots` 同一条取向：由会话每轮现构，工具自己不去猜路径。
+    pub skills_dir: Option<PathBuf>,
+    /// 被用户停用的技能文件夹。工具侧也要挡：隐藏声明不等于拒绝调用。
+    pub skills_disabled: Vec<String>,
 }
 
 impl ToolCtx {
@@ -262,6 +267,8 @@ mod tests {
             http: reqwest::Client::new(),
             cancel: CancellationToken::new(),
             roots,
+            skills_dir: None,
+            skills_disabled: Vec::new(),
         }
     }
 

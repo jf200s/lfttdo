@@ -74,6 +74,20 @@ export interface McpServerView {
   reason: string | null;
 }
 
+/** 技能面板的一行（ipc.rs::SkillView）。选择表按 folder 记，停用的技能仍列出来。 */
+export interface SkillView {
+  name: string;
+  description: string;
+  folder: string;
+  enabled: boolean;
+}
+
+/** `skills_list` 的返回（ipc.rs::SkillsView）：root 是磁盘上的技能目录，面板原样显示。 */
+export interface SkillsView {
+  root: string;
+  skills: SkillView[];
+}
+
 /** `ContentBlock`（types.rs:4-24）：tag 字段是 `type`（不是 `t`），字段 snake_case。 */
 export type ContentBlock =
   | { type: "text"; text: string }

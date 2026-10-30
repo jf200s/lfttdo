@@ -4,3 +4,4 @@ pub mod fetch;
 pub mod fetch_guard;
 pub mod read_file;
 pub mod registry;
+pub mod use_skill;

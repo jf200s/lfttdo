@@ -19,6 +19,7 @@ use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::tools::fetch::FetchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::use_skill::UseSkillTool;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -206,6 +207,9 @@ pub struct AppState {
     /// MCP 的 stdio 桥与配置目录（T35）。桥是进程级单例：工具注册与信任档位都挂在它上面。
     pub mcp: Arc<McpBridge>,
     pub mcp_dir: PathBuf,
+    /// 技能包目录。便携模式下在 exe 的上一级（U 盘上就是 `aidox\skills`，与人设同层），
+    /// 常规安装放数据目录下；装配期建出来，用户把 `SKILL.md` 丢进子目录即可。
+    pub skills_dir: PathBuf,
 }
 
 /// 单轮并发闸门。guard 一析构就释放槽位，所以 `?` 的每条早退路径（读设置失败、
@@ -280,6 +284,12 @@ pub struct TurnDeps {
     /// 空表是**允许值**而且是默认值：那时 `read_file` 一律拒绝，那是设计（R90 取向），
     /// 不是这一层漏了什么。
     pub roots: Vec<PathBuf>,
+    /// 技能包目录（`use_skill` + 系统提示里的技能索引）。与 roots 一样每轮交给会话，
+    /// 会话再原样放进 `ToolCtx` —— 工具层不自己去猜路径。
+    pub skills_dir: Option<PathBuf>,
+    /// 用户停用的技能文件夹（`skills.json`，数据目录）。每轮从磁盘现读：面板一关掉，
+    /// 下一条消息就按新选择走。
+    pub skills_disabled: Vec<String>,
     pub cancel: Arc<Mutex<Option<CancellationToken>>>,
 }
 
@@ -395,6 +405,8 @@ pub async fn run_turn(
         context,
         temperature,
         roots,
+        skills_dir,
+        skills_disabled,
         cancel,
     } = deps;
     let sid = session_id.to_string();
@@ -442,7 +454,9 @@ pub async fn run_turn(
     // （R276 的「每轮从 `Settings` 现取、不缓存」因此更硬了：今天的答案只在今天有效）。
     // 过滤仍然**只此一处** —— `settings.rs::effective_roots` 是它的唯一实现，本行是它唯一的
     // 生产调用点；第二处过滤意味着两处答案可以不一致，那正是 R276 把它钉成一条线的原因。
-    .with_roots(effective_roots(&roots));
+    .with_roots(effective_roots(&roots))
+    .with_skills_dir(skills_dir)
+    .with_skills_disabled(skills_disabled);
     let session_cancel = session.cancel_handle();
     token.install(session_cancel.clone());
     if compaction.is_cancelled() {
@@ -570,6 +584,8 @@ pub async fn send_message(
             // 的说明）：它保证的是「来源是本轮那份 `Settings`」，而「值真的抵达 `ToolCtx`」
             // 由下面的 `run_turn_hands_the_effective_roots_not_the_persisted_list` 钉。
             roots: settings.roots.clone(),
+            skills_dir: Some(state.skills_dir.clone()),
+            skills_disabled: crate::skills::load_selection(&state.mcp_dir).disabled,
             cancel: state.cancel.clone(),
         },
         &session_id,
@@ -775,6 +791,97 @@ pub async fn mcp_disconnect(state: State<'_, AppState>, name: String) -> Result<
     state.mcp.disconnect(&name).await;
     mcp_clear_tools(&state.registry, &name, &decls);
     Ok(())
+}
+
+/// 技能面板的一行。只用来**看**：技能没有开关，模型按描述自动调用。
+#[derive(Debug, Serialize)]
+pub struct SkillView {
+    pub name: String,
+    pub description: String,
+    pub folder: String,
+    /// 选择表里是否启用。停用的技能仍列出来（否则用户没法重新打开）。
+    pub enabled: bool,
+}
+
+#[derive(Serialize)]
+pub struct SkillsView {
+    /// 技能目录（U 盘上就是 `aidox\skills`），面板原样显示给用户。
+    pub root: String,
+    pub skills: Vec<SkillView>,
+}
+
+/// 面板的真相源就是磁盘：每次打开/刷新都重新扫，不在前端另存一份列表。
+pub(crate) fn skills_view_of(dir: &Path, sel: &crate::skills::Selection) -> SkillsView {
+    SkillsView {
+        root: dir.display().to_string(),
+        skills: crate::skills::discover(dir)
+            .into_iter()
+            .map(|e| SkillView {
+                enabled: crate::skills::is_enabled(sel, &e.folder),
+                name: e.name,
+                description: e.description,
+                folder: e.folder,
+            })
+            .collect(),
+    }
+}
+
+#[tauri::command]
+pub async fn skills_list(state: State<'_, AppState>) -> Result<SkillsView, String> {
+    let dir = state.skills_dir.clone();
+    let sel = crate::skills::load_selection(&state.mcp_dir);
+    // 扫盘最多读 50 个文件头；放进阻塞池，别占住 IPC 的主线程。
+    blocking(move || Ok::<SkillsView, String>(skills_view_of(&dir, &sel))).await
+}
+
+/// 启用/停用一个技能。文件夹必须真实存在（面板传回来的那一列），避免选择表里
+/// 长出一条谁也对不上的幽灵记录。
+pub(crate) fn set_skill_enabled_of(
+    skills_dir: &Path,
+    data_dir: &Path,
+    folder: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    let exists = crate::skills::discover(skills_dir)
+        .iter()
+        .any(|e| e.folder == folder);
+    if !exists {
+        return Err(format!("没有这个技能：{folder}"));
+    }
+    let mut sel = crate::skills::load_selection(data_dir);
+    crate::skills::set_enabled(&mut sel, folder, enabled);
+    crate::skills::save_selection(data_dir, &sel)
+}
+
+#[tauri::command]
+pub async fn skills_set_enabled(
+    state: State<'_, AppState>,
+    folder: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let skills_dir = state.skills_dir.clone();
+    let data_dir = state.mcp_dir.clone();
+    blocking(move || set_skill_enabled_of(&skills_dir, &data_dir, &folder, enabled)).await
+}
+
+/// 打开技能文件夹。路径只来自 `AppState`（装配期定死），不接收任何前端参数。
+#[tauri::command]
+pub fn skills_open_folder(state: State<'_, AppState>) -> Result<(), String> {
+    let dir = state.skills_dir.clone();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建技能目录失败：{e}"))?;
+    #[cfg(windows)]
+    {
+        // 参数走数组、不经 cmd /C：这里没有用户输入，也不该为它开一条命令串通路。
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("打开技能文件夹失败：{e}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("打开技能文件夹目前仅支持 Windows".to_string())
+    }
 }
 
 #[tauri::command]
@@ -1090,15 +1197,15 @@ fn persist_window_geometry(window: &tauri::Window) {
 
 /// 生产工具表的**唯一**装配点（Task 27）。
 ///
-/// 零参是刻意的：两把工具都不需要 `AppState`，运行期要的东西（`http`、`cancel`、`roots`）
-/// 由会话每轮现构的 `ToolCtx` 给（R276 的单一入口）。一旦它开始收参数，「全进程装配一次」
+/// 零参是刻意的：三把工具都不需要 `AppState`，运行期要的东西（`http`、`cancel`、`roots`、
+/// `skills_dir`）由会话每轮现构的 `ToolCtx` 给（R276 的单一入口）。一旦它开始收参数，「全进程装配一次」
 /// 就退化成「每个调用点各装配一次」，而 `R101` 那条「一个目录只许一个 `SettingsStore`」
 /// 的教训说的正是这种重复。
 ///
 /// 名字序由 `ToolRegistry` 里的 `BTreeMap` 决定（字典序），**不是**这里的注册顺序；
-/// `production_registry_ships_fetch_url_and_read_file` 钉的是那份字面名单。
+/// `production_registry_ships_the_three_read_tools` 钉的是那份字面名单。
 ///
-/// 两把都是 `Risk::Read`，spec 5.1「内置工具全为 Read ⇒ 全程零弹窗」到这一轮仍然成立。
+/// 三把都是 `Risk::Read`，spec 5.1「内置工具全为 Read ⇒ 全程零弹窗」到这一轮仍然成立。
 ///
 /// 与 R286 的分工：这里**只管注册**，roots 为空时 `read_file` 照样在表里 —— 模型真喊它
 /// 就走闸门被拒。要不要把它的**声明**交给模型，由 `agent/session.rs::request()` 按
@@ -1107,6 +1214,7 @@ pub fn build_production_registry() -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     registry.register(Arc::new(FetchTool::new()));
     registry.register(Arc::new(ReadFileTool));
+    registry.register(Arc::new(UseSkillTool));
     registry
 }
 
@@ -1133,6 +1241,19 @@ fn resolve_data_dir(handle: &AppHandle) -> Option<PathBuf> {
     handle.path().app_data_dir().ok()
 }
 
+/// 技能目录：便携模式放在 exe 的**上一级** —— U 盘上就是 `aidox\skills`，与 `人设.txt`
+/// 同层，用户打开 U 盘就能看见；常规安装放数据目录下。
+/// 「是不是便携模式」沿用同一个 `portable.txt` 判据，不另造第二条真相。
+fn resolve_skills_dir(exe_dir: Option<&Path>, data_dir: &Path) -> PathBuf {
+    if let Some(exe_dir) = exe_dir
+        && exe_dir.join("portable.txt").is_file()
+        && let Some(root) = exe_dir.parent()
+    {
+        return root.join("skills");
+    }
+    data_dir.join("skills")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1143,6 +1264,12 @@ pub fn run() {
         .setup(|app| {
             let dir = resolve_data_dir(app.handle()).ok_or("无法确定数据目录")?;
             std::fs::create_dir_all(&dir)?;
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(Path::to_path_buf));
+            let skills_dir = resolve_skills_dir(exe_dir.as_deref(), &dir);
+            // 建不出来不算失败：发现阶段对不存在的目录就是空表，`use_skill` 随之隐藏。
+            let _ = std::fs::create_dir_all(&skills_dir);
             let log_path = init_logging(&dir);
             let db = Arc::new(Db::open(&dir.join("qwen-do.db"))?);
             // R101：一个目录只许存在**一个** `SettingsStore`。它的 `save()` 锁是实例内的
@@ -1158,7 +1285,7 @@ pub fn run() {
             // R105：装配期还没有 session_id，所以 gate 先不带 sink，由 `run_turn` 每轮开头
             // `set_sink(emitter)`（`gate.rs:77` 的可换内核就是为这一刻准备的）。
             // 这里**不留** brief Step 3 的 `NoopSink`：空 sink 意味着 Plan B 的弹窗静默不发事件。
-            // Task 27 起生产表里有两把工具（见 `build_production_registry`），两把都是
+            // 生产表里三把工具（见 `build_production_registry`），三把都是
             // `Risk::Read` ⇒ 自动放行仍然成立、用户侧仍然零弹窗；而 sink 还没换上的窗口里
             // `check` 给的是 deny（R44：headless ≠ 全授权）。
             let mcp = Arc::new(McpBridge::new());
@@ -1174,6 +1301,7 @@ pub fn run() {
                 // `mcp_dir` 就是 `mcp.json` 所在的 app data 目录。
                 mcp,
                 mcp_dir: dir.clone(),
+                skills_dir,
             });
             // 后台自举：句柄从刚装好的 State 里取（保持装配行仍是唯一一条
             // `registry: build_production_registry()` —— 那条守卫测试盯着它）。
@@ -1233,6 +1361,9 @@ pub fn run() {
             mcp_set_trust,
             mcp_reconnect,
             mcp_disconnect,
+            skills_list,
+            skills_open_folder,
+            skills_set_enabled,
         ])
         // R108 / T18 m2 —— `tauri.conf.json` 里那句 `"label": "main"` 的理由（R108 要求每处
         // conf 改动写清理由，而这份 conf 里放不下理由，原因写在下面）：
@@ -1515,6 +1646,10 @@ mod tests {
                     // 生产装配点那行由 `the_assembly_wires_the_production_registry` 钉（M4：
                     // 把 `app.manage` 换回空表，405 条单测全绿，所以判据只能是源码级守卫）。
                     roots: Vec::new(),
+                    // 夹具不带技能目录：`use_skill` 因此在声明表里被隐藏，
+                    // 需要它的测试自己往会话上挂一个真的临时目录。
+                    skills_dir: None,
+                    skills_disabled: Vec::new(),
                     cancel: self.cancel.clone(),
                 },
                 sid,
@@ -1874,6 +2009,8 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 roots: roots.clone(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
             },
             &sid,
@@ -1943,6 +2080,8 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 roots: Vec::new(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
             },
             &sid,
@@ -1970,7 +2109,7 @@ mod tests {
     /// `echo` / `guarded` 这类替身只该活在 `#[cfg(test)]` 里 —— 它们的名字一旦进生产，
     /// 请求体里就多出一条用户看不懂、实现也不是给用户的工具。
     #[test]
-    fn production_registry_ships_fetch_url_and_read_file() {
+    fn production_registry_ships_the_three_read_tools() {
         let r = build_production_registry();
         let names: Vec<String> = r.defs().into_iter().map(|d| d.name).collect();
         // 这个字面顺序由 `ToolRegistry` 的 `BTreeMap`（字典序）决定，**不是**注册顺序。
@@ -1978,19 +2117,16 @@ mod tests {
         // 保证界面与模型侧的工具列表不因重连而抖动，把这条性质藏起来就没法发现它被改坏。
         assert_eq!(
             names,
-            vec!["fetch_url", "read_file"],
+            vec!["fetch_url", "read_file", "use_skill"],
             "模型看到的工具集必须是这份名单；echo/guarded 这类测试工具绝不能进生产（它们只活在 #[cfg(test)]）"
         );
-        assert_eq!(
-            r.risk_of("fetch_url"),
-            Risk::Read,
-            "内置工具全为 Read ⇒ 才谈得上零弹窗"
-        );
-        assert_eq!(
-            r.risk_of("read_file"),
-            Risk::Read,
-            "read_file 进生产的前提就是它仍是只读档（spec 5.1）；它变成 Write 就会开始弹窗"
-        );
+        for name in ["fetch_url", "read_file", "use_skill"] {
+            assert_eq!(
+                r.risk_of(name),
+                Risk::Read,
+                "{name} 进生产的前提就是它仍是只读档（spec 5.1）；它变成 Write 就会开始弹窗"
+            );
+        }
         assert_eq!(
             r.risk_of("delete_everything"),
             Risk::Exec,
@@ -2536,6 +2672,8 @@ mod tests {
                 context: compacting_cfg(),
                 temperature: None,
                 roots: Vec::new(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
                 cancel: f.cancel.clone(),
             },
             &sid,
@@ -2676,6 +2814,82 @@ mod tests {
             registered.contains(&"normalize_image"),
             "命令写了但没登记，前端调用只会拿到 not found：{registered:?}"
         );
+        // 技能面板的两条命令同一条判据：没登记就是面板点开一片空。
+        for name in ["skills_list", "skills_open_folder", "skills_set_enabled"] {
+            assert!(
+                registered.contains(&name),
+                "{name} 写了但没登记，技能面板只会拿到 not found：{registered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_skills_view_lists_name_description_and_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("translate");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: 翻译助手\ndescription: 中英互译\n---\n正文\n",
+        )
+        .unwrap();
+
+        let view = skills_view_of(dir.path(), &crate::skills::Selection::default());
+        assert_eq!(view.root, dir.path().display().to_string());
+        assert_eq!(view.skills.len(), 1, "{:?}", view.skills);
+        assert_eq!(view.skills[0].name, "翻译助手");
+        assert_eq!(view.skills[0].description, "中英互译");
+        assert_eq!(view.skills[0].folder, "translate");
+        assert!(view.skills[0].enabled, "没有选择表时默认启用");
+
+        let mut sel = crate::skills::Selection::default();
+        sel.disabled.push("translate".to_string());
+        let view = skills_view_of(dir.path(), &sel);
+        assert!(
+            !view.skills[0].enabled,
+            "停用的是 enabled=false，不是列表里消失"
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        let view = skills_view_of(empty.path(), &sel);
+        assert!(view.skills.is_empty(), "空目录要交空表，而不是报错");
+        assert_eq!(view.root, empty.path().display().to_string());
+    }
+
+    #[test]
+    fn toggling_a_skill_persists_and_rejects_unknown_folders() {
+        let skills = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let skill = skills.path().join("translate");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: 翻译助手\ndescription: 中英互译\n---\n正文\n",
+        )
+        .unwrap();
+
+        set_skill_enabled_of(skills.path(), data.path(), "translate", false).unwrap();
+        assert_eq!(
+            crate::skills::load_selection(data.path()).disabled,
+            vec!["translate".to_string()],
+            "停用要落盘（skills.json）"
+        );
+        assert!(!crate::skills::is_enabled(
+            &crate::skills::load_selection(data.path()),
+            "translate"
+        ));
+
+        set_skill_enabled_of(skills.path(), data.path(), "translate", true).unwrap();
+        assert!(
+            crate::skills::load_selection(data.path())
+                .disabled
+                .is_empty(),
+            "重新启用要把这条删掉"
+        );
+
+        let e = set_skill_enabled_of(skills.path(), data.path(), "../etc", false)
+            .expect_err("不存在的文件夹必须拒，选择表里不许出现幽灵记录");
+        assert!(e.contains("没有这个技能"), "{e}");
     }
 
     // ---- resolve_api_key：本机模型免 key 的唯一闸门 ----
@@ -2874,6 +3088,34 @@ mod tests {
         let data = portable_data_dir(dir.path()).expect("有标记就该用 exe 同目录的 data");
         assert_eq!(data, dir.path().join("data"));
         assert!(data.is_dir(), "目录必须被建出来");
+    }
+
+    #[test]
+    fn the_skills_dir_sits_beside_the_persona_on_a_portable_stick() {
+        // U 盘布局：<根>\LFTTDO\lfttdo.exe + portable.txt ⇒ 技能在 <根>\skills
+        // （与人设.txt 同层，用户打开 U 盘就能看见，不用钻进应用目录）。
+        let stick = tempfile::tempdir().unwrap();
+        let app_dir = stick.path().join("LFTTDO");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("portable.txt"), "portable\n").unwrap();
+        assert_eq!(
+            resolve_skills_dir(Some(&app_dir), &app_dir.join("data")),
+            stick.path().join("skills")
+        );
+
+        // 常规安装 / 没有便携标记：落在数据目录下。
+        let data = tempfile::tempdir().unwrap();
+        let exe_dir = data.path().join("Programs").join("LFTTDO");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        assert_eq!(
+            resolve_skills_dir(Some(&exe_dir), data.path()),
+            data.path().join("skills")
+        );
+        assert_eq!(
+            resolve_skills_dir(None, data.path()),
+            data.path().join("skills"),
+            "拿不到 exe 路径时也要有一个确定的兜底"
+        );
     }
 
     #[tokio::test]

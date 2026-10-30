@@ -180,6 +180,8 @@ async fn turn_mode(args: &[String], prompt: &str) -> Result<(), Box<dyn std::err
             context: settings.to_context_config(),
             temperature,
             roots: settings.roots.clone(),
+            skills_dir: None,
+            skills_disabled: Vec::new(),
             cancel: Arc::new(Mutex::new(None)),
         },
         &sid,
@@ -221,6 +223,8 @@ async fn direct_mode(
         http: reqwest::Client::new(),
         cancel: CancellationToken::new(),
         roots: effective_roots(&roots),
+        skills_dir: None,
+        skills_disabled: Vec::new(),
     };
     let outcome = tool.execute(input.clone(), &ctx).await;
     println!(

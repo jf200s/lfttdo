@@ -5,7 +5,7 @@
 // 记录型 sink 就能端到端跑完，文件末尾的测试就是它唯一的运行方式验证。
 // Plan A 的生产工具表是**空的**（plan:1854），所以工具路径的正确性完全由这些测试撑着
 // ——不要以「生产里没有工具」为理由简化循环本身。
-use super::context::ContextBuilder;
+use super::context::{ContextBuilder, TOOL_POLICY};
 use super::events::{AgentEvent, Decision, ErrorWhere, EventSink, StopReason};
 use super::types::*;
 use crate::model::assistant_acc::AssistantAcc;
@@ -13,6 +13,7 @@ use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider};
 use crate::permission::gate::PermissionGate;
 use crate::tools::read_file;
 use crate::tools::registry::{ToolCtx, ToolRegistry};
+use crate::tools::use_skill;
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,6 +63,17 @@ pub struct AgentSession {
     cancel: CancellationToken,
     http: reqwest::Client,
     roots: Vec<PathBuf>,
+    /// 技能包目录（`skills/<名字>/SKILL.md`）。每轮请求现扫，用户改完文件不用重启。
+    skills_dir: Option<PathBuf>,
+    /// 用户在面板里停用的技能文件夹（按文件夹名，稳定键）。
+    skills_disabled: Vec<String>,
+    /// 本轮已经自动加载过正文的技能：`(展示名, [小写技能名, 小写文件夹名])`。
+    /// 只服务一件事 —— 模型再喊一次 `use_skill` 时不重读，回一句提示。
+    turn_skills: Vec<(String, Vec<String>)>,
+    /// 本轮**用户原话**（`run()` 入口那一句）。不能用「最近一条 user 消息」代替：
+    /// 工具返回图片时 `image_followup` 会再补一条 user 轮，那样会让技能在第二次请求里
+    /// 突然从上下文消失。
+    turn_user_text: String,
     /// 发出**当前这次请求**时 `build()` 报的粗估输入 token（切片 5 的校准分母）。
     last_est_input: u32,
 }
@@ -121,6 +133,10 @@ impl AgentSession {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             roots: Vec::new(),
+            skills_dir: None,
+            skills_disabled: Vec::new(),
+            turn_skills: Vec::new(),
+            turn_user_text: String::new(),
             last_est_input: 0,
         }
     }
@@ -130,6 +146,35 @@ impl AgentSession {
     pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.roots = roots;
         self
+    }
+
+    /// 技能目录。`None` 与「目录为空」等价：索引为空 ⇒ `use_skill` 不交给模型。
+    pub fn with_skills_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.skills_dir = dir;
+        self
+    }
+
+    /// 停用列表（文件夹名）。停用的技能既进不了索引，也读不出正文。
+    pub fn with_skills_disabled(mut self, disabled: Vec<String>) -> Self {
+        self.skills_disabled = disabled;
+        self
+    }
+
+    /// 模型喊的 `use_skill` 若指向本轮已经加载过正文的技能，返回那句替代输出。
+    /// 匹配键是技能名与文件夹名（都小写），与 `use_skill` 工具自己认的那一套一致。
+    fn already_loaded_note(&self, input: &serde_json::Value) -> Option<String> {
+        let want = input
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?
+            .to_lowercase();
+        self.turn_skills
+            .iter()
+            .find(|(_, keys)| keys.contains(&want))
+            .map(|(name, _)| {
+                format!("技能「{name}」的完整说明已经在本轮上下文里，直接按它执行，不必重复读取。")
+            })
     }
 
     /// 这一轮之后模型应该看到的完整历史。事件流给 UI，这个给 Task 11 落库。
@@ -158,13 +203,19 @@ impl AgentSession {
         if self.cancel.is_cancelled() {
             return self.finish(StopReason::Interrupted);
         }
-        self.history.push(Message::user(blocks));
+        let user = Message::user(blocks);
+        // 「本轮已加载」和「用户原话」都是**这一轮**的事：下一轮重新按那句话决定。
+        self.turn_user_text = user.text_of();
+        self.turn_skills.clear();
+        self.history.push(user);
         // 工具上下文建一次就够：三个字段整轮不变，而 `CancellationToken` 的克隆共享
         // 同一个状态，所以中途按下停止照样被 `ToolRegistry::execute` 的守卫看见。
         let ctx = ToolCtx {
             http: self.http.clone(),
             cancel: self.cancel.clone(),
             roots: self.roots.clone(),
+            skills_dir: self.skills_dir.clone(),
+            skills_disabled: self.skills_disabled.clone(),
         };
 
         for turn in 1..=self.cfg.max_turns {
@@ -280,37 +331,50 @@ impl AgentSession {
                 // 构造函数负责钉住「顶层 risk == call.risk」这个不变量（agent/events.rs:75）。
                 self.deps.sink.emit(AgentEvent::tool_call(view.clone()));
 
-                // 取消臂住在 gate 内部（R43）：弹窗挂着的时候按停止，`select!` 打不断
-                // 一个已经在 await 的 `check`，只能由它自己收场。
-                let decision = self.deps.gate.check(&view, &ctx.cancel).await;
+                // 本轮已经把正文加载进上下文的技能又被点名：不重读，只回一句提示。
+                // 8B 实测会把同一份正文连读 2–3 遍，每遍都是白烧的输入 token；
+                // 工具卡照常发出去，界面上仍然看得见这一次调用。
+                let already = if name == use_skill::NAME {
+                    self.already_loaded_note(&input)
+                } else {
+                    None
+                };
                 let started = Instant::now();
-                let (output, is_error) = match decision {
-                    Decision::Allow { .. } => {
-                        match self.deps.registry.execute(&name, input, &ctx).await {
-                            // R64：工具失败只由 `ToolResult{is_error:true}` 承载，
-                            // 不再补一条 `Error{at:Tool}` —— 同一个事实报两遍，
-                            // 前端会长出两行（那条分支是 Plan B/C 的 MCP/循环错误用的）。
-                            Ok(output) => (output, false),
-                            Err(e) => (ToolOutput::text(e.to_string()), true),
+                let (output, is_error) = match already {
+                    Some(note) => (ToolOutput::text(note), false),
+                    None => {
+                        // 取消臂住在 gate 内部（R43）：弹窗挂着的时候按停止，`select!` 打不断
+                        // 一个已经在 await 的 `check`，只能由它自己收场。
+                        let decision = self.deps.gate.check(&view, &ctx.cancel).await;
+                        match decision {
+                            Decision::Allow { .. } => {
+                                match self.deps.registry.execute(&name, input, &ctx).await {
+                                    // R64：工具失败只由 `ToolResult{is_error:true}` 承载，
+                                    // 不再补一条 `Error{at:Tool}` —— 同一个事实报两遍，
+                                    // 前端会长出两行（那条分支是 Plan B/C 的 MCP/循环错误用的）。
+                                    Ok(output) => (output, false),
+                                    Err(e) => (ToolOutput::text(e.to_string()), true),
+                                }
+                            }
+                            // R59：内容就是拒绝理由本身。`ToolError::Failed` 的 Display 前缀是
+                            // 「工具执行失败: 」，套上去模型读到的是双重包装（spec:263 说的是理由）。
+                            //
+                            // 归属必须看令牌，不能一律写「用户拒绝执行」：门里的 `已取消` /
+                            // `等待授权时收到中断` 是**用户按了停止**，不是用户否决了这个诉求。写成
+                            // 否决会让模型以为这条路被禁止而不再重试；「中断」才是它能接着做的事实。
+                            // 竞态方向是安全的：用户应答完 deny 再按停止会被归到「本轮已中断」，两句
+                            // 都仍为真，只影响落库措辞；反过来（把停止说成否决）才是说谎。
+                            // headless 的 `没有可应答的界面` 仍会带上「用户拒绝执行」——Plan A 生产里
+                            // 不可达（T13 装配必然 `with_sink`），等它真可达时再连同归属一起改。
+                            Decision::Deny { reason } => {
+                                let who = if ctx.cancel.is_cancelled() {
+                                    "本轮已中断"
+                                } else {
+                                    "用户拒绝执行"
+                                };
+                                (ToolOutput::text(format!("{who}：{reason}")), true)
+                            }
                         }
-                    }
-                    // R59：内容就是拒绝理由本身。`ToolError::Failed` 的 Display 前缀是
-                    // 「工具执行失败: 」，套上去模型读到的是双重包装（spec:263 说的是理由）。
-                    //
-                    // 归属必须看令牌，不能一律写「用户拒绝执行」：门里的 `已取消` /
-                    // `等待授权时收到中断` 是**用户按了停止**，不是用户否决了这个诉求。写成
-                    // 否决会让模型以为这条路被禁止而不再重试；「中断」才是它能接着做的事实。
-                    // 竞态方向是安全的：用户应答完 deny 再按停止会被归到「本轮已中断」，两句
-                    // 都仍为真，只影响落库措辞；反过来（把停止说成否决）才是说谎。
-                    // headless 的 `没有可应答的界面` 仍会带上「用户拒绝执行」——Plan A 生产里
-                    // 不可达（T13 装配必然 `with_sink`），等它真可达时再连同归属一起改。
-                    Decision::Deny { reason } => {
-                        let who = if ctx.cancel.is_cancelled() {
-                            "本轮已中断"
-                        } else {
-                            "用户拒绝执行"
-                        };
-                        (ToolOutput::text(format!("{who}：{reason}")), true)
                     }
                 };
                 let preview = output.preview();
@@ -365,7 +429,51 @@ impl AgentSession {
     /// 交给模型的请求：滑窗组装出来的消息 + 注册表的工具声明。
     /// `&mut self` 只为记下这次请求的粗估（校准的分母）；`run()` 是它唯一的调用方。
     fn request(&mut self) -> ChatRequest {
-        let built = self.deps.context.build(&self.history);
+        // 外壳规矩 + 技能索引 + 本轮命中的技能正文，一起追加在人设**之后**：
+        // `ContextConfig::system_prompt` 非空时是整段替换内置提示词的，工具与技能的调用
+        // 规矩不该跟着人设一起被抹掉（本地小模型「有工具却凭记忆答」的主因之一）。
+        let mut skills = self
+            .skills_dir
+            .as_deref()
+            .map(crate::skills::discover)
+            .unwrap_or_default();
+        skills.retain(|e| !self.skills_disabled.iter().any(|f| f == &e.folder));
+        let mut tail = String::from(TOOL_POLICY);
+        // 技能索引只在请求上、不进历史：用户往 skills 里加/删文件，下一轮就生效。
+        if let Some(section) = crate::skills::prompt_section(&skills) {
+            tail.push_str("\n\n");
+            tail.push_str(&section);
+        }
+        // 用户这句话里出现技能名或触发词，就直接把正文放进本轮：按技能的步骤做这件事
+        // 不该取决于 8B 模型记不记得要先调 `use_skill`。没命中的技能仍然只留一行描述。
+        let hits = crate::skills::matched(
+            &skills,
+            &self.turn_user_text,
+            crate::skills::MAX_LOADED_PER_TURN,
+        );
+        let mut loaded: Vec<crate::skills::Skill> = Vec::new();
+        // 只有**完整**加载的正文才进短路表：被 16 KiB 截断的那份，模型必须还能用
+        // `use_skill` 把剩下的读回来（截断提示就是这么写的）。
+        let mut loaded_keys: Vec<(String, Vec<String>)> = Vec::new();
+        for entry in hits {
+            let Ok(skill) = crate::skills::body_of_entry(entry) else {
+                continue;
+            };
+            if skill.body.len() <= crate::skills::MAX_LOADED_BYTES {
+                loaded_keys.push((
+                    entry.name.clone(),
+                    vec![entry.name.to_lowercase(), entry.folder.to_lowercase()],
+                ));
+            }
+            loaded.push(skill);
+        }
+        self.turn_skills = loaded_keys;
+        if let Some(block) = crate::skills::loaded_section(&loaded) {
+            tail.push_str("\n\n");
+            tail.push_str(&block);
+        }
+        // 追加段交给 ContextBuilder 一起算预算：先 build 再往外贴会让请求凭空超线。
+        let built = self.deps.context.build_with_extra(&self.history, &tail);
         self.last_est_input = built.est_input_tokens;
         // `built.dropped` 在 Plan A 没有消费者：`ContextCompacted` 属切片 5，
         // `context.rs:44` 明确要求 Task 10 不为它造事件。
@@ -378,6 +486,11 @@ impl AgentSession {
         let mut tools = self.deps.registry.defs();
         if !read_file::usable_with_roots(&self.roots) {
             tools.retain(|d| d.name != read_file::NAME);
+        }
+        // 与 read_file 同一条 R286：没有技能时隐藏声明，省一次注定失败的调用。
+        // 隐藏不是授权 —— 模型凭空喊 `use_skill` 会走到工具里的「没有技能目录」失败。
+        if skills.is_empty() {
+            tools.retain(|d| d.name != use_skill::NAME);
         }
         ChatRequest {
             messages: built.messages,
@@ -902,7 +1015,7 @@ mod tests {
         out
     }
 
-    /// 生产那两把工具**本体**（不是替身）：R286 钉的是交给模型的声明表形状，
+    /// 生产那三把工具**本体**（不是替身）：R286 钉的是交给模型的声明表形状，
     /// 用替身的话名字和 `meta()` 都得由夹具自己编，那就变成夹具在测自己。
     /// 与 `ipc::build_production_registry` 是同一批类型，但这里不直接调它 ——
     /// `tools/` 与 `agent/` 整棵子树都不许依赖装配层（`lib.rs` 的边界约束），
@@ -911,7 +1024,32 @@ mod tests {
         vec![
             Arc::new(crate::tools::fetch::FetchTool::new()),
             Arc::new(crate::tools::read_file::ReadFileTool),
+            Arc::new(crate::tools::use_skill::UseSkillTool),
         ]
+    }
+
+    /// 一份最小技能包。返回的 `TempDir` 必须活到会话跑完（技能是在请求时才读盘的）。
+    fn skill_fixture(folder: &str, name: &str, description: &str, body: &str) -> tempfile::TempDir {
+        skill_fixture_with_keywords(folder, name, description, "", body)
+    }
+
+    fn skill_fixture_with_keywords(
+        folder: &str,
+        name: &str,
+        description: &str,
+        keywords: &str,
+        body: &str,
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(folder);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let frontmatter = if keywords.is_empty() {
+            format!("---\nname: {name}\ndescription: {description}\n---\n")
+        } else {
+            format!("---\nname: {name}\ndescription: {description}\nkeywords: {keywords}\n---\n")
+        };
+        std::fs::write(skill_dir.join("SKILL.md"), format!("{frontmatter}{body}\n")).unwrap();
+        dir
     }
 
     /// **每一次**请求里的工具名（按注册表的字典序原样交出，不排序：顺序本身就是被测物）。
@@ -1435,10 +1573,14 @@ mod tests {
             est > 1,
             "夹具前提：粗估必须非零，否则除不出 0.5（est={est}）"
         );
+        // 会话把「工作方式」段并进系统提示一起算预算；分母要按同一条路重算。
+        let denominator = ContextBuilder::new(ContextConfig::default())
+            .build_with_extra(&hist, TOOL_POLICY)
+            .est_input_tokens;
         let mut rig = Rig::new(vec![vec![
             ModelDelta::Text("好".into()),
             ModelDelta::Usage {
-                input_tokens: est / 2,
+                input_tokens: denominator / 2,
                 output_tokens: 7,
             },
         ]]);
@@ -1452,7 +1594,11 @@ mod tests {
             again < est,
             "真实比粗估省 ⇒ 之后的估算必须跟着降：{again} vs {est}"
         );
-        assert_eq!(again, est / 2, "系数必须是真实÷粗估（接反成 2.0 时这条红）");
+        assert!(
+            (again as i64 - (est / 2) as i64).abs() <= 1,
+            "系数必须是真实÷粗估（接反成 2.0 时这条红）：{again} vs 期望 {}",
+            est / 2
+        );
     }
 
     #[tokio::test]
@@ -2099,6 +2245,415 @@ mod tests {
             declared_names(&reqs),
             vec![vec!["fetch_url".to_string(), "read_file".to_string()]],
             "有一条可用 root ⇒ 声明表必须带上 read_file，否则这条工具对用户永久隐形"
+        );
+    }
+
+    // ---- 技能包：索引进提示、正文按需读、没技能时隐藏 ----
+
+    #[tokio::test]
+    async fn skills_are_indexed_in_the_system_prompt_and_offered_as_a_tool() {
+        let skills = skill_fixture("translate", "翻译助手", "中英互译", "先识别语言，再翻译。");
+        let mut rig = Rig::with_only(vec![deltas(&["好的"])], Vec::new(), production_tools());
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(skills.path().to_path_buf()));
+        assert_eq!(rig.run("你会什么").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 1);
+        let system = reqs[0].messages[0].text_of();
+        assert!(
+            system.contains("- 翻译助手：中英互译"),
+            "技能索引必须进系统提示，模型才知道有这个技能：{system}"
+        );
+        assert!(
+            system.contains("use_skill"),
+            "索引要教模型用哪把工具读正文：{system}"
+        );
+        assert_eq!(
+            declared_names(&reqs),
+            vec![vec!["fetch_url".to_string(), "use_skill".to_string()]],
+            "skills 存在时声明表要有 use_skill；空 roots 下 read_file 仍然隐藏"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_skills_dir_adds_no_prompt_section_and_hides_use_skill() {
+        let empty = tempfile::tempdir().unwrap();
+        let mut rig = Rig::with_only(vec![deltas(&["没有技能"])], Vec::new(), production_tools());
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(empty.path().to_path_buf()));
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        let system = reqs[0].messages[0].text_of();
+        assert!(
+            system.starts_with(crate::agent::context::SYSTEM_PROMPT),
+            "内置提示词仍是开头那一段：{system}"
+        );
+        assert!(
+            system.contains(TOOL_POLICY),
+            "没有技能时「工作方式」段照样要在（它不属于技能，属于外壳）：{system}"
+        );
+        assert!(
+            !system.contains("## 技能"),
+            "没有技能时不许留一个空标题：{system}"
+        );
+        assert_eq!(
+            declared_names(&reqs),
+            vec![vec!["fetch_url".to_string()]],
+            "没有技能却把 use_skill 挂在请求里，等于邀请一次注定失败的调用"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tool_policy_survives_a_custom_persona() {
+        // 人设是**整段替换**内置提示词的；工具规矩要是跟着人设走，换成人设的当天
+        // 本地模型就「有工具也凭记忆答」。这一段必须由会话追加，替换不掉。
+        let mut rig = Rig::with_context(
+            ContextConfig {
+                system_prompt: "你是小宋祺。".into(),
+                ..Default::default()
+            },
+            vec![deltas(&["嗯"])],
+        );
+        assert_eq!(rig.run("在干嘛").await, StopReason::EndTurn);
+        let system = rig.reqs()[0].messages[0].text_of();
+        assert!(
+            system.starts_with("你是小宋祺。"),
+            "人设必须仍在最前（追加不许把它挤到后面）：{system}"
+        );
+        assert!(
+            system.contains(TOOL_POLICY),
+            "人设不许把工具与技能的使用规矩一起抹掉：{system}"
+        );
+    }
+
+    #[tokio::test]
+    async fn naming_a_skill_loads_its_body_without_waiting_for_a_tool_call() {
+        let skills = skill_fixture_with_keywords(
+            "translate",
+            "翻译助手",
+            "中英互译",
+            "润色, 译成英文",
+            "先识别语言，再翻译。",
+        );
+        let mut rig = Rig::with_only(
+            vec![deltas(&["This endpoint times out after 30 seconds."])],
+            Vec::new(),
+            production_tools(),
+        );
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(skills.path().to_path_buf()));
+        // 面板「用这个技能」填的就是这句话；用户自己打出来也该同样生效。
+        assert_eq!(
+            rig.run("使用「翻译助手」技能：这个接口默认超时 30 秒。")
+                .await,
+            StopReason::EndTurn
+        );
+
+        let system = rig.reqs()[0].messages[0].text_of();
+        assert!(
+            system.contains("### 本轮已加载的技能"),
+            "点了技能就该把正文带进本轮，而不是赌模型记得调 use_skill：{system}"
+        );
+        assert!(system.contains("先识别语言，再翻译。"), "{system}");
+        assert!(
+            system.contains("## 技能"),
+            "索引仍然要在（其它技能还得能自动命中）：{system}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyword_hit_loads_the_body() {
+        let skills = skill_fixture_with_keywords(
+            "translate",
+            "翻译助手",
+            "中英互译",
+            "润色, 译成英文",
+            "先识别语言，再翻译。",
+        );
+        let mut rig = Rig::with_only(vec![deltas(&["改好了"])], Vec::new(), production_tools());
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(skills.path().to_path_buf()));
+        assert_eq!(rig.run("帮我把这段润色一下").await, StopReason::EndTurn);
+
+        let system = rig.reqs()[0].messages[0].text_of();
+        assert!(
+            system.contains("先识别语言，再翻译。"),
+            "触发词命中却不加载正文 = 又回到赌模型自觉：{system}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_use_skill_call_for_a_loaded_skill_does_not_reread_the_body() {
+        // 自动加载已经生效的那一轮里，模型还是习惯性地喊了一次 use_skill：
+        // 正文不该再被交一遍（8B 实测会连读 2–3 次，每遍都是白烧的输入 token）。
+        let skills = skill_fixture_with_keywords(
+            "translate",
+            "翻译助手",
+            "中英互译",
+            "润色",
+            "先识别语言，再翻译。",
+        );
+        let mut rig = Rig::with_only(
+            vec![
+                tool_round(0, &[("use_skill", r#"{"name":"翻译助手"}"#)]),
+                deltas(&["改好了"]),
+            ],
+            Vec::new(),
+            production_tools(),
+        );
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(skills.path().to_path_buf()));
+        assert_eq!(rig.run("帮我把这段润色一下").await, StopReason::EndTurn);
+
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1, "{:?}", rig.sink.kinds());
+        assert!(!results[0].1, "短路不是失败：{}", results[0].2);
+        assert!(
+            results[0].2.contains("已经在本轮上下文里"),
+            "要明说别重复读：{}",
+            results[0].2
+        );
+        assert!(
+            !results[0].2.contains("先识别语言"),
+            "正文不该再被交一遍：{}",
+            results[0].2
+        );
+        assert_eq!(
+            rig.sink.kinds()[..3],
+            ["turn_start", "tool_call", "tool_result"],
+            "卡片仍然要发给界面（用户看得见这一次调用）"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_auto_load_still_allows_use_skill_to_read_the_rest() {
+        // 自动加载只放前 16 KiB；被截断的那份**不能**进短路表，否则模型照着提示
+        // 去调 use_skill 时会被回一句「已经在本轮上下文里」，剩下的正文永远读不到。
+        let body = "甲".repeat(6000) + "尾部标记";
+        let skills =
+            skill_fixture_with_keywords("translate", "翻译助手", "中英互译", "润色", &body);
+        let mut rig = Rig::with_only(
+            vec![
+                tool_round(0, &[("use_skill", r#"{"name":"翻译助手"}"#)]),
+                deltas(&["读完了"]),
+            ],
+            Vec::new(),
+            production_tools(),
+        );
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(skills.path().to_path_buf()));
+        assert_eq!(rig.run("帮我把这段润色一下").await, StopReason::EndTurn);
+
+        let system = rig.reqs()[0].messages[0].text_of();
+        assert!(
+            system.contains("需要完整步骤请调用 use_skill"),
+            "截断提示必须在：{system}"
+        );
+        let full = tool_results_of(rig.session.history());
+        assert_eq!(full.len(), 1, "{:?}", rig.sink.kinds());
+        assert!(
+            full[0].2.contains("尾部标记"),
+            "被截断的技能必须还能把全文读回来：{}",
+            full[0].2
+        );
+        assert!(
+            !full[0].2.contains("已经在本轮上下文里"),
+            "截断的那份不许被短路：{}",
+            full[0].2
+        );
+        std::fs::remove_dir_all(skills.path()).ok();
+    }
+
+    #[tokio::test]
+    async fn an_image_followup_does_not_drop_the_loaded_skill_on_the_next_request() {
+        // 工具回图片时 `image_followup` 会补一条 user 轮；如果按「最近一条 user」取用户原话，
+        // 第二次请求就会把技能正文丢掉 —— 这里钉住「本轮原话」只认 run() 入口那一句。
+        struct ImageTool;
+        #[async_trait]
+        impl Tool for ImageTool {
+            fn meta(&self) -> ToolMeta {
+                ToolMeta {
+                    name: "picture".into(),
+                    description: "回一张图".into(),
+                    input_schema: json!({"type": "object"}),
+                    risk: Risk::Read,
+                }
+            }
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &ToolCtx,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::Image {
+                    data: "QUJD".into(),
+                    mime: ImageMime::Png,
+                })
+            }
+        }
+
+        let skills = skill_fixture_with_keywords(
+            "translate",
+            "翻译助手",
+            "中英互译",
+            "润色",
+            "先识别语言，再翻译。",
+        );
+        let mut rig = Rig::with_only(
+            vec![tool_round(0, &[("picture", "{}")]), deltas(&["看到了"])],
+            Vec::new(),
+            vec![Arc::new(ImageTool)],
+        );
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(skills.path().to_path_buf()));
+        assert_eq!(rig.run("帮我把这段润色一下").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 2, "{:?}", rig.sink.kinds());
+        assert!(
+            reqs[0].messages[0]
+                .text_of()
+                .contains("先识别语言，再翻译。"),
+            "第一请求应已加载正文"
+        );
+        assert!(
+            reqs[1].messages[0]
+                .text_of()
+                .contains("先识别语言，再翻译。"),
+            "图片回填之后的第二次请求仍然要带着技能正文：{}",
+            reqs[1].messages[0].text_of()
+        );
+        std::fs::remove_dir_all(skills.path()).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_turn_loads_no_skill_body() {
+        let skills = skill_fixture_with_keywords(
+            "translate",
+            "翻译助手",
+            "中英互译",
+            "润色, 译成英文",
+            "先识别语言，再翻译。",
+        );
+        let mut rig = Rig::with_only(vec![deltas(&["晴"])], Vec::new(), production_tools());
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(skills.path().to_path_buf()));
+        assert_eq!(rig.run("今天天气怎么样").await, StopReason::EndTurn);
+
+        let system = rig.reqs()[0].messages[0].text_of();
+        assert!(system.contains("- 翻译助手：中英互译"), "{system}");
+        assert!(
+            !system.contains("### 本轮已加载的技能"),
+            "无关的一轮不该把正文拖进上下文：{system}"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_skill_reads_the_body_through_the_tool_ctx_the_session_built() {
+        let skills = skill_fixture("translate", "翻译助手", "中英互译", "先识别语言，再翻译。");
+        let mut rig = Rig::with_only(
+            vec![
+                tool_round(0, &[("use_skill", r#"{"name":"翻译助手"}"#)]),
+                deltas(&["按技能做了"]),
+            ],
+            Vec::new(),
+            production_tools(),
+        );
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(skills.path().to_path_buf()));
+        assert_eq!(rig.run("用翻译技能").await, StopReason::EndTurn);
+
+        let results = rig.sink.tool_results();
+        assert_eq!(
+            results.len(),
+            1,
+            "工具没跑 ⇒ 这条什么都没量到：{:?}",
+            rig.sink.kinds()
+        );
+        assert!(!results[0].1, "读技能不该失败：{}", results[0].2);
+        assert!(
+            results[0].2.contains("先识别语言，再翻译。"),
+            "技能正文没有经 ToolCtx 抵达工具：{}",
+            results[0].2
+        );
+        assert_eq!(rig.sink.texts(), "按技能做了");
+        assert_every_request_paired(&rig);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_skill_leaves_the_index_and_cannot_be_read() {
+        let skills = skill_fixture("translate", "翻译助手", "中英互译", "先识别语言。");
+        let mut rig = Rig::with_only(
+            vec![
+                tool_round(0, &[("use_skill", r#"{"name":"翻译助手"}"#)]),
+                deltas(&["没用上"]),
+            ],
+            Vec::new(),
+            production_tools(),
+        );
+        rig.session = rig
+            .session
+            .with_skills_dir(Some(skills.path().to_path_buf()))
+            .with_skills_disabled(vec!["translate".to_string()]);
+        assert_eq!(rig.run("用技能").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert!(
+            !reqs[0].messages[0].text_of().contains("## 技能"),
+            "停用后索引里不许再出现这一段：{}",
+            reqs[0].messages[0].text_of()
+        );
+        for (i, names) in declared_names(&reqs).iter().enumerate() {
+            assert!(
+                !names.iter().any(|n| n == "use_skill"),
+                "第 {i} 次请求的声明表里混进了 use_skill（全停用时该藏起来）：{names:?}"
+            );
+        }
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1, "{:?}", rig.sink.kinds());
+        assert!(results[0].1, "停用的技能直接喊名字也必须拒");
+        assert!(
+            results[0].2.contains("已停用"),
+            "拒绝要能归因到「已停用」：{}",
+            results[0].2
+        );
+    }
+
+    #[tokio::test]
+    async fn hiding_use_skill_does_not_weaken_its_failure_without_a_directory() {
+        let mut rig = Rig::with_only(
+            vec![
+                tool_round(0, &[("use_skill", r#"{"name":"翻译助手"}"#)]),
+                deltas(&["没读到"]),
+            ],
+            Vec::new(),
+            production_tools(),
+        );
+        assert_eq!(rig.run("用技能").await, StopReason::EndTurn);
+
+        for (i, names) in declared_names(&rig.reqs()).iter().enumerate() {
+            assert!(
+                !names.iter().any(|n| n == "use_skill"),
+                "第 {i} 次请求的声明表里混进了 use_skill（没有技能目录该藏起来）：{names:?}"
+            );
+        }
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1, "{:?}", rig.sink.kinds());
+        assert!(results[0].1, "没有技能目录时必须报错，而不是静默成功");
+        assert!(
+            results[0].2.contains("技能目录"),
+            "失败要可归因：{}",
+            results[0].2
         );
     }
 

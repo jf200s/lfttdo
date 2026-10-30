@@ -28,6 +28,7 @@ function setup(over: Partial<Parameters<typeof Sidebar>[0]> = {}) {
     onCreate: vi.fn(),
     onDelete: vi.fn(),
     onRename: vi.fn(),
+    onOpenSkills: vi.fn(),
     ...over,
   };
   render(<Sidebar {...props} />);
@@ -93,5 +94,11 @@ describe("Sidebar", () => {
     const target = screen.getByTestId("session-row-mid");
     fireEvent.click(within(target).getByRole("button", { name: /删除/ }));
     expect(props.onDelete).toHaveBeenCalledWith("mid");
+  });
+
+  it("opens the skills panel from the footer", () => {
+    const props = setup();
+    fireEvent.click(screen.getByRole("button", { name: "技能" }));
+    expect(props.onOpenSkills).toHaveBeenCalled();
   });
 });

@@ -40,12 +40,15 @@ export function Composer({
   onSend,
   onStop,
   onNormalize,
+  seed,
 }: {
   streaming: boolean;
   onSend: (blocks: SendBlock[]) => Promise<void>;
   onStop: () => void;
   /** 归一化由 prop 注入（Step 2 第 1 条）：这一层因此可测，`App` 接的是 `api.normalize`。 */
   onNormalize: (bytes: ArrayBuffer) => Promise<ContentBlock>;
+  /** 技能面板“用这个技能”的预填；每次点击换一个新对象（id 递增），同一句话也能再填一次。 */
+  seed?: { id: number; text: string } | null;
 }) {
   const [text, setText] = useState("");
   const [stopRequested, setStopRequested] = useState(false);
@@ -61,10 +64,21 @@ export function Composer({
    * 写这一支的地方只有 `pushPending` / `removePending` / `dropSent` 三处，所以可审。
    */
   const pendingRef = useRef<PendingImage[]>([]);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     if (!streaming) setStopRequested(false);
   }, [streaming]);
+
+  useEffect(() => {
+    if (!seed) return;
+    setText(seed.text);
+    const el = inputRef.current;
+    if (el) {
+      el.focus();
+      el.setSelectionRange(seed.text.length, seed.text.length);
+    }
+  }, [seed]);
 
   const pushPending = (img: PendingImage) => {
     pendingRef.current = [...pendingRef.current, img];
@@ -242,6 +256,7 @@ export function Composer({
         />
         <div className="composer-row">
           <textarea
+            ref={inputRef}
             aria-label="输入消息"
             className="composer-input"
             value={text}

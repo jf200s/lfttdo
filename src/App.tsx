@@ -3,6 +3,7 @@ import { Composer } from "./components/Composer";
 import { MessageList } from "./components/MessageList";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { McpPanel } from "./components/McpPanel";
+import { SkillsPanel } from "./components/SkillsPanel";
 import { Sidebar } from "./components/Sidebar";
 import * as api from "./ipc/commands";
 import { useTextBuffer } from "./ipc/batching";
@@ -38,6 +39,12 @@ export default function App() {
    */
   const [settingsView, setSettingsView] = useState<SettingsView | null>(null);
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [composerSeed, setComposerSeed] = useState<{
+    id: number;
+    text: string;
+  } | null>(null);
+  const seedId = useRef(0);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   /**
    * 当前会话的**同步**影子。事件回调是 tauri 那边推进来的，读 `activeId` 这个 state
@@ -284,6 +291,16 @@ export default function App() {
 
   const closeSettings = useCallback(() => setSettingsView(null), []);
 
+  /** 技能面板的“用这个技能”：关面板，把一句引导填进输入框并聚焦（不替用户发送）。 */
+  const useSkill = useCallback((name: string) => {
+    seedId.current += 1;
+    setComposerSeed({
+      id: seedId.current,
+      text: `使用「${name}」技能：`,
+    });
+    setSkillsOpen(false);
+  }, []);
+
   /**
    * 这里**不许**把 rejection 吞成 resolved：`SettingsPanel` 靠它决定「面板关不关、
    * 错误原文显不显示」。理由与 `send` 那句 `throw e` 完全同构（`AppImages.test.tsx`
@@ -333,6 +350,7 @@ export default function App() {
         onToggleCollapsed={() => setSidebarOpen((v) => !v)}
         onOpenSettings={openSettings}
         onOpenMcp={() => setMcpOpen(true)}
+        onOpenSkills={() => setSkillsOpen(true)}
         rows={rows}
         activeId={activeId}
         onSelect={(id) => {
@@ -389,6 +407,7 @@ export default function App() {
           onSend={send}
           onStop={stop}
           onNormalize={normalize}
+          seed={composerSeed}
         />
         <div className="statusbar" data-testid="usage">
           {usageText}
@@ -407,6 +426,12 @@ export default function App() {
         />
       ) : null}
       {mcpOpen ? <McpPanel onClose={() => setMcpOpen(false)} /> : null}
+      {skillsOpen ? (
+        <SkillsPanel
+          onClose={() => setSkillsOpen(false)}
+          onUseSkill={useSkill}
+        />
+      ) : null}
     </div>
   );
 }

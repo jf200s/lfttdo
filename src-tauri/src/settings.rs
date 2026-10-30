@@ -1706,6 +1706,8 @@ mod tests {
             http: reqwest::Client::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             roots: Settings::default().roots,
+            skills_dir: None,
+            skills_disabled: Vec::new(),
         };
         let e = ctx
             .resolve_within_roots(&file.to_string_lossy())

@@ -20,6 +20,9 @@ const h = vi.hoisted(() => {
     getSettings: vi.fn(),
     setSettings: vi.fn(),
     setApiKey: vi.fn(),
+    skillsList: vi.fn(),
+    skillsOpenFolder: vi.fn(),
+    skillsSetEnabled: vi.fn(),
     subscribeAgent: (cb: (sessionId: string, e: AgentEvent) => void) => {
       listeners.push(cb);
       return () => {
@@ -89,6 +92,9 @@ beforeEach(() => {
   h.renameSession.mockReset().mockResolvedValue(undefined);
   h.setSettings.mockReset().mockResolvedValue(undefined);
   h.setApiKey.mockReset().mockResolvedValue(undefined);
+  h.skillsList.mockReset().mockResolvedValue({ root: "", skills: [] });
+  h.skillsOpenFolder.mockReset().mockResolvedValue(undefined);
+  h.skillsSetEnabled.mockReset().mockResolvedValue(undefined);
   h.replaySession.mockReset().mockResolvedValue([]);
   h.sessions.mockReset().mockResolvedValue([row("B", 2)]);
   h.createSession.mockReset().mockResolvedValue("N");
@@ -121,6 +127,49 @@ describe("App", () => {
     expect(
       within(screen.getByTestId("bubble-assistant")).getByText("上次答的"),
     ).toBeInTheDocument();
+  });
+
+  it("opens the skills panel from the sidebar", async () => {
+    h.skillsList.mockResolvedValue({
+      root: "E:\\skills",
+      skills: [
+        {
+          name: "翻译润色",
+          description: "中英互译",
+          folder: "translate",
+          enabled: true,
+        },
+      ],
+    });
+    render(<App />);
+    await settled();
+    fireEvent.click(screen.getByRole("button", { name: "技能" }));
+    const panel = await screen.findByRole("region", { name: "技能" });
+    expect(within(panel).getByText("翻译润色")).toBeInTheDocument();
+    expect(within(panel).getByText("中英互译")).toBeInTheDocument();
+  });
+
+  it("prefills the composer when choosing a skill from the panel", async () => {
+    h.skillsList.mockResolvedValue({
+      root: "E:\\skills",
+      skills: [
+        {
+          name: "翻译润色",
+          description: "中英互译",
+          folder: "translate",
+          enabled: true,
+        },
+      ],
+    });
+    render(<App />);
+    await settled();
+    fireEvent.click(screen.getByRole("button", { name: "技能" }));
+    const panel = await screen.findByRole("region", { name: "技能" });
+    fireEvent.click(within(panel).getByRole("button", { name: "用这个技能" }));
+    expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(
+      "使用「翻译润色」技能：",
+    );
+    expect(screen.queryByRole("region", { name: "技能" })).toBeNull();
   });
 
   it("creates a session when the store has none", async () => {

@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod model;
 pub mod permission;
 pub mod settings;
+pub mod skills;
 pub mod store;
 pub mod text;
 pub mod tools;

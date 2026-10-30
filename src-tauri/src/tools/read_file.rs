@@ -495,6 +495,8 @@ mod tests {
             http: reqwest::Client::new(),
             cancel: CancellationToken::new(),
             roots,
+            skills_dir: None,
+            skills_disabled: Vec::new(),
         }
     }
 

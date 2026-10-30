@@ -238,7 +238,7 @@ Running `src-tauri\target\debug\examples\slice3_probe.exe --live --turn '读一�
 {"base_url":"http://127.0.0.1:11434/v1","effective_roots":["\\\\?\\D:\\slice3-notes"],"model":"huihui_ai/qwen3-abliterated:14b-q4_K_M","persisted_roots":["D:\\slice3-notes"],"t":"setup"}
 {"messages":2,"t":"request","temperature":0.699999988079071,"tools":["fetch_url","read_file"],"tools_json_bytes":2583}
 {"seq_ms":12243,"tag":"tool_result","event":{"t":"tool_result","call_id":"call_r6o9uys3","is_error":false,"ms":0,"preview":"第一行标记：SLICE3-ALPHA-7731\n[已截断，共 6 行，续页请填 offset=3]"}}
-{"db_path":"C:\\Users\\user\\AppData\\Local\\Temp\\slice3-probe-1792828623964.db","permission_request_events":0,"stop_reason":"EndTurn","t":"summary","tool_call_events":1,"tool_result_events":1}
+{"db_path":"...slice3-probe-1792828623964.db","permission_request_events":0,"stop_reason":"EndTurn","t":"summary","tool_call_events":1,"tool_result_events":1}
 ```
 
 `persisted_roots` 就是文件里那条（`slice3_probe.rs:146-152` 只往**内存里那份**追加 `--roots`，
