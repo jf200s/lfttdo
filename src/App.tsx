@@ -27,6 +27,13 @@ function newest(rows: SessionRow[]): SessionRow | undefined {
   );
 }
 
+/**
+ * P1 轻提示在屏上的毫秒数。8 秒的取法：短到不挡住下一句话（用户读到「已记住 3 条」就够了），
+ * 长到够他看到并决定要不要点进设置页。它不是可配置项 —— 一个记忆写入的提示没有
+ * 重要到值得占一个设置键。
+ */
+const MEMORY_TOAST_MS = 8_000;
+
 export default function App() {
   const [rows, setRows] = useState<SessionRow[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -47,6 +54,18 @@ export default function App() {
   const seedId = useRef(0);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   /**
+   * P1：轻提示当前要显示的那一条（`null` = 没有）。只留一个槽 ——
+   * 「同一轮连续事件只留最后一条」因此是免费的：新的一条覆盖旧的，并重置计时。
+   */
+  const [memoryToast, setMemoryToast] = useState<{ count: number } | null>(null);
+  const memoryToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * 面板打开时要不要滚到「长期记忆」那一组。由轻提示的点击置真。
+   * 它是**一次性的意图**而不是持久设置：关闭面板时归假，否则下一次从侧栏正常打开
+   * 也会莫名其妙滚到记忆区。
+   */
+  const [scrollMemories, setScrollMemories] = useState(false);
+  /**
    * 当前会话的**同步**影子。事件回调是 tauri 那边推进来的，读 `activeId` 这个 state
    * 会拿到旧值；这一支只有一处写（`openSession` / 启动那次），所以它是可审的。
    */
@@ -61,6 +80,52 @@ export default function App() {
     (text: string) => setAppNotices((n) => [...n, text]),
     [],
   );
+
+  /**
+   * P1：弹「已记住 N 条」。两个来源汇到这里 ——
+   * 1. `ui.memorySaved`：本会话抽取完成后后端发的 `memory_saved` 事件；
+   * 2. `flushMemory` 的返回值：切走那一刻的收尾抽取，它发生在会话已经离开之后，
+   *    事件通道里不会再有它的 `memory_saved`。
+   *
+   * 为什么 `count <= 0` 不弹：0 条不是「记住了 0 条」，是「这一轮没有新东西」。
+   * 后端也刻意不发零条的事件（`ipc.rs` 的测试钉着），前端补一条「已记住 0 条」
+   * 等于替它编了一次写入。
+   */
+  const showMemoryToast = useCallback((count: number) => {
+    if (count <= 0) return;
+    setMemoryToast({ count });
+    // 连续第二条重置计时，而不是让第一条的 8 秒把第二条一起带走 ——
+    // 否则快速两轮写入时，第二条只剩很短的存活时间。
+    if (memoryToastTimer.current !== null) clearTimeout(memoryToastTimer.current);
+    memoryToastTimer.current = setTimeout(() => {
+      setMemoryToast(null);
+      memoryToastTimer.current = null;
+    }, MEMORY_TOAST_MS);
+  }, []);
+
+  // 卸载时清计时器：留着的 setTimeout 会在一个已经不存在的组件上 setState，
+  // 症状是测试之间互相串（前一条的计时器把后一条的 toast 提前抹掉）。
+  useEffect(
+    () => () => {
+      if (memoryToastTimer.current !== null) {
+        clearTimeout(memoryToastTimer.current);
+        memoryToastTimer.current = null;
+      }
+    },
+    [],
+  );
+
+  /**
+   * 事件 → 轻提示。依赖是 `ui.memorySaved` 的**对象身份**：reducer 每次 `memory_saved`
+   * 都造一个新对象（`types.ts` 的 `memorySaved.at` 说明为什么），所以连续两次同 count
+   * 也会重开这 8 秒。换成依赖 `ui.memorySaved?.count` 的话，同 count 的第二次就是 no-op。
+   */
+  useEffect(() => {
+    // `memorySaved` 在类型上是可选的（见 types.ts 的说明）：外部手工构造的 `UiState`
+    // 可能根本没有这一键，`undefined` 与 `null` 在这里读成同一件事 —— 没有新计数。
+    if (!ui.memorySaved) return;
+    showMemoryToast(ui.memorySaved.count);
+  }, [ui.memorySaved, showMemoryToast]);
 
   // 帧合流：Rust 已经按 30ms 合过一帧，这里再按 rAF 合一次，渲染频率 ≤ 帧率。
   const buf = useTextBuffer((chunk) =>
@@ -149,6 +214,20 @@ export default function App() {
   /** 切会话：先打断正在跑的那一轮，再用 `replaySession` 重建界面（要求 5）。 */
   const openSession = useCallback(
     async (id: string, mustInterrupt: boolean) => {
+      const previous = activeRef.current;
+      // P1：切走前给**旧**会话一次收尾抽取（spec §4.1：「会话收尾」与空闲 worker 同源）。
+      // 三条纪律，缺一条都会把主路径弄糟：
+      // 1. `void` + 不 await —— 切换不该为一次后台抽取多等一个来回；
+      // 2. `.catch(() => {})` —— 后端已把一切失败收成 Ok(0)，这里兜的是 IPC 层自身的错；
+      // 3. 返回值 > 0 才弹提示 —— 它的 `memory_saved` 事件永远不会到（那时已经在别的会话），
+      //    所以这条路径必须自己把「记住了几条」说出来。
+      // `previous === id` 时不调：没有切换，谈不上收尾（也避免重复抽取同一段游标）。
+      if (previous !== null && previous !== id) {
+        void api
+          .flushMemory(previous)
+          .then((saved) => showMemoryToast(saved))
+          .catch(() => {});
+      }
       if (mustInterrupt) {
         try {
           await api.interrupt();
@@ -171,7 +250,7 @@ export default function App() {
     },
     // 依赖里**不能有 `buf`**：见上面 `bufRef` 的注释 —— 它每次渲染都是新对象，
     // 放进依赖就等于让 `openSession`、进而让启动 effect 每次渲染都重跑一遍。
-    [notice],
+    [notice, showMemoryToast],
   );
 
   const refresh = useCallback(async () => {
@@ -282,14 +361,28 @@ export default function App() {
    * （`ipc.rs:370` → `settings.rs:432`），用户在外面改了 `settings.json`，
    * 面板复用旧值就等于让他对着一个已经过期的模型名编辑。
    */
-  const openSettings = useCallback(() => {
-    api
-      .getSettings()
-      .then((v) => setSettingsView(v))
-      .catch((e) => notice(`读取设置失败：${String(e)}`));
-  }, [notice]);
+  const openSettingsAt = useCallback(
+    (memories: boolean) => {
+      // 先记下「要不要滚到记忆区」的意图，再读设置：`setSettingsView` 之后面板才挂载，
+      // 面板的挂载 effect 会消费这个布尔。反过来的话，滚动发生在节点还不存在的时候。
+      setScrollMemories(memories);
+      api
+        .getSettings()
+        .then((v) => setSettingsView(v))
+        .catch((e) => notice(`读取设置失败：${String(e)}`));
+    },
+    [notice],
+  );
+  /** 侧栏「设置」：从顶部开始看，不滚动。 */
+  const openSettings = useCallback(() => openSettingsAt(false), [openSettingsAt]);
+  /** P1 轻提示的点击目标：打开面板并滚到长期记忆区。 */
+  const openMemorySettings = useCallback(() => openSettingsAt(true), [openSettingsAt]);
 
-  const closeSettings = useCallback(() => setSettingsView(null), []);
+  const closeSettings = useCallback(() => {
+    setSettingsView(null);
+    // 一次性意图在这里收口：下一次从侧栏打开时不该再滚到记忆区。
+    setScrollMemories(false);
+  }, []);
 
   /** 技能面板的“用这个技能”：关面板，把一句引导填进输入框并聚焦（不替用户发送）。 */
   const useSkill = useCallback((name: string) => {
@@ -325,6 +418,38 @@ export default function App() {
   const clearKey = useCallback(async () => {
     await api.setApiKey("");
   }, []);
+
+  // 长期记忆子区的三条回调（设计文档 §7），转发 `commands.ts` 的命令，**都不 catch**：
+  // 失败原文要交给面板自己的 error 通道（同 saveKey/clearKey 的口径）。记忆列表的状态
+  // 只活在面板挂载期间（打开拉一次、删除/清空后重拉），App 不持有第二份 —— 这里
+  // 只递命令、不递数据。三个都用 `useCallback` 钉住身份：面板的挂载 effect 以
+  // `onLoadMemories` 为依赖，身份漂一次就重拉一次列表。
+  const loadMemories = useCallback(() => api.listMemories(), []);
+  const removeMemory = useCallback(async (id: number) => {
+    await api.deleteMemory(id);
+  }, []);
+  const clearAllMemories = useCallback(async () => {
+    await api.clearMemories();
+  }, []);
+  // P1：用户权威的两个写入口。与上面三条同一条线 —— 只转发命令、不持数据；
+  // **不 catch**：失败原文交给面板自己的 error 通道（用户正在编辑框里，只有面板
+  // 知道他刚才改的是哪一行）。成功后也不会在这里刷列表：面板自己重拉。
+  const updateMemory = useCallback(async (id: number, body: string) => {
+    await api.updateMemoryBody(id, body);
+  }, []);
+  const addMemory = useCallback(
+    async (kind: string, body: string, dueAt: number | null) => {
+      // `memory_add` 返回新行 id（面板当前不消费它，但签名要如实传递，免得将来
+      // 「按 id 高亮新行」时有人以为命令不返回东西）。
+      // `dueAt` 原样转发：字面值 → UTC 毫秒的换算归面板，App 不做第二次解释
+      // （多一处换算就多一处会漂的口径）。
+      return await api.addMemory(kind, body, dueAt);
+    },
+    [],
+  );
+  // T12：常驻画像。与上面三条同一条线 —— 只转发命令、不持数据，失败原文交给面板。
+  // 身份必须稳定：面板的画像 effect 以它为依赖，漂一次就重拉一次。
+  const loadProfile = useCallback(() => api.memoryProfile(), []);
 
   const usageText =
     ui.usage === null
@@ -413,6 +538,22 @@ export default function App() {
           {usageText}
         </div>
       </main>
+      {/* P1 轻提示。`role="status"` + `aria-live="polite"`：它**不该抢焦点**，
+          也不该在用户正在打字时打断他，只排到下一句话之后读一次。
+          区域常驻、内容条件渲染：live region 必须在内容变化之前就在 DOM 里，
+          否则屏幕阅读器对「新挂载的 live region」通常不播报。
+          两个来源都汇进同一个槽，所以屏幕上永远只有一条「已记住 N 条」。 */}
+      <div className="toast-region" role="status" aria-live="polite">
+        {memoryToast === null ? null : (
+          <button
+            type="button"
+            className="toast"
+            onClick={openMemorySettings}
+          >
+            已记住 {memoryToast.count} 条
+          </button>
+        )}
+      </div>
       {/* 面板是**视图**，不是另一份状态：它开着的时候 `ui`、订阅、会话列表全都照旧跑
           （判据在 `AppSettings.test.tsx` 那条「keeps rendering the live turn …」）。
           `backdrop` 是 fixed 全屏，所以挂在 `.app` 这个 grid 的最后一个子位上不影响布局。 */}
@@ -423,6 +564,13 @@ export default function App() {
           onSaveKey={saveKey}
           onClearKey={clearKey}
           onClose={closeSettings}
+          onLoadMemories={loadMemories}
+          onDeleteMemory={removeMemory}
+          onClearMemories={clearAllMemories}
+          onLoadProfile={loadProfile}
+          onUpdateMemory={updateMemory}
+          onAddMemory={addMemory}
+          scrollToMemories={scrollMemories}
         />
       ) : null}
       {mcpOpen ? <McpPanel onClose={() => setMcpOpen(false)} /> : null}

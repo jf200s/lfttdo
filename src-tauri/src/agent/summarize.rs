@@ -50,24 +50,25 @@ pub fn summary_request(src: &[Message]) -> ChatRequest {
     }
 }
 
-/// 收流。只认 `ModelDelta::Text`；`ToolCall*` 与 `Usage` 一律忽略（摘要不需要工具，
-/// 也不该拿它的 usage 去校准主对话的系数——那不是同一批 token）。
-///
-/// 循环体是 `session.rs:144-170` 已经跑通的那个形状：`while` + `tokio::select!{ biased; .. }`
-/// + `deltas.next()`。**不复用 `AssistantAcc`**：那个累加器的职责是 tool_call 分片，
-/// 用它只会让摘要文本的来源多一条路径。取消语义也照它：`biased` 让取消优先，
-/// 且取消时**不**把半截文本当成功返回。
-///
-/// 合同（由测试钉住，见 `mod tests`）：
-/// 1) `Ok(空串/纯空白)` 是不可能状态 —— 空摘要必须转成 `Err`，否则会落一条零信息备注
-///    并把原文删掉（净损失，比不压更糟）。
-/// 2) `Err` 的字符串是给用户看的（进 notice），要能判断「该重试还是该改设置」，
-///    所以它带的是端点的原始报错，且**不含**已经收到的半截摘要文本。
-pub async fn collect_summary(
+/// 收流结果:**不含任何用户可见文案**。文案归各调用方 —— 摘要侧(`collect_summary`)
+/// 与长期记忆的抽取/合并侧(`agent::memory`)各有各的说法,收流机制只此一份。
+/// 「取消优先于失败」的裁定钉在这里:用户先按了停止,那件事就是「我取消了」。
+pub(crate) enum TextStreamOutcome {
+    Done(String),
+    Cancelled,
+    Failed(String),
+}
+
+/// 收一条模型文本流(原 `collect_summary` 的循环体,行为原样抽出):
+/// 只认 `ModelDelta::Text`,`ToolCall*` 与 `Usage` 一律忽略;`biased` 让取消优先,
+/// 取消/失败时**不**把半截文本当结果(`Done` 只在流干净走完后出现)。
+/// 循环形状源自 `session.rs:144-170`。**不复用 `AssistantAcc`**:它的职责是
+/// tool_call 分片,复用只会给文本来源多开一条路径。
+pub(crate) async fn drain_text_stream(
     model: &dyn ModelProvider,
     req: ChatRequest,
     cancel: &CancellationToken,
-) -> Result<String, String> {
+) -> TextStreamOutcome {
     let mut deltas = model.stream(req);
     let mut text = String::new();
     let mut stream_done = false;
@@ -81,28 +82,44 @@ pub async fn collect_summary(
             item = deltas.next() => match item {
                 None => stream_done = true,
                 Some(Ok(ModelDelta::Text(t))) => text.push_str(&t),
-                // 工具分片与 usage 都不采纳（见函数文档第 2 行）。
+                // 工具分片与 usage 都不采纳(理由见各调用方文档)。
                 Some(Ok(_)) => {}
                 Some(Err(e)) => model_error = Some(e.to_string()),
             }
         }
     }
-    // 借 `session.rs:185-187` 同一招：流还挂着的时候先把它关掉，
-    // 不把一条没人读完的响应体拖过这次压缩。
+    // 流还挂着的时候先把它关掉,不把一条没人读完的响应体拖过这次调用。
     drop(deltas);
 
-    // 顺序是刻意的：**取消优先于报错**。用户在 429 之前按了停止，那件事就是「我取消了」，
-    // 把端点错误报给他会让他去查设置。
     if interrupted {
-        return Err("摘要已取消，未压缩本轮".to_string());
+        return TextStreamOutcome::Cancelled;
     }
     if let Some(message) = model_error {
-        return Err(format!("摘要调用失败：{message}"));
+        return TextStreamOutcome::Failed(message);
     }
-    if text.trim().is_empty() {
-        return Err("摘要调用返回了空文本".to_string());
+    TextStreamOutcome::Done(text)
+}
+
+/// 收流。只认 `ModelDelta::Text`；`ToolCall*` 与 `Usage` 一律忽略（摘要不需要工具，
+/// 也不该拿它的 usage 去校准主对话的系数——那不是同一批 token）。
+///
+/// 合同（由测试钉住，见 `mod tests`）：
+/// 1) `Ok(空串/纯空白)` 是不可能状态 —— 空摘要必须转成 `Err`，否则会落一条零信息备注
+///    并把原文删掉（净损失，比不压更糟）。
+/// 2) `Err` 的字符串是给用户看的（进 notice），要能判断「该重试还是该改设置」，
+///    所以它带的是端点的原始报错，且**不含**已经收到的半截摘要文本。
+pub async fn collect_summary(
+    model: &dyn ModelProvider,
+    req: ChatRequest,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    // 文案层的壳:机制在 drain_text_stream,摘要自己的三种说法只在这里。
+    match drain_text_stream(model, req, cancel).await {
+        TextStreamOutcome::Done(text) if !text.trim().is_empty() => Ok(text),
+        TextStreamOutcome::Done(_) => Err("摘要调用返回了空文本".to_string()),
+        TextStreamOutcome::Cancelled => Err("摘要已取消，未压缩本轮".to_string()),
+        TextStreamOutcome::Failed(message) => Err(format!("摘要调用失败：{message}")),
     }
-    Ok(text)
 }
 
 #[cfg(test)]

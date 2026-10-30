@@ -158,6 +158,9 @@ const probe: Record<AgentEvent["t"], AgentEvent> = {
   tool_result: toolResult("c1", "结果"),
   usage: { t: "usage", input_tokens: 1, output_tokens: 2 },
   context_compacted: { t: "context_compacted", dropped: 4, summary_chars: 120 },
+  // P1：放在 Rust 名单里的同一位置（`context_compacted` 与 `error` 之间）。
+  // 这条键本身就是「镜像有 12 支、reducer 有 12 臂」的机器判据之一（缺键 TS2741）。
+  memory_saved: { t: "memory_saved", count: 2 },
   error: { t: "error", where: "loop", message: "循环了", fatal: false },
   done: done(),
 };
@@ -472,14 +475,14 @@ describe("reducer", () => {
     expect(replay([{ t: "user_message", blocks: b }])).toEqual(appendUserTurn(initialState(), b));
   });
 
-  // ==== R118：11 个标签表驱动 ====
+  // ==== R118：12 个标签表驱动 ====
 
-  it("handles every one of the 11 wire t tags without falling through to default", () => {
+  it("handles every one of the 12 wire t tags without falling through to default", () => {
     // 名单来自 `Object.keys(probe)`，probe 的类型是 `Record<AgentEvent["t"], AgentEvent>`：
-    // 镜像有第 12 支而 probe 没补 → tsc 红；probe 补了而 reducer 没写臂 → reducer 的
+    // 镜像有第 13 支而 probe 没补 → tsc 红；probe 补了而 reducer 没写臂 → reducer 的
     // never 守卫红（tsc）+ 这里的 swallowed 断言红。三层都在（评审 F1③）。
     // R202：锚点写 Rust 的测试函数名，不写行号 —— 行号每次上游插删就指偏，名字不会。
-    expect(WIRE_TAGS).toHaveLength(11); // 锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 那条 (11, 11) 断言上
+    expect(WIRE_TAGS).toHaveLength(12); // 锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 那条 (12, 12) 断言上
     const base = replay([start(1), d("在写正文"), toolCall("c1"), permRequest("p1")]);
     const swallowed = WIRE_TAGS.filter((tag) => reduce(base, probe[tag]) === base);
     expect(swallowed).toEqual([]);
@@ -499,7 +502,7 @@ describe("reducer", () => {
     // 旧写法只做到了前一半：`anchor` 买来的是上面那条唯一性断言，`indexOf(openMarker)` 却
     // 仍然从字节 0 起搜 —— 于是真正的起点由 marker 决定，锚点形同虚设。实测的洞：
     // 在锚点**之前**的 `decision_allow_field_always_agrees_with_its_variant` 里塞一份
-    // 完整的 11 支影子名单，同时把锚点后那份真名单删掉一支，本用例照样全绿（评审 Q01）。
+    // 完整的标签表影子名单，同时把锚点后那份真名单删掉一支，本用例照样全绿（评审 Q01）。
     // 现在把搜索起点推到锚点文本之后：锚点前面发生什么都不再参与判定。
     const openMarker = "let tags = [";
     const open = src.indexOf(openMarker, anchorIdx + anchor.length);
@@ -531,16 +534,16 @@ describe("reducer", () => {
     // 只报一个数字的话，改的人还得先去 events.rs 里数一遍。
     // R202（评审 NIT2）：失败消息里**一律不许写行号** —— 本文件的行号每加一条断言就整体下移
     // （本轮自己插了 21 行就重算过一次，而没有任何测试守着它），评审引用的 Rust 行号也已经指偏
-    // （`events.rs:358` 指到函数名那一行、`(11, 11)` 在它下面十几行）。定位改用**测试函数名**。
+    // （`events.rs:358` 只指到函数名那一行，计数断言在它下面十几行）。定位改用**测试函数名**。
     const handoff =
       "这个计数锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 里那条 " +
-      "`assert_eq!((events.len(), tags.len()), (11, 11))` 断言上；" +
-      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那个测试里的 tags 表和 (11, 11)）、" +
+      "`assert_eq!((events.len(), tags.len()), (12, 12))` 断言上；" +
+      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那个测试里的 tags 表和 (12, 12)）、" +
       "src/types.ts 的 AgentEvent、本文件的 probe 表，" +
-      "以及本文件那三处计数断言（用例 `handles every one of the 11 wire t tags without falling through to default` " +
+      "以及本文件那三处计数断言（用例 `handles every one of the 12 wire t tags without falling through to default` " +
       "里的 WIRE_TAGS，和**本用例**里的 rust 与 WIRE_TAGS 两条 toHaveLength）";
-    expect(rust, `events.rs 的 tags 表读到 ${rust.length} 支：${JSON.stringify(rust)}。${handoff}`).toHaveLength(11);
-    expect(WIRE_TAGS, `TS 侧镜像只有 ${WIRE_TAGS.length} 支：${JSON.stringify(WIRE_TAGS)}。${handoff}`).toHaveLength(11);
+    expect(rust, `events.rs 的 tags 表读到 ${rust.length} 支：${JSON.stringify(rust)}。${handoff}`).toHaveLength(12);
+    expect(WIRE_TAGS, `TS 侧镜像只有 ${WIRE_TAGS.length} 支：${JSON.stringify(WIRE_TAGS)}。${handoff}`).toHaveLength(12);
     // 集合相等，**不**比顺序：Rust 那边把 tags 数组重新排序不影响线格式，
     // 断言顺序只会造出一个假红。
     // 差集要**点名**（评审 R176）：两边各多出哪几支直接写进消息，别让人去猜 diff。
@@ -579,6 +582,30 @@ describe("reducer", () => {
     expect(s.permIndex).toEqual({});
     expect(s.usage).toBeNull(); // R114：usage 是瞬时事件，重开即消失
     expect(s.streaming).toBe(false);
+  });
+
+  // ==== P1：memory_saved 是「它真的在记」的唯一可见证据 ====
+
+  it("keeps only the latest memory_saved count and bumps a local sequence every time", () => {
+    // `at` 不是时钟：R119 不许 reducer 读 `Date.now()`（下面那条源码扫描钉着）。
+    // 它只需要承担一件事 —— **每次事件都是一个不同的值**。拿 count 当键的话，
+    // 「连续两次都记住 2 条」里第二声 toast 会因为依赖没变化而哑掉。
+    const first = reduce(initialState(), { t: "memory_saved", count: 2 });
+    expect(first.memorySaved).toEqual({ count: 2, at: 1 });
+    const second = reduce(first, { t: "memory_saved", count: 2 });
+    expect(second.memorySaved).toEqual({ count: 2, at: 2 });
+    expect(second.memorySaved).not.toBe(first.memorySaved);
+  });
+
+  it("keeps memory_saved out of the conversation and out of the notice flood", () => {
+    // `notices` 是重放时会堆成上百条的字符串通道（评审 F5），而这条事件是瞬时的
+    // 「刚才记住了几条」。混进去的话，重开会话会凭空多出几条没人发过的通知（R113 的同类错误）。
+    const base = replay([start(1), d("正文"), done()]);
+    const s = reduce(base, { t: "memory_saved", count: 3 });
+    expect(s.turns).toEqual(base.turns);
+    expect(s.notices).toEqual(base.notices);
+    expect(s.streaming).toBe(base.streaming);
+    expect(s.memorySaved).toEqual({ count: 3, at: 1 });
   });
 
   // ==== 归位失败的兜底 ====
@@ -634,6 +661,7 @@ describe("reducer", () => {
       toolResult("c1", "结果", true, 4),
       { t: "usage", input_tokens: 7, output_tokens: 8 },
       { t: "context_compacted", dropped: 1, summary_chars: 2 },
+      { t: "memory_saved", count: 4 },
       { t: "error", where: "store", message: "写库失败", fatal: true },
       done("interrupted"),
     ];
@@ -658,6 +686,7 @@ describe("reducer", () => {
       { t: "error", where: "mcp", message: "超时", fatal: false },
       { t: "usage", input_tokens: 3, output_tokens: 4 },
       { t: "context_compacted", dropped: 9, summary_chars: 30 },
+      { t: "memory_saved", count: 2 },
       done("max_turns"),
     ];
     // 评审 F2①：这条以前是 R119「同输入同输出」的唯一守卫，而两次 replay 落在**同一毫秒**里

@@ -38,6 +38,7 @@ export function initialState(): UiState {
     turns: [],
     streaming: false,
     usage: null,
+    memorySaved: null,
     fatal: null,
     notices: [],
     toolIndex: {},
@@ -280,6 +281,17 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
         state,
         `已压缩早期对话：省略 ${e.dropped} 条，摘要 ${e.summary_chars} 字`,
       );
+
+    // P1：只留最新一次的条数 —— 它不是通知列表（`notices` 会随重放堆成上百条），
+    // 而是「刚才这一轮记住了几条」的即时反馈，界面拿它弹一条 8 秒的轻提示。
+    // `at` 是**本地递增序号**而不是时间戳：本函数必须是纯的（R119，`reducer.test.ts`
+    // 有一条剥注释后的源码扫描盯 `Date.now(`）。它唯一的职责是让同 count 的第二次
+    // 事件也换一个值 —— 界面以它为依赖重开计时，否则「连着两轮都记住 2 条」第二声就哑了。
+    case "memory_saved":
+      return {
+        ...state,
+        memorySaved: { count: e.count, at: (state.memorySaved?.at ?? 0) + 1 },
+      };
 
     case "error":
       return e.fatal

@@ -29,13 +29,14 @@ use futures::StreamExt;
 use lfttdo_lib::agent::context::ContextBuilder;
 use lfttdo_lib::agent::events::{AgentEvent, EventSink};
 use lfttdo_lib::agent::types::{ContentBlock, Message};
-use lfttdo_lib::ipc::{TurnDeps, build_production_registry, run_turn};
+use lfttdo_lib::ipc::{MemoryTurnCfg, TurnDeps, build_production_registry, run_turn};
 use lfttdo_lib::model::openai_compat::{OpenAiCompat, is_loopback_endpoint};
 use lfttdo_lib::model::provider::{ChatRequest, ModelDelta, ModelError, ModelProvider};
 use lfttdo_lib::permission::gate::PermissionGate;
 use lfttdo_lib::settings::{SettingsStore, effective_roots};
 use lfttdo_lib::store::db::Db;
-use lfttdo_lib::tools::registry::ToolCtx;
+use lfttdo_lib::tools::registry::{ToolCtx, ToolRegistry};
+
 use serde_json::{json, value::Value};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -168,17 +169,51 @@ async fn turn_mode(args: &[String], prompt: &str) -> Result<(), Box<dyn std::err
     let model: Arc<dyn ModelProvider> = Arc::new(Recording {
         inner: Arc::new(OpenAiCompat::new(model_cfg)?),
     });
+    // T6:嵌入客户端与生产装配(send_message)同一条线 —— source=="endpoint" 才构造,
+    // 失败 warn 后降 None(检索退化为纯关键词)。key 在此处可用,构造即持走明文。
+    let embed: Option<Arc<dyn lfttdo_lib::model::embed::EmbedProvider>> =
+        if settings.memory_embedding_source == "endpoint" {
+            match lfttdo_lib::model::embed::EmbedEndpoint::new(
+                &settings.base_url,
+                &settings.memory_embedding_model,
+                &api_key,
+            ) {
+                Ok(e) => Some(Arc::new(e)),
+                Err(reason) => {
+                    eprintln!("{{\"t\":\"embed_off\",\"reason\":{reason:?}}}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
     let sink = JsonSink::new();
 
     let reason = run_turn(
         TurnDeps {
             db: db.clone(),
-            registry: build_production_registry(),
+            registry: build_production_registry(db.clone()),
             gate: Arc::new(PermissionGate::new()),
             model,
             sink: sink.clone(),
             context: settings.to_context_config(),
             temperature,
+            // T5：记忆四项与生产装配(send_message)同一条线 —— 从本轮那份 Settings 现取。
+            // T6 两键同线:embedding_endpoint 是 source=="endpoint" 的现算形态。
+            memory: MemoryTurnCfg {
+                enabled: settings.memory_enabled,
+                recall_k: settings.memory_recall_k as usize,
+                note_token_cap: settings.memory_note_token_cap as usize,
+                profile_char_cap: settings.memory_profile_char_cap as usize,
+                // T10/T12:待办提醒窗口与衰减半衰期都从本轮 Settings 现取(与生产装配同一条线)。
+                prospective_window_hours: settings.memory_prospective_window_hours,
+                fact_half_life_days: settings.memory_decay_half_life_days as f64,
+                embedding_endpoint: settings.memory_embedding_source == "endpoint",
+                embedding_model: settings.memory_embedding_model.clone(),
+            },
+            embed,
+            // 探针只跑一轮、单线程:一把空锁足够(并发语义不是探针要验的事)。
+            extract_locks: Default::default(),
             roots: settings.roots.clone(),
             skills_dir: None,
             skills_disabled: Vec::new(),
@@ -203,12 +238,19 @@ async fn turn_mode(args: &[String], prompt: &str) -> Result<(), Box<dyn std::err
 
 /// 不经模型、直接叫工具：SSRF 文案与越界拒绝的**逐字**读数在这里最干净
 /// （模型会改写文案，那是要另测的另一件事 —— `--turn` 那条测的就是它）。
+/// 探针自己的工具表:内存库让 `memory_search` 能注册(生产装配的一致性),
+/// 但查不到任何东西 —— 探针不碰用户的真实记忆库。
+fn probe_registry() -> Arc<ToolRegistry> {
+    let db = Arc::new(Db::open(std::path::Path::new(":memory:")).expect("内存库"));
+    build_production_registry(db)
+}
+
 async fn direct_mode(
     name: &str,
     input: Value,
     roots: Vec<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = build_production_registry();
+    let registry = probe_registry();
     let tool = registry.get(name).ok_or_else(|| {
         format!(
             "生产工具表里没有 {name}（实得 {:?}）",
@@ -244,7 +286,7 @@ async fn token_delta_mode() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = api_key_for(&settings.base_url);
     let model_cfg = settings.to_model_config(&api_key);
     let provider = OpenAiCompat::new(model_cfg)?;
-    let registry = build_production_registry();
+    let registry = probe_registry();
 
     let history = vec![Message::user(vec![ContentBlock::Text {
         text: "请把下面这句话原样复述一遍：切片 3 令牌测量。".to_string(),
@@ -314,7 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let settings = SettingsStore::new(&dir).load()?;
         println!(
             "{}",
-            json!({"t": "plan", "live": false, "settings_dir": dir, "base_url": settings.base_url, "model": settings.model, "persisted_roots": settings.roots, "registry_tools": build_production_registry().defs().iter().map(|d| d.name.clone()).collect::<Vec<_>>(), "modes": ["--turn <话>", "--direct <tool> --input <json> [--roots <dir>]", "--token-delta"], "note": "加 --live 才会真发请求；本探针只读设置，绝不 save()"})
+            json!({"t": "plan", "live": false, "settings_dir": dir, "base_url": settings.base_url, "model": settings.model, "persisted_roots": settings.roots, "registry_tools": probe_registry().defs().iter().map(|d| d.name.clone()).collect::<Vec<_>>(), "modes": ["--turn <话>", "--direct <tool> --input <json> [--roots <dir>]", "--token-delta"], "note": "加 --live 才会真发请求；本探针只读设置，绝不 save()"})
         );
         return Ok(());
     }

@@ -2,6 +2,7 @@
 pub mod echo;
 pub mod fetch;
 pub mod fetch_guard;
+pub mod memory_search;
 pub mod read_file;
 pub mod registry;
 pub mod use_skill;
