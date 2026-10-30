@@ -206,8 +206,10 @@ describe("theme tokens", () => {
     expect(USER_TOKENS).toEqual(["--font-size"]);
     expect(THEME_TOKENS.filter((t) => USER_TOKENS.includes(t))).toEqual([]);
     expect(new Set(THEME_TOKENS).size).toBe(THEME_TOKENS.length);
-    // F16：spec 443 明写「预设主题 3 套」，块数期望值就是从这个数字推出来的，所以它自己也得有牙。
-    expect(THEME_NAMES.length * 2).toBe(6);
+    // F16：spec 443 原写「预设主题 3 套」，块数期望值从这个数字推出来，所以它自己也得有牙。
+    // 2026-10-25：业主批准追加第 4 套 dusk（暮褐）后改为 8；仍写死数字而不是推导，
+    // 是为了「名单悄悄加第五套」时这里必须红一下、由人来更新这句与 spec 的对应关系。
+    expect(THEME_NAMES.length * 2).toBe(8);
     // T44 裁定 1：`--accent*` 走**新名单** `ACCENT_TOKENS`，不进 `USER_TOKENS`（上面那条
     // `toEqual(["--font-size"])` 与不相交、双向相等三条钉的是旧语义，照计划把它们塞进
     // `USER_TOKENS` 会同时撞红三条在跑的闸）。这条子集关系**就是**「清掉 inline 能回到预设」
@@ -523,7 +525,7 @@ describe("theme tokens", () => {
         /^\[data-theme="([a-z-]+)"\]\[data-mode="(light|dark)"\]\s*\{([^}]*)\}/gm,
       ),
     ];
-    expect(blocks).toHaveLength(6);
+    expect(blocks).toHaveLength(THEME_NAMES.length * 2);
     for (const m of blocks) {
       const key = `${m[1]}/${m[2]}`;
       const values = presetTokenValues(m[3]);
@@ -549,8 +551,8 @@ describe("theme tokens", () => {
     ];
     expect(
       blocks,
-      "预设块不是 6 块 —— 这条对比度判据的覆盖面会跟着少一块（R201）",
-    ).toHaveLength(6);
+      "预设块数量与 THEME_NAMES × {dark, light} 不一致 —— 这条对比度判据的覆盖面会跟着缺一块（R201）",
+    ).toHaveLength(THEME_NAMES.length * 2);
     for (const m of blocks) {
       const key = `${m[1]}/${m[2]}`;
       const values = presetTokenValues(m[3]);
@@ -653,7 +655,10 @@ describe("theme tokens", () => {
         /^\[data-theme="([a-z-]+)"\]\[data-mode="(light|dark)"\]\s*\{([^}]*)\}/gm,
       ),
     ];
-    expect(blocks, "预设块不是 6 块 —— 这条判据的覆盖面会跟着少一块").toHaveLength(6);
+    expect(
+      blocks,
+      "预设块数量与 THEME_NAMES × {dark, light} 不一致 —— 这条判据的覆盖面会跟着缺一块",
+    ).toHaveLength(THEME_NAMES.length * 2);
     for (const m of blocks) {
       const key = `${m[1]}/${m[2]}`;
       const values = presetTokenValues(m[3]);

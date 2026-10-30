@@ -50,3 +50,57 @@ html[data-theme][data-mode] {
   --accent-hover: #9aa7ff;
   --accent-text: #0a0d1c;
 }
+
+/* dusk（暮褐）的玻璃层覆盖（2026-10-25 追加）：与上面那块同特异度，靠「写在后面」赢。
+   上面那块的取舍是「统一深色玻璃、不随预设变暗」（R330）——dusk 偏要按主题分暮光/夜幕
+   两个暖褐档，所以色相 token 在这里压回与 presets.css dusk 块相同的实色值
+   （否则层叠会被 mode 级玻璃块的靛蓝夜色吃掉，预设块等于白写）；
+   dusk 独有的是光晕与玻璃材质：夜幕档铜色光晕 + 暖白玻璃，暮光档沙色底 + 高白玻璃。
+   blur / saturate / radius 不覆盖，沿用通用块的值。 */
+html[data-theme="dusk"][data-mode="dark"] {
+  --app-base: #1a120c;
+  --app-glow-a: rgb(201 139 94 / 45%);
+  --app-glow-b: rgb(122 80 52 / 32%);
+  --glass-bg: rgb(255 244 230 / 7%);
+  --glass-bg-strong: rgb(255 244 230 / 12%);
+  --glass-border: rgb(240 228 214 / 22%);
+  --glass-sheen: rgb(255 240 220 / 28%);
+  --glass-sheen-weak: rgb(255 240 220 / 7%);
+  --glass-shadow: rgb(10 6 3 / 55%);
+  --glass-hover: rgb(255 244 230 / 18%);
+  --glass-scrim: rgb(16 10 6 / 60%);
+  --text-primary: #f0e4d6;
+  --text-muted: #a89684;
+  --border: rgb(240 228 214 / 16%);
+  --bg-input: #1a120d;
+  --bg-raised: #2f231a;
+  --bg-surface: #221812;
+  --code-bg: #170f0a;
+  --accent: #c98b5e;
+  --accent-hover: #dca777;
+  --accent-text: #241812;
+}
+
+html[data-theme="dusk"][data-mode="light"] {
+  --app-base: #f1e6d8;
+  --app-glow-a: rgb(156 107 69 / 20%);
+  --app-glow-b: rgb(182 138 114 / 16%);
+  --glass-bg: rgb(255 251 246 / 55%);
+  --glass-bg-strong: rgb(255 251 246 / 78%);
+  --glass-border: rgb(59 42 30 / 16%);
+  --glass-sheen: rgb(255 255 255 / 60%);
+  --glass-sheen-weak: rgb(255 255 255 / 25%);
+  --glass-shadow: rgb(74 58 32 / 22%);
+  --glass-hover: rgb(255 251 246 / 70%);
+  --glass-scrim: rgb(58 42 30 / 30%);
+  --text-primary: #3b2a1e;
+  --text-muted: #6a5643;
+  --border: rgb(59 42 30 / 18%);
+  --bg-input: #e4d5c1;
+  --bg-raised: #faf3ea;
+  --bg-surface: #efe3d3;
+  --code-bg: #ece1d0;
+  --accent: #7e4b2a;
+  --accent-hover: #6a3c1f;
+  --accent-text: #fdf9f4;
+}

@@ -81,6 +81,13 @@ pub struct Built {
 pub struct ContextBuilder {
     cfg: ContextConfig,
     calibration: f64,
+    /// 长期记忆的常驻备注(画像 + 召回,spec §5)。整段替换而非逐条追加:
+    /// 每轮发送都是「按当前消息现算一份」,上一轮的召回不该渗进这一轮
+    /// —— 渗进来等于召回结果跨轮存活,而检索口径每轮都该刷新。
+    /// 计价与注入都走 `build()` 的 head(自动进 `est_input_tokens`);
+    /// `compaction_plan` **看不见**它们(压缩判定跑在备注装配之前,时序见 ipc.rs
+    /// 的 run_turn)—— 有意的已知漂移:备注有独立上限,量级远小于阈值留的 15% 余量。
+    memory_notes: Vec<String>,
 }
 
 impl ContextBuilder {
@@ -88,7 +95,14 @@ impl ContextBuilder {
         Self {
             cfg,
             calibration: 1.0,
+            memory_notes: Vec::new(),
         }
+    }
+
+    /// 装入本轮的记忆备注(画像一条 + 召回一条,由 run_turn 的装配段拼好)。
+    /// 空表 = 无记忆,行为与从未调用过逐字节一致(有测试钉着)。
+    pub fn set_memory_notes(&mut self, notes: Vec<String>) {
+        self.memory_notes = notes;
     }
 
     /// 用真实 usage 校准粗估系数：**factor 的语义是 `真实 ÷ 粗估`**，
@@ -119,8 +133,9 @@ impl ContextBuilder {
     /// 已加载正文、外壳工作方式）。追加段**参与**预算裁剪与 token 粗估：
     /// 先 build 再往外贴，会让一条已经按预算裁好的请求凭空超线。
     pub fn build_with_extra(&self, history: &[Message], extra_system: &str) -> Built {
-        // 请求头部 = 本机 SYSTEM_PROMPT + 历史里已有的 system 备注（Plan C 的摘要消息走
-        // 这一路），但去掉与 SYSTEM_PROMPT 重复的那条，避免同一提示词进两次。
+        // 请求头部 = 本机 SYSTEM_PROMPT + 记忆备注(画像/召回,spec §5) + 历史里已有的
+        // system 备注（Plan C 的摘要消息走这一路），但去掉与 SYSTEM_PROMPT 重复的那条，
+        // 避免同一提示词进两次。记忆备注在摘要备注**之前**:「当前相关性」先于「过去发生了什么」。
         let mut prompt = if self.cfg.system_prompt.trim().is_empty() {
             SYSTEM_PROMPT.to_string()
         } else {
@@ -132,6 +147,11 @@ impl ContextBuilder {
         }
         let prompt = prompt.as_str();
         let mut head: Vec<Message> = vec![Message::system_note(prompt)];
+        head.extend(
+            self.memory_notes
+                .iter()
+                .map(|n| Message::system_note(n)),
+        );
         head.extend(
             history
                 .iter()
@@ -260,6 +280,13 @@ fn is_cjk(ch: char) -> bool {
         0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF
         | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0x20000..=0x2FA1F
         | 0x3000..=0x303F | 0xFF00..=0xFFEF)
+}
+
+/// 一条**完整备注**(画像/召回)进 head 的预算口径:与 `estimate_tokens` 同一套字符
+/// 计价,外加每条消息的结构开销。供 ipc 侧在装配时执行 `MEMORY_NOTE_TOKEN_CAP`;
+/// 不直接暴露 `text_tokens` —— 消费方要的是「这条进 head 花多少」,不是裸文本估价。
+pub(crate) fn note_tokens(s: &str) -> usize {
+    MSG_TOKEN_OVERHEAD + text_tokens(s)
 }
 
 /// 该消息是否携带 `ToolResult` 块（Task 5 的 `Message::tool(..)` 就是这一形态）。
@@ -1093,6 +1120,122 @@ mod tests {
             ceiling.build(&hist).est_input_tokens
         );
         assert_eq!(huge.build(&hist).messages.len(), 2);
+    }
+}
+
+// ---- 长期记忆备注的注入(spec 2026-10-25 §5)----
+
+#[cfg(test)]
+mod memory_injection {
+    use super::*;
+
+    fn u(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    fn notes_of(built: &Built) -> Vec<String> {
+        built
+            .messages
+            .iter()
+            .take_while(|m| m.role == Role::System)
+            .map(|m| m.text_of())
+            .collect()
+    }
+
+    #[test]
+    fn memory_notes_ride_between_the_prompt_and_the_history_notes() {
+        // 顺序是硬性的:系统提示词 → 记忆(画像+召回,本轮现算) → 历史摘要备注 → tail。
+        // 记忆是「当前相关性」,摘要备注是「过去发生了什么」,越靠近提示词的越新鲜。
+        let mut b = ContextBuilder::new(ContextConfig::default());
+        b.set_memory_notes(vec!["[用户画像]用户是 Rust 开发者".into(), "[长期记忆]用户住在上海".into()]);
+        let hist = vec![
+            Message::system_note("早期对话摘要:聊了天气"),
+            u("第一"),
+            u("第二"),
+        ];
+        let built = b.build(&hist);
+        assert_eq!(
+            notes_of(&built),
+            vec![
+                SYSTEM_PROMPT.to_string(),
+                "[用户画像]用户是 Rust 开发者".to_string(),
+                "[长期记忆]用户住在上海".to_string(),
+                "早期对话摘要:聊了天气".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_notes_are_priced_into_the_estimate_of_the_actual_request() {
+        // spec §8 不变量 1:记忆与画像计入 est —— est 是状态条显示的数,
+        // 也必须描述实际发出的请求(镜像 a_cut_request_reports_the_estimate… 的判据,
+        // 且同样测在**真的裁了**的路径上)。
+        let cfg = ContextConfig {
+            reserve_output: 100,
+            budget_tokens: 1_000,
+            window_messages: 40,
+            ..Default::default()
+        };
+        let hist: Vec<Message> = (0..12).map(|i| u(&("句子".repeat(150) + &format!(" {i}")))).collect();
+
+        let mut with = ContextBuilder::new(cfg.clone());
+        with.set_memory_notes(vec!["画像很长".repeat(40)]);
+        let built = with.build(&hist);
+        assert!(built.dropped > 1, "夹具前提:必须走到裁剪,否则没测到循环");
+        assert_eq!(
+            built.est_input_tokens,
+            estimate_tokens(&built.messages) as u32,
+            "est 与实际发出的消息对不上(含记忆备注)"
+        );
+
+        // 同一份历史,带记忆的请求粗估必须严格大于不带的 —— head 多了那一条。
+        let bare = ContextBuilder::new(cfg).build(&hist);
+        let with_est = estimate_tokens(&with.build(&hist).messages);
+        let bare_est = estimate_tokens(&bare.messages);
+        assert!(with_est > bare_est, "记忆备注必须真的进预算:{with_est} vs {bare_est}");
+    }
+
+    #[test]
+    fn memory_notes_survive_the_window_and_never_count_as_dropped() {
+        // spec :365 同一条规矩的推广:备注是 head 的一部分,滑窗只裁对话行。
+        let mut b = ContextBuilder::new(ContextConfig::default());
+        b.set_memory_notes(vec!["[用户画像]常驻".into()]);
+        let hist: Vec<Message> = (0..200).map(|i| u(&format!("轮 {i}"))).collect();
+        let built = b.build(&hist);
+        assert_eq!(built.messages[1].text_of(), "[用户画像]常驻");
+        assert_eq!(
+            built.dropped,
+            200 - ContextConfig::default().window_messages,
+            "dropped 只数对话行,备注与摘要备注都不算"
+        );
+    }
+
+    #[test]
+    fn empty_memory_notes_behave_exactly_like_never_setting_them() {
+        let hist = vec![u("第一"), u("第二")];
+        let fresh = ContextBuilder::new(ContextConfig::default()).build(&hist);
+        let mut cleared = ContextBuilder::new(ContextConfig::default());
+        cleared.set_memory_notes(Vec::new());
+        let cleared = cleared.build(&hist);
+        assert_eq!(fresh.messages, cleared.messages);
+        assert_eq!(fresh.est_input_tokens, cleared.est_input_tokens);
+        assert_eq!(fresh.dropped, cleared.dropped);
+    }
+
+    #[test]
+    fn memory_notes_follow_a_custom_system_prompt_the_same_way() {
+        // 人设模型(自定义 system_prompt 整段替换)下记忆照样注入 —— 顺序不变。
+        let mut b = ContextBuilder::new(ContextConfig {
+            system_prompt: "你是小宋祺。".into(),
+            ..Default::default()
+        });
+        b.set_memory_notes(vec!["[长期记忆]用户在学日语".into()]);
+        let built = b.build(&[]);
+        assert_eq!(built.messages[0].text_of(), "你是小宋祺。");
+        assert_eq!(built.messages[1].text_of(), "[长期记忆]用户在学日语");
     }
 }
 

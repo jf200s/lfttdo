@@ -11,6 +11,7 @@ import type {
   Decision,
   McpServerView,
   McpTrust,
+  MemoryView,
   SendBlock,
   SessionRow,
   Settings,
@@ -68,6 +69,59 @@ export const setSettings = (settings: Settings) =>
 /** 明文 key 只进这一条命令：不打印、不日志、不进返回值（spec:473）。空串按清除处理（R88）。 */
 export const setApiKey = (apiKey: string) =>
   invoke("settings_set_api_key", { apiKey });
+
+/**
+ * 长期记忆的管理命令（设计文档 §7：记忆对用户必须可审计，物理删除的入口只在这里）。
+ * 形状镜像 `MemoryView` 住在 `../types`（与 `SessionRow` 同一分工：形状住 types，这里只放函数）。
+ * 「失效不删除」是**库内**的 Graphiti 纪律（旧行留 `invalid_at`，检索不再返回）；但设置页的
+ * 「删除 / 清空全部」是**物理删** —— 隐私出口的最后一环：二期的 `memory_forget` 工具只置失效，
+ * 管不到这两条（§6），「忘掉我说的卡号」的兜底就是这里。
+ */
+export const listMemories = () => invoke<MemoryView[]>("memories_list");
+export const deleteMemory = (id: number) => invoke("memories_delete", { id });
+export const clearMemories = () => invoke("memories_clear");
+/**
+ * 常驻画像的当前正文（`memory_profile` 恒单行，设计文档 §3）。命令先备齐并钉住命令名，
+ * 面板本切片**不消费**它（画像展示不在这一片 —— `SettingsPanelProps` 只加三个回调，
+ * 见该文件的裁定注释）。
+ */
+export const memoryProfile = () => invoke<string>("memory_profile");
+
+/**
+ * P1：会话切走时的**第二次轻量抽取**（`ipc.rs::memory_flush_session`）。返回本次新记住
+ * 了几条（`usize` 线上是数字）。
+ *
+ * 参数键写成 `sessionId` —— 与上面 `sendMessage` 对 `session_id` 的写法**同一条惯例**：
+ * Tauri v2 把 JS 侧的 camelCase 键映射到 Rust 的 snake_case 形参。写成 `session_id`
+ * 在这里反而对不上（命令按形参名取值），症状是切换时抽取永远收到空会话。
+ *
+ * **调用方必须 fire-and-forget**：切换会话是主路径，不能为一次后台抽取多等一个来回；
+ * 后端也把一切失败都收成 `Ok(0)`（它连 `Err` 都不往上抛），所以 `catch` 只是防御性的 ——
+ * 命令本身不存在、或 IPC 层出错时才走得到那里。
+ */
+export const flushMemory = (sessionId: string) =>
+  invoke<number>("memory_flush_session", { sessionId });
+
+/**
+ * P1：用户亲手改一条记忆的正文。后端会把这一行打上 `user_edited = 1`、置信度抬到 1.0，
+ * 于是模型此后的 UPDATE/INVALIDATE 只会降级成「并存」—— 用户的话从此是权威。
+ * 空正文由后端 `reject_empty_body` 拒收；前端只负责把按钮禁用（真校验只有一处）。
+ */
+export const updateMemoryBody = (id: number, body: string) =>
+  invoke("memory_update_body", { id, body });
+
+/**
+ * P1：用户手动新增一条记忆，返回新行 id。`kind` 的白名单与回落都在 Rust
+ * （`fact`/`preference`/`prospective`，不认识的一律回落 `fact`），前端不校验第二遍。
+ *
+ * `dueAt` 是毫秒时间戳（spec §12.5：面板新增的待办也要能到期提醒），
+ * `null` = 待办但没有到期时刻（先记下来，不提醒）。
+ * **换算义务在调用方**（`SettingsPanel`），且必须按 **UTC** 解释字面值 ——
+ * 与 Rust 侧 `parse_iso8601_ms` 的既有裁定同口径。这里只负责把数字原样递过去，
+ * 参数键写 `dueAt`（Tauri v2 的 camelCase → snake_case 映射，同 `flushMemory`）。
+ */
+export const addMemory = (kind: string, body: string, dueAt: number | null) =>
+  invoke<number>("memory_add", { kind, body, dueAt });
 
 /**
  * 把一张图的原始字节交给 Rust 归一化，回来的就是可以直接进 `send_message` 的那一支

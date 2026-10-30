@@ -60,6 +60,15 @@ pub enum AgentEvent {
         dropped: usize,
         summary_chars: usize,
     },
+    /// P1(spec §12):这一轮**新记住了几条**。存在的唯一理由是给用户一个
+    /// 「它真的在记」的可见证据 —— 没有它,记忆是一条完全静默的后台流水线,
+    /// 用户只能靠翻设置页去猜它有没有工作。
+    ///
+    /// 与 `ContextCompacted` 的分工:那个说「忘了多少」(压缩),这个说「记住了多少」。
+    /// `count` 是**本次事务里新增+变更**的条数(画像另算,它不是一条条的记忆)。
+    MemorySaved {
+        count: usize,
+    },
     Error {
         #[serde(rename = "where")]
         at: ErrorWhere,
@@ -388,6 +397,7 @@ mod tests {
                 dropped: 0,
                 summary_chars: 0,
             },
+            AgentEvent::MemorySaved { count: 0 },
             AgentEvent::Error {
                 at: ErrorWhere::Model,
                 message: String::new(),
@@ -407,13 +417,14 @@ mod tests {
             "tool_result",
             "usage",
             "context_compacted",
+            "memory_saved",
             "error",
             "done",
         ];
         assert_eq!(
             (events.len(), tags.len()),
-            (11, 11),
-            "AgentEvent 有 11 个变体，标签表必须一一对应；新增事件要同步补进这张表"
+            (12, 12),
+            "AgentEvent 有 12 个变体，标签表必须一一对应；新增事件要同步补进这张表"
         );
         for (e, tag) in events.iter().zip(tags) {
             let v = serde_json::to_value(e).unwrap();

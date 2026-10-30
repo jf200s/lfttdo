@@ -6,7 +6,7 @@
 // key「不写 settings 表、不进导出、不写日志」，三条里最容易失守的是第一条，而靠纪律
 // （「记得别写」）守的规矩一定会被下一次加字段破掉；字段不存在才是结构性防线：
 // serde 写不出一个不存在的字段，`{:?}` 打不出它，导出也就无从带上它。
-// `serialized_field_names_are_exactly_the_thirteen_settings_fields` 那条测试钉的正是这件事，
+// `serialized_field_names_are_exactly_the_twenty_three_settings_fields` 那条测试钉的正是这件事，
 // 它同时也是 R89 的防线：加字段必须先给出它的消费者，否则 Plan A 里多一个没人读的键。
 // （T26 落 `roots` 时它的名字从 `twelve` 变成 `thirteen` —— 名字里的数字就是这条防线的读数。）
 //
@@ -100,6 +100,50 @@ const DEFAULT_KEEP_TURNS: u32 = 10;
 const MIN_KEEP_TURNS: u32 = 1;
 const MAX_KEEP_TURNS: u32 = 50;
 
+/// T5（spec §7）：长期记忆四个设置项的默认值与区间。与上面几组同理，
+/// `DEFAULT_*` 与 `MIN_*`/`MAX_*` 分开列。`memory_note_token_cap` 的下限是**软**的：
+/// 夹进 200..=2000 之后还要对 `budget_tokens / 5` 取 min，小预算下最终值可以低于 200
+/// —— 那是有意的（预算安全优先于下限），不是漏了半边钳位；`normalize()` 与
+/// `a_tiny_budget_squeezes_the_note_cap_below_its_floor_on_purpose` 都写着这件事。
+const DEFAULT_MEMORY_RECALL_K: u32 = 5;
+const MIN_MEMORY_RECALL_K: u32 = 1;
+const MAX_MEMORY_RECALL_K: u32 = 20;
+const DEFAULT_MEMORY_NOTE_TOKEN_CAP: u32 = 600;
+const MIN_MEMORY_NOTE_TOKEN_CAP: u32 = 200;
+const MAX_MEMORY_NOTE_TOKEN_CAP: u32 = 2000;
+const DEFAULT_MEMORY_PROFILE_CHAR_CAP: u32 = 500;
+const MIN_MEMORY_PROFILE_CHAR_CAP: u32 = 100;
+const MAX_MEMORY_PROFILE_CHAR_CAP: u32 = 2000;
+/// T12:记忆节奏的两个旋钮(设计文档的「类人记忆」升级)。默认值与 `store::memory::RecallCfg`
+/// 的默认半衰期(60/180 天)以及 `ipc::MEMORY_PROSPECTIVE_WINDOW_HOURS`(24)逐字相同 ——
+/// 两边分叉由 ipc 的 `memory_turn_cfg_defaults_match_the_settings_defaults` 盯着。
+/// 区间一侧的理由:半衰期下限 1 天(再小等于「记了等于没记」)、上限 3650 天(十年,
+/// 再大则一条 2010 年的事实永远霸榜);待办窗口下限 1 小时(再小等于「永远不提醒」)、
+/// 上限 168 小时(一周,再大「提醒」变成「提前一周念一遍」,用户会学会无视它)。
+const DEFAULT_MEMORY_DECAY_HALF_LIFE_DAYS: u32 = 60;
+const MIN_MEMORY_DECAY_HALF_LIFE_DAYS: u32 = 1;
+const MAX_MEMORY_DECAY_HALF_LIFE_DAYS: u32 = 3650;
+const DEFAULT_MEMORY_PROSPECTIVE_WINDOW_HOURS: u32 = 24;
+const MIN_MEMORY_PROSPECTIVE_WINDOW_HOURS: u32 = 1;
+const MAX_MEMORY_PROSPECTIVE_WINDOW_HOURS: u32 = 168;
+/// T15(P0):空闲抽取的间隔(分钟)。默认 5 分钟 = 「用户停下来收拾一下,记忆就跟上了」;
+/// 上限 120 分钟让「半天才抽一次」成为可能,但不超过 2 小时 —— 再长就等于关掉了,
+/// 而关掉有更明确的一档(0)。
+///
+/// **下限是 0 而不是 1**,这与半衰期/待办窗口那两项恰好相反,而且 0 是**合法值**:
+/// 它表示「关闭空闲抽取」,不是手滑写错。理由在于这个旋钮管的是一个**后台模型调用点**
+/// (没有用户手势触发的唯一一处):「不想让它偷跑」必须有一个干净、可解释的关法。
+/// 把它钳到 1 会让「设 0」变成「每 1 分钟偷偷调一次模型」—— 比不关更糟。
+const DEFAULT_MEMORY_IDLE_EXTRACT_MINUTES: u32 = 5;
+const MIN_MEMORY_IDLE_EXTRACT_MINUTES: u32 = 0;
+const MAX_MEMORY_IDLE_EXTRACT_MINUTES: u32 = 120;
+/// T6(裁定 2/3):嵌入二源一开关的白名单与默认。**`"local"`(fastembed)是二期** ——
+/// 新依赖 + 本地模型下载是业主才能拍板的事,这里不预支第三态;不认识的值回落
+/// `"endpoint"`(模仿 `accent` 白名单的回落纪律),回落目标是**默认档**而不是报错:
+/// 设置文件是用户可手改的文件,一个拼错的档位不该让记忆系统整体罢工(裁定 4 的近亲)。
+const DEFAULT_MEMORY_EMBEDDING_SOURCE: &str = "endpoint";
+const DEFAULT_MEMORY_EMBEDDING_MODEL: &str = "text-embedding-v3";
+
 /// 设置与凭据的失败面（R82）。仓库约定是每模块一个枚举，不用 `Result<_, String>`：
 /// T13 要能区分「没有条目」（显示「未配置」）与「读不到」（显示原因），
 /// 后者被降级成前者会让用户重设 key、覆盖掉其实还在库里的那一条（R83/R71 同病）。
@@ -134,7 +178,7 @@ pub enum SettingsError {
 /// 打成十进制转储 —— spec :473 说的「不写日志」在这种形态下守不住，而且 spec :543 计划的
 /// 「全文搜索 key 字符串」根本查不到十进制转储。Display 侧本来就安全（那两个变体的 Display
 /// 只说 "Password data is not valid UTF-8"），所以这里每一支都借 Display 落地。
-/// `serialized_field_names_are_exactly_the_twelve_settings_fields` 同族的
+/// `serialized_field_names_are_exactly_the_twenty_three_settings_fields` 同族的
 /// `credential_debug_never_prints_the_secret_bytes` 钉住它。
 impl std::fmt::Debug for SettingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -298,6 +342,52 @@ pub struct Settings {
     /// 归一分两处（R284）：`dedupe_roots` 只管用户写的那份（读写两侧各过一次，同 R86，
     /// 不碰盘、一条都不丢），`effective_roots` 只管这一轮能用哪几条（使用点，每轮一次）。
     pub roots: Vec<PathBuf>,
+    /// T5（spec §7）：长期记忆的总开关。`false` = 压缩段零抽取（记忆侧的模型调用
+    /// 一个都不发起）且请求头零备注（连召回读库都不做）。记忆数据**不**因此清除：
+    /// 开回来还在 —— 关闭是「停用功能」，不是「抹掉历史」，后者的入口在设置页的清空。
+    pub memory_enabled: bool,
+    /// T5：召回条数上限，夹 `1..=20`。0 的语义是「召回关闭」，不是合法档位 ——
+    /// 想关就关总开关；留一个「设成 0 却以为还在召回」的静默档没有消费者。
+    pub memory_recall_k: u32,
+    /// T5：画像+召回两条备注合计的 token 上限，夹 `200..=2000` 后再对
+    /// `budget_tokens / 5` 取 min（spec §7「< 预算的 20%」）。**夹完 min 可能低于 200，
+    /// 这是有意的**：预算安全优先于下限 —— 记忆备注挤爆对话预算的症状（预算塌 0、
+    /// 当场失忆）比「注入少了」严重，与 `BUDGET_HEADROOM` 防 budget==reserve 是同一类取向。
+    pub memory_note_token_cap: u32,
+    /// T5：画像正文的字符上限，夹 `100..=2000`。约束的是压缩路径上画像归并的输出
+    /// （`agent::memory::merge_profile` 的 cap 参数）；`PROFILE_CHAR_CAP`（500）只是
+    /// 本项的默认锚点，不是第二处真相。
+    pub memory_profile_char_cap: u32,
+    /// T12:事实记忆的衰减半衰期(天),夹 `1..=3650`。它是召回排序里时间衰减的唯一旋钮:
+    /// `store::memory::RecallCfg` 的 `fact_half_life_days` 由这一项转成 `f64` 传下去
+    /// (单一来源 —— 不在 ipc 侧再留一个默认值)。偏好的半衰期按它的 3 倍推导,
+    /// 比例是刻意的近似(见 `memory_notes_for_turn` 的注释),不为此再开第二个设置项。
+    /// 待办(`prospective`)**不衰减**:它的价值与 `due_at` 绑定、与年龄无关。
+    pub memory_decay_half_life_days: u32,
+    /// T12:待办提醒的前瞻窗口(小时),夹 `1..=168`。到期时刻落在「现在 + 窗口」内的
+    /// 待办会在本轮 head 里出现一条 `[待办提醒]`。T10 时它还是硬编码常量(「先固定 24
+    /// 小时」),T12 把它交给用户:T10 的裁定是「等用户真的需要调再说」,而 24 小时在
+    /// 「周计划」与「明天交」两种用法之间确实不够用。
+    pub memory_prospective_window_hours: u32,
+    /// T15(P0)：空闲抽取的间隔（分钟），夹 `0..=120`，默认 5。
+    ///
+    /// 消费方是 `ipc::spawn_memory_idle_worker` 那一圈 60 秒的 tick：它把「最后活动
+    /// 早于 `now - 本值×60s`、且游标落后于最大消息 id」的会话捞出来抽一遍。
+    /// **`0` 是合法的关闭档，不是错误值**（见 `MIN_MEMORY_IDLE_EXTRACT_MINUTES` 的注释）：
+    /// 这是全程序唯一一个没有用户手势触发的模型调用点，必须有一个说得清的关法。
+    /// 与本项不同，`memory_prospective_window_hours` 的 0 要钳到 1 —— 那是「永不提醒」
+    /// 的静默故障，而这里的 0 是用户明确要求的「别在后台调模型」。
+    pub memory_idle_extract_minutes: u32,
+    /// T6（裁定 2）：嵌入来源的白名单值，`"endpoint" | "off"`，默认 `"endpoint"`。
+    /// normalize 里不认识的值回落 `"endpoint"`（见 `normalize_memory_embedding_source`）。
+    /// `"off"` = 写入侧不建向量、读取侧不嵌查询 —— 检索退化为纯 2-gram 关键词
+    /// （spec §3.1「记忆系统在无 embedding 模型时仍可用」）。
+    pub memory_embedding_source: String,
+    /// T6（裁定 3）：嵌入请求体里的 `model` 字段,默认与默认 chat 模型同源的 Qwen 生态
+    /// 常用 embedding 模型。normalize **只 trim 不校验** —— 端点支不支持某个模型
+    /// 只有端点知道,这里校验等于替用户编答案;配错的症状是端点 400 → 嵌入失败
+    /// 降级纯关键词(裁定 4),真话优先。
+    pub memory_embedding_model: String,
 }
 
 impl Default for Settings {
@@ -311,7 +401,10 @@ impl Default for Settings {
             reserve_output: 4096,
             budget_tokens: 32_000,
             window_messages: 40,
-            theme: "noir".into(),
+            // 2026-10-25 默认主题从 noir 换成 dusk（暮褐）：业主拍板的第 4 套预设。
+            // 前端 `resolveTheme` 的损坏回落仍是 noir —— 那是「存值读不了」的兜底，
+            // 不是默认值，两者语义不同，不跟着换。
+            theme: "dusk".into(),
             mode: Mode::Dark,
             font_size: 15,
             temperature: DEFAULT_TEMPERATURE,
@@ -324,6 +417,24 @@ impl Default for Settings {
             // 任何「先给个常用目录试试看」的写法都会让一把只读工具在用户没同意的前提下
             // 读到用户没打算给的东西，而那正是 spec 5.1「内置工具零弹窗」兑不兑现的前提。
             roots: Vec::new(),
+            // T5：长期记忆默认开（spec §7 的表）。关是用户的决定，不是默认 —— 这个功能
+            // 关着就等于不存在；默认开也不扩暴露面：注入的画像/召回进的是同一条聊天端点，
+            // 入库只进本地 SQLite（spec §10 隐私条的口径）。
+            memory_enabled: true,
+            memory_recall_k: DEFAULT_MEMORY_RECALL_K,
+            memory_note_token_cap: DEFAULT_MEMORY_NOTE_TOKEN_CAP,
+            memory_profile_char_cap: DEFAULT_MEMORY_PROFILE_CHAR_CAP,
+            // T12:节奏两项的默认值同样是「锚点常量」而不是字面量 —— 与 ipc 侧共用同一个
+            // 语义值(60 天 / 24 小时),这里引用常量,谁改默认值只有一处要改。
+            memory_decay_half_life_days: DEFAULT_MEMORY_DECAY_HALF_LIFE_DAYS,
+            memory_prospective_window_hours: DEFAULT_MEMORY_PROSPECTIVE_WINDOW_HOURS,
+            // T15(P0):空闲抽取默认 5 分钟。它不是「越勤越好」:每次 tick 真的抽到东西
+            // 才调模型,而 5 分钟是「用户离开一个会话后,记忆在下一次会话前跟上」的量级。
+            memory_idle_extract_minutes: DEFAULT_MEMORY_IDLE_EXTRACT_MINUTES,
+            // T6:嵌入默认走现有聊天端点(零新依赖;隐私边界与聊天一致 —— 同一家端点
+            // 本来就看得到原文,spec §3.1),模型默认 Qwen 生态的 text-embedding-v3。
+            memory_embedding_source: DEFAULT_MEMORY_EMBEDDING_SOURCE.into(),
+            memory_embedding_model: DEFAULT_MEMORY_EMBEDDING_MODEL.into(),
         }
     }
 }
@@ -371,6 +482,20 @@ pub fn normalize_accent(s: &str) -> String {
         return String::new();
     }
     format!("#{}", expanded.to_lowercase())
+}
+
+/// T6:嵌入来源的**唯一**白名单(同 `normalize_accent` 的「一个字段一处校验」纪律)。
+/// 只放行 `"endpoint"` 与 `"off"`,其余(含 `"local"` —— 二期的 fastembed 档,新依赖 +
+/// 模型下载由业主拍板,这里不预支)一律回落 `"endpoint"`:回落目标是**默认档**,
+/// 不是报错也不是发明第三态 —— 与 accent「认不出来回落预设」同一取向。
+/// 幂等(读写两侧各过一次):输出本身在白名单里,第二遍判定的结果相同。
+pub fn normalize_memory_embedding_source(s: &str) -> String {
+    match s.trim() {
+        "off" => "off".into(),
+        // "endpoint" 与一切不认识的值同路:`_` 臂就是回落纪律本身,写两条臂反而
+        // 暗示「还有别的合法形状」。
+        _ => "endpoint".into(),
+    }
 }
 
 /// T26（R284 的第一半）：`roots` 在**持久化路径**上的归一处。签名是纯的（进一张表、出一张表，
@@ -483,6 +608,52 @@ impl Settings {
         if self.budget_tokens <= self.reserve_output {
             self.budget_tokens = self.reserve_output + BUDGET_HEADROOM;
         }
+        // T5（spec §7）：记忆四项里的三个数值键走同一道只调不报错的闸，而且必须排在
+        // 上面那段预算重算**之后** —— note cap 的联动吃的是钳定后的 `budget_tokens`，
+        // 顺序反了它就一直对着一个还会被改写的旧值夹。
+        // `recall_k` 下限 1：0 是「召回关闭」的语义，不是档位 —— 想关请关总开关，
+        // 留一个「设成 0 却以为还在召回」的静默档只会生产「它记不住」的报障。
+        // 两个 cap 的上界同理：它们的去处都是请求 head，无限大等于预算作废。
+        // note cap 最后那句 `.min(budget/5)` 是 spec §7 的「< 预算 20%」：**min 可能
+        // 把值压到 200 以下，这是有意的**（预算安全优先于下限）；顺序必须「先夹区间
+        // 再 min」—— 反过来先 min 再夹下限，小预算会被顶回 200，这条保护就失效了。
+        self.memory_recall_k = self
+            .memory_recall_k
+            .clamp(MIN_MEMORY_RECALL_K, MAX_MEMORY_RECALL_K);
+        self.memory_note_token_cap = self
+            .memory_note_token_cap
+            .clamp(MIN_MEMORY_NOTE_TOKEN_CAP, MAX_MEMORY_NOTE_TOKEN_CAP)
+            .min(self.budget_tokens / 5);
+        self.memory_profile_char_cap = self
+            .memory_profile_char_cap
+            .clamp(MIN_MEMORY_PROFILE_CHAR_CAP, MAX_MEMORY_PROFILE_CHAR_CAP);
+        // T12:节奏两项走同一道只调不报错的闸。它们与上面的 cap 不同,没有与预算的联动:
+        // 半衰期只改排序、窗口只改「哪些待办该提醒」,两者都不增加请求 head 的体积,
+        // 所以纯粹的区间钳位就够,不存在第二条规则要维护。
+        // 0 是这两种失效最安静的形状(0 天 ⇒ 记忆立刻沉底、0 小时 ⇒ 待办永不提醒),
+        // 所以下限 1 不是装饰:`clamp` 的 min 参数就是它的唯一防线。
+        self.memory_decay_half_life_days = self
+            .memory_decay_half_life_days
+            .clamp(MIN_MEMORY_DECAY_HALF_LIFE_DAYS, MAX_MEMORY_DECAY_HALF_LIFE_DAYS);
+        self.memory_prospective_window_hours = self
+            .memory_prospective_window_hours
+            .clamp(
+                MIN_MEMORY_PROSPECTIVE_WINDOW_HOURS,
+                MAX_MEMORY_PROSPECTIVE_WINDOW_HOURS,
+            );
+        // T15(P0):空闲抽取间隔夹 0..=120。下限 0 是**合法开关**,所以这里的 clamp
+        // 与上面两项方向不同 —— 它只挡「负不了(u32)但可能大到没意义」的那一侧,
+        // 让 0 原样穿过。写成 `clamp(0,..)` 而不是只写 `.min(MAX)` 是为了让读代码的人
+        // 一眼看到「0 是被明确允许的」,而不是怀疑这里漏了半边钳位。
+        self.memory_idle_extract_minutes = self
+            .memory_idle_extract_minutes
+            .clamp(MIN_MEMORY_IDLE_EXTRACT_MINUTES, MAX_MEMORY_IDLE_EXTRACT_MINUTES);
+        // T6:嵌入两键 —— source 走白名单回落(脏值出不了读侧,同 accent 放在这里
+        // 而不是只放 save 前的理由);model 只 trim 不校验(裁定 3:端点支不支持
+        // 只有端点知道,这里是零知识通道)。
+        self.memory_embedding_source =
+            normalize_memory_embedding_source(&self.memory_embedding_source);
+        self.memory_embedding_model = self.memory_embedding_model.trim().to_string();
         // R123（边界由 T15 定，这里是唯一钳位处）：`applyTheme` 原样把它写成 inline `--font-size`，
         // 0 → 看不见字、`u32::MAX` → 一行一个字，都不报错。TS 侧不再钳第二遍，免得两处边界漂移。
         self.font_size = self.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
@@ -909,6 +1080,37 @@ mod tests {
         assert_eq!(s.temperature, 0.7);
         assert_eq!(s.compact_threshold, 0.85);
         assert_eq!(s.keep_turns, 10);
+        // T15(P0):空闲抽取默认 5 分钟。这一项没有别的默认锚点,漏进 Default 会静默
+        // 变成 0 —— 而 0 恰好是「关闭」这个合法档,于是「默认开着」静默变成「默认关了」,
+        // 没有任何报错。所以它必须在这里被钉住。
+        assert_eq!(s.memory_idle_extract_minutes, 5);
+    }
+
+    /// T15(P0):空闲抽取间隔的钳位。与半衰期/待办窗口那两条的关键差别:**0 是合法值**,
+    /// 必须原样穿过(它 = 用户明确要求关闭后台抽取)。只有上界 120 是纠正目标。
+    /// 一条测试同时钉住「0 不被误钳到 1」—— 那会变成「设 0 反而每 1 分钟偷偷调一次模型」,
+    /// 是本设置项最坏的失效形态。
+    #[test]
+    fn the_idle_extract_minutes_clamps_at_the_top_but_lets_zero_mean_off() {
+        for (input, want) in [
+            (0u32, 0),
+            (1, 1),
+            (5, 5),
+            (60, 60),
+            (120, 120),
+            (121, 120),
+            (u32::MAX, 120),
+        ] {
+            let n = Settings {
+                memory_idle_extract_minutes: input,
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(
+                n.memory_idle_extract_minutes, want,
+                "memory_idle_extract_minutes={input} 应钳到 {want}(0 = 关闭,是合法档)"
+            );
+        }
     }
 
     #[test]
@@ -1312,10 +1514,13 @@ mod tests {
 
     #[test]
     fn normalize_keeps_valid_numbers_untouched() {
+        // T5 之后预算与 `memory_note_token_cap` 有联动（< budget/5），2001 那种小预算
+        // 会把默认 cap 600 合法地压到 400 —— 那是设计（spec §7），不是「动了合法值」。
+        // 本条量的是「合法的不许被顺手改」，所以夹具换成一笔 cap 不受联动的预算。
         let mut s = Settings {
             base_url: "https://x.com/v1".into(),
             reserve_output: 2_000,
-            budget_tokens: 2_001,
+            budget_tokens: 32_000,
             window_messages: 2,
             ..Default::default()
         };
@@ -1325,7 +1530,7 @@ mod tests {
             Settings {
                 base_url: "https://x.com/v1".into(),
                 reserve_output: 2_000,
-                budget_tokens: 2_001,
+                budget_tokens: 32_000,
                 window_messages: 2,
                 ..Default::default()
             }
@@ -1506,6 +1711,269 @@ mod tests {
             };
             s.normalize();
             assert_eq!(s.keep_turns, want, "keep_turns={input} 应钳到 {want}");
+        }
+    }
+
+    // ---- T5：长期记忆的四个设置项（spec §7 的表） ----
+
+    #[test]
+    fn memory_settings_default_to_on_with_five_recalls_and_the_spec_caps() {
+        // 四个键的默认值都得在这里钉字面量：漏进 `Default` 的字段会被所有
+        // `..Default::default()` 的夹具静默读成 0/false —— `defaults_match_spec_numbers`
+        // 注释里那句话对它们同样成立，而记忆侧 0/false 的形状是「功能开着却什么都不做」。
+        let s = Settings::default();
+        assert!(s.memory_enabled);
+        assert_eq!(s.memory_recall_k, 5);
+        assert_eq!(s.memory_note_token_cap, 600);
+        assert_eq!(s.memory_profile_char_cap, 500);
+    }
+
+    // ---- T12：记忆节奏的两项设置（衰减半衰期 + 待办提醒窗口） ----
+
+    #[test]
+    fn the_two_memory_pacing_settings_default_to_sixty_days_and_a_day_long_prospective_window() {
+        // 两个新键的默认值必须钉字面量（与上面那条同一纪律）：漏进 `Default` 的字段会被
+        // 所有 `..Default::default()` 夹具静默读成 0，而 0 天半衰期意味着「记忆立刻沉到底」、
+        // 0 小时窗口意味着「待办永远不提醒」—— 两种都是「功能开着却什么都不做」的静默故障。
+        let s = Settings::default();
+        assert_eq!(s.memory_decay_half_life_days, 60);
+        assert_eq!(s.memory_prospective_window_hours, 24);
+        // normalize 是幂等的定点：默认值本身在区间内，读写两侧各过一次也不许改它。
+        let n = s.normalized();
+        assert_eq!(n.memory_decay_half_life_days, 60);
+        assert_eq!(n.memory_prospective_window_hours, 24);
+    }
+
+    #[test]
+    fn absurd_memory_pacing_values_are_clamped_into_their_ranges_not_obeyed() {
+        // 半衰期夹 1..=3650（10 年）：下限 1 是「至少一天」，再小就是「记了等于没记」；
+        // 上限 3650 是「人到十年，忘了也正常」，再大则一条 2010 年的事实永远霸榜。
+        for (input, want) in [
+            (0u32, 1),
+            (1, 1),
+            (60, 60),
+            (3650, 3650),
+            (3651, 3650),
+            (u32::MAX, 3650),
+        ] {
+            let n = Settings {
+                memory_decay_half_life_days: input,
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(
+                n.memory_decay_half_life_days, want,
+                "memory_decay_half_life_days={input} 应钳到 {want}"
+            );
+        }
+        // 待办窗口夹 1..=168（一周）：小于一天会让今天下午的待办在上午的会话里漏掉，
+        // 大于一周则「提醒」变成「提前一周念一遍」，用户会学会无视它。
+        for (input, want) in [
+            (0u32, 1),
+            (1, 1),
+            (24, 24),
+            (168, 168),
+            (169, 168),
+            (u32::MAX, 168),
+        ] {
+            let n = Settings {
+                memory_prospective_window_hours: input,
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(
+                n.memory_prospective_window_hours, want,
+                "memory_prospective_window_hours={input} 应钳到 {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn absurd_memory_settings_are_clamped_into_their_ranges_not_obeyed() {
+        // spec §7 的钳制列：recall_k 1..=20、note cap 200..=2000、profile cap 100..=2000。
+        // 与 compact/keep 同一道闸：越界值的处置是纠正到能用的最近值，只调不报错。
+        // 默认 budget（32_000）下 budget/5 = 6_400，min 那一刀在这条测试里**不参与** ——
+        // 纯区间钳位与预算联动是两件事，后者由下一条单独钉。
+        for (input, want) in [
+            (0u32, 1),
+            (1, 1),
+            (5, 5),
+            (20, 20),
+            (21, 20),
+            (u32::MAX, 20),
+        ] {
+            let n = Settings {
+                memory_recall_k: input,
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(n.memory_recall_k, want, "memory_recall_k={input} 应钳到 {want}");
+        }
+        for (input, want) in [
+            (0u32, 200),
+            (199, 200),
+            (600, 600),
+            (2000, 2000),
+            (2001, 2000),
+            (u32::MAX, 2000),
+        ] {
+            let n = Settings {
+                memory_note_token_cap: input,
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(
+                n.memory_note_token_cap, want,
+                "memory_note_token_cap={input} 应钳到 {want}"
+            );
+        }
+        for (input, want) in [
+            (0u32, 100),
+            (99, 100),
+            (500, 500),
+            (2000, 2000),
+            (2001, 2000),
+            (u32::MAX, 2000),
+        ] {
+            let n = Settings {
+                memory_profile_char_cap: input,
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(
+                n.memory_profile_char_cap, want,
+                "memory_profile_char_cap={input} 应钳到 {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tiny_budget_squeezes_the_note_cap_below_its_floor_on_purpose() {
+        // 联动（spec §7「且 < budget_tokens 的 20%」）：先夹 200..=2000，再对
+        // `budget_tokens / 5` 取 min。**夹完 min 可能低于下限 200，这是有意的**：
+        // 预算安全优先于下限 —— 记忆备注挤爆对话预算的症状（预算塌 0、当场失忆）
+        // 比「注入少了」严重。顺序也不能反：先 min 再夹下限会把小预算顶回 200，
+        // 这条保护就等于没写。
+        let n = Settings {
+            reserve_output: 1,
+            budget_tokens: 500,
+            memory_note_token_cap: 600,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(
+            n.budget_tokens, 500,
+            "前提：这笔预算本身合法（500 > reserve 1），normalize 不改它"
+        );
+        assert_eq!(
+            n.memory_note_token_cap, 100,
+            "budget/5 = 100 把 600 的 cap 压到下限之下 —— 预算安全优先于 200 的下限"
+        );
+        // 幂等：normalize 读写两侧各跑一次，第二遍不许把压下去的 cap 再顶回 200
+        // （「先夹区间再 min」的顺序保证它是定点；反了就是「存一次盘 cap 自己变一次」）。
+        let mut again = n.clone();
+        again.normalize();
+        assert_eq!(again.memory_note_token_cap, 100, "联动必须幂等");
+    }
+
+    #[test]
+    fn memory_embedding_defaults_pin_endpoint_source_and_the_qwen_model() {
+        // 两个新键的默认值得在这里钉字面量(与上面那条同一纪律):漏进 `Default` 的字段
+        // 会被所有 `..Default::default()` 的夹具静默读成空串。模型默认取
+        // `text-embedding-v3`:与默认 chat 模型同源的 Qwen 生态常用 embedding 模型。
+        let s = Settings::default();
+        assert_eq!(s.memory_embedding_source, "endpoint");
+        assert_eq!(s.memory_embedding_model, "text-embedding-v3");
+        // 默认值必须是 normalize 的定点:读写两侧各过一次不许变。
+        let n = s.normalized();
+        assert_eq!(n.memory_embedding_source, "endpoint");
+        assert_eq!(n.memory_embedding_model, "text-embedding-v3");
+    }
+
+    #[test]
+    fn an_unrecognized_embedding_source_falls_back_to_endpoint_not_to_a_third_state() {
+        // 白名单只有 "endpoint"|"off"(spec §3.1 的二源一开关,`local`/fastembed 是二期,
+        // 新依赖 + 模型下载由业主拍板 —— 不替它预支第三态)。不认识的值回落 "endpoint",
+        // 与 `accent` 白名单同一条回落纪律:认不出来不等于可以原样带出去,也不等于可以
+        // 替用户发明一个新档位。trim 之后判定,粘贴带空白照常工作。
+        assert_eq!(normalize_memory_embedding_source("off"), "off");
+        assert_eq!(normalize_memory_embedding_source("  off \n"), "off");
+        assert_eq!(normalize_memory_embedding_source("endpoint"), "endpoint");
+        for bad in ["", "   ", "local", "Local", "OFF", "on", "endpoint2", "garbage"] {
+            assert_eq!(
+                normalize_memory_embedding_source(bad),
+                "endpoint",
+                "{bad:?} 不许原样带出去,也不许变成第三态"
+            );
+        }
+        // 幂等:normalize 读写两侧各跑一次,输出必须是定点。
+        for v in ["off", "endpoint", "local"] {
+            let once = normalize_memory_embedding_source(v);
+            assert_eq!(normalize_memory_embedding_source(&once), once, "{v:?} 必须是定点");
+        }
+        // 经 `Settings::normalize` 也一样:磁盘上的脏值出不了读侧。
+        let n = Settings {
+            memory_embedding_source: "local".into(),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(n.memory_embedding_source, "endpoint");
+        // 落盘往返:off 是**合法值**,必须能原样读回 —— 回落只针对不认识的,
+        // 别把用户显式关掉的开关偷偷打开。
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        store
+            .save(&Settings {
+                memory_embedding_source: "off".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(store.load().unwrap().memory_embedding_source, "off");
+        std::fs::write(
+            store.path(),
+            r#"{"model":"qwen-turbo","memory_embedding_source":"fastembed"}"#,
+        )
+        .unwrap();
+        let got = store.load().unwrap();
+        assert_eq!(got.memory_embedding_source, "endpoint", "脏值出不了读侧");
+        assert_eq!(got.model, "qwen-turbo", "其余设置照原样保住");
+        assert!(
+            corrupt_backups(d.path()).is_empty(),
+            "单个可修字段不是文件损坏,不许留备份(与 accent 同一条 R84/R91 边界)"
+        );
+    }
+
+    #[test]
+    fn the_embedding_model_is_trimmed_but_never_invented() {
+        // normalize 只 trim 不校验:端点支不支持某个模型只有端点知道,这里是零知识通道。
+        // 校验(或替用户回落默认)都会掩盖「他到底配了什么」—— 配错的症状是端点 400,
+        // 嵌入失败降级纯关键词(裁定 4),那个症状比静默换模型名诚实得多。
+        let n = Settings {
+            memory_embedding_model: " text-embedding-v3 \n".into(),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(n.memory_embedding_model, "text-embedding-v3");
+        // 空串照原样保留,不是回落默认:空模型名 → 端点 400 → 降级,真话优先。
+        let n = Settings {
+            memory_embedding_model: "  ".into(),
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!(n.memory_embedding_model, "");
+    }
+
+    #[test]
+    fn memory_enabled_is_a_bool_and_normalize_never_touches_it() {
+        // 布尔没有「越界」：true/false 原样进出。这条钉的是「别给它发明钳位」——
+        // 谁把它改成三态或 0/1 数值口径，这里当场红。
+        for v in [true, false] {
+            let n = Settings {
+                memory_enabled: v,
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(n.memory_enabled, v, "memory_enabled={v} 必须原样保留");
         }
     }
 
@@ -2005,7 +2473,7 @@ mod tests {
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_fourteen_settings_fields() {
+    fn serialized_field_names_are_exactly_the_twenty_three_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -2023,6 +2491,15 @@ mod tests {
                 "compact_threshold",
                 "font_size",
                 "keep_turns",
+                "memory_decay_half_life_days",
+                "memory_embedding_model",
+                "memory_embedding_source",
+                "memory_enabled",
+                "memory_idle_extract_minutes",
+                "memory_note_token_cap",
+                "memory_profile_char_cap",
+                "memory_prospective_window_hours",
+                "memory_recall_k",
                 "mode",
                 "model",
                 "reserve_output",
@@ -2105,7 +2582,7 @@ mod tests {
         let got = store.load().unwrap();
         assert_eq!(got.model, "qwen-turbo");
         assert_eq!(got.reserve_output, 4096);
-        assert_eq!(got.theme, "noir");
+        assert_eq!(got.theme, "dusk");
         assert!(
             corrupt_backups(d.path()).is_empty(),
             "缺字段是可读的，不该按损坏处理（R84 与 R91 的边界）"

@@ -13,7 +13,7 @@ import {
   within,
 } from "@testing-library/react";
 import App from "./App";
-import type { AgentEvent, SessionRow, SettingsView } from "./types";
+import type { AgentEvent, MemoryView, SessionRow, SettingsView } from "./types";
 
 const h = vi.hoisted(() => {
   const listeners: ((sessionId: string, e: AgentEvent) => void)[] = [];
@@ -30,6 +30,20 @@ const h = vi.hoisted(() => {
     setSettings: vi.fn(),
     setApiKey: vi.fn(),
     normalize: vi.fn(),
+    // 长期记忆子区的三条命令：面板一挂载就要拉列表，mock 里没有这支的话，
+    // 每一条开面板的用例都会走进面板的 error 通道（No "listMemories" export is defined
+    // on the mock），把真正的失败淹没 —— 在这里给空表，与面板默认夹具同一口径。
+    listMemories: vi.fn(),
+    deleteMemory: vi.fn(),
+    clearMemories: vi.fn(),
+    // T12：面板挂载时还要拉常驻画像。缺这一支的话每条开面板的用例都会走进
+    // 面板的 error 通道（No "memoryProfile" export is defined on the mock），
+    // 真正的失败会被那条噪声淹掉。
+    memoryProfile: vi.fn(),
+    // P1：面板里用户权威的两个写入口。App 在这一层只递命令（不持数据、不 catch），
+    // 所以判据是「面板里点的那一下，最终打到了哪个命令、带的是哪个正文」。
+    updateMemoryBody: vi.fn(),
+    addMemory: vi.fn(),
     subscribeAgent: (cb: (sessionId: string, e: AgentEvent) => void) => {
       listeners.push(cb);
       return () => {
@@ -53,11 +67,12 @@ const row = (id: string, updated_at: number): SessionRow => ({
   updated_at,
 });
 
-// 夹具写满 15 个键（`SettingsView` 是 flatten 后拍平一层的形状，13 个可写 + 2 只读）：
+// 夹具写满 19 个键（`SettingsView` 是 flatten 后拍平一层的形状，17 个可写 + 2 只读）：
 // App 若把 view 降级成只剩面板渲染的那几键再传进面板，`api_key_masked` / `corrupt_backup`
 // 那两块界面会**静默消失**，少写一项 TS 当场报错 —— 这是这份夹具唯一有用的报错方式。
 // T39 那三键 + T43 的 `accent` + T26 的 `roots`（五只面板都不渲染）必须一路带到保存，
 // 所以它们在这里也得不漏 —— 漏了就是 `SettingsPanel.test.tsx` 那条 carry-through 测试的现场。
+// 长期记忆四键（memory_*）面板**渲染**，照旧不漏：载荷断言证明的是「App 原样转交整张表」。
 const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   base_url: "https://example.invalid/v1",
   model: "qwen-plus",
@@ -76,12 +91,44 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   // 面板把它抹回默认 = 抹成空 = 下面那条 `toHaveBeenCalledWith` 照样绿，而用户手改进
   // settings.json 的目录表已经没了，症状是「read_file 什么都读不到」。
   roots: ["C:\\notes", "D:\\code"],
+  // 长期记忆四键给 Rust 默认值（true/5/600/500）：它们与 roots 不同，面板**渲染**它们，
+  // 载荷断言只证明「App 没有重新拼表」，默认值在这个判据下够用。
+  memory_enabled: true,
+  memory_recall_k: 5,
+  memory_note_token_cap: 600,
+  memory_profile_char_cap: 500,
+  memory_decay_half_life_days: 60,
+  memory_prospective_window_hours: 24,
+  memory_embedding_source: "endpoint",
+  memory_embedding_model: "text-embedding-v3",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
 });
 
 const FAKE = "sk-THIS-IS-NOT-A-REAL-KEY";
+
+/** 记忆列表一行。默认全空、全有效、非用户编辑：用例只覆写它关心的键。
+ *  P1 的 `user_edited` 与 T12 那三个标价字段同一口径 —— 默认取「不显示任何标记」那一档。 */
+const memory = (id: number, p: Partial<MemoryView> = {}): MemoryView => ({
+  id,
+  session_id: null,
+  kind: "fact",
+  subject: null,
+  predicate: null,
+  object: null,
+  body: `记忆 ${id}`,
+  confidence: 1,
+  valid_from: 0,
+  invalid_at: null,
+  updated_at: 0,
+  valid: true,
+  reinforcements: 0,
+  due_at: null,
+  is_due: false,
+  user_edited: false,
+  ...p,
+});
 
 beforeEach(() => {
   vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
@@ -111,6 +158,12 @@ beforeEach(() => {
   h.getSettings.mockReset().mockResolvedValue(view());
   h.respond.mockReset().mockResolvedValue(false);
   h.normalize.mockReset().mockResolvedValue({ type: "image", data: "", mime: "png" });
+  h.listMemories.mockReset().mockResolvedValue([]);
+  h.deleteMemory.mockReset().mockResolvedValue(undefined);
+  h.clearMemories.mockReset().mockResolvedValue(undefined);
+  h.memoryProfile.mockReset().mockResolvedValue("");
+  h.updateMemoryBody.mockReset().mockResolvedValue(undefined);
+  h.addMemory.mockReset().mockResolvedValue(1);
   h.listeners.length = 0;
 });
 
@@ -137,8 +190,86 @@ describe("App 设置接线", () => {
     expect(h.subCount()).toBe(1);
   });
 
-  it("writes the whole table through settings_set and applies the theme once", async () => {
+  it("loads the resident memory profile through memory_profile when the panel opens", async () => {
+    // T12：面板里的画像那一行靠 App 递进去的 `onLoadProfile` 取数。这条钉的是**接线**
+    // 本身（面板组件那一侧只证明「给了回调就会调」，证不了 App 递的是不是
+    // `commands.memoryProfile`）。空串的静默由 SettingsPanel.test.tsx 管，这里只钉有内容。
+    h.memoryProfile.mockResolvedValue("用户是 Rust 开发者");
     render(<App />);
+    await settled();
+    const dialog = await openPanel();
+    await waitFor(() =>
+      expect(within(dialog).getByTestId("memory-profile")).toHaveTextContent(
+        "用户是 Rust 开发者",
+      ),
+    );
+    expect(h.memoryProfile).toHaveBeenCalledTimes(1);
+  });
+
+  // ==== P1：面板里的用户权威接线（行内编辑 / 手动新增）====
+  // 组件层那几条只证明「给了回调就会调」；这里钉的是 App 递进去的确实是
+  // `memory_update_body` / `memory_add`，且写入后列表真值来自重拉（不是前端 splice）。
+
+  it("forwards an inline memory edit to memory_update_body and reloads the list", async () => {
+    h.listMemories
+      .mockResolvedValueOnce([memory(7, { body: "用户住在北京" })])
+      .mockResolvedValueOnce([memory(7, { body: "用户住在上海", user_edited: true })]);
+    render(<App />);
+    await settled();
+    const dialog = await openPanel();
+    await within(dialog).findByTestId("memory-item");
+    fireEvent.click(within(dialog).getByRole("button", { name: "编辑" }));
+    fireEvent.change(within(dialog).getByLabelText(/编辑记忆/), {
+      target: { value: "用户住在上海" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "保存修改" }));
+    await waitFor(() =>
+      expect(h.updateMemoryBody).toHaveBeenCalledWith(7, "用户住在上海"),
+    );
+    // 重拉之后带上「已编辑」标记 —— 这条标记不是前端自己造的，是后端视图给的。
+    await waitFor(() =>
+      expect(within(dialog).getByText(/用户住在上海/)).toBeInTheDocument(),
+    );
+    expect(within(dialog).getByText(/已编辑/)).toBeInTheDocument();
+  });
+
+  it("forwards a hand-written memory to memory_add with the chosen kind", async () => {
+    h.listMemories
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        memory(9, {
+          kind: "prospective",
+          body: "下周三交季度报告",
+          user_edited: true,
+        }),
+      ]);
+    h.addMemory.mockResolvedValue(9);
+    render(<App />);
+    await settled();
+    const dialog = await openPanel();
+    await within(dialog).findByTestId("memory-empty");
+    fireEvent.change(within(dialog).getByLabelText(/记忆类型/), {
+      target: { value: "prospective" },
+    });
+    fireEvent.change(within(dialog).getByLabelText(/记忆正文/), {
+      target: { value: "下周三交季度报告" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "添加" }));
+    await waitFor(() =>
+      expect(h.addMemory).toHaveBeenCalledWith(
+        "prospective",
+        "下周三交季度报告",
+        // 这条用例没填「提醒时间」→ 待办但不提醒,第三参必须是 null(不是 0)。
+        null,
+      ),
+    );
+    await waitFor(() =>
+      expect(within(dialog).getByText(/下周三交季度报告/)).toBeInTheDocument(),
+    );
+    expect(h.listMemories).toHaveBeenCalledTimes(2);
+  });
+
+  it("writes the whole table through settings_set and applies the theme once", async () => {    render(<App />);
     await settled();
     expect(document.documentElement.getAttribute("data-theme")).toBe("noir");
     const dialog = await openPanel();
@@ -172,6 +303,14 @@ describe("App 设置接线", () => {
         keep_turns: 10,
         accent: "",
         roots: ["C:\\notes", "D:\\code"],
+        memory_enabled: true,
+        memory_recall_k: 5,
+        memory_note_token_cap: 600,
+        memory_profile_char_cap: 500,
+        memory_decay_half_life_days: 60,
+        memory_prospective_window_hours: 24,
+        memory_embedding_source: "endpoint",
+        memory_embedding_model: "text-embedding-v3",
       }),
     );
     // 保存成功才改界面：这三项是 `applyTheme` 唯一的三个可见后果。

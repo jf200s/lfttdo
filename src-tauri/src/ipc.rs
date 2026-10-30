@@ -6,22 +6,30 @@
 // 这段每次发送都要跑几百次的代码在生产里就永远没有测试。
 use crate::agent::context::{ContextBuilder, ContextConfig};
 use crate::agent::events::{AgentEvent, Decision, EventSink, StopReason};
+use crate::agent::memory::{
+    MemoryCandidate, MemoryDecision, PROFILE_CHAR_CAP, consolidate_memory, extract_memories,
+    merge_profile,
+};
 use crate::agent::session::{AgentSession, SessionDeps};
 use crate::agent::summarize::{SUMMARY_OMITTED, collect_summary, summary_note, summary_request};
-use crate::agent::types::{ContentBlock, Message};
+use crate::agent::types::{ContentBlock, Message, Role};
 use crate::mcp::bridge::{McpBridge, McpTool, ServerStatus};
 use crate::mcp::config::ServerDef;
+use crate::model::embed::{EmbedEndpoint, EmbedProvider};
 use crate::model::openai_compat::{OpenAiCompat, is_loopback_endpoint};
 use crate::model::provider::ModelProvider;
 use crate::permission::gate::{PermissionGate, Verdict};
 use crate::settings::{Settings, SettingsStore, effective_roots};
 use crate::store::db::{Db, SessionRow, events_from_messages};
+use crate::store::memory::{MemoryRow, MemoryWrite, RecallCfg};
 use crate::tools::fetch::FetchTool;
+use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::use_skill::UseSkillTool;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -190,6 +198,52 @@ impl Publish for AppPublisher {
 /// Tauri 托管的应用状态。每个字段都是长命的：`Db`/`SettingsStore` 各只允许一个实例
 /// （R101 的 `SettingsStore` 锁是**实例内**的，两个实例同目录并发 save 实测 48 次里
 /// 20~30 次报 `Io(os error 2)`），所以一律 `Arc` + 一次 `manage`。
+/// 按会话互斥的抽取锁(spec §12.5 缺口 1)。三条抽取路径(压缩 / 空闲 / 会话切换)
+/// 共用这一把:同一会话同时只许一次抽取。
+///
+/// 为什么必须是**按会话**而不是一把全局锁:抽取内含一次模型调用(数秒),全局锁会让
+/// 「A 会话在抽」挡住「B 会话在抽」—— 两个无关会话没有冲突的理由。
+/// 为什么是「标记集」而不是阻塞锁:重复触发时的正确处置是**放弃**而不是排队 ——
+/// 排队意味着用户切会话要等一次模型调用,而游标保证了被放弃的那次不会丢内容
+/// (另一次抽取正在处理同一批消息)。
+#[derive(Clone, Default)]
+pub struct ExtractLocks(Arc<Mutex<std::collections::HashSet<String>>>);
+
+impl ExtractLocks {
+    /// 认领一个会话的抽取权;`None` = 它已经在抽了,本次调用应当**安静地放弃**。
+    pub fn try_acquire(&self, session_id: &str) -> Option<ExtractGuard> {
+        let mut set = crate::lock::guard(&self.0);
+        if !set.insert(session_id.to_string()) {
+            return None;
+        }
+        drop(set);
+        Some(ExtractGuard {
+            locks: self.clone(),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    fn release(&self, session_id: &str) {
+        // 中毒不可怕:这个集合只是个「谁在忙」的提示,拿走一条记录本身没有不变量。
+        // 用 `into_inner` 而不是 unwrap —— panic 之后永久卡住一个会话的抽取,
+        // 比恢复一个死锁集合糟得多。
+        let mut set = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        set.remove(session_id);
+    }
+}
+
+/// 抽取权的 RAII guard:析构即释放,`?` 的每条早退路径都不会把会话永久留在「正在抽取」。
+pub struct ExtractGuard {
+    locks: ExtractLocks,
+    session_id: String,
+}
+
+impl Drop for ExtractGuard {
+    fn drop(&mut self) {
+        self.locks.release(&self.session_id);
+    }
+}
+
 pub struct AppState {
     pub db: Arc<Db>,
     pub settings: Arc<SettingsStore>,
@@ -210,6 +264,9 @@ pub struct AppState {
     /// 技能包目录。便携模式下在 exe 的上一级（U 盘上就是 `aidox\skills`，与人设同层），
     /// 常规安装放数据目录下；装配期建出来，用户把 `SKILL.md` 丢进子目录即可。
     pub skills_dir: PathBuf,
+    /// 按会话的抽取互斥(spec §12.5 缺口 1)。空闲 worker 与切换回补都经它,
+    /// 避免同一会话被两条路径同时抽取、堆出重复记忆。
+    pub extracting: ExtractLocks,
 }
 
 /// 单轮并发闸门。guard 一析构就释放槽位，所以 `?` 的每条早退路径（读设置失败、
@@ -239,6 +296,17 @@ impl Drop for RunningGuard {
     fn drop(&mut self) {
         *guard(&self.slot) = None;
     }
+}
+
+/// 「这个会话正在跑一轮吗」——**只读一次、立刻释放锁**的判据。
+///
+/// 抽成函数而不是在调用点写 `guard(..).as_deref() == Some(..)`:`if` 条件里的临时
+/// guard 虽然在该语句结束时就丢弃,但把它藏在一个布尔表达式里会让「锁有没有跨
+/// await」变成读者要靠编译器版本去猜的事。函数边界把「拿锁 → 抄出一个 bool →
+/// 放锁」钉死,后台 tick 的循环里因此不可能持锁跨 await(那会让一次网络调用
+/// 把整条命令层卡住)。
+fn a_turn_is_running(slot: &Arc<Mutex<Option<String>>>, session_id: &str) -> bool {
+    guard(slot).as_deref() == Some(session_id)
 }
 
 /// 取消令牌的槽位生命周期也交给所有权：`run_turn` 无论从哪儿退出都清空，
@@ -271,6 +339,20 @@ pub struct TurnDeps {
     /// 由 `Settings::to_model_config()` 给（T39）：`None` = 请求体不带 `temperature`，
     /// 端点自己定。和 `context` 同样理由 —— 会话不许自己去读 `Settings`。
     pub temperature: Option<f32>,
+    /// T5：记忆的四项开关（spec §7），由 `send_message` 从本轮那份 `Settings` 现取
+    /// （context/temperature 同一条线：会话不自己读 `Settings`）。`enabled=false` 的
+    /// 语义有两级：压缩段零抽取（记忆侧模型调用一个不发起）+ 请求头零备注（连召回
+    /// 读库都不做）；记忆数据不清除，清空的入口只在设置页。
+    pub memory: MemoryTurnCfg,
+    /// T6：嵌入端点客户端。`None` = source 是 `"off"`（用户显式关掉）或构造失败
+    /// （warn 后降级）—— 两种形态在检索侧**同一个**答案：纯 2-gram 关键词召回、
+    /// 写入侧不建向量。嵌入失败永远降级、永远不阻塞对话/压缩/落库（裁定 4，
+    /// spec §8 不变量 5），所以它不是 `Result` 而是 `Option`：失败在构造点就化掉了。
+    pub embed: Option<Arc<dyn EmbedProvider>>,
+    /// 按会话的抽取互斥(同 `AppState.extracting` 的同一份)。压缩段在抽之前认领;
+    /// 拿不到说明另一个路径正在抽同一会话 —— 那段内容归它处理,本轮跳过抽取、
+    /// 压缩照常(游标由它推进,内容不丢)。
+    pub extract_locks: ExtractLocks,
     /// T26（R276）：`read_file` 能读的那张目录表，**每轮从 `Settings` 现取**（`send_message`
     /// 头里那一次 `store.load()` 是它唯一的来源，不缓存 —— 用户改了设置，下一轮就该生效）。
     ///
@@ -324,16 +406,197 @@ where
 /// 交回的是重读后的历史：调用方必须在这份历史之上才取 `prior`（brief §4 的第一个陷阱）。
 /// 交回的事件只带两个数（`dropped` / `summary_chars`），摘要文本一个字都不在其中 ——
 /// 它唯一的去处是库里那条 `Role::System` 备注，而那条备注在模型侧可见、用户侧不可见（R69）。
+/// 抽取 →(按需)合并 → 画像归并,产出一次压缩事务里的记忆写入(spec §4)。
+/// **每一段的失败都只降级自己**(warn 日志 + 该段零写入),压缩本体照常;
+/// 用户按停止的裁定不在这里 —— 调用方(`compact_before_turn`)在事务前统一裁。
+/// 读库(同键查重/现画像)发生在事务之前:只读不写,且单轮闸门保证此刻没有第二个写者。
+///
+/// T15:真正的合并逻辑搬到 [`plan_memory_writes_from_candidates`],本函数只保留
+/// 「压缩路径的失败语义」—— 抽取失败 = 本轮零写入(warn),而不是冒泡。空闲/切换抽取
+/// 需要相反的语义(失败必须冒泡,否则游标会被推过一段没抽成的对话),所以它直接调
+/// 候选层,两条路径共用同一份合并/保护逻辑,不复制。
+async fn plan_memory_writes(
+    db: &Arc<Db>,
+    session_id: &str,
+    model: &dyn ModelProvider,
+    source: &[Message],
+    profile_char_cap: usize,
+    cancel: &CancellationToken,
+) -> Vec<MemoryWrite> {
+    match plan_memory_writes_for_source(
+        db,
+        session_id,
+        model,
+        source,
+        profile_char_cap,
+        cancel,
+    )
+    .await
+    {
+        Ok(writes) => writes,
+        // 取消不是故障:用户按了停止,压缩段随后整段放弃(调用方还会再查一次令牌),
+        // 这里不刷「抽取失败」的日志,免得把一次正常的中断说成端点问题。
+        Err(_) if cancel.is_cancelled() => Vec::new(),
+        Err(reason) => {
+            tracing::warn!("会话 {session_id} 的记忆抽取/合并没有结论,本轮零记忆写入:{reason}");
+            Vec::new()
+        }
+    }
+}
+
+/// [`plan_memory_writes`] 的「抽取 + 合并」形态,失败用 `Err` 冒泡。
+/// 两个调用方的差别只在**怎么处理 Err**,不在做什么:
+/// - 压缩路径(`plan_memory_writes`):Err → warn + 零写入,压缩照常;
+/// - 空闲/切换路径([`extract_session_memories`]):Err → 冒泡,**游标不推进**,
+///   下一个 tick 重试。抽取失败绝不能当成「这段没什么可记」——那会把记忆永久丢掉。
+async fn plan_memory_writes_for_source(
+    db: &Arc<Db>,
+    session_id: &str,
+    model: &dyn ModelProvider,
+    source: &[Message],
+    profile_char_cap: usize,
+    cancel: &CancellationToken,
+) -> Result<Vec<MemoryWrite>, String> {
+    let candidates = extract_memories(model, source, cancel).await?;
+    plan_memory_writes_from_candidates(db, session_id, model, candidates, profile_char_cap, cancel)
+        .await
+}
+
+/// 候选 → 写入的**唯一**合并层(压缩/空闲/切换三条触发路径共用)。
+///
+/// T16(user_edited 保护):模型对某一行做的 UPDATE/INVALIDATE,如果那一行是
+/// **用户亲手改过**的,就降级成 ADD(新旧并存),并记一行 info。判据在 `existing`
+/// ——它就是本次同键对照集,保护集只从它里面取,和 Reinforce 的存在性核对同一个来源。
+/// 为什么允许 REINFORCE 指向保护行:它不改正文,只加确认计数 —— 用户写的句子
+/// 被「再说一遍」变强是完全正确的语义,没有需要保护的内容。
+async fn plan_memory_writes_from_candidates(
+    db: &Arc<Db>,
+    session_id: &str,
+    model: &dyn ModelProvider,
+    candidates: Vec<MemoryCandidate>,
+    profile_char_cap: usize,
+    cancel: &CancellationToken,
+) -> Result<Vec<MemoryWrite>, String> {
+    let mut writes: Vec<MemoryWrite> = Vec::new();
+    let mut profile_adds: Vec<MemoryCandidate> = Vec::new();
+    for c in candidates {
+        // 取消 = 「这一段没有结论」:返回 Err 而不是半截 writes。空闲路径据此
+        // 不推进游标;压缩路径在调用方还会再查一次令牌并整段放弃。
+        if cancel.is_cancelled() {
+            return Err("记忆管线已取消".to_string());
+        }
+        if c.kind == "profile" {
+            profile_adds.push(c);
+            continue;
+        }
+        // 同键查重:查不了就**跳过该候选**,不按无冲突硬写 —— 重复记忆比漏记难清理
+        // (漏记下段对话还能再抽,重复要靠用户手删)。
+        let existing: Vec<MemoryRow> = match (c.subject.as_deref(), c.predicate.as_deref()) {
+            (Some(s), Some(p)) => {
+                let reader = db.clone();
+                let (rs, rp) = (s.to_string(), p.to_string());
+                match blocking(move || {
+                    reader.find_active_by_key(&rs, &rp).map_err(|e| e.to_string())
+                })
+                .await
+                {
+                    Ok(rows) => rows,
+                    Err(reason) => {
+                        tracing::warn!("会话 {session_id} 的同键查重读库失败,跳过该候选:{reason}");
+                        continue;
+                    }
+                }
+            }
+            _ => Vec::new(),
+        };
+        // T16:保护集 = 本次同键对照里**用户亲手改过**的行的 id。
+        // 每候选现算而不是全局算一次:existing 是按候选键取的,保护范围天然随之变化。
+        let protected: HashSet<i64> = existing
+            .iter()
+            .filter(|r| r.user_edited)
+            .map(|r| r.id)
+            .collect();
+        match consolidate_memory(model, &c, &existing, cancel).await {
+            Ok(MemoryDecision::Add) => writes.push(MemoryWrite::Add(
+                c.into_new_memory(Some(session_id.to_string())),
+            )),
+            Ok(MemoryDecision::UpdateBody { id, body }) => {
+                if protected.contains(&id) {
+                    // 用户权威优先于系统自洽:改写被降级成「并存」,用户自己决定删哪条。
+                    tracing::info!(
+                        "会话 {session_id} 的记忆 id={id} 被用户编辑过,模型的 UPDATE 降级为 ADD 并存"
+                    );
+                    writes.push(MemoryWrite::Add(
+                        c.into_new_memory(Some(session_id.to_string())),
+                    ));
+                } else {
+                    writes.push(MemoryWrite::UpdateBody { id, body });
+                }
+            }
+            Ok(MemoryDecision::Invalidate { id }) => {
+                if protected.contains(&id) {
+                    // 失效同样不动保护行:新候选入库,旧行保持有效。
+                    tracing::info!(
+                        "会话 {session_id} 的记忆 id={id} 被用户编辑过,模型的 INVALIDATE 降级为 ADD 并存"
+                    );
+                    writes.push(MemoryWrite::Add(
+                        c.into_new_memory(Some(session_id.to_string())),
+                    ));
+                } else {
+                    writes.push(MemoryWrite::Invalidate { id });
+                }
+            }
+            // 强化只对「确实存在的那一行」有意义。模型偶尔会自己编序号:把一条指向
+            // 不存在行的 Reinforce 交给事务,`reinforce_row` 的 affected=0 会报错,
+            // 整个压缩事务随之回滚 —— 一条垃圾候选拖垮整次压缩,代价远大于漏记。
+            // 所以先在 existing 里核对(它就是本次合并的对照集,同一份真相),
+            // 查不到只 warn + 跳过该候选,压缩照常。
+            // T16:指向保护行**允许** —— REINFORCE 不改正文,只加确认计数。
+            Ok(MemoryDecision::Reinforce { id }) => {
+                if existing.iter().any(|r| r.id == id) {
+                    writes.push(MemoryWrite::Reinforce { id });
+                } else {
+                    tracing::warn!(
+                        "会话 {session_id} 的记忆合并返回了不存在的 id={id},跳过该条候选"
+                    );
+                }
+            }
+            Err(reason) => {
+                tracing::warn!("会话 {session_id} 的记忆合并失败,跳过该条候选:{reason}");
+            }
+        }
+    }
+    if !profile_adds.is_empty() {
+        let reader = db.clone();
+        let current = blocking(move || reader.profile().map_err(|e| e.to_string()))
+            .await
+            .unwrap_or_else(|reason| {
+                tracing::warn!("会话 {session_id} 的画像读取失败,按空画像归并:{reason}");
+                String::new()
+            });
+        match merge_profile(model, &current, &profile_adds, profile_char_cap, cancel).await {
+            Ok(body) => writes.push(MemoryWrite::SetProfile(body)),
+            Err(reason) => {
+                tracing::warn!("会话 {session_id} 的画像归并失败,画像保持现状:{reason}");
+            }
+        }
+    }
+    Ok(writes)
+}
+
 pub(crate) async fn compact_before_turn(
     db: &Arc<Db>,
     session_id: &str,
     model: &dyn ModelProvider,
     builder: &ContextBuilder,
     history: Vec<Message>,
+    memory: &MemoryTurnCfg,
+    embed: Option<Arc<dyn EmbedProvider>>,
+    locks: &ExtractLocks,
     cancel: &CancellationToken,
-) -> Result<(Vec<Message>, Option<AgentEvent>), String> {
+) -> Result<(Vec<Message>, Option<AgentEvent>, usize), String> {
     let Some(plan) = builder.compaction_plan(&history) else {
-        return Ok((history, None));
+        return Ok((history, None, 0));
     };
 
     let body = match collect_summary(model, summary_request(&plan.source), cancel).await {
@@ -341,7 +604,7 @@ pub(crate) async fn compact_before_turn(
         // 取消优先于报错。`collect_summary` 的 `Err` 在这一臂既可能是「用户按了停止」也可能
         // 是端点报错，所以判据看令牌、不看错误文本（错误文本里那句「已取消」是它的兜底说法，
         // 不是事实来源）。没压成，也就没什么可宣布的。
-        Err(_) if cancel.is_cancelled() => return Ok((history, None)),
+        Err(_) if cancel.is_cancelled() => return Ok((history, None, 0)),
         // 降级。原因只进日志、不进事件：`ContextCompacted` 的载荷是两个数，前端那句
         // 「已压缩 N 轮」不该被一条端点文案污染；日志才是它该去的地方（R107，GUI 没有控制台）。
         Err(reason) => {
@@ -350,18 +613,75 @@ pub(crate) async fn compact_before_turn(
         }
     };
 
+    // 记忆抽取(spec §4.1):输入就是即将永久消失的那段原文 —— 压缩从纯损失变成一次蒸馏。
+    // 取消语义与摘要侧同一条:事务还没开始,一个字节都不写;其余失败已在里面各自降级。
+    // 总开关关掉 = 这一段**整段跳过**:零记忆写入、零记忆模型调用(不是「抽了不写」,
+    // 抽取是一次真实端点调用,用户关掉的功能不许还有开销 ——
+    // `memory_disabled_skips_extraction_entirely` 钉着);`profile_char_cap` 只在这条
+    // 路径上约束画像归并的输出。
+    // 认领抽取权:拿不到说明同一会话正被空闲 worker / 切换回补处理 —— 那批内容归它,
+    // 本轮跳过抽取、压缩照常(它会把游标推过去,内容不会被重抽也不会丢)。
+    // 这个窗口极小(压缩发生时本轮已占 `running` 槽,另外两条路径都会先看那个槽),
+    // 但「极小」不是「不存在」。
+    let writes = if memory.enabled {
+        match locks.try_acquire(session_id) {
+            Some(_guard) => {
+                plan_memory_writes(
+                    &db,
+                    session_id,
+                    model,
+                    &plan.source,
+                    memory.profile_char_cap,
+                    cancel,
+                )
+                .await
+            }
+            None => {
+                tracing::info!(
+                    "会话 {session_id} 正被另一条路径抽取记忆,本轮压缩段跳过抽取"
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if cancel.is_cancelled() {
+        return Ok((history, None, 0));
+    }
+    // 本次记住了几条(画像另算:它不是一条条的记忆)。给 `MemorySaved` 用。
+    let saved = writes
+        .iter()
+        .filter(|w| !matches!(w, MemoryWrite::SetProfile(_)))
+        .count();
+
     let note = summary_note(&body);
     let dropped = plan.dropped;
     // 字数按字符算不是按字节：中文备注用 `len()` 会显示成 3 倍（brief §4 的第三条陷阱）。
     let summary_chars = note.chars().count();
+    // 新增行的 body 在事务**前**收好(只对 Add —— Update/Invalidate 复用旧行、
+    // SetProfile 是单行画像,都不产新行):事务返回的新增 id 按同一顺序对位,
+    // zip 起来才是「这一行记忆 ↔ 这一条向量」。事务失败时这段清单跟着被丢,不会外泄。
+    let add_bodies: Vec<String> = writes
+        .iter()
+        .filter_map(|w| match w {
+            MemoryWrite::Add(m) => Some(m.body.clone()),
+            _ => None,
+        })
+        .collect();
     let writer = db.clone();
     let write_sid = session_id.to_string();
-    blocking(move || {
+    let new_ids = blocking(move || {
         writer
-            .compact_session(&write_sid, &plan, &note)
+            .compact_session_with_memories(&write_sid, &plan, &note, &writes, None)
             .map_err(|e| e.to_string())
     })
     .await?;
+
+    // 嵌入补写(T6,裁定 4):压缩事务已提交,新行先以「纯关键词可检索」的形态落地;
+    // 向量随后补。抽成 [`backfill_memory_embeddings`] 是因为空闲/切换抽取要**同一套**
+    // 语义与日志(顺序对位、失败不回滚),复制一份就会在两次升级之间分叉。
+    backfill_memory_embeddings(db, new_ids, add_bodies, embed).await;
 
     // 重读，不在内存里自己拼那份「删了若干行 + 加了一条备注」的结果：
     // 库里是什么样就以库为准，`run_turn` 之后的 `restore`/`append_rows` 才有同一个基准。
@@ -374,7 +694,484 @@ pub(crate) async fn compact_before_turn(
             dropped,
             summary_chars,
         }),
+        saved,
     ))
+}
+
+/// 写入侧补向量的**唯一**一处(T6 裁定 4,压缩/空闲/切换三条路径共用):
+/// 记忆行已随事务落地,向量随后补 —— 批量嵌入一次,逐行落 BLOB。
+/// 任何失败只 warn,**不回滚、不阻塞**:行已在库里,降级的代价只是该行少一个召回通道。
+/// `embed` 为 `None`(off/构造失败)时整段跳过 —— off 是用户显式选择,不是故障,不刷日志。
+///
+/// 顺序对位不变量:`new_ids` 与 `add_bodies` 都按 `writes` 里 `Add` 的顺序 ——
+/// 调用方(两个事务入口)返回的 id 都遵守同一条约定,这里的 zip 才是「这一行 ↔ 这条向量」。
+async fn backfill_memory_embeddings(
+    db: &Arc<Db>,
+    new_ids: Vec<i64>,
+    add_bodies: Vec<String>,
+    embed: Option<Arc<dyn EmbedProvider>>,
+) {
+    if new_ids.is_empty() {
+        return;
+    }
+    let Some(provider) = embed else {
+        return;
+    };
+    match provider.embed(&add_bodies).await {
+        Ok(vecs) if vecs.len() == new_ids.len() => {
+            let pairs: Vec<(i64, Vec<f32>)> = new_ids.into_iter().zip(vecs).collect();
+            let blob_writer = db.clone();
+            if let Err(reason) = blocking(move || {
+                for (id, vec) in &pairs {
+                    if let Err(e) = blob_writer.set_memory_embedding(*id, vec) {
+                        // 单行失败(该行刚被用户清空是唯一现实来源):行已不在,
+                        // 向量无处可写,其余行照常。
+                        tracing::warn!("记忆 id={id} 的向量写入失败,该行保留为纯关键词可检索:{e}");
+                    }
+                }
+                Ok(())
+            })
+            .await
+            {
+                tracing::warn!("记忆向量写入任务失败,新增行保留为纯关键词可检索:{reason}");
+            }
+        }
+        Ok(vecs) => {
+            tracing::warn!(
+                "嵌入端点返回 {} 条向量与新增记忆 {} 条不符,新行保留为纯关键词可检索",
+                vecs.len(),
+                new_ids.len()
+            );
+        }
+        Err(reason) => {
+            tracing::warn!("记忆嵌入失败,新增行保留为纯关键词可检索:{reason}");
+        }
+    }
+}
+
+/// T15(P0):一次空闲抽取最多吃多少条消息。
+///
+/// 为什么是 40:空闲抽取的输入量要与**一次压缩段**同量级(spec §4.1 的抽取输入就是
+/// 被压掉的那段原文,默认窗口 40 条)。无上限会让「一个聊了 500 轮的会话」在第一次
+/// tick 里把整段历史塞进一次请求 —— 成本不可控,而且模型的注意力会被稀释。
+/// 超出的部分不丢:游标只推进到第 40 条的 id,下一 tick 接着抽(每 60 秒一 tick)。
+pub(crate) const MAX_IDLE_EXTRACT_MESSAGES: usize = 40;
+
+/// 空闲/切换会话时的一次抽取:游标之后的新对话 → 记忆,并推进游标。
+///
+/// 与压缩路径的区别**只在失败语义**(见 [`plan_memory_writes_for_source`]):
+/// 抽取/合并任何一步失败都返回 `Err` 且**不推进游标**,下一个 tick(或下一次切换)
+/// 从头重试。这与压缩路径「抽取失败仍然压缩」的取向相反,因为这里的抽取**没有别的
+/// 消费者**:压缩即使不抽记忆,原文也已经变成摘要(至少还剩一句话);空闲抽取若不重试,
+/// 那段对话会在下一次压缩时被当摘要处理,细节永久消失。
+///
+/// 返回**变更条数**(`Add`/`UpdateBody`/`Invalidate`/`Reinforce` 的总数)。
+/// `SetProfile` 不计入:画像是覆盖写,不是「一条新记忆」,把它算进来会让设置页的
+/// 「这次抽到几条」在读起来时对不上账。
+pub(crate) async fn extract_session_memories(
+    db: &Arc<Db>,
+    session_id: &str,
+    model: &dyn ModelProvider,
+    memory: &MemoryTurnCfg,
+    embed: Option<Arc<dyn EmbedProvider>>,
+    locks: &ExtractLocks,
+    cancel: &CancellationToken,
+) -> Result<usize, String> {
+    // 按会话互斥(spec §12.5 缺口 1):另一条路径正在抽这个会话 ⇒ 放弃,不是排队。
+    // 返回 Ok(0) 而不是 Err:被放弃不是失败,调用方(切换/空闲)都按「这次没抽到东西」处理。
+    let _guard = match locks.try_acquire(session_id) {
+        Some(g) => g,
+        None => return Ok(0),
+    };
+    // 游标与待抽取行**同一次**读库:分两次读会夹进这一瞬间的新 append,让
+    // 「读了游标、取了行」之间出现一段既不在行里也不在游标之前的空洞。
+    let reader = db.clone();
+    let read_sid = session_id.to_string();
+    let rows = blocking(move || {
+        let cursor = reader
+            .memory_cursor(&read_sid)
+            .map_err(|e| format!("读取抽取游标失败:{e}"))?;
+        reader
+            .messages_for_extraction(&read_sid, cursor)
+            .map_err(|e| format!("读取待抽取消息失败:{e}"))
+    })
+    .await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    // 上限之外的部分留给下一个 tick:游标只推进到**实际送进模型**的最后一条。
+    let take = rows.len().min(MAX_IDLE_EXTRACT_MESSAGES);
+    let upto_id = rows[take - 1].0;
+    let source: Vec<Message> = rows.into_iter().take(take).map(|(_, m)| m).collect();
+
+    // 抽取失败 → `?` 冒泡,游标不动(见函数文档)。空 candidates 是**成功**的
+    // 一次抽取(「这段没什么值得记」),游标照常推进 —— 否则同一段会被每 tick 重抽。
+    let candidates = extract_memories(model, &source, cancel).await?;
+    let writes = plan_memory_writes_from_candidates(
+        db,
+        session_id,
+        model,
+        candidates,
+        memory.profile_char_cap,
+        cancel,
+    )
+    .await?;
+    let changed = writes
+        .iter()
+        .filter(|w| !matches!(w, MemoryWrite::SetProfile(_)))
+        .count();
+    let add_bodies: Vec<String> = writes
+        .iter()
+        .filter_map(|w| match w {
+            MemoryWrite::Add(m) => Some(m.body.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // 记忆写入与游标推进在**同一个事务**里(store 层的不变量):只写记忆不推游标
+    // ⇒ 下次重抽;只推游标不写记忆 ⇒ 这段永久丢失。
+    let writer = db.clone();
+    let write_sid = session_id.to_string();
+    let new_ids = blocking(move || {
+        writer
+            .apply_memories_and_advance_cursor(&write_sid, &writes, upto_id)
+            .map_err(|e| format!("写入记忆并推进游标失败:{e}"))
+    })
+    .await?;
+    backfill_memory_embeddings(db, new_ids, add_bodies, embed).await;
+    Ok(changed)
+}
+
+/// 一期记忆注入的默认参数(spec §7 的表)。T5 起它们是**设置项的默认锚点**:
+/// `MemoryTurnCfg::default` 引用这两个常量与 `agent::memory::PROFILE_CHAR_CAP`,
+/// `Settings` 侧的默认值不许与此分叉
+/// (`memory_turn_cfg_defaults_match_the_settings_defaults` 钉着)。
+/// `MEMORY_RECALL_K` 是召回条数上限,`MEMORY_NOTE_TOKEN_CAP` 是两条备注(画像+召回)
+/// 合计的 token 上限 —— 超了从相关度最低的召回行开始砍,画像永不因超限丢失。
+pub(crate) const MEMORY_RECALL_K: usize = 5;
+pub(crate) const MEMORY_NOTE_TOKEN_CAP: usize = 600;
+/// T10:待办提醒的默认前瞻窗口(小时)。到期时刻落在「现在 + 这个窗口」内的待办
+/// 会在本轮被提醒一次。24 小时 = 「今天该做的事,今天早上就告诉你」;窗口太短会让
+/// 早上九点的待办在八点五十九分的会话里悄无声息地漏掉。
+pub(crate) const MEMORY_PROSPECTIVE_WINDOW_HOURS: u32 = 24;
+/// T12:事实记忆衰减半衰期的默认锚点(天),与 `settings::DEFAULT_MEMORY_DECAY_HALF_LIFE_DAYS`
+/// 及 `store::memory::RecallCfg::default().fact_half_life_days`(60.0)逐字相同。
+/// 偏好不另立常量:它按事实的 3 倍推导(`memory_notes_for_turn` 的注释说明这个比例)。
+pub(crate) const MEMORY_FACT_HALF_LIFE_DAYS: f64 = 60.0;
+/// T10:一次最多提醒几条待办。超出的**不提醒也不标记**,留给下一轮 ——
+/// 一次塞十条会淹没真正的紧急项,而标记了却不注入等于把提醒吞掉。
+pub(crate) const MEMORY_DUE_NOTE_MAX_ITEMS: usize = 5;
+/// T10:编码特异性里「上一轮用户消息」保留的字符数。query 只是召回线索,
+/// 不是要原样发出去的正文;200 字足够覆盖一句追问所依赖的实体。
+pub(crate) const RECALL_QUERY_PRIOR_CHARS: usize = 200;
+/// T6:`memory_embedding_model` 的默认锚点(裁定 3,与 settings.rs 的
+/// `DEFAULT_MEMORY_EMBEDDING_MODEL` 同字面量 —— 分叉由
+/// `memory_turn_cfg_defaults_match_the_settings_defaults` 盯着)。
+pub(crate) const MEMORY_EMBEDDING_MODEL: &str = "text-embedding-v3";
+
+/// 一轮记忆行为的全部开关(spec §7 的表)。住在 ipc.rs 而不是 settings.rs 是有意的:
+/// settings.rs 的纪律是连 tauri 都不依赖的底层文件,给它加一个「to_memory_cfg」
+/// 派生方法是让底层认识上层的形状 —— 组装由唯一的生产装配点 `send_message`
+/// 从本轮那份 `Settings` 现做,与 context/temperature/roots 同一条线。
+/// `Clone` 而不是 `Copy`(T6 加了 `embedding_model: String`):run_turn 需要的字段
+/// 提前拆成局部量再进 `move` 闭包,不为保留 Copy 给 String 找托管类型。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryTurnCfg {
+    /// 总开关。`false` = 压缩段零抽取(记忆侧的模型调用一个不发起)+ 请求头零备注
+    /// (连召回读库都不做);记忆数据**不**因此清除 —— 关闭是停用,不是抹掉。
+    pub enabled: bool,
+    /// 召回条数上限(spec §7:1..=20)。
+    pub recall_k: usize,
+    /// 画像+召回+概览几条备注合计的 token 上限(spec §7:200..=2000 且 ≤ budget/5)。
+    /// 待办提醒**不在**这个预算里(见 `prospective_window_hours`):它是「必须说的事」,
+    /// 与可选的召回不同。
+    pub note_token_cap: usize,
+    /// 画像正文的字符上限(spec §7:100..=2000),约束压缩路径上的画像归并输出。
+    pub profile_char_cap: usize,
+    /// T10/T12:待办提醒的前瞻窗口(小时,默认 24)。到期时刻落在这个窗口内的待办
+    /// 会在本轮 head 里出现一条 `[待办提醒]`。**T12 起它由设置项
+    /// `memory_prospective_window_hours` 驱动**(T10 时是硬编码常量);这一项没有
+    /// 预算耦合 —— 待办提醒本来就不计入 note token cap(见 `note_token_cap`)。
+    pub prospective_window_hours: u32,
+    /// T12:事实记忆的衰减半衰期(天),由 `Settings::memory_decay_half_life_days` 转成
+    /// `f64` 进来。召回排序里 `RecallCfg::fact_half_life_days` 的唯一来源 ——
+    /// `memory_notes_for_turn` 不再读 `RecallCfg::default()`,否则设置页的旋钮就是装饰品。
+    pub fact_half_life_days: f64,
+    /// T6(裁定 2):嵌入来源是不是 `"endpoint"`。`false` = `"off"` —— 构造
+    /// `EmbedEndpoint` 的判据就这一个布尔,让「第三态不存在」在类型上成立
+    /// (normalize 已把一切不认识的值回落成 endpoint,见 settings.rs)。
+    pub embedding_endpoint: bool,
+    /// T6(裁定 3):嵌入请求体里的 model 名,原样透传给端点(支不支持只有端点知道)。
+    pub embedding_model: String,
+}
+
+impl Default for MemoryTurnCfg {
+    /// 逐字等于 `Settings::default()` 的记忆项。锚点引用常量而不是再抄字面量:
+    /// 这些 `pub(crate)`/`pub` 常量从一期起就是这些默认值的唯一真相,谁改常量这里跟着走;
+    /// 与 Settings 侧不许分叉,由 `memory_turn_cfg_defaults_match_the_settings_defaults` 盯着。
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            recall_k: MEMORY_RECALL_K,
+            note_token_cap: MEMORY_NOTE_TOKEN_CAP,
+            profile_char_cap: PROFILE_CHAR_CAP,
+            prospective_window_hours: MEMORY_PROSPECTIVE_WINDOW_HOURS,
+            // T12:半衰期的默认锚点(60 天),与 Settings::default() 同值(check 由
+            // `memory_turn_cfg_defaults_match_the_settings_defaults` 盯着)。
+            fact_half_life_days: MEMORY_FACT_HALF_LIFE_DAYS,
+            // 默认 source 是 "endpoint"(裁定 2)⇒ 布尔默认 true。
+            embedding_endpoint: true,
+            embedding_model: MEMORY_EMBEDDING_MODEL.to_string(),
+        }
+    }
+}
+
+/// T12:`Settings → MemoryTurnCfg` 的**唯一**转换点。原本这段内联在 `send_message` 里,
+/// 但 `#[tauri::command]` 在单测里调不动(R103 段),于是「设置页改了一个旋钮,它到底有没有
+/// 到达这一轮」这件事在测试里无法取证。抽成纯函数之后,`the_turn_cfg_takes_both_pacing_
+/// settings_from_the_settings_table` 能直接钉住两项新设置的传递,而 `send_message` 只剩
+/// 一行调用 —— 与 context/temperature/roots 的「装配层从本轮 Settings 现取」同一条线。
+///
+/// 放在 ipc.rs 而不是 `Settings` 的派生方法:settings.rs 是不依赖上层的底层文件,
+/// 给它加 `to_memory_cfg` 就是让底层认识 ipc 的形状(与 `MemoryTurnCfg` 的文档同一理由)。
+pub(crate) fn memory_turn_cfg(settings: &Settings) -> MemoryTurnCfg {
+    MemoryTurnCfg {
+        enabled: settings.memory_enabled,
+        recall_k: settings.memory_recall_k as usize,
+        note_token_cap: settings.memory_note_token_cap as usize,
+        profile_char_cap: settings.memory_profile_char_cap as usize,
+        // T12:T10 的「先固定 24 小时」到此为止 —— 两个节奏旋钮都从本轮设置现取。
+        prospective_window_hours: settings.memory_prospective_window_hours,
+        fact_half_life_days: settings.memory_decay_half_life_days as f64,
+        // T6:source 归一后只有两种取值,== "endpoint" 即精确判定。
+        embedding_endpoint: settings.memory_embedding_source == "endpoint",
+        // normalize 已 trim,这里原样透传(端点支不支持只有端点知道,裁定 3)。
+        embedding_model: settings.memory_embedding_model.clone(),
+    }
+}
+
+/// T10(机制一:编码特异性):召回 query 拼上**上一轮**用户消息的文本。
+///
+/// 人回忆时并不只用当前这句话当线索:追问(「那它呢」「还有别的吗」)本身没有实体,
+/// 但紧邻的上一句有。把「上一轮用户说过什么」拼在当前消息之前,指代性追问才能命中
+/// 上一轮提到的实体 —— 这是编码特异性(encoding specificity)在检索侧的工程对应:
+/// 提取线索与编码时的上下文越接近,回忆越容易。
+///
+/// 取 `history` 里**最后一条** `role == User` 且**不含 ToolResult** 的消息:
+/// - 工具结果消息的 role 也是 `User`(`Message::tool` 的协议妥协),它根本不是
+///   用户说的话,不能当上下文线索。判据与 `agent::context` 里那个私有谓词
+///   `has_tool_result` 同一个思路,但**不**把它提成跨模块公共 API(那会让「哪些
+///   消息算用户轮」多一个定义点),就地按块种类判断。
+/// - 上一轮文本截前 `RECALL_QUERY_PRIOR_CHARS` 字符:query 只是线索,不是要原样
+///   发出去的正文;再长会把窗口外的旧话题一起拖进检索。
+/// - `history` 是**压缩后**的历史(不含本轮),所以这里看到的「上一轮」就是模型
+///   在上一轮真正见过的最后一句用户话。
+/// - 没有这样的消息、或它的文本为空(纯图片轮)→ 只返回 `current`。
+pub(crate) fn recall_query(history: &[Message], current: &str) -> String {
+    let prior = history.iter().rev().find(|m| {
+        m.role == Role::User
+            && !m
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+    });
+    let Some(m) = prior else {
+        return current.to_string();
+    };
+    let text = m.text_of();
+    let text = text.trim();
+    if text.is_empty() {
+        return current.to_string();
+    }
+    let clipped: String = text.chars().take(RECALL_QUERY_PRIOR_CHARS).collect();
+    format!("{clipped}\n{current}")
+}
+
+/// T10(机制二:前瞻记忆):把「到期了、还没提醒过」的待办拼成一条备注。
+///
+/// 窗口是 `now + window_hours`:到期时刻落进这个窗口(含已过期)的行由
+/// `Db::due_prospective` 捞出,按 `due_at` 升序。最多取
+/// `MEMORY_DUE_NOTE_MAX_ITEMS` 条;**超出的行既不提醒也不标记**,留给下一轮 ——
+/// 一次塞十条会淹没真正的紧急项,而标记了却不注入等于把提醒悄悄吞掉。
+///
+/// 交回 `(笔记文本, 被收进这条笔记的行 id)`:文本是空表或一个元素的 Vec(注入侧
+/// 的统一形状),id 供调用方在**注入之后**标记 `notified_at`。标记不在这里做,
+/// 是因为「注入」发生在调用方装配 head 的那一刻;把读与写拆开,调用方才能钉住
+/// 「标记失败仍要注入」这个取向。
+///
+/// 日期按 **UTC** 格式化(与 T9 的 `parse_iso8601_ms` 同一口径:无时区字面值按
+/// UTC 解释)。不引 chrono —— 一段纯整数换算就能把日期钉死,而新增依赖会拖
+/// 整条构建链(见 `agent::memory` 里 `days_from_civil` 的同一条注释)。
+pub(crate) fn due_notes(db: &Db, window_hours: u32) -> Result<(Vec<String>, Vec<i64>), String> {
+    let until = Db::now_ms() + window_hours as i64 * 60 * 60 * 1_000;
+    let rows = db.due_prospective(until).map_err(|e| e.to_string())?;
+    let mut note = String::from("[待办提醒]");
+    let mut ids = Vec::new();
+    for m in rows.iter().take(MEMORY_DUE_NOTE_MAX_ITEMS) {
+        // 查询本身保证 due_at 非空;`unwrap_or_default` 只是不让一条坏数据把
+        // 整条提醒打空(真的出现时日期显示为空,正文仍然在)。
+        let due = m.due_at.map(due_date_label).unwrap_or_default();
+        note.push_str(&format!("\n- {}({due})", m.body));
+        ids.push(m.id);
+    }
+    if ids.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    Ok((vec![note], ids))
+}
+
+/// T10(机制三:元记忆):记忆库概览。
+///
+/// 没有这条备注,模型不知道「我有一个可以检索的库」,`memory_search` 工具就形同
+/// 虚设 —— 它不会凭空想到去调一个不知道有内容的东西。所以概览只说两件事:
+/// 有多少条(按 kind 分)、该用哪个工具去查。
+///
+/// 没有任何有效记忆 → `None`(空库不注入,消费方据此完全跳过)。
+/// 极短是有意的:它是「元」信息,不该挤占真正的画像与召回。
+pub(crate) fn overview_note(db: &Db) -> Result<Option<String>, String> {
+    let summary = db.memory_summary().map_err(|e| e.to_string())?;
+    let total: i64 = summary.iter().map(|(_, n)| *n).sum();
+    if total == 0 {
+        return Ok(None);
+    }
+    let parts: Vec<String> = summary
+        .iter()
+        .map(|(kind, n)| format!("{} {n}", kind_label(kind)))
+        .collect();
+    Ok(Some(format!(
+        "[记忆库]你有 {total} 条长期记忆({}),可用 memory_search 工具按需检索。",
+        parts.join("、")
+    )))
+}
+
+/// kind 的中文标签(只服务概览这一条备注)。不认识的 kind 原样显示 ——
+/// 与其猜一个中文名把模型的胡话洗成正常分类,不如让用户/模型看到原始值。
+fn kind_label(kind: &str) -> &str {
+    match kind {
+        "fact" => "事实",
+        "preference" => "偏好",
+        "prospective" => "待办",
+        other => other,
+    }
+}
+
+/// epoch 毫秒 → UTC 的 `YYYY-MM-DD`。负时间戳用 `div_euclid`(向负无穷取整),
+/// 否则 1970 年之前的那半天会被算到前一天 —— 待办的期限不会落在 1970 年,
+/// 但一个只在正数上正确的换算不值得写。
+fn due_date_label(ms: i64) -> String {
+    let (y, m, d) = civil_from_days(ms.div_euclid(86_400_000));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// 距 1970-01-01 的天数 → 公历日期。Howard Hinnant 的 `civil_from_days`,与
+/// `agent::memory::days_from_civil` 互为反函数(那边把日期换成毫秒,T9 的解析口径;
+/// 这边把毫秒换回日期,给提醒里的「到期日」用)。
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+/// 装配本轮的记忆备注(纯 db 读写,无模型调用)。顺序是硬性的(T10):
+///
+/// ```text
+/// [待办提醒] → [用户画像] → [长期记忆·按相关度] → [记忆库]
+/// ```
+///
+/// 也就是「最紧急的先被看到」:到期的事 → 用户是谁 → 这轮相关的旧事 → 库里还有什么。
+/// 概览在最后,因为它是唯一一条「关于记忆的记忆」。
+///
+/// 预算口径分两类:
+/// - **待办提醒不受 `cap` 约束**。它是「必须说的事」,漏掉一条到期的承诺比多花几十
+///   token 糟得多;它有自己的独立上限(`MEMORY_DUE_NOTE_MAX_ITEMS` 条)。
+/// - 画像/召回/概览合计受 `cap` 约束,超了从**相关度最低的召回行**开始砍,再砍概览;
+///   画像永不因超限丢失(画像受 `PROFILE_CHAR_CAP` 独立约束)。
+///
+/// 待办在**注入之后**立刻标记 `notified_at`:注入在内存、标记在库,同一事务做不到。
+/// 取向是**宁可重复,不可丢失** —— 标记失败只 warn,这一轮的提醒照常注入。反过来
+/// (先标记、失败了就不注入)会让一条到期承诺彻底消失,而重复一次只是多看一眼。
+pub(crate) fn memory_notes_for_turn(
+    db: &Db,
+    query: &str,
+    query_vec: Option<Vec<f32>>,
+    k: usize,
+    cap: usize,
+    window_hours: u32,
+    fact_half_life_days: f64,
+) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+
+    // ① 待办提醒:先取、先标记。`due_notes` 只读,标记在这里做 ——
+    // 标记失败不影响注入(见上面的取向说明)。
+    let (due, due_ids) = due_notes(db, window_hours)?;
+    if !due_ids.is_empty() {
+        if let Err(reason) = db.mark_notified(&due_ids, Db::now_ms()) {
+            tracing::warn!("待办提醒标记失败,本轮仍然注入(宁可重复一次,不可丢失):{reason}");
+        }
+    }
+    notes.extend(due);
+
+    // ② 画像:常驻,不受超限影响。
+    let mut used = 0usize;
+    let profile = db.profile().map_err(|e| e.to_string())?;
+    if !profile.is_empty() {
+        let note = format!("[用户画像]{profile}");
+        used += crate::agent::context::note_tokens(&note);
+        notes.push(note);
+    }
+
+    // ③ 召回:按相关度装,装不下就从最低分那行开始放弃。
+    //
+    // T12:打分配置**只从参数取半衰期**,不再吃 `RecallCfg::default()` —— 那一份的 60 天
+    // 会把设置页的旋钮变成装饰品。其余三项(strength_weight/decay_floor/now_ms)仍走默认:
+    // 它们是「人味」的形状参数,没有一个用户会为它调滑块,收进设置页只会把一行挤掉。
+    //
+    // 偏好半衰期按 **事实的 3 倍** 推导,比例是**刻意的近似**,不是从哪条公式推出来的:
+    // 「用户偏好简洁回答」这类自我描述会一直成立,而「用户住在北京」会变(搬家、换工作)。
+    // 3 倍与 store 侧默认锚点(60/180)同比例,于是用户把事实调到 7 天时偏好是 21 天,
+    // 两档的相对关系在所有设置下都保持不变 —— 一个旋钮改两档,不多开一个没人能解释
+    // 「偏好应该是事实的几倍」的设置项。
+    let recall_cfg = RecallCfg {
+        fact_half_life_days,
+        preference_half_life_days: fact_half_life_days * 3.0,
+        ..Default::default()
+    };
+    let hits = db
+        .search_memories(query, query_vec.as_deref(), k, &recall_cfg)
+        .map_err(|e| e.to_string())?;
+    if !hits.is_empty() {
+        let header = "[长期记忆·按相关度]";
+        let mut note = String::from(header);
+        let mut included = 0usize;
+        for m in &hits {
+            let next = format!("{note}\n- {}", m.body);
+            if crate::agent::context::note_tokens(&next) + used > cap {
+                break;
+            }
+            note = next;
+            included += 1;
+        }
+        if included > 0 {
+            used += crate::agent::context::note_tokens(&note);
+            notes.push(note);
+        }
+    }
+
+    // ④ 概览:最后一条,也是最先被 cap 砍掉的一条(它最「元」、最不紧急)。
+    if let Some(overview) = overview_note(db)? {
+        if used + crate::agent::context::note_tokens(&overview) <= cap {
+            notes.push(overview);
+        }
+    }
+
+    Ok(notes)
 }
 
 /// 一轮对话的完整生产路径：读历史 →（越线就）摘要压缩 → `AgentSession::run` →
@@ -404,10 +1201,13 @@ pub async fn run_turn(
         sink,
         context,
         temperature,
+        memory,
+        embed,
         roots,
         skills_dir,
         skills_disabled,
         cancel,
+        extract_locks,
     } = deps;
     let sid = session_id.to_string();
 
@@ -417,7 +1217,7 @@ pub async fn run_turn(
     let history = blocking(move || reader.messages(&read_sid).map_err(|e| e.to_string())).await?;
 
     // 构建器只在这里造一次（②），压缩段与本轮用的是同一个。
-    let builder = ContextBuilder::new(context);
+    let mut builder = ContextBuilder::new(context);
 
     // 摘要调用挂在流上的那几秒也必须能被「停止」打到，所以先把**这一只**令牌装进槽位。
     // `AgentSession::new` 自己造令牌（`session.rs:74`）且不接受外来的，只能先装这只、
@@ -426,12 +1226,100 @@ pub async fn run_turn(
     let token = TurnToken { slot: cancel };
     token.install(compaction.clone());
 
-    let (history, compacted) =
-        compact_before_turn(&db, &sid, &*model, &builder, history, &compaction).await?;
+    let (history, compacted, saved) = compact_before_turn(
+        &db,
+        &sid,
+        &*model,
+        &builder,
+        history,
+        &memory,
+        // 写路径的嵌入客户端与读路径共用同一只(同一来源同一凭据):Arc clone 一份
+        // 随压缩段走,本体留给下面的查询嵌入。
+        embed.clone(),
+        &extract_locks,
+        &compaction,
+    )
+    .await?;
     // ③：先宣布，再答这句。此刻本轮的一行都还没写。
     if let Some(event) = compacted {
         sink.emit(event);
     }
+    // P1(spec §12)：「记住了多少」的可见证据。压缩是记忆的主要写入路径，所以这里是
+    // 用户唯一能实时看见「它在记」的地方；`saved == 0` 不发（「已记住 0 条」只会让人
+    // 以为坏了）。它排在 `ContextCompacted` 之后、本轮回答之前 —— 先说「忘了多少」，
+    // 再说「记住了多少」，最后才回答这一句。
+    if saved > 0 {
+        sink.emit(AgentEvent::MemorySaved { count: saved });
+    }
+
+    // ④ 长期记忆注入（spec §5）：画像常驻 + 按本轮消息召回。备注是**易失**的 ——
+    // 只进这一次请求的 head，不碰 `history`、不落库，`prior` 量到的仍是纯历史。
+    // 检索口径每轮现算：上一轮的召回渗进这一轮等于召回结果跨轮存活。
+    let current_text: String = blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    // T10(机制一):query 拼上上一轮用户消息。`history` 是压缩后的历史(不含本轮),
+    // 所以这里拿到的「上一轮」就是模型上一轮真正见过的最后一句用户话。追问
+    // (「那它呢」)因此也能带着上一句的实体去召回;详情见 `recall_query`。
+    let query = recall_query(&history, &current_text);
+    let db_ro = db.clone();
+    // 查询向量(T6):一轮最多嵌一次 —— 嵌的是**上面那个拼好的 query**(含上一轮
+    // 上下文),让语义通道与关键词通道看同一份线索。三个 None 形态都在这里
+    // 收敛:开关关(零记忆开销,嵌入也不该发)、embed 为 None(off/构造失败)、
+    // 嵌入调用失败(warn 后降级)。**没有跨轮状态**,嵌入失败每一次发送都会重试
+    // 一次 —— 这是接受的:无状态重试的代价是失败轮多一次失败调用,换来的是
+    // 「端点恢复后的下一条消息立刻回到混合召回」,不需要任何缓存失效逻辑。
+    // 空白 query(空历史 + 纯图片轮)也不嵌:空串没有可嵌的语义,发了也是端点的错题。
+    let query_vec = if memory.enabled {
+        match embed.as_ref() {
+            Some(provider) if !query.trim().is_empty() => {
+                match provider.embed(std::slice::from_ref(&query)).await {
+                    Ok(mut v) if v.len() == 1 => Some(v.pop().unwrap_or_default()),
+                    Ok(v) => {
+                        tracing::warn!(
+                            "嵌入端点对查询返回 {} 条向量,本轮退化为纯关键词召回",
+                            v.len()
+                        );
+                        None
+                    }
+                    Err(reason) => {
+                        tracing::warn!("本轮查询向量嵌入失败,退化为纯关键词召回:{reason}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    // 总开关关掉 = 请求头零备注,连召回读库都不做(R69 的另一面:用户关掉的功能不许
+    // 还有开销);压缩段那边的 disabled cfg 让抽取同样整段跳过。开启时的三个口径
+    // (k、cap、待办窗口)不再吃常量,从 `TurnDeps.memory` 现取 —— 与
+    // context/temperature 同一条线。待办提醒也在这一段里:disabled 时既不提醒、
+    // 也不标记 `notified_at`(「停用」不许偷偷消费掉本该在开回来时提醒的待办)。
+    // (cfg 失去 Copy 后这里把闭包要的字段先拆成局部量,整份 cfg 不进闭包。)
+    let notes = if memory.enabled {
+        let (k, cap, window, half_life) = (
+            memory.recall_k,
+            memory.note_token_cap,
+            memory.prospective_window_hours,
+            memory.fact_half_life_days,
+        );
+        blocking(move || {
+            memory_notes_for_turn(&db_ro, &query, query_vec, k, cap, window, half_life)
+        })
+        .await?
+    } else {
+        Vec::new()
+    };
+    builder.set_memory_notes(notes);
+
     // ①：这一行必须在压缩段之后，量的才是「restore 回来的那份历史」。
     let prior = history.len();
 
@@ -559,6 +1447,21 @@ pub async fn send_message(
     let model_cfg = settings.to_model_config(&api_key);
     let temperature = model_cfg.temperature;
     let model = Arc::new(OpenAiCompat::new(model_cfg).map_err(|e| e.to_string())?);
+    // T6:嵌入客户端与聊天**同源**(同 base_url、同 api_key —— 隐私边界与聊天一致,
+    // spec §3.1)。source=="endpoint" 才构造(normalize 白名单保证只有这两种取值);
+    // base_url 的非空守卫在上面已经收过。构造失败 warn 后降 None:检索退化为纯关键词,
+    // 发送照常(裁定 4)。明文 key 在 drop(api_key) 之前装进客户端,此后无人再持它。
+    let embed: Option<Arc<dyn EmbedProvider>> = if settings.memory_embedding_source == "endpoint" {
+        match EmbedEndpoint::new(&settings.base_url, &settings.memory_embedding_model, &api_key) {
+            Ok(e) => Some(Arc::new(e)),
+            Err(reason) => {
+                tracing::warn!("嵌入端点构造失败,记忆检索退化为纯关键词召回:{reason}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     drop(api_key);
 
     let emitter = Arc::new(TauriEmitter::new(
@@ -576,6 +1479,7 @@ pub async fn send_message(
             context: settings.to_context_config(),
             // T39：同上，温度的唯一来源是上面那个 `ModelConfig`（同一个 `normalize()` 出来的）。
             temperature,
+            extract_locks: state.extracting.clone(),
             // T26（R276）：roots 和上面两项同源 —— 同一个 `store.load()` 的每一轮现取，
             // 因此**用户改完设置发下一条消息就生效**，这里没有任何缓存可以过期。
             // R284：交的是设置文件里那份**原表**（不再是在读盘时被裁过的），裁剪在
@@ -586,6 +1490,14 @@ pub async fn send_message(
             roots: settings.roots.clone(),
             skills_dir: Some(state.skills_dir.clone()),
             skills_disabled: crate::skills::load_selection(&state.mcp_dir).disabled,
+            // T5：记忆四项与上面各项同一条线 —— 同一份 `store.load()` 现取，改完下一条
+            // 消息就生效。组装**在 ipc 侧**手写而不做成 `Settings` 的派生方法：settings.rs
+            // 是不依赖上层的底层文件（「to_memory_cfg」是让底层认识 ipc 的形状）。
+            // T6 两键同线:embedding_endpoint 由白名单归一后的 source 现算(只有两种取值,
+            // == "endpoint" 即精确判定),embedding_model 原样透传(normalize 已 trim)。
+            memory: memory_turn_cfg(&settings),
+            // T6:上面的构造已把「构造失败」化成 None,这里只是搬运。
+            embed,
             cancel: state.cancel.clone(),
         },
         &session_id,
@@ -932,6 +1844,267 @@ pub async fn session_messages(
     .await
 }
 
+// ───────────────────────── T5：长期记忆的审计与清空（设置页） ─────────────────────────
+
+/// 设置页审计视图的一条：字段与 `MemoryRow` **同名同序** + 计算字段 `valid`。
+/// 序列化走 snake_case（与 `SessionRow` 的线上惯例一致，前端镜像按这个键名读）。
+/// `valid` 在这里算好而不是让前端拿 `invalid_at` 与当前时间比：判据就是
+/// 「invalid_at 是否为空」（Graphiti 失效不删除），与当前时间无关。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct MemoryView {
+    pub id: i64,
+    pub session_id: Option<String>,
+    pub kind: String,
+    pub subject: Option<String>,
+    pub predicate: Option<String>,
+    pub object: Option<String>,
+    pub body: String,
+    pub confidence: f64,
+    pub valid_from: i64,
+    pub invalid_at: Option<i64>,
+    pub updated_at: i64,
+    pub valid: bool,
+    /// T12:同一事实被再次确认的次数(设置页每行显示「确认 N 次」)。
+    /// 原样来自 `MemoryRow.reinforcements` —— 检索排序里的「强度」就是它。
+    pub reinforcements: i64,
+    /// T12:待办的到期时刻(ms),非 `prospective` 或没解析出时间时是 `None`。
+    /// 原样透传,前端只负责按本地时区格式化日期。
+    pub due_at: Option<i64>,
+    /// T12:`due_at` 非空且 `<= now`。**在 Rust 侧现算**而不是让前端拿 `due_at` 与
+    /// `Date.now()` 比:比较口径只能有一处,前端复算第二遍就会在时钟/时区上分叉。
+    /// 已失效的记忆同样按这个口径算 —— 设置页要能看见「这条待办已经过期且已失效」。
+    pub is_due: bool,
+    /// P0(spec §12):这一行是**用户亲手改过**的。设置页据此打「已编辑」标记,
+    /// 也让用户知道「模型以后不会改写它」—— 这条标记是那句话的唯一证据。
+    pub user_edited: bool,
+}
+
+/// 行 → 视图的唯一映射点（镜像 `memory_from_row` 的解码纪律：同名同序只此一处）。
+impl From<MemoryRow> for MemoryView {
+    fn from(r: MemoryRow) -> Self {
+        // 先把判据算成局部量再搬字段:两个字段都要用 `r.due_at`,而结构体字面量里
+        // 先把 `r` 的某个字段 move 走之后就不能再读它了(这里的 `Option<i64>` 是 Copy,
+        // 但把「判据」与「搬运」分成两行,改起来不必再想 move 的顺序)。
+        let is_due = r.due_at.is_some_and(|due| due <= Db::now_ms());
+        Self {
+            id: r.id,
+            session_id: r.session_id,
+            kind: r.kind,
+            subject: r.subject,
+            predicate: r.predicate,
+            object: r.object,
+            body: r.body,
+            confidence: r.confidence,
+            valid_from: r.valid_from,
+            invalid_at: r.invalid_at,
+            updated_at: r.updated_at,
+            valid: r.invalid_at.is_none(),
+            reinforcements: r.reinforcements,
+            due_at: r.due_at,
+            is_due,
+            user_edited: r.user_edited,
+        }
+    }
+}
+
+/// 设置页「逐条查看」：走 `all_memories` 的**审计口径**（含已失效的）——
+/// 用户要能看见「程序记过什么、又否定过什么」，只给有效集是替记忆系统隐恶。
+#[tauri::command]
+pub async fn memories_list(state: State<'_, AppState>) -> Result<Vec<MemoryView>, String> {
+    let db = state.db.clone();
+    blocking(move || {
+        db.all_memories()
+            .map(|rows| rows.into_iter().map(MemoryView::from).collect())
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// 设置页「删除这一条」：物理删（`delete_memory` 的语义）。语义否定（失效）走
+/// 记忆管线，不走这里 —— 两个出口、两种不可逆程度（store::memory 的既有裁定）。
+#[tauri::command]
+pub async fn memories_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let db = state.db.clone();
+    blocking(move || db.delete_memory(id).map_err(|e| e.to_string())).await
+}
+
+/// 设置页「清空全部记忆」：物理删（含失效行）并把画像归空 —— spec §7 的唯一清空入口。
+#[tauri::command]
+pub async fn memories_clear(state: State<'_, AppState>) -> Result<(), String> {
+    let db = state.db.clone();
+    blocking(move || db.clear_memories().map_err(|e| e.to_string())).await
+}
+
+/// 设置页的常驻画像正文（恒单行；从未写过 = 空串，前端据此显示「未生成」）。
+#[tauri::command]
+pub async fn memory_profile(state: State<'_, AppState>) -> Result<String, String> {
+    let db = state.db.clone();
+    blocking(move || db.profile().map_err(|e| e.to_string())).await
+}
+
+/// T16(P0):用户亲手改一条记忆的正文(设置页的编辑权)。
+///
+/// 走 `update_memory_body_by_user` 而不是模型侧那条:`user_edited=1 + confidence=1.0`
+/// 是「用户权威」的存储层表达,模型此后的 UPDATE/INVALIDATE 会被合并管线降级成
+/// 「并存」(见 [`plan_memory_writes_from_candidates`]),不再是改写。
+#[tauri::command]
+pub async fn memory_update_body(
+    state: State<'_, AppState>,
+    id: i64,
+    body: String,
+) -> Result<(), String> {
+    let db = state.db.clone();
+    blocking(move || {
+        db.update_memory_body_by_user(id, &body)
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// T16(P0):用户手动新增一条记忆。返回新行 id(前端可据此高亮这一条)。
+///
+/// `kind` 白名单:`fact`/`preference`/`prospective`,不认识的一律 **回落 `fact`**,
+/// 而不是在这一层报错。理由:用户手写的东西比模型的分类意图更可信 —— 界面传下来的
+/// 一个拼错的值不该让「我想记一件事」失败;退一步说,`kind` 只影响检索展示的标签,
+/// 正文才是用户真正想留下的东西。
+///
+/// `due_at`(毫秒,spec §12.5 补的缺口):前端 `datetime-local` 的字面值**按 UTC**
+/// 换算后传下来,与抽取侧 `parse_iso8601_ms` 的口径严格一致(少一处换算,同一个时间
+/// 就不会在两处显示成不同的时刻)。`None` = 待办但不提醒。
+/// 非待办带着值也不会有害:`insert_memory_row` 在插入时丢弃它(唯一判据)。
+/// 前端参数键是 `dueAt`(Tauri v2 的 camelCase → snake_case 映射,与本文件
+/// `memory_flush_session` 的 `sessionId` 同一惯例)。
+#[tauri::command]
+pub async fn memory_add(
+    state: State<'_, AppState>,
+    kind: String,
+    body: String,
+    due_at: Option<i64>,
+) -> Result<i64, String> {
+    let db = state.db.clone();
+    let kind = normalize_user_memory_kind(&kind);
+    blocking(move || {
+        db.add_user_memory(kind, &body, due_at)
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// `memory_add` 的 kind 白名单(唯一判定处)。回落目标是 `fact` —— 最中性的一种,
+/// 不会被当成待办弹提醒,也不会污染偏好画像。
+pub(crate) fn normalize_user_memory_kind(kind: &str) -> &'static str {
+    match kind.trim() {
+        "fact" => "fact",
+        "preference" => "preference",
+        "prospective" => "prospective",
+        _ => "fact",
+    }
+}
+
+/// 会话切换/关闭时的**第二次轻量抽取**(spec §4.1 的「会话收尾」)。
+///
+/// 与空闲 worker 的区别只有触发源:这里是用户的手势(切走/关掉),worker 是定时器。
+/// 核心行为完全共用 [`extract_session_memories`](游标、上限、合并、保护、向量)。
+///
+/// **所有失败都返回 `Ok(0)`**:切换会话是界面的主路径,它不该因为「记忆抽取失败」
+/// 而卡住或弹错 —— 用户在切换,不是在做记忆管理。失败只落日志,下一次空闲 tick
+/// 会因为游标没推进而重试。这也是为什么这里连 `Err` 都不往上抛:
+/// `#[tauri::command]` 的 `Err` 会变成前端一个可见的失败。
+#[tauri::command]
+pub async fn memory_flush_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<usize, String> {
+    // 同一会话正在跑一轮时不做:**同一段对话被两条路径同时抽**既会烧调用,
+    // 也会让两条写路径竞争游标(store 只保证「只前进」,不保证不重复)。
+    // 与空闲 worker 的判据同源,共用 `a_turn_is_running`。
+    if a_turn_is_running(&state.running, &session_id) {
+        tracing::debug!("会话 {session_id} 正在运行,跳过切换时的记忆抽取");
+        return Ok(0);
+    }
+    // 读设置失败 → 后台行为静默放弃(理由见函数文档)。
+    let store = state.settings.clone();
+    let settings = match blocking(move || store.load().map_err(|e| e.to_string())).await {
+        Ok(s) => s,
+        Err(reason) => {
+            tracing::warn!("切换会话时读取设置失败,跳过记忆抽取:{reason}");
+            return Ok(0);
+        }
+    };
+    let memory = memory_turn_cfg(&settings);
+    // 记忆总开关关掉 = 连模型都不构造(与压缩路径同一条纪律:关掉的功能不许有开销)。
+    if !memory.enabled {
+        return Ok(0);
+    }
+    // base_url 为空是**尚未配置**,不是错误:后台行为不该让切换失败。
+    if settings.base_url.trim().is_empty() {
+        return Ok(0);
+    }
+    // 以下装配与 `send_message` 逐段同线(同一份 Settings、同一个 resolve_api_key、
+    // 同一个 EmbedEndpoint 构造);差别只在失败一律降级成 Ok(0)。
+    let key_store = state.settings.clone();
+    let stored_key = match blocking(move || key_store.api_key().map_err(|e| e.to_string())).await
+    {
+        Ok(k) => k,
+        Err(reason) => {
+            tracing::warn!("切换会话时读取 API key 失败,跳过记忆抽取:{reason}");
+            return Ok(0);
+        }
+    };
+    let api_key = match resolve_api_key(stored_key, &settings.base_url) {
+        Ok(k) => k,
+        Err(reason) => {
+            tracing::debug!("切换会话时跳过记忆抽取:{reason}");
+            return Ok(0);
+        }
+    };
+    let model = match OpenAiCompat::new(settings.to_model_config(&api_key)) {
+        Ok(m) => m,
+        Err(reason) => {
+            tracing::warn!("切换会话时构造模型失败,跳过记忆抽取:{reason}");
+            return Ok(0);
+        }
+    };
+    let embed: Option<Arc<dyn EmbedProvider>> = if settings.memory_embedding_source == "endpoint" {
+        match EmbedEndpoint::new(&settings.base_url, &settings.memory_embedding_model, &api_key) {
+            Ok(e) => Some(Arc::new(e)),
+            Err(reason) => {
+                tracing::warn!("切换会话时嵌入端点构造失败,本次抽取不建向量:{reason}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    drop(api_key);
+
+    // 独立令牌:这次抽取不挂在用户那一轮的中断令牌上(那是给前台 turn 的),
+    // 否则用户按下停止会顺手取消一次已经提交给端点的后台抽取。
+    let cancel = CancellationToken::new();
+    match extract_session_memories(
+        &state.db,
+        &session_id,
+        &model,
+        &memory,
+        embed,
+        &state.extracting,
+        &cancel,
+    )
+    .await
+    {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!("会话 {session_id} 切换时抽取了 {n} 条记忆变更");
+            }
+            Ok(n)
+        }
+        Err(reason) => {
+            tracing::warn!("会话 {session_id} 切换时的记忆抽取失败,游标保持原位:{reason}");
+            Ok(0)
+        }
+    }
+}
+
 /// 设置页要的一切。**这里没有任何一个字段承载明文 key**（R83 / spec:473）：
 /// 凭据只以掩码形状出这道边界。
 #[derive(Serialize)]
@@ -1210,11 +2383,14 @@ fn persist_window_geometry(window: &tauri::Window) {
 /// 与 R286 的分工：这里**只管注册**，roots 为空时 `read_file` 照样在表里 —— 模型真喊它
 /// 就走闸门被拒。要不要把它的**声明**交给模型，由 `agent/session.rs::request()` 按
 /// `read_file::usable_with_roots` 决定（那是省 token 的事，不是授权的事）。
-pub fn build_production_registry() -> Arc<ToolRegistry> {
+pub fn build_production_registry(db: Arc<Db>) -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     registry.register(Arc::new(FetchTool::new()));
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(UseSkillTool));
+    // T11:记忆检索是元记忆的出口 —— 三把工具都是 `Risk::Read`,
+    // 「内置工具零弹窗」的承诺仍然成立。
+    registry.register(Arc::new(MemorySearchTool::new(db)));
     registry
 }
 
@@ -1254,6 +2430,183 @@ fn resolve_skills_dir(exe_dir: Option<&Path>, data_dir: &Path) -> PathBuf {
     data_dir.join("skills")
 }
 
+/// 一次空闲 tick 的**全部决策**。worker 只负责「每 60 秒调一次它」,因此这一层
+/// 可以在测试里同步驱动:模型由 `model_factory` 注入,不碰 tauri、不碰真实端点。
+///
+/// 它做的事按顺序是:
+/// 1. 记忆总开关关着 → 什么也不做(`0`);
+/// 2. 间隔为 0(= 用户明确关闭空闲抽取) → 什么也不做(`0`);
+/// 3. 取「最后活动早于 `now - 间隔`、且游标落后于最大消息 id」的会话(id 表,
+///    store 侧已按最后活动升序排好);
+/// 4. 逐个抽:正在跑一轮的会话跳过(绝不并发同一会话),其余调
+///    [`extract_session_memories`],失败只 warn(游标不动,下 tick 重试)。
+///
+/// 返回**成功处理**的会话数(失败/跳过都不计)。模型惰性构造:一个待抽会话都没有、
+/// 或者全被 running 跳过时,不构造客户端、不读 keyring。
+pub(crate) async fn idle_extract_tick(
+    db: &Arc<Db>,
+    settings: &Settings,
+    running: &Arc<Mutex<Option<String>>>,
+    model_factory: &(dyn Fn(
+        &Settings,
+    ) -> Option<(
+        Arc<dyn ModelProvider>,
+        Option<Arc<dyn EmbedProvider>>,
+    )> + Send
+              + Sync),
+    locks: &ExtractLocks,
+) -> usize {
+    if !settings.memory_enabled || settings.memory_idle_extract_minutes == 0 {
+        return 0;
+    }
+    let idle_before =
+        Db::now_ms() - settings.memory_idle_extract_minutes as i64 * 60 * 1_000;
+    let reader = db.clone();
+    let due = match blocking(move || {
+        reader
+            .sessions_needing_extraction(idle_before)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(reason) => {
+            tracing::warn!("空闲记忆抽取:查询待抽取会话失败:{reason}");
+            return 0;
+        }
+    };
+    if due.is_empty() {
+        return 0;
+    }
+    let memory = memory_turn_cfg(settings);
+    let mut built: Option<(Arc<dyn ModelProvider>, Option<Arc<dyn EmbedProvider>>)> = None;
+    let mut processed = 0usize;
+    for sid in due {
+        // 「绝不并发同一会话」:同一段对话被前台一轮与后台 tick 同时抽,既烧调用,
+        // 也会让两条写路径竞争游标。这是本 worker 存在的唯一硬约束。
+        if a_turn_is_running(running, &sid) {
+            tracing::debug!("会话 {sid} 正在运行,跳过空闲记忆抽取");
+            continue;
+        }
+        if built.is_none() {
+            match model_factory(settings) {
+                Some(pair) => built = Some(pair),
+                // 没有可用的模型(没配 key、回环端点之外没有 key、构造失败):
+                // 这一 tick 的所有会话都不可能有结论,直接收工 —— 每个会话再试一次
+                // 只会把同一条 warn 刷 N 遍。
+                None => break,
+            }
+        }
+        let (model, embed) = built.as_ref().expect("上一行刚保证它有值");
+        // 每个会话一条独立令牌:后台抽取不该被用户按下的「停止」波及(那是前台 turn 的令牌)。
+        let cancel = CancellationToken::new();
+        match extract_session_memories(db, &sid, &**model, &memory, embed.clone(), locks, &cancel).await {
+            Ok(_) => processed += 1,
+            Err(reason) => {
+                tracing::warn!("会话 {sid} 的空闲记忆抽取失败,游标保持原位:{reason}");
+            }
+        }
+    }
+    processed
+}
+
+/// 后台 tick 的模型装配(与 `send_message`/`memory_flush_session` 同一套:
+/// 同一份 Settings、同一个 `resolve_api_key`、同一个 EmbedEndpoint)。
+///
+/// 这里读 keyring 是**同步**调用,而且发生在 tokio 任务里 —— 这是有意的取舍:
+/// 它每 60 秒最多一次、只在真的有待抽会话时发生(惰性构造),一次本地凭据读取
+/// 的阻塞量级远小于它要发起的网络调用。为它套一层 `spawn_blocking` 只是把同一段
+/// 阻塞挪到另一个线程,不会让 tick 更快。
+fn build_idle_model(
+    settings: &Settings,
+    store: &SettingsStore,
+) -> Option<(Arc<dyn ModelProvider>, Option<Arc<dyn EmbedProvider>>)> {
+    if settings.base_url.trim().is_empty() {
+        return None;
+    }
+    let stored_key = match store.api_key() {
+        Ok(k) => k,
+        Err(reason) => {
+            tracing::warn!("空闲记忆抽取:读取 API key 失败,本次跳过:{reason}");
+            return None;
+        }
+    };
+    let api_key = match resolve_api_key(stored_key, &settings.base_url) {
+        Ok(k) => k,
+        Err(reason) => {
+            tracing::debug!("空闲记忆抽取跳过:{reason}");
+            return None;
+        }
+    };
+    let model: Arc<dyn ModelProvider> = match OpenAiCompat::new(settings.to_model_config(&api_key))
+    {
+        Ok(m) => Arc::new(m),
+        Err(reason) => {
+            tracing::warn!("空闲记忆抽取:模型构造失败:{reason}");
+            return None;
+        }
+    };
+    let embed: Option<Arc<dyn EmbedProvider>> = if settings.memory_embedding_source == "endpoint" {
+        match EmbedEndpoint::new(&settings.base_url, &settings.memory_embedding_model, &api_key) {
+            Ok(e) => Some(Arc::new(e)),
+            Err(reason) => {
+                tracing::warn!("空闲记忆抽取:嵌入端点构造失败,本次不建向量:{reason}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    Some((model, embed))
+}
+
+/// 空闲记忆抽取 worker(T15,P0)。
+///
+/// **这是全程序唯一一个没有用户手势触发的模型调用点**。正因为没有用户在场看着它,
+/// 它必须同时满足三条,缺一条都不该存在:
+/// (a) **可关闭**:`memory_idle_extract_minutes == 0`(或总开关关)= 一次 tick 都不发;
+/// (b) **失败静默**:读设置/读 key/构造模型/抽取的任何失败都只 warn,不弹错、不重试风暴
+///     —— 用户没发起这件事,不该被打断;失败的下一个 tick 会因游标没推进而自然重试;
+/// (c) **绝不并发同一会话**:`running` 槽里是它就跳过 —— 与前台的写路径互斥。
+///
+/// 循环形态刻意最简:`sleep(60s)` → 现读设置(用户改了间隔,下一分钟就生效,
+/// 不缓存)→ 一次 tick。不用 `tokio::select!`,因为没有任何东西需要与睡眠赛跑:
+/// 取消这个 worker 的时机是进程退出,那时整个运行时一起消失。
+pub fn spawn_memory_idle_worker(
+    app: AppHandle,
+    db: Arc<Db>,
+    settings: Arc<SettingsStore>,
+    running: Arc<Mutex<Option<String>>>,
+    locks: ExtractLocks,
+) {
+    tauri::async_runtime::spawn(async move {
+        // 每 tick 复用的那把按会话锁(与 `AppState.extracting` 是同一份的 clone)。
+        let locks = locks;
+        // 用一句启动日志把 app 句柄用起来:它是观测入口(哪个应用、什么时候起的),
+        // 也是这个函数签名保留 `AppHandle` 的理由 —— worker 本身不碰任何窗口。
+        tracing::debug!("空闲记忆抽取 worker 已启动:{}", app.package_info().name);
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            // 每 tick 现读一次设置:间隔旋钮改完,下一次 tick 就该用新值。
+            let store = settings.clone();
+            let current = match blocking(move || store.load().map_err(|e| e.to_string())).await {
+                Ok(s) => s,
+                Err(reason) => {
+                    tracing::warn!("空闲记忆抽取:读取设置失败,本次跳过:{reason}");
+                    continue;
+                }
+            };
+            // 闭包按引用借 `settings`(Arc),tick 结束即释放;不捕获 `current`,
+            // 因为 tick 收到的 settings 已经是这一轮的快照。
+            let factory = |s: &Settings| build_idle_model(s, &settings);
+            let n = idle_extract_tick(&db, &current, &running, &factory, &locks).await;
+            if n > 0 {
+                tracing::info!("空闲记忆抽取:本次处理了 {n} 个会话");
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1289,10 +2642,13 @@ pub fn run() {
             // `Risk::Read` ⇒ 自动放行仍然成立、用户侧仍然零弹窗；而 sink 还没换上的窗口里
             // `check` 给的是 deny（R44：headless ≠ 全授权）。
             let mcp = Arc::new(McpBridge::new());
+            // 注册表要 clone 一份 db,而 `db` 字段本身会被 move 进 AppState ——
+            // 先单独克隆一次避开 E0382(字面量里既 move 又借用不合法)。
+            let db_for_registry = db.clone();
             app.manage(AppState {
                 db,
                 settings,
-                registry: build_production_registry(),
+                registry: build_production_registry(db_for_registry),
                 gate,
                 cancel: Arc::new(Mutex::new(None)),
                 running: Arc::new(Mutex::new(None)),
@@ -1302,6 +2658,7 @@ pub fn run() {
                 mcp,
                 mcp_dir: dir.clone(),
                 skills_dir,
+                extracting: ExtractLocks::default(),
             });
             // 后台自举：句柄从刚装好的 State 里取（保持装配行仍是唯一一条
             // `registry: build_production_registry()` —— 那条守卫测试盯着它）。
@@ -1319,6 +2676,18 @@ pub fn run() {
                 }
                 let _ = mcp_bootstrap(&bootstrap_bridge, &bootstrap_registry, cfg.servers).await;
             });
+            // T15(P0)：空闲记忆抽取 worker。放在 `manage` 之后、几何恢复之前 ——
+            // 它要的四个东西（app/db/settings/running）这时都已是托管实例。
+            // 它是**唯一一个没有用户手势触发的模型调用点**，所以间隔为 0 时必须
+            // 一次都不发（`idle_extract_tick` 的第一道闸），失败只 warn（第二道），
+            // 正在跑的会话跳过（第三道）。三条都写在 `spawn_memory_idle_worker` 的文档里。
+            spawn_memory_idle_worker(
+                app.handle().clone(),
+                managed.db.clone(),
+                managed.settings.clone(),
+                managed.running.clone(),
+                managed.extracting.clone(),
+            );
             // T46b：几何恢复放在 `manage` 之后、`Ok(())` 之前——`app_data_dir()` 与
             // `create_dir_all` 已经在前头跑过，存档目录这时一定存在。
             restore_window_geometry(app.handle());
@@ -1352,6 +2721,13 @@ pub fn run() {
             session_rename,
             session_delete,
             session_messages,
+            memories_list,
+            memories_delete,
+            memories_clear,
+            memory_profile,
+            memory_flush_session,
+            memory_update_body,
+            memory_add,
             settings_get,
             settings_set,
             settings_set_api_key,
@@ -1650,6 +3026,13 @@ mod tests {
                     // 需要它的测试自己往会话上挂一个真的临时目录。
                     skills_dir: None,
                     skills_disabled: Vec::new(),
+                    // 夹具用默认记忆 cfg:既有测试量的都不是记忆开关,
+                    // disabled/自定义口径由 T5 那组测试自己定制。
+                    memory: MemoryTurnCfg::default(),
+                    // 夹具默认不带嵌入:embed=None 的行为与 T5 完全一致(纯关键词),
+                    // 带假嵌入的测试由 T6 那组自己定制。
+                    embed: None,
+                    extract_locks: crate::ipc::ExtractLocks::default(),
                     cancel: self.cancel.clone(),
                 },
                 sid,
@@ -1689,6 +3072,7 @@ mod tests {
             AgentEvent::ToolResult { .. } => "tool_result",
             AgentEvent::Usage { .. } => "usage",
             AgentEvent::ContextCompacted { .. } => "context_compacted",
+            AgentEvent::MemorySaved { .. } => "memory_saved",
             AgentEvent::Error { .. } => "error",
             AgentEvent::Done { .. } => "done",
         }
@@ -2011,6 +3395,9 @@ mod tests {
                 roots: roots.clone(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
                 cancel: f.cancel.clone(),
             },
             &sid,
@@ -2082,6 +3469,9 @@ mod tests {
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
                 cancel: f.cancel.clone(),
             },
             &sid,
@@ -2109,15 +3499,18 @@ mod tests {
     /// `echo` / `guarded` 这类替身只该活在 `#[cfg(test)]` 里 —— 它们的名字一旦进生产，
     /// 请求体里就多出一条用户看不懂、实现也不是给用户的工具。
     #[test]
-    fn production_registry_ships_the_three_read_tools() {
-        let r = build_production_registry();
+    fn production_registry_ships_fetch_url_read_file_memory_search_and_use_skill() {
+        let (_dir, db) = (tempfile::tempdir().unwrap(), Arc::new(Db::open(
+            &tempfile::tempdir().unwrap().path().join("r.db"),
+        ).unwrap()));
+        let r = build_production_registry(db);
         let names: Vec<String> = r.defs().into_iter().map(|d| d.name).collect();
         // 这个字面顺序由 `ToolRegistry` 的 `BTreeMap`（字典序）决定，**不是**注册顺序。
         // 刻意不加 `.sort()`、也不换成集合比较：T33 的 MCP 工具重挂之后仍然靠「名字序不变」
         // 保证界面与模型侧的工具列表不因重连而抖动，把这条性质藏起来就没法发现它被改坏。
         assert_eq!(
             names,
-            vec!["fetch_url", "read_file", "use_skill"],
+            vec!["fetch_url", "memory_search", "read_file", "use_skill"],
             "模型看到的工具集必须是这份名单；echo/guarded 这类测试工具绝不能进生产（它们只活在 #[cfg(test)]）"
         );
         for name in ["fetch_url", "read_file", "use_skill"] {
@@ -2127,6 +3520,11 @@ mod tests {
                 "{name} 进生产的前提就是它仍是只读档（spec 5.1）；它变成 Write 就会开始弹窗"
             );
         }
+        assert_eq!(
+            r.risk_of("memory_search"),
+            Risk::Read,
+            "记忆检索只读本机库,与 fs.read 同档 ⇒ 零弹窗"
+        );
         assert_eq!(
             r.risk_of("delete_everything"),
             Risk::Exec,
@@ -2222,7 +3620,7 @@ mod tests {
 
     /// 摘要调用与本轮回答共用**同一只**模型 —— 生产就是这样（`TurnDeps.model` 只有一个
     /// `Arc`，`compact_before_turn` 与 `AgentSession` 拿的是它），所以这个替身按请求头部分流：
-    /// 头一条是 `SUMMARY_INSTRUCTION` 就走摘要那一支，否则走回答那一支。
+    /// 头一条 system 是哪条指令就走哪一支(摘要/记忆抽取/记忆合并/画像归并),否则走回答那一支。
     /// `calls` 逐次记账（R57：「模型实际看到了什么」只能从模型这一侧取证）。
     struct FakeModel {
         /// 摘要调用吐出的分片（失败那一支里它是「报错之前已经到的半句」）
@@ -2231,6 +3629,17 @@ mod tests {
         summary_fails: bool,
         /// `true` = 摘要调用吐完分片后**挂住不回**，等测试按停止
         summary_stalls: bool,
+        /// 记忆抽取那一支的回复。默认 `[]`(「这段没什么可记」),让既有压缩测试
+        /// 走「抽取成功但零候选」而不是「抽取报错」,日志干净、路径是真实生产路径。
+        extraction_parts: Vec<String>,
+        /// `true` = 抽取调用吐完分片后挂住,等测试按停止。
+        extraction_stalls: bool,
+        /// `true` = 抽取调用在吐完分片之后回一个错误(T15:游标必须不动的那些用例)。
+        extraction_fails: bool,
+        /// 记忆合并那一支的回复(只有存在同键冲突的测试会配;默认空串=模型答非所问→跳过)。
+        consolidation_parts: Vec<String>,
+        /// 画像归并那一支的回复(只有抽取产出 profile 候选的测试会配;默认空串=Err→保持现状)。
+        profile_parts: Vec<String>,
         /// 本轮回答的队列（只有走 `run_turn` 的那条测试用得到）
         replies: Mutex<VecDeque<String>>,
         calls: Mutex<Vec<ChatRequest>>,
@@ -2244,6 +3653,11 @@ mod tests {
                 summary_parts: parts.iter().map(|s| s.to_string()).collect(),
                 summary_fails: false,
                 summary_stalls: false,
+                extraction_parts: vec!["[]".to_string()],
+                extraction_stalls: false,
+                extraction_fails: false,
+                consolidation_parts: vec![String::new()],
+                profile_parts: vec![String::new()],
                 replies: Mutex::new(answers.iter().map(|s| s.to_string()).collect()),
                 calls: Mutex::new(vec![]),
                 stalled: Arc::new(AtomicBool::new(false)),
@@ -2265,6 +3679,49 @@ mod tests {
             Arc::get_mut(&mut raw).unwrap().summary_stalls = true;
             raw
         }
+        /// 抽取那一支回 `parts`(join 成一条文本),回答队列照旧。
+        fn extracting(parts: &[&str], answers: &[&str]) -> Arc<Self> {
+            let mut raw = Self::build(&[], answers);
+            Arc::get_mut(&mut raw).unwrap().extraction_parts =
+                parts.iter().map(|s| s.to_string()).collect();
+            raw
+        }
+        /// 抽取吐完分片后挂住:取消语义的夹具(同 stalling,只是挂的那一支换成了抽取)。
+        fn extraction_stalling(parts: &[&str]) -> Arc<Self> {
+            let mut raw = Self::build(&[], &[]);
+            let m = Arc::get_mut(&mut raw).unwrap();
+            m.extraction_parts = parts.iter().map(|s| s.to_string()).collect();
+            m.extraction_stalls = true;
+            raw
+        }
+        /// T15:抽取先吐 `parts` 再回一个端点错误(半截输出不是结论 ——
+        /// 有没有那半截,调用方都必须把它当成失败、游标不动)。
+        fn extraction_failing(parts: &[&str]) -> Arc<Self> {
+            let mut raw = Self::build(&[], &[]);
+            let m = Arc::get_mut(&mut raw).unwrap();
+            m.extraction_parts = parts.iter().map(|s| s.to_string()).collect();
+            m.extraction_fails = true;
+            raw
+        }
+        /// 在抽取之上再配合并/画像的回复(按需,没配的那支维持降级默认)。
+        fn with_consolidation(mut raw: Arc<Self>, parts: &[&str]) -> Arc<Self> {
+            Arc::get_mut(&mut raw).unwrap().consolidation_parts =
+                parts.iter().map(|s| s.to_string()).collect();
+            raw
+        }
+        fn with_profile(mut raw: Arc<Self>, parts: &[&str]) -> Arc<Self> {
+            Arc::get_mut(&mut raw).unwrap().profile_parts =
+                parts.iter().map(|s| s.to_string()).collect();
+            raw
+        }
+        /// 在摘要+回答之上再配抽取的回复(T7 主闭环用:压缩段要真抽出一条事实候选,
+        /// 而 `summarizing_and_replying` 默认的抽取支是 `[]` 零候选)。与上面两个
+        /// 组合器同款:必须趁 Arc 引用计数还是 1 时改,构造链上不许有第二只手。
+        fn with_extraction(mut raw: Arc<Self>, parts: &[&str]) -> Arc<Self> {
+            Arc::get_mut(&mut raw).unwrap().extraction_parts =
+                parts.iter().map(|s| s.to_string()).collect();
+            raw
+        }
         /// 走完整 `run_turn` 时用：摘要与回答都要能答。
         fn summarizing_and_replying(parts: &[&str], answers: &[&str]) -> Arc<Self> {
             Self::build(parts, answers)
@@ -2281,57 +3738,101 @@ mod tests {
             req: ChatRequest,
         ) -> std::pin::Pin<Box<dyn Stream<Item = Result<ModelDelta, ModelError>> + Send + 'a>>
         {
+            use crate::agent::memory::{
+                CONSOLIDATE_INSTRUCTION, EXTRACT_INSTRUCTION, PROFILE_INSTRUCTION,
+            };
             self.calls.lock().unwrap().push(req.clone());
-            let is_summary = req
+            let head_sys = req
                 .messages
                 .first()
-                .is_some_and(|m| m.role == Role::System && m.text_of() == SUMMARY_INSTRUCTION);
-            if !is_summary {
-                // 回答那一支：取完了就是夹具写错（轮数不够），不许安静地回一条空消息把测试做绿。
-                let reply = self
-                    .replies
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("夹具的回答轮数不够");
-                return Box::pin(futures::stream::iter(
-                    vec![ModelDelta::Text(reply)].into_iter().map(Ok),
-                ));
-            }
-            if self.summary_fails {
-                let head = self.summary_parts.clone();
-                return Box::pin(futures::stream::iter(
-                    head.into_iter()
-                        .map(|t| Ok(ModelDelta::Text(t)))
-                        .chain(std::iter::once(Err(ModelError::Api(
-                            "429 rate limited".to_string(),
-                        )))),
-                ));
-            }
-            if self.summary_stalls {
-                let head: Vec<ModelDelta> = self
-                    .summary_parts
-                    .iter()
-                    .cloned()
-                    .map(ModelDelta::Text)
-                    .collect();
-                let ready = self.stalled.clone();
-                return Box::pin(stream! {
-                    for d in head {
-                        yield Ok(d);
-                    }
-                    ready.store(true, Ordering::SeqCst);
-                    std::future::pending::<()>().await;
-                });
-            }
-            Box::pin(futures::stream::iter(
-                self.summary_parts
+                .filter(|m| m.role == Role::System)
+                .map(|m| m.text_of());
+            let one_shot = |parts: &[String]| -> Vec<Result<ModelDelta, ModelError>> {
+                parts
                     .iter()
                     .cloned()
                     .map(ModelDelta::Text)
                     .map(Ok)
-                    .collect::<Vec<_>>(),
-            ))
+                    .collect()
+            };
+            match head_sys.as_deref() {
+                Some(SUMMARY_INSTRUCTION) if self.summary_fails => {
+                    let head = self.summary_parts.clone();
+                    Box::pin(futures::stream::iter(
+                        head.into_iter()
+                            .map(|t| Ok(ModelDelta::Text(t)))
+                            .chain(std::iter::once(Err(ModelError::Api(
+                                "429 rate limited".to_string(),
+                            )))),
+                    ))
+                }
+                Some(SUMMARY_INSTRUCTION) if self.summary_stalls => {
+                    let head: Vec<ModelDelta> = self
+                        .summary_parts
+                        .iter()
+                        .cloned()
+                        .map(ModelDelta::Text)
+                        .collect();
+                    let ready = self.stalled.clone();
+                    Box::pin(stream! {
+                        for d in head {
+                            yield Ok(d);
+                        }
+                        ready.store(true, Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                    })
+                }
+                Some(SUMMARY_INSTRUCTION) => {
+                    Box::pin(futures::stream::iter(one_shot(&self.summary_parts)))
+                }
+                Some(EXTRACT_INSTRUCTION) if self.extraction_fails => {
+                    let head = self.extraction_parts.clone();
+                    Box::pin(futures::stream::iter(
+                        head.into_iter()
+                            .map(|t| Ok(ModelDelta::Text(t)))
+                            .chain(std::iter::once(Err(ModelError::Api(
+                                "500 extraction failed".to_string(),
+                            )))),
+                    ))
+                }
+                Some(EXTRACT_INSTRUCTION) if self.extraction_stalls => {
+                    let head: Vec<ModelDelta> = self
+                        .extraction_parts
+                        .iter()
+                        .cloned()
+                        .map(ModelDelta::Text)
+                        .collect();
+                    let ready = self.stalled.clone();
+                    Box::pin(stream! {
+                        for d in head {
+                            yield Ok(d);
+                        }
+                        ready.store(true, Ordering::SeqCst);
+                        std::future::pending::<()>().await;
+                    })
+                }
+                Some(EXTRACT_INSTRUCTION) => {
+                    Box::pin(futures::stream::iter(one_shot(&self.extraction_parts)))
+                }
+                Some(CONSOLIDATE_INSTRUCTION) => {
+                    Box::pin(futures::stream::iter(one_shot(&self.consolidation_parts)))
+                }
+                Some(PROFILE_INSTRUCTION) => {
+                    Box::pin(futures::stream::iter(one_shot(&self.profile_parts)))
+                }
+                // 回答那一支：取完了就是夹具写错（轮数不够），不许安静地回一条空消息把测试做绿。
+                _ => {
+                    let reply = self
+                        .replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("夹具的回答轮数不够");
+                    Box::pin(futures::stream::iter(
+                        vec![ModelDelta::Text(reply)].into_iter().map(Ok),
+                    ))
+                }
+            }
         }
     }
 
@@ -2373,24 +3874,150 @@ mod tests {
 
     /// Step 1–4 共用的一次压缩。`ContextBuilder` 与生产同一处造出来（造一次、然后 move 进
     /// `SessionDeps`），所以这里也是 `new(cfg)` 之后再借 `&builder`（§2a 的形状）。
+    /// T5 起多带一份记忆开关：压缩段对记忆的全部行为都由它定，夹具不许替调用方暗定。
+    /// T6 起多带一份嵌入客户端:`None` = off/构造失败,写路径整段跳过;
+    /// 假实现由 T6 的写路径测试注入。
     async fn compact_once(
         f: &Fixture,
         model: &Arc<FakeModel>,
         sid: &str,
         history: Vec<Message>,
         cfg: ContextConfig,
+        memory: &MemoryTurnCfg,
+        embed: Option<Arc<dyn EmbedProvider>>,
         cancel: &CancellationToken,
-    ) -> (Vec<Message>, Option<AgentEvent>) {
+    ) -> (Vec<Message>, Option<AgentEvent>, usize) {
+        // 每个测试夹具自带一把空锁:测试是顺序调用,不存在并发抽取的场景。
+        // 并发语义由 `extract_locks_*` 那一组专测覆盖。
+        let locks = ExtractLocks::default();
         compact_before_turn(
             &f.db,
             sid,
             &**model,
             &ContextBuilder::new(cfg),
             history,
+            memory,
+            embed,
+            &locks,
             cancel,
         )
         .await
         .expect("压缩段本身不许报错（摘要失败的降级由另一条测试管）")
+    }
+
+    // ==== P1:MemorySaved 的可见性(spec §12)====
+
+    /// 记住了就说一声,而且数字要对。位置:排在 `context_compacted` 之后、本轮回答之前
+    /// —— 先「忘了多少」、再「记住了多少」、最后才回答。
+    #[tokio::test]
+    async fn a_compaction_that_saved_memories_emits_memory_saved_with_the_count() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        // 两条**不同键**的候选:同键会走合并(夹具没配合并支),只剩一条。
+        let model = FakeModel::extracting(
+            &[r#"[{"kind":"fact","subject":"用户","predicate":"住在","object":"上海","body":"用户搬到上海了","confidence":0.95},
+                 {"kind":"preference","subject":"用户","predicate":"偏好","object":"简洁","body":"用户喜欢简洁回答","confidence":0.9}]"#],
+            &["好的"],
+        );
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: model.clone(),
+                sink: sink.clone(),
+                context: compacting_cfg(),
+                temperature: None,
+                roots: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "上海那边怎么样".into(),
+            }],
+        )
+        .await
+        .expect("压缩 + 一轮发送必须整体成功");
+        sink.flush();
+
+        let tags: Vec<&str> = rec.frames().iter().map(event_tag).collect();
+        assert_eq!(
+            tags.first().copied(),
+            Some("context_compacted"),
+            "压缩通知排最前:{tags:?}"
+        );
+        let saved_at = tags
+            .iter()
+            .position(|t| *t == "memory_saved")
+            .unwrap_or_else(|| panic!("记住了两条却没有 memory_saved:{tags:?}"));
+        assert_eq!(
+            tags[saved_at - 1], "context_compacted",
+            "先说忘了多少,再说记住了多少:{tags:?}"
+        );
+        assert!(
+            tags[saved_at..].iter().any(|t| *t == "text_delta"),
+            "记住的通知必须排在本轮回答之前:{tags:?}"
+        );
+        match &rec.frames()[saved_at] {
+            AgentEvent::MemorySaved { count } => assert_eq!(*count, 2, "两条候选 ⇒ 2"),
+            other => panic!("第 {saved_at} 帧不是 MemorySaved:{other:?}"),
+        }
+        // 用户可见面:只说「记住了几条」,记忆正文一个字都不许进帧流(R69 的推广)。
+        let wire = serde_json::to_string(&rec.frames()).unwrap();
+        assert!(!wire.contains("用户搬到上海了"), "记忆正文泄漏:{wire}");
+        assert!(!wire.contains("用户喜欢简洁回答"), "记忆正文泄漏:{wire}");
+    }
+
+    /// 零条不弹:白弹一句「已记住 0 条」只会让用户以为它坏了。
+    #[tokio::test]
+    async fn a_compaction_that_saved_nothing_emits_no_memory_saved() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        // 默认抽取支回 `[]`:一次成功的「没什么值得记」。
+        let model = FakeModel::summarizing_and_replying(&["早期要点:聊了些日常"], &["好的"]);
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: model.clone(),
+                sink: sink.clone(),
+                context: compacting_cfg(),
+                temperature: None,
+                roots: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "随便聊聊".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        sink.flush();
+        assert!(
+            !rec
+                .frames()
+                .iter()
+                .any(|e| matches!(e, AgentEvent::MemorySaved { .. })),
+            "零条时不许发 MemorySaved"
+        );
     }
 
     /// 摘要文本**绝不进用户可见的事件流**（brief §1 的那句话）。
@@ -2405,12 +4032,14 @@ mod tests {
         seed(&f.db, &sid, &all);
         let before = f.db.messages(&sid).unwrap();
         let model = FakeModel::summarizing(&["早期要点：用户叫林，", "卡号尾 4021"]);
-        let (_, event) = compact_once(
+        let (_, event, _) = compact_once(
             &f,
             &model,
             &sid,
             before,
             compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
             &CancellationToken::new(),
         )
         .await;
@@ -2438,7 +4067,11 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::ContextCompacted { .. })),
             "压缩事件是直播时发的一条通知，不是历史（库里没有这一列，重放也不该编造它）"
         );
-        assert_eq!(model.calls().len(), 1, "一次压缩恰好一次摘要调用");
+        assert_eq!(
+            model.calls().len(),
+            2,
+            "一次压缩 = 摘要一次 + 记忆抽取一次(抽取默认回 [],零候选也算真跑过)"
+        );
     }
 
     /// §9「存在一条覆盖被丢弃区间的摘要消息」的可测形式，加上「不重复」。
@@ -2452,12 +4085,14 @@ mod tests {
         seed(&f.db, &sid, &all);
         let before = f.db.messages(&sid).unwrap();
         let model = FakeModel::summarizing(&["早期要点：", "用户叫林，卡号尾 4021"]);
-        let (history, _) = compact_once(
+        let (history, _, _) = compact_once(
             &f,
             &model,
             &sid,
             before,
             compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
             &CancellationToken::new(),
         )
         .await;
@@ -2516,12 +4151,14 @@ mod tests {
         let before = f.db.messages(&sid).unwrap();
         // 报错之前先到了半句：那半句**不是**摘要，也不许落进备注。
         let model = FakeModel::failing(&["早期要点：用户叫"]);
-        let (history, event) = compact_once(
+        let (history, event, _) = compact_once(
             &f,
             &model,
             &sid,
             before,
             compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
             &CancellationToken::new(),
         )
         .await;
@@ -2578,11 +4215,15 @@ mod tests {
         let before = f.db.messages(&sid).unwrap();
         let model = FakeModel::stalling(&["早期要点：用户叫林，"]);
         let cancel = CancellationToken::new();
+        // join! 的两个 future 都借 `memory` —— 临时值活不过语句,必须先落成 let。
+        let memory = MemoryTurnCfg::default();
         let ready = model.stalled.clone();
         let builder = ContextBuilder::new(compacting_cfg());
         // 同步点而非 sleep：`ready` 置位时分片已经抵达消费者，摘要此刻确实还挂在流上。
+        // 临时值必须落成 let:join! 的两个 future 都借它,语句结束就失效。
+        let locks = ExtractLocks::default();
         let (got, _) = tokio::join!(
-            compact_before_turn(&f.db, &sid, &*model, &builder, before.clone(), &cancel),
+            compact_before_turn(&f.db, &sid, &*model, &builder, before.clone(), &memory, None, &locks, &cancel),
             async {
                 while !ready.load(Ordering::SeqCst) {
                     tokio::task::yield_now().await;
@@ -2590,7 +4231,7 @@ mod tests {
                 cancel.cancel();
             }
         );
-        let (history, event) = got.expect("取消不是失败：压缩段必须正常返回");
+        let (history, event, _) = got.expect("取消不是失败：压缩段必须正常返回");
         assert!(event.is_none(), "没压成就别说压了：{event:?}");
         assert_eq!(
             history, before,
@@ -2624,12 +4265,14 @@ mod tests {
         ];
         seed(&f.db, &sid, &short);
         let model = FakeModel::summarizing(&["不该被调用的摘要"]);
-        let (history, event) = compact_once(
+        let (history, event, _) = compact_once(
             &f,
             &model,
             &sid,
             short.clone(),
             ContextConfig::default(),
+            &MemoryTurnCfg::default(),
+            None,
             &CancellationToken::new(),
         )
         .await;
@@ -2674,6 +4317,9 @@ mod tests {
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
                 cancel: f.cancel.clone(),
             },
             &sid,
@@ -2726,7 +4372,2453 @@ mod tests {
             !wire.contains("早期要点"),
             "摘要文本进了用户可见的事件流：{wire}"
         );
-        assert_eq!(model.calls().len(), 2, "一次摘要 + 一次回答");
+        assert_eq!(
+            model.calls().len(),
+            3,
+            "摘要一次 + 记忆抽取一次(默认零候选) + 回答一次"
+        );
+    }
+
+    // ==== 长期记忆:压缩钩子的抽取/合并/画像(T4)====
+
+    use crate::agent::memory::{
+        CONSOLIDATE_INSTRUCTION, EXTRACT_INSTRUCTION, PROFILE_INSTRUCTION,
+    };
+    use crate::store::memory::NewMemory;
+
+    fn fact_candidate(object: &str, body: &str) -> String {
+        format!(
+            r#"{{"kind":"fact","subject":"用户","predicate":"住在","object":"{object}","body":"{body}","confidence":0.95}}"#
+        )
+    }
+
+    fn profile_candidate(body: &str) -> String {
+        format!(r#"{{"kind":"profile","subject":null,"predicate":null,"object":null,"body":"{body}","confidence":0.9}}"#)
+    }
+
+    /// 抽取产物真的落了库,而且输入逐字等于被删的那段(R57 同款取证)。
+    #[tokio::test]
+    async fn compaction_extracts_memories_from_the_dropped_segment_and_lands_them() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let all = long_history();
+        seed(&f.db, &sid, &all);
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+            &[],
+        );
+        // 无同键旧记忆 ⇒ 走零调用快路径,合并那一支不会被问到。
+        let (history, event, _) = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(event.is_some(), "压缩本体照常发生");
+
+        let mems = f.db.valid_memories().unwrap();
+        assert_eq!(mems.len(), 1, "抽取出的唯一事实必须落库");
+        assert_eq!(mems[0].body, "用户搬到上海");
+        assert_eq!(
+            mems[0].session_id.as_deref(),
+            Some(sid.as_str()),
+            "来源会话要随写入落上"
+        );
+
+        // 抽取输入 = 被删的那 20 条,与摘要同一个 source(「即将永久消失的原文」)。
+        let calls = model.calls();
+        assert_eq!(
+            calls[0].messages.first().unwrap().text_of(),
+            SUMMARY_INSTRUCTION
+        );
+        assert_eq!(
+            calls[1].messages.first().unwrap().text_of(),
+            EXTRACT_INSTRUCTION
+        );
+        assert_eq!(
+            &calls[1].messages[1..],
+            &all[..20],
+            "抽取输入必须逐字是被丢的那一段(与摘要同一份 source)"
+        );
+        // 压缩本体没有因此变形:仍然只有一条摘要备注、仍然压掉 20 条。
+        let after = f.db.messages(&sid).unwrap();
+        assert_eq!(after.len(), 21);
+        assert_eq!(history, after);
+    }
+
+    /// 抽取输出是垃圾 ⇒ 本轮零写入、压缩照常:功能降级,不留半条状态。
+    #[tokio::test]
+    async fn a_garbage_extraction_degrades_to_no_memory_writes_but_compaction_stands() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::extracting(&["这段对话没什么值得记的"], &[]);
+        let (_, event, _) = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(event.is_some(), "抽取失败不许阻塞压缩");
+        assert!(
+            f.db.valid_memories().unwrap().is_empty(),
+            "垃圾输出不许产出半条记忆"
+        );
+        assert_eq!(f.db.messages(&sid).unwrap().len(), 21, "压缩照常完成");
+        assert_eq!(model.calls().len(), 2, "摘要 + 抽取,各一次");
+    }
+
+    /// 用户在抽取还挂着的时候按停止:与摘要侧同一条语义 —— 事务还没开始,
+    /// 一个字节都不写,历史原样交回。
+    #[tokio::test]
+    async fn cancelling_during_extraction_leaves_the_history_untouched() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::extraction_stalling(&[r#"[{"kind":"fact""#]);
+        let cancel = CancellationToken::new();
+        // 同上:join! 的两个 future 都借 `memory`,临时值必须先落成 let。
+        let memory = MemoryTurnCfg::default();
+        let ready = model.stalled.clone();
+        let builder = ContextBuilder::new(compacting_cfg());
+        // 临时值必须落成 let:join! 的两个 future 都借它,语句结束就失效。
+        let locks = ExtractLocks::default();
+        let (got, _) = tokio::join!(
+            compact_before_turn(&f.db, &sid, &*model, &builder, before.clone(), &memory, None, &locks, &cancel),
+            async {
+                // 超时护栏:抽取侧永远不被调用时(实现缺失)不许把测试挂死,超时即按停止。
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !ready.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                cancel.cancel();
+            }
+        );
+        let (history, event, _) = got.expect("取消不是失败");
+        assert!(event.is_none(), "没压成就别说压了:{event:?}");
+        assert_eq!(history, before, "交回的历史必须原样");
+        assert_eq!(f.db.messages(&sid).unwrap(), before, "库里一个字都不动");
+        assert!(
+            f.db.valid_memories().unwrap().is_empty(),
+            "取消不许留下半条记忆"
+        );
+    }
+
+    #[test]
+    fn the_skills_view_lists_name_description_and_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("translate");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: 翻译助手\ndescription: 中英互译\n---\n正文\n",
+        )
+        .unwrap();
+
+        let view = skills_view_of(dir.path(), &crate::skills::Selection::default());
+        assert_eq!(view.root, dir.path().display().to_string());
+        assert_eq!(view.skills.len(), 1, "{:?}", view.skills);
+        assert_eq!(view.skills[0].name, "翻译助手");
+        assert_eq!(view.skills[0].description, "中英互译");
+        assert_eq!(view.skills[0].folder, "translate");
+        assert!(view.skills[0].enabled, "没有选择表时默认启用");
+
+        let mut sel = crate::skills::Selection::default();
+        sel.disabled.push("translate".to_string());
+        let view = skills_view_of(dir.path(), &sel);
+        assert!(
+            !view.skills[0].enabled,
+            "停用的是 enabled=false，不是列表里消失"
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        let view = skills_view_of(empty.path(), &sel);
+        assert!(view.skills.is_empty(), "空目录要交空表，而不是报错");
+        assert_eq!(view.root, empty.path().display().to_string());
+    }
+
+    #[test]
+    fn toggling_a_skill_persists_and_rejects_unknown_folders() {
+        let skills = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let skill = skills.path().join("translate");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: 翻译助手\ndescription: 中英互译\n---\n正文\n",
+        )
+        .unwrap();
+
+        set_skill_enabled_of(skills.path(), data.path(), "translate", false).unwrap();
+        assert_eq!(
+            crate::skills::load_selection(data.path()).disabled,
+            vec!["translate".to_string()],
+            "停用要落盘（skills.json）"
+        );
+        assert!(!crate::skills::is_enabled(
+            &crate::skills::load_selection(data.path()),
+            "translate"
+        ));
+
+        set_skill_enabled_of(skills.path(), data.path(), "translate", true).unwrap();
+        assert!(
+            crate::skills::load_selection(data.path())
+                .disabled
+                .is_empty(),
+            "重新启用要把这条删掉"
+        );
+
+        let e = set_skill_enabled_of(skills.path(), data.path(), "../etc", false)
+            .expect_err("不存在的文件夹必须拒，选择表里不许出现幽灵记录");
+        assert!(e.contains("没有这个技能"), "{e}");
+    }
+
+    /// profile 候选不进检索库,经归并后落成**单行**画像。
+    #[tokio::test]
+    async fn profile_candidates_merge_into_the_single_profile_row() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::with_profile(
+            FakeModel::extracting(&[&format!("[{}]", profile_candidate("用户在学日语"))], &[]),
+            &["用户是 Rust 开发者,在学日语"],
+        );
+        let _ = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(
+            f.db.valid_memories().unwrap().is_empty(),
+            "profile 候选不进检索库"
+        );
+        assert_eq!(
+            f.db.profile().unwrap(),
+            "用户是 Rust 开发者,在学日语",
+            "归并结果落成单行画像"
+        );
+        let calls = model.calls();
+        assert_eq!(calls.len(), 3, "摘要 + 抽取 + 画像归并");
+        assert_eq!(
+            calls[2].messages.first().unwrap().text_of(),
+            PROFILE_INSTRUCTION
+        );
+    }
+
+    /// 同键冲突 ⇒ 问模型三选一;模型说 INVALIDATE ⇒ 旧行失效、新行**不**加。
+    #[tokio::test]
+    async fn a_conflicting_candidate_asks_the_model_and_applies_its_choice() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let old_id = f
+            .db
+            .add_memory(&NewMemory {
+                session_id: Some(sid.clone()),
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在".into()),
+                object: Some("北京".into()),
+                body: "用户住在北京".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::with_consolidation(
+            FakeModel::extracting(
+                &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+                &[],
+            ),
+            &[&format!(r#"{{"action":"INVALIDATE","id":{old_id}}}"#)],
+        );
+        let _ = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let audit = f.db.all_memories().unwrap();
+        assert_eq!(audit.len(), 1, "INVALIDATE 不添新行");
+        assert_eq!(audit[0].id, old_id);
+        assert!(audit[0].invalid_at.is_some(), "旧行必须被打上失效时间");
+        assert!(
+            f.db.valid_memories().unwrap().is_empty(),
+            "失效后检索视角必须为空"
+        );
+        let calls = model.calls();
+        assert_eq!(calls.len(), 3, "摘要 + 抽取 + 合并");
+        assert_eq!(
+            calls[2].messages.first().unwrap().text_of(),
+            CONSOLIDATE_INSTRUCTION
+        );
+    }
+
+    /// 第四种合并答案:新旧实质是同一件事(措辞不同)⇒ 不新增、不改正文,
+    /// 只把该行强度加一 —— 「重复接触使记忆变强」的落库形状。
+    #[tokio::test]
+    async fn a_reinforcing_candidate_bumps_the_existing_row_strength_without_a_new_row() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let old_id = f
+            .db
+            .add_memory(&NewMemory {
+                session_id: Some(sid.clone()),
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在".into()),
+                object: Some("北京".into()),
+                body: "用户住在北京".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::with_consolidation(
+            FakeModel::extracting(
+                &[&format!("[{}]", fact_candidate("北京", "用户在北京居住"))],
+                &[],
+            ),
+            &[&format!(r#"{{"action":"REINFORCE","id":{old_id}}}"#)],
+        );
+        let _ = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let audit = f.db.all_memories().unwrap();
+        assert_eq!(audit.len(), 1, "强化不添新行");
+        assert_eq!(audit[0].id, old_id);
+        assert_eq!(audit[0].reinforcements, 1, "同一事实再说一遍必须记一次强度");
+        assert_eq!(audit[0].body, "用户住在北京", "强化不许动正文(改正文是 UPDATE 的事)");
+        assert!(audit[0].invalid_at.is_none(), "强化不等于失效");
+        let calls = model.calls();
+        assert_eq!(calls.len(), 3, "摘要 + 抽取 + 合并");
+        assert_eq!(
+            calls[2].messages.first().unwrap().text_of(),
+            CONSOLIDATE_INSTRUCTION
+        );
+    }
+
+    /// 模型编了一个不存在的 id:这条变更指向不存在行,若交给事务会整笔失败
+    /// (压缩也一起回滚)。管线必须在写入前丢掉它,压缩照常完成。
+    #[tokio::test]
+    async fn a_reinforce_decision_for_a_missing_id_is_dropped_and_compaction_stands() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let old_id = f
+            .db
+            .add_memory(&NewMemory {
+                session_id: Some(sid.clone()),
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在".into()),
+                object: Some("北京".into()),
+                body: "用户住在北京".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::with_consolidation(
+            FakeModel::extracting(
+                &[&format!("[{}]", fact_candidate("北京", "用户在北京居住"))],
+                &[],
+            ),
+            // 存在的行是 old_id,模型却报了一个不存在的 id(常见于它自己编序号)。
+            &[&format!(r#"{{"action":"REINFORCE","id":{}}}"#, old_id + 999)],
+        );
+        let (_, event, _) = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert!(event.is_some(), "跳过一条候选不许影响压缩");
+        let audit = f.db.all_memories().unwrap();
+        assert_eq!(audit.len(), 1, "不许新增行");
+        assert_eq!(audit[0].reinforcements, 0, "不许误给任何行加计数");
+        assert_eq!(f.db.messages(&sid).unwrap().len(), 21, "压缩照常完成");
+    }
+
+    // ==== 长期记忆:注入的装配(T4)====
+
+    /// `memory_notes_for_turn` 的装配规则:画像在前、召回按相关度、超限砍召回不砍画像。
+    #[test]
+    fn memory_notes_assemble_profile_first_then_ranked_recall_within_the_cap() {
+        let f = Fixture::new();
+        f.db.set_profile("用户是 Rust 开发者").unwrap();
+        for (object, body) in [("北京", "用户住在北京"), ("咖啡", "用户喜欢咖啡")] {
+            f.db
+                .add_memory(&NewMemory {
+                    session_id: None,
+                    kind: "fact".into(),
+                    subject: Some("用户".into()),
+                    predicate: Some("住在".into()),
+                    object: Some(object.into()),
+                    body: body.into(),
+                    confidence: 0.9,
+                    due_at: None,
+                })
+                .unwrap();
+        }
+
+        let notes =
+            memory_notes_for_turn(&f.db, "北京有什么好玩的", None, 5, 600, 24, 60.0).unwrap();
+        // T10:顺序是 画像 → 召回 → 概览;概览因为存在记忆而必须出现。
+        assert_eq!(notes.len(), 3);
+        assert_eq!(notes[0], "[用户画像]用户是 Rust 开发者");
+        assert!(
+            notes[1].starts_with("[长期记忆"),
+            "召回备注必须有可识别前缀:{}",
+            notes[1]
+        );
+        assert!(
+            notes[1].contains("用户住在北京"),
+            "与查询相关的记忆必须在召回里:{}",
+            notes[1]
+        );
+        assert!(
+            !notes[1].contains("咖啡"),
+            "零重叠的记忆不许混进召回:{}",
+            notes[1]
+        );
+        assert!(
+            notes[2].starts_with("[记忆库]"),
+            "概览必须是最后一条备注:{}",
+            notes[2]
+        );
+
+        // 上限砍的是召回与概览,不是画像:cap 收到只够画像时,两条都让路。
+        let tight = memory_notes_for_turn(&f.db, "北京有什么好玩的", None, 5, 20, 24, 60.0).unwrap();
+        assert_eq!(tight.len(), 1, "画像永不因超限丢失");
+        assert!(tight[0].starts_with("[用户画像]"));
+
+        // k=0 = 召回关闭;画像与概览仍在(概览不依赖召回)。
+        let no_recall = memory_notes_for_turn(&f.db, "北京有什么好玩的", None, 0, 600, 24, 60.0).unwrap();
+        assert_eq!(no_recall.len(), 2, "画像 + 概览");
+        assert!(no_recall[1].starts_with("[记忆库]"));
+
+        // 空库 = 无备注,消费方(注入)据此完全跳过。
+        let empty = Fixture::new();
+        assert!(
+            memory_notes_for_turn(&empty.db, "随便什么", None, 5, 600, 24, 60.0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// run_turn 级的端到端:画像与召回进的是**发给模型的请求头**,而库里零新增行
+    /// (注入是易失的,不许渗进持久层 —— dropped/行数都不许动)。
+    #[tokio::test]
+    async fn run_turn_carries_profile_and_recall_in_the_request_head_only() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.set_profile("用户是 Rust 开发者").unwrap();
+        f.db
+            .add_memory(&NewMemory {
+                session_id: None,
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在".into()),
+                object: Some("北京".into()),
+                body: "用户住在北京".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        seed(
+            &f.db,
+            &sid,
+            &[
+                Message::user(vec![ContentBlock::Text { text: "上一轮".into() }]),
+                Message {
+                    role: Role::Assistant,
+                    blocks: vec![ContentBlock::Text { text: "上一答".into() }],
+                },
+            ],
+        );
+        let model = FakeModel::build(&[], &["好的"]);
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        let reason = run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: model.clone(),
+                sink: sink.clone(),
+                context: ContextConfig::default(),
+                temperature: None,
+                roots: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "北京有什么好玩的".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        sink.flush();
+        assert_eq!(reason, StopReason::EndTurn);
+
+        let calls = model.calls();
+        let answer = &calls[0]; // 短历史不压缩,第一只调用就是回答
+        assert_eq!(answer.messages[0].role, Role::System);
+        assert!(
+            answer.messages[1].text_of().starts_with("[用户画像]"),
+            "画像必须紧跟系统提示词:{}",
+            answer.messages[1].text_of()
+        );
+        assert!(
+            answer.messages[2].text_of().starts_with("[长期记忆"),
+            "召回必须排在画像之后:{}",
+            answer.messages[2].text_of()
+        );
+        assert!(answer.messages[2].text_of().contains("用户住在北京"));
+
+        // 注入是易失的:库里只多了本轮两行,没有 memory 行、没有 system 备注。
+        let after = f.db.messages(&sid).unwrap();
+        assert_eq!(after.len(), 4, "上一轮两行 + 本轮两行");
+        assert!(
+            !after.iter().any(|m| m.role == Role::System),
+            "记忆备注不许落库"
+        );
+        assert_eq!(f.db.valid_memories().unwrap().len(), 1, "记忆本体没动");
+    }
+
+    // ==== T13：类人记忆的端到端（强化 / 衰减 / 待办 / 多轮指代 / 元记忆）====
+
+    /// 一段「人生」:同一件事被反复确认 → 强度上升;旧事因时间下沉但仍可被查到;
+    /// 待办到期被提醒一次;追问时靠上一轮的消息召回;概览告诉模型库里有东西。
+    /// 这条测试是升级后所有机制的**接缝**检查 —— 单条机制各有专测,这里证明它们
+    /// 在同一份库上互不打架。
+    #[tokio::test]
+    async fn a_memory_lifecycle_holds_together_across_confirmations_decay_and_due_dates() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+
+        // ---- ① 同一事实被压缩抽到两次:第一次 ADD,第二次 REINFORCE ----
+        seed(&f.db, &sid, &long_history());
+        let first = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海了"))],
+            &[],
+        );
+        let before = f.db.messages(&sid).unwrap();
+        compact_once(
+            &f,
+            &first,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+        let after_first = f.db.valid_memories().unwrap();
+        assert_eq!(after_first.len(), 1);
+        let memory_id = after_first[0].id;
+        assert_eq!(after_first[0].reinforcements, 0, "第一次只是 ADD");
+
+        // 第二次:再来一轮长历史并压缩,模型认出「是同一件事」→ REINFORCE。
+        let more: Vec<Message> = (0..40)
+            .map(|i| Message {
+                role: if i % 2 == 0 { Role::User } else { Role::Assistant },
+                blocks: vec![ContentBlock::Text {
+                    text: format!("第二轮历史 {i:0>800}"),
+                }],
+            })
+            .collect();
+        seed(&f.db, &sid, &more);
+        let second = FakeModel::with_consolidation(
+            FakeModel::extracting(
+                &[&format!("[{}]", fact_candidate("上海", "用户现在在上海"))],
+                &[],
+            ),
+            &[&format!(r#"{{"action":"REINFORCE","id":{memory_id}}}"#)],
+        );
+        let before2 = f.db.messages(&sid).unwrap();
+        compact_once(
+            &f,
+            &second,
+            &sid,
+            before2,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+        let strengthened = f.db.valid_memories().unwrap();
+        assert_eq!(strengthened.len(), 1, "REINFORCE 不添新行");
+        assert_eq!(strengthened[0].id, memory_id);
+        assert_eq!(strengthened[0].reinforcements, 1, "强度 +1");
+        assert_eq!(
+            strengthened[0].body, "用户搬到上海了",
+            "REINFORCE 不动正文(改写是 UPDATE 的事)"
+        );
+
+        // ---- ② 一条很久以前的事:衰减让它排在后面,但绝不消失 ----
+        let old = f
+            .db
+            .add_memory(&NewMemory {
+                session_id: None,
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("养过".into()),
+                object: Some("仓鼠".into()),
+                body: "用户在上海养过一只仓鼠".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        {
+            let c = f.db.lock();
+            let ancient = Db::now_ms() - 900 * 86_400_000;
+            c.execute(
+                "UPDATE memories SET valid_from=?2, updated_at=?2 WHERE id=?1",
+                params![old, ancient],
+            )
+            .unwrap();
+        }
+        let hits = f
+            .db
+            .search_memories("上海", None, 10, &RecallCfg::default())
+            .unwrap();
+        let ids: Vec<i64> = hits.iter().map(|m| m.id).collect();
+        assert!(
+            ids.contains(&memory_id) && ids.contains(&old),
+            "两条都要在:{ids:?}"
+        );
+        assert_eq!(ids[0], memory_id, "新鲜的/被确认过的在前,陈年的在后");
+
+        // ---- ③ 待办:本轮提醒一次,下一轮不再提 ----
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "prospective".into(),
+            subject: None,
+            predicate: None,
+            object: None,
+            body: "下周三把合同发给老王".into(),
+            confidence: 0.95,
+            due_at: Some(Db::now_ms() + 3_600_000),
+        })
+        .unwrap();
+
+        let answerer = FakeModel::build(&[], &["好的"]);
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: answerer.clone(),
+                sink: sink.clone(),
+                context: ContextConfig::default(),
+                temperature: None,
+                roots: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "上海那边最近怎么样".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        sink.flush();
+
+        let head = &answerer.calls()[0];
+        let systems: Vec<String> = head
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .map(|m| m.text_of())
+            .collect();
+        let due_at = systems
+            .iter()
+            .position(|t| t.starts_with("[待办提醒]"))
+            .expect("到期的待办必须被提醒");
+        let recall_at = systems
+            .iter()
+            .position(|t| t.starts_with("[长期记忆"))
+            .expect("相关记忆必须被召回");
+        assert!(due_at < recall_at, "待办要排在召回之前(最紧急的先被看到)");
+        assert!(
+            systems[due_at].contains("下周三把合同发给老王"),
+            "待办正文要在提醒里:{}",
+            systems[due_at]
+        );
+        let overview_at = systems
+            .iter()
+            .position(|t| t.starts_with("[记忆库]"))
+            .expect("有记忆时必须有概览(元记忆)");
+        assert!(recall_at < overview_at, "概览排最后(最元的信息)");
+        assert!(
+            systems[overview_at].contains("memory_search"),
+            "概览要告诉模型可以主动查:{}",
+            systems[overview_at]
+        );
+
+        // 第二轮:待办已标记,不再提醒。
+        let answerer2 = FakeModel::build(&[], &["好"]);
+        let rec2 = Arc::new(Recorded::default());
+        let sink2 = Arc::new(TauriEmitter::new(rec2.clone(), sid.clone()));
+        run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: answerer2.clone(),
+                sink: sink2.clone(),
+                context: ContextConfig::default(),
+                temperature: None,
+                roots: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "那它呢".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        sink2.flush();
+        let second_head = &answerer2.calls()[0];
+        assert!(
+            !second_head
+                .messages
+                .iter()
+                .any(|m| m.text_of().starts_with("[待办提醒]")),
+            "同一待办不该刷屏"
+        );
+        // ---- ④ 多轮指代:上一轮说了「上海」,这一轮只说「那它呢」,仍能召回 ----
+        let recall = second_head
+            .messages
+            .iter()
+            .find(|m| m.text_of().starts_with("[长期记忆"))
+            .expect("追问必须靠上一轮的消息召回,而不是当前这句「那它呢」");
+        assert!(
+            recall.text_of().contains("上海"),
+            "召回内容要来自上一轮的「上海」:{}",
+            recall.text_of()
+        );
+    }
+
+    /// 元记忆的主动通路:模型调 `memory_search` 能拿到库里的东西 ——
+    /// 这条把工具、注册表、存储层串起来(单测各自在测自己那一层)。
+    #[tokio::test]
+    async fn the_model_can_actively_search_memories_through_the_registry() {
+        let f = Fixture::new();
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "fact".into(),
+            subject: Some("用户".into()),
+            predicate: Some("在做".into()),
+            object: Some("一个桌面助手".into()),
+            body: "用户在做一个小宋祺桌面助手".into(),
+            confidence: 0.9,
+            due_at: None,
+        })
+        .unwrap();
+        let registry = build_production_registry(f.db.clone());
+        let out = registry
+            .get("memory_search")
+            .expect("生产工具表里必须有 memory_search")
+            .execute(
+                serde_json::json!({"query": "桌面助手"}),
+                &crate::tools::registry::ToolCtx {
+                    http: reqwest::Client::new(),
+                    cancel: CancellationToken::new(),
+                    roots: Vec::new(),
+                    skills_dir: None,
+                    skills_disabled: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let text = match out {
+            crate::agent::types::ToolOutput::Text { text } => text,
+            other => panic!("期望文本输出:{other:?}"),
+        };
+        assert!(
+            text.contains("小宋祺桌面助手"),
+            "主动检索必须能翻到自动召回漏掉的内容:{text}"
+        );
+        // 门槛:Risk::Read ⇒ 权限闸零弹窗(与 fs.read 同档)。
+        assert_eq!(
+            registry.risk_of("memory_search"),
+            crate::agent::types::Risk::Read
+        );
+    }
+
+    // ==== T7：端到端闭环（压缩→记忆落地→下一轮召回） ====
+
+    /// 整条闭环串起来:长历史触发压缩 → 抽取出的事实**落库** → 下一轮发送时它**回到请求头**,
+    /// 而库里只多本轮两行。分段测试(T1/T2/T4)各自只证明一段;这条证明段与段之间的**接缝**
+    /// 没错位:抽取输入是真正被删的那段、落库的 session_id 是当前会话、下一轮召回用的是
+    /// 本轮消息而不是上一轮的 query。
+    /// 守 spec §8 的不变量 1(est 含记忆)与不变量 6(注入不改行数/投影)。
+    #[tokio::test]
+    async fn a_full_memory_cycle_survives_compaction_and_returns_next_turn() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let all = long_history();
+        seed(&f.db, &sid, &all);
+
+        // ---- 第一段:压缩时抽取并落库 ----
+        let before = f.db.messages(&sid).unwrap();
+        let extractor = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海了"))],
+            &[],
+        );
+        let (compacted_history, event, _) = compact_once(
+            &f,
+            &extractor,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(event.is_some(), "夹具前提:长历史必须触发压缩");
+
+        let mems = f.db.valid_memories().unwrap();
+        assert_eq!(mems.len(), 1, "抽取的唯一事实必须落库");
+        assert_eq!(mems[0].body, "用户搬到上海了");
+        assert_eq!(
+            mems[0].session_id.as_deref(),
+            Some(sid.as_str()),
+            "来源会话必须是本会话(接缝:写入侧的 session_id 由编排层补)"
+        );
+
+        // ---- 第二段:下一轮发送,记忆回到请求头 ----
+        // 换一只干净模型:它只该被问一次(回答),零压缩(压缩后的历史已在阈值内)。
+        let answerer = FakeModel::build(&[], &["上海可以去外滩"]);
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        let rows_before_turn = f.db.messages(&sid).unwrap().len();
+        let reason = run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: answerer.clone(),
+                sink: sink.clone(),
+                context: ContextConfig::default(),
+                temperature: None,
+                roots: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "上海有什么好玩的地方".into(),
+            }],
+        )
+        .await
+        .expect("压缩后的历史在预算内,本轮不该再压缩");
+        sink.flush();
+        assert_eq!(reason, StopReason::EndTurn);
+        assert_eq!(
+            compacted_history.len(),
+            rows_before_turn,
+            "压缩段交回的历史与库里的一致(两段之间没人动库)"
+        );
+
+        let calls = answerer.calls();
+        assert_eq!(calls.len(), 1, "压缩后的历史不越线 ⇒ 本轮只有回答一次调用");
+        let head = &calls[0];
+        let recall = head
+            .messages
+            .iter()
+            .find(|m| m.role == Role::System && m.text_of().starts_with("[长期记忆"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "上一轮抽取的记忆没有回到请求头:{:?}",
+                    head.messages.iter().map(|m| m.text_of()).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            recall.text_of().contains("用户搬到上海了"),
+            "召回内容必须是那条记忆:{}",
+            recall.text_of()
+        );
+        assert!(
+            head.messages
+                .iter()
+                .filter(|m| m.role == Role::System)
+                .all(|m| !m.text_of().starts_with("[用户画像]")),
+            "画像为空时不许出现空画像行"
+        );
+
+        // ---- 不变量 1:记忆行真的计入了这次请求的粗估 ----
+        // `estimate_tokens` 是 pub,所以这里能直接重放同一条算式:带记忆的请求
+        // 必须严格贵于把同一份 head 里的记忆行摘掉之后。
+        let with_memory = crate::agent::context::estimate_tokens(&head.messages);
+        let stripped: Vec<Message> = head
+            .messages
+            .iter()
+            .filter(|m| !m.text_of().starts_with("[长期记忆"))
+            .cloned()
+            .collect();
+        let without_memory = crate::agent::context::estimate_tokens(&stripped);
+        assert!(
+            with_memory > without_memory,
+            "记忆行没进预算:{with_memory} vs {without_memory}"
+        );
+
+        // ---- 不变量 6:注入是易失的,库里只多本轮两行 ----
+        let after = f.db.messages(&sid).unwrap();
+        assert_eq!(after.len(), rows_before_turn + 2, "只多 user + assistant 两行");
+        assert!(
+            !after.iter().any(|m| m.role == Role::System
+                && (m.text_of().starts_with("[长期记忆") || m.text_of().starts_with("[用户画像]"))),
+            "记忆备注不许落库"
+        );
+        assert_eq!(f.db.valid_memories().unwrap().len(), 1, "记忆本体没动");
+    }
+
+    /// 记忆比会话活得久:schema 层刻意没有外键,删会话不许连带删记忆。
+    #[tokio::test]
+    async fn memories_outlive_the_session_that_produced_them() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海了"))],
+            &[],
+        );
+        compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(f.db.valid_memories().unwrap().len(), 1, "夹具前提:先有一条记忆");
+
+        f.db.delete_session(&sid).unwrap();
+
+        assert!(
+            f.db.messages(&sid).unwrap().is_empty(),
+            "夹具前提:消息确实被 CASCADE 删掉了"
+        );
+        let survivors = f.db.valid_memories().unwrap();
+        assert_eq!(survivors.len(), 1, "删会话不许连带删记忆");
+        assert_eq!(survivors[0].body, "用户搬到上海了");
+        assert_eq!(
+            survivors[0].session_id.as_deref(),
+            Some(sid.as_str()),
+            "来源会话 id 留作审计痕迹 —— 它现在指向一个已不存在的会话,这是有意的"
+        );
+    }
+
+    /// R69 的推广:记忆对模型可见、对用户不可见。整轮(含压缩与注入)的全部可见帧
+    /// 序列化后不许出现记忆备注的文本。
+    #[tokio::test]
+    async fn a_memory_note_never_reaches_the_event_stream() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.set_profile("用户是 Rust 开发者").unwrap();
+        f.db
+            .add_memory(&NewMemory {
+                session_id: None,
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在".into()),
+                object: Some("上海".into()),
+                body: "用户住在上海".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        seed(&f.db, &sid, &long_history());
+
+        // 抽取支也配一条真候选:这一轮因此同时覆盖「压缩时新抽出并落库的记忆」与
+        // 「预置的画像/记忆」两条来源,证明它们**都**不会出现在用户可见帧里。
+        // 候选**必须换一个 key**(predicate 不用「住在」):同键会触发查重合并,
+        // 而本夹具没配合并支的模型答复 —— 那条路归 T4 的专测,这里要的只是「真的落了一条」。
+        let model = FakeModel::with_extraction(
+            FakeModel::summarizing_and_replying(&["早期要点:搬到了上海"], &["好的"]),
+            &[r#"[{"kind":"fact","subject":"用户","predicate":"常去","object":"杭州","body":"用户也常去杭州","confidence":0.95}]"#],
+        );
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: model.clone(),
+                sink: sink.clone(),
+                context: compacting_cfg(),
+                temperature: None,
+                roots: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "上海有什么好玩的".into(),
+            }],
+        )
+        .await
+        .expect("压缩 + 一轮发送必须整体成功");
+        sink.flush();
+
+        let wire = serde_json::to_string(&rec.frames()).unwrap();
+        assert!(
+            !wire.contains("[长期记忆"),
+            "记忆备注进了用户可见的帧流:{wire}"
+        );
+        assert!(
+            !wire.contains("[用户画像]"),
+            "画像进了用户可见的帧流:{wire}"
+        );
+        assert!(
+            !wire.contains("用户住在上海") && !wire.contains("用户是 Rust 开发者"),
+            "记忆正文进了用户可见的帧流:{wire}"
+        );
+        assert!(
+            !wire.contains("用户也常去杭州"),
+            "压缩时新抽出的记忆也进了用户可见的帧流:{wire}"
+        );
+        // 夹具守卫:上面第四条不是空断言 —— 抽取真的落了一条新记忆。
+        assert!(
+            f.db.valid_memories()
+                .unwrap()
+                .iter()
+                .any(|m| m.body == "用户也常去杭州"),
+            "夹具前提:抽取出的新记忆确实落库了"
+        );
+        // 夹具守卫:这一轮确实注入了(否则上面三条只是在复述「没注入」)。
+        let injected = model.calls().iter().any(|c| {
+            c.messages
+                .iter()
+                .any(|m| m.text_of().starts_with("[长期记忆"))
+        });
+        assert!(injected, "夹具前提:记忆确实进过某次请求头");
+    }
+
+    // ==== T5：记忆的总开关与设置流转（压缩段 + run_turn 两级） ====
+
+    /// 总开关关掉 = 抽取整段跳过：压缩路径上的模型调用恰好 1（只有摘要），库零记忆。
+    /// 这一刀砍在 `plan_memory_writes` **之前**，不是「抽了不写」—— 那是用户可见的
+    /// 行为差（一次端点调用 vs 零次），也是 spec §10「设置页可见调用计数」能对上账的前提。
+    #[tokio::test]
+    async fn memory_disabled_skips_extraction_entirely() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let before = f.db.messages(&sid).unwrap();
+        // 抽取那一支配的是真候选：开关若只是「抽了丢弃」，这里会看到两次调用与一条记忆。
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+            &[],
+        );
+        let (history, event, _) = compact_before_turn(
+            &f.db,
+            &sid,
+            &*model,
+            &ContextBuilder::new(compacting_cfg()),
+            before.clone(),
+            &MemoryTurnCfg {
+                enabled: false,
+                ..Default::default()
+            },
+            None,
+            &ExtractLocks::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("disabled 只关记忆，压缩本体照常");
+        assert!(event.is_some(), "压缩本体不许被记忆开关拦下");
+        assert_eq!(
+            model.calls().len(),
+            1,
+            "只许有摘要一次：抽取/合并/画像一个调用都不许发起"
+        );
+        assert!(f.db.valid_memories().unwrap().is_empty(), "零记忆写入");
+        assert!(f.db.profile().unwrap().is_empty(), "画像也不许动");
+        assert_eq!(
+            f.db.messages(&sid).unwrap().len(),
+            21,
+            "压缩本体一个字不少"
+        );
+        assert_eq!(history, f.db.messages(&sid).unwrap());
+    }
+
+    /// run_turn 级：开关关掉时请求头不带任何记忆备注（画像/召回都不许出现）。
+    #[tokio::test]
+    async fn memory_disabled_request_head_carries_no_memory_notes() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.set_profile("用户是 Rust 开发者").unwrap();
+        f.db
+            .add_memory(&NewMemory {
+                session_id: None,
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在".into()),
+                object: Some("北京".into()),
+                body: "用户住在北京".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        seed(
+            &f.db,
+            &sid,
+            &[
+                Message::user(vec![ContentBlock::Text { text: "上一轮".into() }]),
+                Message {
+                    role: Role::Assistant,
+                    blocks: vec![ContentBlock::Text { text: "上一答".into() }],
+                },
+            ],
+        );
+        let model = FakeModel::build(&[], &["好的"]);
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        let reason = run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: model.clone(),
+                sink: sink.clone(),
+                context: ContextConfig::default(),
+                temperature: None,
+                roots: Vec::new(),
+                memory: MemoryTurnCfg {
+                    enabled: false,
+                    ..Default::default()
+                },
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "北京有什么好玩的".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        sink.flush();
+        assert_eq!(reason, StopReason::EndTurn);
+        let calls = model.calls();
+        assert_eq!(calls.len(), 1, "短历史不压缩，唯一的调用就是回答");
+        for m in &calls[0].messages {
+            let t = m.text_of();
+            assert!(
+                !t.starts_with("[用户画像]") && !t.starts_with("[长期记忆"),
+                "总开关关掉时请求头不许带任何记忆备注，实得:{t}"
+            );
+        }
+        // 数据还在：关闭是停用，不是清除 —— 开回来记忆必须原样召回（清空的入口在设置页）。
+        assert_eq!(f.db.valid_memories().unwrap().len(), 1);
+        assert_eq!(f.db.profile().unwrap(), "用户是 Rust 开发者");
+    }
+
+    /// `memory_settings_flow_from_turn_deps` 的共用跑法：种好库、按给定 cfg 跑一轮，
+    /// 取模型看到的请求（R57：装配结果只能从模型那一侧取证）。
+    /// T6:嵌入客户端也是一轮的输入,None = off/构造失败(与 T5 行为逐字一致)。
+    async fn run_one_memory_turn(
+        f: &Fixture,
+        memory: MemoryTurnCfg,
+        embed: Option<Arc<dyn EmbedProvider>>,
+    ) -> Vec<ChatRequest> {
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let model = FakeModel::build(&[], &["好的"]);
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: model.clone(),
+                sink: sink.clone(),
+                context: ContextConfig::default(),
+                temperature: None,
+                roots: Vec::new(),
+                memory,
+                embed,
+                extract_locks: ExtractLocks::default(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "北京有什么好玩的".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        sink.flush();
+        model.calls()
+    }
+
+    /// 三条都命中「北京」的记忆 + 一份画像，两个 run 共用。
+    fn seed_beijing_memories(f: &Fixture) {
+        f.db.set_profile("用户是 Rust 开发者").unwrap();
+        for (object, body) in [
+            ("北京", "用户住在北京"),
+            ("出差", "用户去北京出差"),
+            ("秋天", "用户喜欢北京的秋天"),
+        ] {
+            f.db
+                .add_memory(&NewMemory {
+                    session_id: None,
+                    kind: "fact".into(),
+                    subject: Some("用户".into()),
+                    predicate: Some("住在北京".into()),
+                    object: Some(object.into()),
+                    body: body.into(),
+                    confidence: 0.9,
+                    due_at: None,
+                })
+                .unwrap();
+        }
+    }
+
+    /// 设置真的流进了装配：recall_k=2 时三条命中最多进两条（默认 5 会是三条）；
+    /// note cap 压到极小时召回整条让路、画像照常 —— 两条装配口径都吃 `TurnDeps.memory`。
+    #[tokio::test]
+    async fn memory_settings_flow_from_turn_deps() {
+        let f = Fixture::new();
+        seed_beijing_memories(&f);
+        let calls = run_one_memory_turn(
+            &f,
+            MemoryTurnCfg {
+                recall_k: 2,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let recall = calls[0]
+            .messages
+            .iter()
+            .find(|m| m.text_of().starts_with("[长期记忆"))
+            .expect("k=2 时召回必须在请求头里");
+        let lines = recall
+            .text_of()
+            .lines()
+            .filter(|l| l.starts_with("- "))
+            .count();
+        assert_eq!(
+            lines, 2,
+            "recall_k=2 必须生效（默认 5 会是三条），实得:{}",
+            recall.text_of()
+        );
+
+        let f = Fixture::new();
+        seed_beijing_memories(&f);
+        let calls = run_one_memory_turn(
+            &f,
+            MemoryTurnCfg {
+                note_token_cap: 1,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        assert!(
+            !calls[0]
+                .messages
+                .iter()
+                .any(|m| m.text_of().starts_with("[长期记忆")),
+            "cap=1 连表头都装不下 ⇒ 召回必须整条让路"
+        );
+        assert!(
+            calls[0]
+                .messages
+                .iter()
+                .any(|m| m.text_of().starts_with("[用户画像]")),
+            "画像永不因超限丢失"
+        );
+    }
+
+    /// 两份默认值必须逐字相同：`MemoryTurnCfg::default` 是测试夹具的锚，
+    /// `Settings::default` 是生产装配（`send_message`）的锚 —— 分叉了，
+    /// 「测试看到的记忆行为」和「用户拿到的」就不是一回事。
+    #[test]
+    fn memory_turn_cfg_defaults_match_the_settings_defaults() {
+        let s = Settings::default();
+        let c = MemoryTurnCfg::default();
+        assert_eq!(c.enabled, s.memory_enabled);
+        assert_eq!(c.recall_k, s.memory_recall_k as usize);
+        assert_eq!(c.note_token_cap, s.memory_note_token_cap as usize);
+        assert_eq!(c.profile_char_cap, s.memory_profile_char_cap as usize);
+        // T10:待办窗口没有对应设置项(裁定:先固定 24 小时),所以它只与常量对齐 ——
+        // 这一条断言的意义是「默认值不许在别处被悄悄改成别的数字」。
+        assert_eq!(c.prospective_window_hours, MEMORY_PROSPECTIVE_WINDOW_HOURS);
+        assert_eq!(c.prospective_window_hours, 24);
+        // T12:两个节奏旋钮也必须在默认值上对齐 —— 这一对是「同一条线」在默认值层面的证明:
+        // `Send_message` 与 `MemoryTurnCfg::default` 任何一侧偷偷写死别的数,这里当场红。
+        assert_eq!(c.prospective_window_hours, s.memory_prospective_window_hours);
+        assert_eq!(c.fact_half_life_days, s.memory_decay_half_life_days as f64);
+        // T6 两键:布尔是 source=="endpoint" 的现算形态;模型名逐字透传。
+        assert_eq!(c.embedding_endpoint, s.memory_embedding_source == "endpoint");
+        assert_eq!(c.embedding_model, s.memory_embedding_model);
+        // source 归一后只有两种取值,布尔与字符串的换算因此是精确的(没有第三态可漏)。
+        assert_eq!(s.memory_embedding_source, "endpoint");
+    }
+
+    /// T12:装配函数是 `Settings → MemoryTurnCfg` 的唯一一处转换,所以两个新设置项
+    /// **改了就一定到达装配**这件事只能在这里钉。`send_message` 本身是
+    /// `#[tauri::command]`、单测调不动(本模块测试头的 R103 段);把它拆成这个纯函数,
+    /// 就是为了让「设置里改了 7 天半衰期 / 72 小时窗口,这一轮就按 7 天 / 72 小时跑」
+    /// 有一个不依赖 tauri 的判据。
+    #[test]
+    fn the_turn_cfg_takes_both_pacing_settings_from_the_settings_table() {
+        let s = Settings {
+            memory_decay_half_life_days: 7,
+            memory_prospective_window_hours: 72,
+            ..Default::default()
+        };
+        let c = memory_turn_cfg(&s);
+        assert_eq!(c.fact_half_life_days, 7.0, "半衰期必须原样转成 f64");
+        assert_eq!(c.prospective_window_hours, 72, "待办窗口必须读设置,不许写死 24");
+        // 其余键不许被这次转换顺手改掉(一个装配函数改两项,别的项必须原样)。
+        assert_eq!(c.recall_k, s.memory_recall_k as usize);
+        assert_eq!(c.note_token_cap, s.memory_note_token_cap as usize);
+        assert_eq!(c.profile_char_cap, s.memory_profile_char_cap as usize);
+        assert_eq!(c.enabled, s.memory_enabled);
+    }
+
+    /// T12:半衰期真的从参数流进打分。夹具是 store 侧 `decay_can_flip_the_order_…`
+    /// 的同款:一条**更相关但更旧**的记忆(含查询全部 gram)对一条较新、较不相关的。
+    /// 半衰期长到 10 年时旧行仍然霸榜;缩到 60 天(默认锚点)时旧行被压到新的后面。
+    ///
+    /// 两次测量必须用**两个独立的库**:`search_memories` 的「访问即再巩固」会把
+    /// `last_accessed` 刷成 now,同一个库上跑第二次时旧行已经变新鲜了,测的就是
+    /// 再巩固而不是半衰期 —— 那正是这条测试最容易被写假的地方。
+    #[test]
+    fn a_shorter_half_life_sinks_an_old_but_more_relevant_memory_below_a_fresh_one() {
+        const DAY_MS: i64 = 86_400_000;
+        // 每个夹具种同样的两行:旧的含查询全部 gram(相关性 1.0),新的只含 5/8(0.625)。
+        let seed = |f: &Fixture| {
+            // 新的那条:只含查询的一部分 gram(相关性 0.625),但 age = 0。
+            f.db.add_memory(&NewMemory {
+                session_id: None,
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在".into()),
+                object: Some("北京".into()),
+                body: "用户住在北京".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+            let old = f
+                .db
+                .add_memory(&NewMemory {
+                    session_id: None,
+                    kind: "fact".into(),
+                    subject: Some("用户".into()),
+                    predicate: Some("住在".into()),
+                    object: Some("北京朝阳区".into()),
+                    body: "用户住在北京朝阳区".into(),
+                    confidence: 0.9,
+                    due_at: None,
+                })
+                .unwrap();
+            // 旧的那条:含查询全部 gram(相关性 1.0),但 900 天没被碰过。
+            {
+                let c = f.db.lock();
+                let ancient = Db::now_ms() - 900 * DAY_MS;
+                c.execute(
+                    "UPDATE memories SET valid_from=?2, updated_at=?2 WHERE id=?1",
+                    params![old, ancient],
+                )
+                .unwrap();
+            }
+        };
+
+        let long_lived = Fixture::new();
+        seed(&long_lived);
+        let note = memory_notes_for_turn(
+            &long_lived.db,
+            "用户住在北京朝阳区",
+            None,
+            1,
+            600,
+            24,
+            3650.0,
+        )
+        .unwrap();
+        let recall = note
+            .iter()
+            .find(|n| n.starts_with("[长期记忆"))
+            .expect("召回备注必须在");
+        assert!(
+            recall.contains("朝阳区"),
+            "半衰期 10 年 ⇒ 900 天只掉了约 15%,更相关的旧行仍该排第一:{recall}"
+        );
+
+        let short_lived = Fixture::new();
+        seed(&short_lived);
+        let note = memory_notes_for_turn(
+            &short_lived.db,
+            "用户住在北京朝阳区",
+            None,
+            1,
+            600,
+            24,
+            60.0,
+        )
+        .unwrap();
+        let recall = note
+            .iter()
+            .find(|n| n.starts_with("[长期记忆"))
+            .expect("召回备注必须在");
+        assert!(
+            !recall.contains("朝阳区"),
+            "半衰期 60 天 ⇒ 900 天掉到下限,更相关的旧行必须沉到新的后面:{recall}"
+        );
+        assert!(
+            recall.contains("用户住在北京"),
+            "新的那条必须在:{recall}"
+        );
+    }
+
+    // ==== T6:嵌入端点客户端 + 混合召回(读/写两条路径) ====
+
+    use rusqlite::params;
+
+    /// 关键词假嵌入器:文本含 `keyword` → 与查询同向的单位向量,否则 → 正交向量。
+    /// 向量本身由测试设定,这里只做「哪个词」的映射。
+    struct KeywordEmbedder {
+        keyword: &'static str,
+        hit: &'static [f32],
+        miss: &'static [f32],
+    }
+
+    #[async_trait]
+    impl EmbedProvider for KeywordEmbedder {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            Ok(texts
+                .iter()
+                .map(|t| {
+                    (if t.contains(self.keyword) { self.hit } else { self.miss }).to_vec()
+                })
+                .collect())
+        }
+    }
+
+    /// 永远失败的假嵌入器:写路径/读路径的降级测试都用它。
+    struct FailingEmbedder;
+
+    #[async_trait]
+    impl EmbedProvider for FailingEmbedder {
+        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            Err("端点不可达(测试注入)".to_string())
+        }
+    }
+
+    /// 混合召回端到端:gram 分 0 的「帝都日常」靠与查询同向的向量(0.6 权重)压过
+    /// gram 分 0.5 但无向量的「用户住在北京」(只剩 0.4 权重) —— 语义通道与关键词
+    /// 通道都在同一份排序里真实生效。对照组:embed=None 时「帝都日常」gram 为 0,
+    /// 根本不该出现在召回里(T5 行为逐字保持)。
+    #[tokio::test]
+    async fn a_fake_embedder_reranks_the_recall_head_by_hybrid_score() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db
+            .add_memory(&NewMemory {
+                session_id: None,
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在".into()),
+                object: Some("北京".into()),
+                body: "用户住在北京".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        let semantic = f
+            .db
+            .add_memory(&NewMemory {
+                session_id: None,
+                kind: "fact".into(),
+                subject: None,
+                predicate: None,
+                object: None,
+                body: "帝都日常".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        f.db.set_memory_embedding(semantic, &[1.0, 0.0]).unwrap();
+
+        let model = FakeModel::build(&[], &["好的"]);
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
+        let reason = run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: model.clone(),
+                sink: sink.clone(),
+                context: ContextConfig::default(),
+                temperature: None,
+                roots: Vec::new(),
+                memory: MemoryTurnCfg::default(),
+                extract_locks: ExtractLocks::default(),
+                // 假嵌入器只对**本轮查询**生效(「北京住在哪」含「北京」→ [1,0]);
+                // 行向量走库里已写好的 BLOB —— 读路径的向量来源与写路径解耦,
+                // 这正是要端到端验证的线。
+                embed: Some(Arc::new(KeywordEmbedder {
+                    keyword: "北京",
+                    hit: &[1.0, 0.0],
+                    miss: &[0.0, 1.0],
+                })),
+                cancel: f.cancel.clone(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+            },
+            &sid,
+            vec![ContentBlock::Text {
+                text: "北京住在哪".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        sink.flush();
+        assert_eq!(reason, StopReason::EndTurn);
+
+        let recall = model
+            .calls()
+            .remove(0)
+            .messages
+            .into_iter()
+            .find(|m| m.text_of().starts_with("[长期记忆"))
+            .expect("带嵌入的查询必须召回出结果");
+        let beijing = recall.text_of().find("用户住在北京").expect("gram 命中的行必须在");
+        let dudu = recall.text_of().find("帝都日常").expect("向量行必须进召回");
+        assert!(
+            dudu < beijing,
+            "gram=0 的向量行(0.6 分)必须排在 gram 命中的无向量行(0.4 分)之前,实得:{}",
+            recall.text_of()
+        );
+
+        // 对照组:同一批数据,embed=None → 纯关键词,「帝都日常」gram=0 不入召回。
+        let calls = run_one_memory_turn(&f, MemoryTurnCfg::default(), None).await;
+        let plain = calls
+            .into_iter()
+            .next()
+            .unwrap()
+            .messages
+            .into_iter()
+            .find(|m| m.text_of().starts_with("[长期记忆"))
+            .expect("纯关键词路径照样召回到北京行");
+        assert!(
+            !plain.text_of().contains("帝都日常"),
+            "embed=None 必须与 T5 逐字一致:gram 零重叠的行不许出现,实得:{}",
+            plain.text_of()
+        );
+        assert!(plain.text_of().contains("用户住在北京"));
+    }
+
+    /// 查询嵌入失败(网络断/端点 4xx):本轮退化为纯关键词,**不许阻塞对话** ——
+    /// 回答照常、召回照常有 gram 命中的行。无跨轮状态 ⇒ 下一次发送自然重试,
+    /// 没有任何缓存要失效。
+    #[tokio::test]
+    async fn a_failing_query_embed_degrades_to_keyword_recall_without_blocking() {
+        let f = Fixture::new();
+        seed_beijing_memories(&f);
+        let calls = run_one_memory_turn(&f, MemoryTurnCfg::default(), Some(Arc::new(FailingEmbedder)))
+            .await;
+        let recall = calls[0]
+            .messages
+            .iter()
+            .find(|m| m.text_of().starts_with("[长期记忆"))
+            .expect("嵌入失败只降级通道,不消灭召回");
+        assert!(
+            recall.text_of().contains("用户住在北京"),
+            "gram 通道必须还在工作:{}",
+            recall.text_of()
+        );
+        assert_eq!(
+            calls[0]
+                .messages
+                .iter()
+                .filter(|m| m.text_of().starts_with("[用户画像]"))
+                .count(),
+            1,
+            "画像照常注入:降级的只是向量半边"
+        );
+    }
+
+    /// 压缩事务提交后,新增记忆行被补写向量:BLOB 里就是假嵌入器对 body 的输出
+    /// (直接读 BLOB 取证,不经 search —— 检索行为由 store 层自己的测试管)。
+    #[tokio::test]
+    async fn compaction_embeds_the_new_memory_rows_after_the_transaction() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+            &[],
+        );
+        // body 含「上海」⇒ 假嵌入器对它给 hit 向量 [1,0],事务提交后应原样落进 BLOB。
+        let (_, event, _) = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            Some(Arc::new(KeywordEmbedder {
+                keyword: "上海",
+                hit: &[1.0, 0.0],
+                miss: &[0.0, 1.0],
+            })),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(event.is_some(), "压缩本体照常");
+
+        let rows = f.db.valid_memories().unwrap();
+        assert_eq!(rows.len(), 1);
+        let c = f.db.lock();
+        let blob: Vec<u8> = c
+            .query_row(
+                "SELECT embedding FROM memories WHERE id=?1",
+                params![rows[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(c);
+        assert_eq!(
+            crate::store::memory::from_vec(&blob).unwrap(),
+            vec![1.0f32, 0.0],
+            "嵌入补写必须把向量写进新行的 BLOB"
+        );
+    }
+
+    /// 嵌入失败(端点挂了):记忆行**照常落库**,纯关键词照样能召回 ——
+    /// 失败只降级,不回滚压缩事务、不丢行、不阻塞(裁定 4,spec §8 不变量 5)。
+    #[tokio::test]
+    async fn a_failing_memory_embedder_keeps_new_rows_keyword_searchable() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let before = f.db.messages(&sid).unwrap();
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+            &[],
+        );
+        let (_, event, _) = compact_once(
+            &f,
+            &model,
+            &sid,
+            before,
+            compacting_cfg(),
+            &MemoryTurnCfg::default(),
+            Some(Arc::new(FailingEmbedder)),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(event.is_some(), "嵌入失败不许阻塞压缩");
+        let rows = f.db.valid_memories().unwrap();
+        assert_eq!(rows.len(), 1, "行必须保留");
+        // BLOB 仍是 NULL(嵌入没成),但关键词通道完好。
+        let c = f.db.lock();
+        let blob: Option<Vec<u8>> = c
+            .query_row(
+                "SELECT embedding FROM memories WHERE id=?1",
+                params![rows[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(c);
+        assert!(blob.is_none(), "失败不许写出半截向量");
+        let hits = f.db.search_memories("上海", None, 10, &RecallCfg::default()).unwrap();
+        assert_eq!(hits.len(), 1, "关键词召回照常工作");
+    }
+
+    /// 设置页审计视图的线上形状：字段与 `MemoryRow` 同名同序（snake_case，与
+    /// `SessionRow` 的线上惯例一致）+ 计算字段 `valid`（= invalid_at 是否为空 ——
+    /// 判据与当前时间无关，前端不该被邀请去比时间）。
+    #[test]
+    fn the_memory_view_keeps_the_row_shape_and_marks_validity() {
+        let f = Fixture::new();
+        let dead = f
+            .db
+            .add_memory(&NewMemory {
+                session_id: Some("s1".into()),
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在".into()),
+                object: Some("北京".into()),
+                body: "用户住在北京".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        f.db
+            .add_memory(&NewMemory {
+                session_id: None,
+                kind: "preference".into(),
+                subject: None,
+                predicate: None,
+                object: None,
+                body: "用户喜欢咖啡".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        f.db.invalidate_memory(dead).unwrap();
+
+        let views: Vec<MemoryView> = f
+            .db
+            .all_memories()
+            .unwrap()
+            .into_iter()
+            .map(MemoryView::from)
+            .collect();
+        assert_eq!(views.len(), 2);
+        let by_id: std::collections::HashMap<i64, &MemoryView> =
+            views.iter().map(|v| (v.id, v)).collect();
+        assert!(!by_id[&dead].valid, "invalid_at 非空 ⇒ valid=false");
+        assert!(by_id[&dead].invalid_at.is_some());
+        assert!(
+            views.iter().any(|v| v.id != dead && v.valid),
+            "invalid_at 为空 ⇒ valid=true"
+        );
+
+        let v = serde_json::to_value(&views[0]).unwrap();
+        for key in [
+            "id",
+            "session_id",
+            "kind",
+            "subject",
+            "predicate",
+            "object",
+            "body",
+            "confidence",
+            "valid_from",
+            "invalid_at",
+            "updated_at",
+            "valid",
+            // T12：强度与待办状态也必须出现在线上形状里（设置页每行要显示）。
+            "reinforcements",
+            "due_at",
+            "is_due",
+        ] {
+            assert!(v.get(key).is_some(), "缺键 {key}:{v:?}");
+        }
+        let wire = serde_json::to_string(&views).unwrap();
+        assert!(
+            !wire.contains("sessionId"),
+            "线上惯例是 snake_case（与 SessionRow 一致），camelCase 键前端读不到:{wire}"
+        );
+    }
+
+    /// T12:设置页每行要显示的三项 —— 确认次数、待办日期、「已到期」。
+    /// `is_due` 在 Rust 侧现算(= `due_at` 非空且 `<= now`),前端不复算第二遍:
+    /// 两处比较时间的写法会在时区/时钟漂移上分叉,而这里只需要一个布尔。
+    #[test]
+    fn the_memory_view_exposes_reinforcement_count_and_the_prospective_due_state() {
+        let f = Fixture::new();
+        const DAY_MS: i64 = 86_400_000;
+        let overdue = Db::now_ms() - DAY_MS;
+        let id = f
+            .db
+            .add_memory(&NewMemory {
+                session_id: None,
+                kind: "prospective".into(),
+                subject: Some("用户".into()),
+                predicate: Some("要".into()),
+                object: Some("交季度报告".into()),
+                body: "用户要在明天交季度报告".into(),
+                confidence: 0.9,
+                due_at: Some(overdue),
+            })
+            .unwrap();
+        f.db.reinforce_memory(id).unwrap();
+        f.db.reinforce_memory(id).unwrap();
+        let up = f
+            .db
+            .add_memory(&NewMemory {
+                session_id: None,
+                kind: "prospective".into(),
+                subject: Some("用户".into()),
+                predicate: Some("要".into()),
+                object: Some("体检".into()),
+                body: "用户下个月要体检".into(),
+                confidence: 0.9,
+                due_at: Some(Db::now_ms() + DAY_MS),
+            })
+            .unwrap();
+        let fact = f
+            .db
+            .add_memory(&NewMemory {
+                session_id: None,
+                kind: "fact".into(),
+                subject: None,
+                predicate: None,
+                object: None,
+                body: "用户住在北京".into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+
+        let views: std::collections::HashMap<i64, MemoryView> = f
+            .db
+            .all_memories()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.id, MemoryView::from(r)))
+            .collect();
+        let v = &views[&id];
+        assert_eq!(v.reinforcements, 2, "确认次数必须原样出现在视图里");
+        assert_eq!(v.due_at, Some(overdue), "到期时刻原样透传");
+        assert!(v.is_due, "due_at <= now ⇒ 已到期");
+        let v = &views[&up];
+        assert_eq!(v.reinforcements, 0);
+        assert!(!v.is_due, "未来的待办不算已到期");
+        let v = &views[&fact];
+        assert_eq!(v.due_at, None, "非待办没有到期时刻");
+        assert!(!v.user_edited, "模型抽出来的行不是用户编辑的");
+
+        // P0:用户改过的行必须在视图里看得出来 —— 前端的「已编辑」标记只认这个字段,
+        // 它漏传的话用户永远看不到「模型以后不会改写它」的那条承诺被兑现。
+        f.db.update_memory_body_by_user(fact, "用户住在上海")
+            .unwrap();
+        let v = MemoryView::from(
+            f.db.all_memories()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == fact)
+                .unwrap(),
+        );
+        assert!(v.user_edited, "用户编辑标记必须出现在视图里");
+        assert_eq!(v.body, "用户住在上海");
+        assert!(!v.is_due, "没有 due_at 的永远不算已到期");
+
+        // 线上形状是 snake_case 的三个新键(前端 types.ts 的镜像靠这一条兜住)。
+        let wire = serde_json::to_value(&views[&id]).unwrap();
+        assert_eq!(wire["reinforcements"], 2);
+        assert_eq!(wire["is_due"], true);
+        assert_eq!(wire["due_at"], overdue);
+    }
+
+    // ==== T10:注入侧的三个类人机制(编码特异性 / 前瞻记忆 / 元记忆)====
+
+    /// 机制一的纯函数:上一轮用户消息拼在本轮消息之前,换行分隔。
+    #[test]
+    fn recall_query_prefixes_the_current_message_with_the_previous_user_turn() {
+        let history = vec![
+            Message::user(vec![ContentBlock::Text {
+                text: "更早的一句".into(),
+            }]),
+            Message {
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: "上一答".into(),
+                }],
+            },
+            Message::user(vec![ContentBlock::Text {
+                text: "上一轮说的话".into(),
+            }]),
+        ];
+        assert_eq!(
+            recall_query(&history, "那它呢"),
+            "上一轮说的话\n那它呢",
+            "最后一条用户消息才是线索,助手消息不许顶替"
+        );
+    }
+
+    /// 历史里没有用户消息(空历史 / 全是助手与备注)→ 只返回当前消息。
+    #[test]
+    fn recall_query_returns_only_the_current_message_when_no_prior_user_turn_exists() {
+        assert_eq!(recall_query(&[], "那它呢"), "那它呢", "空历史");
+        let history = vec![
+            Message::system_note("早期对话摘要：……"),
+            Message {
+                role: Role::Assistant,
+                blocks: vec![ContentBlock::Text {
+                    text: "上一答".into(),
+                }],
+            },
+        ];
+        assert_eq!(recall_query(&history, "那它呢"), "那它呢");
+    }
+
+    /// 工具结果消息的 role 也是 User,但它不是用户说的话 —— 跳过它,继续往前找。
+    /// 只剩工具结果时退化为「没有上一轮」。
+    #[test]
+    fn recall_query_skips_tool_result_messages_when_looking_for_the_prior_turn() {
+        let tool_result = || {
+            Message::tool(
+                "c1",
+                ToolOutput::Text {
+                    text: "工具返回的一堆数据".into(),
+                },
+                false,
+            )
+        };
+        let history = vec![
+            Message::user(vec![ContentBlock::Text {
+                text: "真正的上一句".into(),
+            }]),
+            tool_result(),
+        ];
+        assert_eq!(
+            recall_query(&history, "那它呢"),
+            "真正的上一句\n那它呢",
+            "工具结果不许被当成用户的话"
+        );
+
+        let only_tool = vec![tool_result()];
+        assert_eq!(recall_query(&only_tool, "那它呢"), "那它呢");
+    }
+
+    /// 上一轮文本超过 200 字符 → 截前 200 字符,别把窗口外的旧话题拖进检索。
+    #[test]
+    fn recall_query_truncates_the_prior_turn_to_two_hundred_characters() {
+        let long: String = std::iter::repeat_n('字', 250).collect();
+        let history = vec![Message::user(vec![ContentBlock::Text { text: long }])];
+        let got = recall_query(&history, "那它呢");
+        let (prior, current) = got.split_once('\n').expect("换行分隔");
+        assert_eq!(prior.chars().count(), RECALL_QUERY_PRIOR_CHARS, "截到 200 字符");
+        assert_eq!(current, "那它呢");
+        assert_eq!(RECALL_QUERY_PRIOR_CHARS, 200);
+    }
+
+    /// 上一轮用户消息的文本为空(纯图片轮)→ 只返回当前消息,不拼一条空线索。
+    #[test]
+    fn recall_query_returns_only_the_current_message_when_the_prior_turn_has_no_text() {
+        let history = vec![Message::user(vec![ContentBlock::Image {
+            data: "iVBORw0KGgo=".into(),
+            mime: crate::agent::types::ImageMime::Png,
+        }])];
+        assert_eq!(recall_query(&history, "这是什么"), "这是什么");
+    }
+
+    /// 共用跑法:按给定 cfg 跑一轮,交回模型看到的全部请求(R57:装配结果只能从
+    /// 模型那一侧取证)。与本文件既有的 `run_one_memory_turn` 分开,是因为 T10 的
+    /// 多轮测试要自己控制 session 与历史。
+    async fn run_memory_turn(
+        f: &Fixture,
+        sid: &str,
+        model: &Arc<FakeModel>,
+        memory: MemoryTurnCfg,
+        text: &str,
+    ) -> Vec<ChatRequest> {
+        let rec = Arc::new(Recorded::default());
+        let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.to_string()));
+        run_turn(
+            TurnDeps {
+                db: f.db.clone(),
+                registry: f.registry.clone(),
+                gate: f.gate.clone(),
+                model: model.clone(),
+                sink: sink.clone(),
+                context: ContextConfig::default(),
+                temperature: None,
+                roots: Vec::new(),
+                memory,
+                embed: None,
+                extract_locks: crate::ipc::ExtractLocks::default(),
+                skills_dir: None,
+                skills_disabled: Vec::new(),
+                cancel: f.cancel.clone(),
+            },
+            sid,
+            vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+        sink.flush();
+        model.calls()
+    }
+
+    /// 请求头里以某前缀开头的那条备注(没有就是 None)。
+    fn head_note(req: &ChatRequest, prefix: &str) -> Option<String> {
+        req.messages
+            .iter()
+            .find(|m| m.text_of().starts_with(prefix))
+            .map(|m| m.text_of())
+    }
+
+    /// 批量种待办:第 i 条的到期时刻是 `now + i*hours`,body 由调用方给。
+    fn seed_prospective(f: &Fixture, body: &str, due_in_hours: i64) -> i64 {
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "prospective".into(),
+            subject: Some("用户".into()),
+            predicate: Some("要做".into()),
+            object: Some(body.into()),
+            body: body.into(),
+            confidence: 0.95,
+            due_at: Some(Db::now_ms() + due_in_hours * 60 * 60 * 1_000),
+        })
+        .unwrap()
+    }
+
+    /// 提醒里的到期日按 UTC 的 `YYYY-MM-DD` 格式化(与 T9 的解析同一口径:
+    /// 无时区字面值按 UTC 解释)。`1_793_523_600_000` = 2026-11-01T09:00:00Z。
+    #[test]
+    fn due_date_labels_use_the_same_utc_calendar_as_t9_parsing() {
+        assert_eq!(due_date_label(1_793_523_600_000), "2026-11-01");
+        assert_eq!(due_date_label(0), "1970-01-01", "月/日必须补零");
+    }
+
+    /// 机制二的端到端:第一轮追问「那它呢」本身没有实体,靠编码特异性把上一轮的
+    /// 「我在上海工作」拼进 query,才召回到含「上海」的记忆。
+    /// 对照:两条文本的 2-gram 零重叠(「那它呢」⇔「用户在上海工作」),所以这条
+    /// 召回只可能来自上一轮上下文的拼接。
+    #[tokio::test]
+    async fn a_follow_up_question_recalls_memories_through_the_previous_user_turn() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "fact".into(),
+            subject: Some("用户".into()),
+            predicate: Some("工作于".into()),
+            object: Some("上海".into()),
+            body: "用户在上海工作".into(),
+            confidence: 0.95,
+            due_at: None,
+        })
+        .unwrap();
+        let model = FakeModel::build(&[], &["好的", "好的"]);
+
+        // 第一轮:把「我在上海工作」写进历史(压缩后历史里它就是上一轮)。
+        run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "我在上海工作").await;
+        // 第二轮:只有指代词。
+        let calls =
+            run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "那它呢").await;
+        assert_eq!(calls.len(), 2, "短历史 ⇒ 每轮只有回答一次调用");
+
+        let recall = head_note(&calls[1], "[长期记忆")
+            .unwrap_or_else(|| panic!("第二轮必须召回:上一轮上下文被拼进了 query"));
+        assert!(
+            recall.contains("用户在上海工作"),
+            "含「上海」的记忆必须靠上一轮上下文被召回,实得:{recall}"
+        );
+    }
+
+    /// 机制二:到期窗口内的待办在本轮 head 里出现一次,并立刻标记 `notified_at`;
+    /// 第二轮不再提醒。提醒文本的形状也在这里钉住(前缀 + 正文 + 到期日)。
+    #[tokio::test]
+    async fn a_due_prospective_is_reminded_once_and_then_marked_notified() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed_prospective(&f, "交季度报告", 3);
+        let model = FakeModel::build(&[], &["好的", "好的"]);
+
+        let calls = run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "你好").await;
+        let due = head_note(&calls[0], "[待办提醒]").expect("到期窗口内的待办必须提醒");
+        assert!(due.contains("交季度报告"), "提醒里必须有待办正文:{due}");
+        assert!(
+            due.contains('(') && due.contains(')'),
+            "到期日必须附在正文后面:{due}"
+        );
+        assert!(
+            f.db.all_memories().unwrap()[0].notified_at.is_some(),
+            "注入之后必须立刻标记 notified_at"
+        );
+
+        let calls =
+            run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "又一句").await;
+        assert!(
+            head_note(&calls[1], "[待办提醒]").is_none(),
+            "提醒过的不许每轮重复:notified_at 是唯一闸门"
+        );
+    }
+
+    /// 机制二的上限:一次最多提醒 5 条;第 6 条这一轮**不提醒也不标记**,
+    /// 留给下一轮 —— 一次刷十条会淹没真正的紧急项。
+    #[tokio::test]
+    async fn at_most_five_due_prospectives_are_reminded_and_the_rest_wait_for_the_next_turn() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let bodies = [
+            "待办一", "待办二", "待办三", "待办四", "待办五", "待办六",
+        ];
+        for (i, body) in bodies.iter().enumerate() {
+            seed_prospective(&f, body, i as i64 + 1);
+        }
+        let model = FakeModel::build(&[], &["好的", "好的"]);
+
+        let calls = run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "开始").await;
+        let due = head_note(&calls[0], "[待办提醒]").expect("有 6 条待办,前 5 条必须提醒");
+        for body in &bodies[..5] {
+            assert!(due.contains(body), "前 5 条都该在:{body} / {due}");
+        }
+        assert!(
+            !due.contains("待办六"),
+            "第 6 条这一轮不许提醒(否则 5 条上限没有意义):{due}"
+        );
+        let notified: Vec<bool> = f
+            .db
+            .all_memories()
+            .unwrap()
+            .iter()
+            .map(|m| m.notified_at.is_some())
+            .collect();
+        assert_eq!(
+            notified,
+            vec![true, true, true, true, true, false],
+            "只标记真正注入过的那 5 条"
+        );
+
+        let calls =
+            run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "继续").await;
+        let due = head_note(&calls[1], "[待办提醒]")
+            .expect("上一轮留下的第 6 条必须在下一轮提醒");
+        assert!(due.contains("待办六"), "轮到第 6 条了:{due}");
+        for body in &bodies[..5] {
+            assert!(!due.contains(body), "前 5 条已经提醒过,不许再来一次:{due}");
+        }
+    }
+
+    /// 机制二的总开关:disabled 时既不提醒、也**不标记** —— 待办还在库里,
+    /// 用户把记忆开回来时它仍然该被提醒(「停用」不许偷偷消费掉提醒)。
+    #[tokio::test]
+    async fn a_disabled_memory_switch_neither_reminds_nor_marks_due_prospectives() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed_prospective(&f, "交季度报告", 3);
+        let model = FakeModel::build(&[], &["好的"]);
+
+        let calls = run_memory_turn(
+            &f,
+            &sid,
+            &model,
+            MemoryTurnCfg {
+                enabled: false,
+                ..Default::default()
+            },
+            "你好",
+        )
+        .await;
+        assert!(
+            head_note(&calls[0], "[待办提醒]").is_none(),
+            "总开关关掉:请求头零记忆备注"
+        );
+        assert!(
+            f.db.all_memories().unwrap()[0].notified_at.is_none(),
+            "disabled 不许标记:开回来时这条待办还得提醒"
+        );
+    }
+
+    /// 机制三的纯函数:按 kind 计数,中文标签;未知 kind 原样显示;空库 None。
+    #[test]
+    fn overview_note_counts_valid_memories_by_kind_with_chinese_labels() {
+        let f = Fixture::new();
+        assert_eq!(
+            overview_note(&f.db).unwrap(),
+            None,
+            "没有记忆就不注入概览"
+        );
+        for kind in ["fact", "fact", "fact", "preference", "preference"] {
+            f.db.add_memory(&NewMemory {
+                session_id: None,
+                kind: kind.into(),
+                subject: None,
+                predicate: None,
+                object: None,
+                body: format!("一条 {kind} 记忆"),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        }
+        // 未知 kind 原样显示(不猜一个中文名把模型的分类洗掉)。
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "entity_rel".into(),
+            subject: None,
+            predicate: None,
+            object: None,
+            body: "一条关系".into(),
+            confidence: 0.9,
+            due_at: None,
+        })
+        .unwrap();
+
+        // SQL 的 ORDER BY kind:entity_rel < fact < preference。
+        assert_eq!(
+            overview_note(&f.db).unwrap().as_deref(),
+            Some(
+                "[记忆库]你有 6 条长期记忆(entity_rel 1、事实 3、偏好 2),可用 memory_search 工具按需检索。"
+            )
+        );
+    }
+
+    /// 机制三的端到端:有记忆时概览进请求头且条数正确;空库不注入。
+    #[tokio::test]
+    async fn a_memory_overview_is_injected_only_when_the_library_is_non_empty() {
+        // 空库:没有任何 [记忆库] 备注。
+        let empty = Fixture::new();
+        let esid = empty.db.create_session(DEFAULT_TITLE).unwrap();
+        let emodel = FakeModel::build(&[], &["好的"]);
+        let calls =
+            run_memory_turn(&empty, &esid, &emodel, MemoryTurnCfg::default(), "今天天气").await;
+        assert!(
+            head_note(&calls[0], "[记忆库]").is_none(),
+            "空库不注入概览"
+        );
+
+        // 有记忆:3 条事实 + 2 条偏好,概览条数必须对得上。
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        for kind in ["fact", "fact", "fact", "preference", "preference"] {
+            f.db.add_memory(&NewMemory {
+                session_id: None,
+                kind: kind.into(),
+                subject: None,
+                predicate: None,
+                object: None,
+                body: format!("一条 {kind} 记忆"),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
+        }
+        let model = FakeModel::build(&[], &["好的"]);
+        let calls = run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "今天天气").await;
+        let overview = head_note(&calls[0], "[记忆库]").expect("有记忆就必须有概览");
+        assert!(
+            overview.contains("你有 5 条长期记忆(事实 3、偏好 2)"),
+            "概览条数与分布必须正确:{overview}"
+        );
+        assert!(overview.contains("memory_search"), "概览要告诉模型去查:{overview}");
+    }
+
+    /// 机制顺序(硬性):待办 → 画像 → 召回 → 概览 → 历史摘要。一条测试同时钉住
+    /// 五个相对位置 —— 任何两段调换都该在这里红。
+    #[tokio::test]
+    async fn the_head_orders_due_then_profile_then_recall_then_overview_then_summary() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed_prospective(&f, "交季度报告", 3);
+        f.db.set_profile("用户是 Rust 开发者").unwrap();
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "fact".into(),
+            subject: Some("用户".into()),
+            predicate: Some("住在".into()),
+            object: Some("北京".into()),
+            body: "用户住在北京".into(),
+            confidence: 0.9,
+            due_at: None,
+        })
+        .unwrap();
+        // 历史里放一条摘要备注:head 里它排在全部记忆备注之后。
+        seed(
+            &f.db,
+            &sid,
+            &[
+                Message::system_note("早期对话摘要：之前聊过 Debian"),
+                Message::user(vec![ContentBlock::Text {
+                    text: "上一轮".into(),
+                }]),
+                Message {
+                    role: Role::Assistant,
+                    blocks: vec![ContentBlock::Text {
+                        text: "上一答".into(),
+                    }],
+                },
+            ],
+        );
+        let model = FakeModel::build(&[], &["好的"]);
+        let calls = run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "北京有什么好玩的").await;
+
+        let msgs = &calls[0].messages;
+        let index_of = |prefix: &str| {
+            msgs.iter()
+                .position(|m| m.text_of().starts_with(prefix))
+                .unwrap_or_else(|| panic!("请求头缺少 {prefix} 备注"))
+        };
+        let due = index_of("[待办提醒]");
+        let profile = index_of("[用户画像]");
+        let recall = index_of("[长期记忆");
+        let overview = index_of("[记忆库]");
+        let summary = index_of("早期对话摘要：");
+        assert!(due < profile, "待办必须最先被看到:due={due} profile={profile}");
+        assert!(profile < recall, "画像是常驻背景,排在召回之前");
+        assert!(recall < overview, "概览是最后一条记忆备注");
+        assert!(
+            overview < summary,
+            "概览必须紧挨历史摘要之前:overview={overview} summary={summary}"
+        );
+        assert_eq!(
+            0,
+            msgs.iter().position(|m| m.role == Role::System).unwrap(),
+            "系统提示词仍在最前"
+        );
+    }
+
+    /// 机制二不受 note token 预算约束:cap 压到极小,召回整条让路、概览被砍,
+    /// 待办提醒仍然在 —— 它是「必须说的事」,与可选的召回不是一类。
+    #[tokio::test]
+    async fn due_notes_survive_a_tiny_note_token_cap_while_recall_yields() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed_prospective(&f, "交季度报告", 3);
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "fact".into(),
+            subject: Some("用户".into()),
+            predicate: Some("住在".into()),
+            object: Some("北京".into()),
+            body: "用户住在北京".into(),
+            confidence: 0.9,
+            due_at: None,
+        })
+        .unwrap();
+        let model = FakeModel::build(&[], &["好的"]);
+        let calls = run_memory_turn(
+            &f,
+            &sid,
+            &model,
+            MemoryTurnCfg {
+                note_token_cap: 1,
+                ..Default::default()
+            },
+            "北京有什么好玩的",
+        )
+        .await;
+
+        let due = head_note(&calls[0], "[待办提醒]").expect("待办不受 cap 约束");
+        assert!(due.contains("交季度报告"), "待办正文必须在:{due}");
+        assert!(
+            head_note(&calls[0], "[长期记忆").is_none(),
+            "cap=1 连召回表头都装不下 ⇒ 召回必须让路"
+        );
+        assert!(
+            head_note(&calls[0], "[记忆库]").is_none(),
+            "概览计入 cap,这里也该被砍掉"
+        );
+    }
+
+    /// T5 的四条记忆命令与 `normalize_image` 同一个坑（`generate_handler!` 是宏）：
+    /// 漏登记不编译报错，只会在运行时让前端拿到 not found。机制照抄上面那条守卫。
+    #[test]
+    fn the_memory_commands_are_registered_in_the_handler_list() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ipc.rs"));
+        let list = src
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split("]").next())
+            .expect("找不到 generate_handler 的登记表");
+        let registered: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        for cmd in [
+            "memories_list",
+            "memories_delete",
+            "memories_clear",
+            "memory_profile",
+            // T15/T16(P0):空闲/切换抽取与用户的编辑权。这三条同样是宏登记,
+            // 漏了只会在运行时变成前端的 not found。
+            "memory_flush_session",
+            "memory_update_body",
+            "memory_add",
+        ] {
+            assert!(
+                registered.contains(&cmd),
+                "命令 {cmd} 写了但没登记，前端调用只会拿到 not found:{registered:?}"
+            );
+        }
     }
 
     /// 单轮并发闸门：任何一轮都在跑的时候都不许起第二轮 —— 同会话也不行，
@@ -2814,82 +6906,24 @@ mod tests {
             registered.contains(&"normalize_image"),
             "命令写了但没登记，前端调用只会拿到 not found：{registered:?}"
         );
-        // 技能面板的两条命令同一条判据：没登记就是面板点开一片空。
-        for name in ["skills_list", "skills_open_folder", "skills_set_enabled"] {
+        // 技能面板与记忆面板的命令同一条判据：没登记就是面板点开一片空。
+        for name in [
+            "skills_list",
+            "skills_open_folder",
+            "skills_set_enabled",
+            "memories_list",
+            "memories_delete",
+            "memories_clear",
+            "memory_profile",
+            "memory_flush_session",
+            "memory_update_body",
+            "memory_add",
+        ] {
             assert!(
                 registered.contains(&name),
-                "{name} 写了但没登记，技能面板只会拿到 not found：{registered:?}"
+                "{name} 写了但没登记，对应面板只会拿到 not found：{registered:?}"
             );
         }
-    }
-
-    #[test]
-    fn the_skills_view_lists_name_description_and_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        let skill = dir.path().join("translate");
-        std::fs::create_dir_all(&skill).unwrap();
-        std::fs::write(
-            skill.join("SKILL.md"),
-            "---\nname: 翻译助手\ndescription: 中英互译\n---\n正文\n",
-        )
-        .unwrap();
-
-        let view = skills_view_of(dir.path(), &crate::skills::Selection::default());
-        assert_eq!(view.root, dir.path().display().to_string());
-        assert_eq!(view.skills.len(), 1, "{:?}", view.skills);
-        assert_eq!(view.skills[0].name, "翻译助手");
-        assert_eq!(view.skills[0].description, "中英互译");
-        assert_eq!(view.skills[0].folder, "translate");
-        assert!(view.skills[0].enabled, "没有选择表时默认启用");
-
-        let mut sel = crate::skills::Selection::default();
-        sel.disabled.push("translate".to_string());
-        let view = skills_view_of(dir.path(), &sel);
-        assert!(
-            !view.skills[0].enabled,
-            "停用的是 enabled=false，不是列表里消失"
-        );
-
-        let empty = tempfile::tempdir().unwrap();
-        let view = skills_view_of(empty.path(), &sel);
-        assert!(view.skills.is_empty(), "空目录要交空表，而不是报错");
-        assert_eq!(view.root, empty.path().display().to_string());
-    }
-
-    #[test]
-    fn toggling_a_skill_persists_and_rejects_unknown_folders() {
-        let skills = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let skill = skills.path().join("translate");
-        std::fs::create_dir_all(&skill).unwrap();
-        std::fs::write(
-            skill.join("SKILL.md"),
-            "---\nname: 翻译助手\ndescription: 中英互译\n---\n正文\n",
-        )
-        .unwrap();
-
-        set_skill_enabled_of(skills.path(), data.path(), "translate", false).unwrap();
-        assert_eq!(
-            crate::skills::load_selection(data.path()).disabled,
-            vec!["translate".to_string()],
-            "停用要落盘（skills.json）"
-        );
-        assert!(!crate::skills::is_enabled(
-            &crate::skills::load_selection(data.path()),
-            "translate"
-        ));
-
-        set_skill_enabled_of(skills.path(), data.path(), "translate", true).unwrap();
-        assert!(
-            crate::skills::load_selection(data.path())
-                .disabled
-                .is_empty(),
-            "重新启用要把这条删掉"
-        );
-
-        let e = set_skill_enabled_of(skills.path(), data.path(), "../etc", false)
-            .expect_err("不存在的文件夹必须拒，选择表里不许出现幽灵记录");
-        assert!(e.contains("没有这个技能"), "{e}");
     }
 
     // ---- resolve_api_key：本机模型免 key 的唯一闸门 ----
@@ -2977,9 +7011,12 @@ mod tests {
             "装配段里 `registry:` 那一行必须**恰好一条**（0 条=换了写法或没了，2 条=两条装配路径）；\
              实得 {wired:?}"
         );
-        assert_eq!(
-            wired[0], "registry: build_production_registry()",
-            "装配点没接上生产工具表：模型永远只有 0 把工具，而其余 405 条单测全绿 \
+        // 按**前缀**匹配而不是整行:T11 起这个函数要收一个 `Arc<Db>` 才能注册
+        // `memory_search`,把整行钉死会让守卫在参数变化时假红。它要防的是
+        // 「这一行不再是生产表的装配点」,不是「参数永远为空」。
+        assert!(
+            wired[0].starts_with("registry: build_production_registry("),
+            "装配点没接上生产工具表：模型永远只有 0 把工具，而其余单测全绿 \
              （`production_registry_ships_fetch_url_and_read_file` 量的是那个函数自己，\
              不是这行接线 —— 实现者亲跑的 M4 就是这个形状）；实得 {:?}",
             wired[0]
@@ -3090,34 +7127,6 @@ mod tests {
         assert!(data.is_dir(), "目录必须被建出来");
     }
 
-    #[test]
-    fn the_skills_dir_sits_beside_the_persona_on_a_portable_stick() {
-        // U 盘布局：<根>\LFTTDO\lfttdo.exe + portable.txt ⇒ 技能在 <根>\skills
-        // （与人设.txt 同层，用户打开 U 盘就能看见，不用钻进应用目录）。
-        let stick = tempfile::tempdir().unwrap();
-        let app_dir = stick.path().join("LFTTDO");
-        std::fs::create_dir_all(&app_dir).unwrap();
-        std::fs::write(app_dir.join("portable.txt"), "portable\n").unwrap();
-        assert_eq!(
-            resolve_skills_dir(Some(&app_dir), &app_dir.join("data")),
-            stick.path().join("skills")
-        );
-
-        // 常规安装 / 没有便携标记：落在数据目录下。
-        let data = tempfile::tempdir().unwrap();
-        let exe_dir = data.path().join("Programs").join("LFTTDO");
-        std::fs::create_dir_all(&exe_dir).unwrap();
-        assert_eq!(
-            resolve_skills_dir(Some(&exe_dir), data.path()),
-            data.path().join("skills")
-        );
-        assert_eq!(
-            resolve_skills_dir(None, data.path()),
-            data.path().join("skills"),
-            "拿不到 exe 路径时也要有一个确定的兜底"
-        );
-    }
-
     #[tokio::test]
     async fn an_empty_mcp_config_bootstraps_to_nothing() {
         let out = mcp_bootstrap(&Arc::new(McpBridge::new()), &ToolRegistry::new(), vec![]).await;
@@ -3173,5 +7182,860 @@ mod tests {
         let removed = mcp_clear_tools(&registry, server, std::slice::from_ref(&decl));
         assert_eq!(removed, vec![registered[0].name.clone()]);
         assert!(registry.get(&registered[0].name).is_none());
+    }
+
+    // ==== T15(P0)：抽取触发（空闲 tick / 切换会话） ====
+
+    /// 测试专用的一条用户消息。抽取源只认带文本的对话行。
+    fn user_says(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    /// 把会话的最后活动时刻推到过去。空闲 tick 的唯一判据是 `sessions.updated_at`，
+    /// 而生产里没有任何路径该改它 —— 所以这里直接写库，**不**为测试开一个 store 方法。
+    fn backdate_session(db: &Db, sid: &str, at_ms: i64) {
+        let c = db.lock();
+        c.execute(
+            "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+            rusqlite::params![sid, at_ms],
+        )
+        .unwrap();
+    }
+
+    /// 抽取请求 = 头一条 system 是 `EXTRACT_INSTRUCTION` 的那些。合并/画像请求也进
+    /// `FakeModel::calls`，不筛掉的话「模型被调用了几次」会把三件事混成一个数。
+    fn extraction_requests(model: &FakeModel) -> Vec<crate::model::provider::ChatRequest> {
+        model
+            .calls()
+            .into_iter()
+            .filter(|r| {
+                r.messages
+                    .first()
+                    .filter(|m| m.role == Role::System)
+                    .map(|m| m.text_of())
+                    .as_deref()
+                    == Some(EXTRACT_INSTRUCTION)
+            })
+            .collect()
+    }
+
+    /// T15 的核心不变量之一：一次抽取最多吃 40 条，超出的部分留给下一个 tick，
+    /// 游标只推进到**真正送进模型**的那一条。
+    ///
+    /// 为什么这条重要：没有上限时，一个聊了 500 轮的会话会在第一次 tick 里把整段
+    /// 历史塞进一次请求（成本不可控）；推进到 45 而不是 40 则会把 41..=45 永久跳过
+    /// —— 那正是「游标推过没抽成的对话」的静默丢失。两半都要钉。
+    #[tokio::test]
+    async fn idle_extraction_takes_at_most_forty_messages_and_advances_only_to_the_last_one_it_saw()
+    {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        for i in 0..45 {
+            f.db.append_message(&sid, &user_says(&format!("第 {i} 句")))
+                .unwrap();
+        }
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+            &[],
+        );
+        let memory = MemoryTurnCfg::default();
+
+        let changed = extract_session_memories(
+            &f.db,
+            &sid,
+            &*model,
+            &memory,
+            None,
+            &ExtractLocks::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("抽取成功");
+        assert_eq!(changed, 1, "一条新事实");
+        assert_eq!(
+            f.db.memory_cursor(&sid).unwrap(),
+            40,
+            "游标停在第 40 条：41..=45 必须留给下一个 tick"
+        );
+        let first = extraction_requests(&model);
+        assert_eq!(first.len(), 1, "第一次只该有一次抽取调用");
+        assert_eq!(
+            first[0].messages.len(),
+            41,
+            "指令 + 40 条对话，多一条都是超限"
+        );
+
+        // 第二个 tick 把剩下的 5 条抽掉。同一候选会撞上第一次写的同键行 ⇒ 合并请求
+        // 走 FakeModel 的默认空回复（解析失败 → 跳过候选），但**抽取本身成功**，
+        // 游标必须继续前进 —— 「没什么新东西」不等于「没抽过」。
+        let changed2 = extract_session_memories(
+            &f.db,
+            &sid,
+            &*model,
+            &memory,
+            None,
+            &ExtractLocks::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("第二次抽取也成功");
+        assert_eq!(changed2, 0, "同键候选在合并段被跳过，不产生变更");
+        assert_eq!(f.db.memory_cursor(&sid).unwrap(), 45, "剩余 5 条处理完");
+        let all = extraction_requests(&model);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].messages.len(), 6, "指令 + 剩下的 5 条");
+    }
+
+    /// T15 与压缩路径**取向相反**的那条：抽取失败时游标不动，下一个 tick 重试。
+    /// 如果这里把 Err 吞成「零写入 + 推进游标」，那 3 条对话就永久不会再被抽取
+    /// （它们已经落在游标之前），下一次压缩会把它们当摘要处理。
+    #[tokio::test]
+    async fn a_failed_idle_extraction_keeps_the_cursor_so_the_next_tick_retries() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        for i in 0..3 {
+            f.db.append_message(&sid, &user_says(&format!("第 {i} 句")))
+                .unwrap();
+        }
+        let memory = MemoryTurnCfg::default();
+        let broken = FakeModel::extraction_failing(&[r#"[{"kind":"fact""#]);
+        let err = extract_session_memories(
+            &f.db,
+            &sid,
+            &*broken,
+            &memory,
+            None,
+            &ExtractLocks::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("抽取调用报错必须冒泡");
+        assert!(err.contains("抽取"), "失败面要说清是哪一段：{err}");
+        assert_eq!(f.db.memory_cursor(&sid).unwrap(), 0, "游标必须原地不动");
+        assert!(
+            f.db.valid_memories().unwrap().is_empty(),
+            "半截输出不许落库"
+        );
+
+        // 重试：换一个能答的模型，同一条对话仍然抽得到（证明游标真的没吞掉它）。
+        let healthy = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+            &[],
+        );
+        let changed = extract_session_memories(
+            &f.db,
+            &sid,
+            &*healthy,
+            &memory,
+            None,
+            &ExtractLocks::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("重试成功");
+        assert_eq!(changed, 1);
+        assert_eq!(f.db.memory_cursor(&sid).unwrap(), 3, "这次才推进");
+    }
+
+    /// 没有新消息时连模型都不调：tick 每分钟跑一次，query 不该变成一次白烧的调用。
+    #[tokio::test]
+    async fn an_idle_extraction_with_nothing_new_never_calls_the_model() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.append_message(&sid, &user_says("已经抽过的一句话"))
+            .unwrap();
+        let max = f.db.max_message_id(&sid).unwrap();
+        f.db.apply_memories_and_advance_cursor(&sid, &[], max)
+            .unwrap();
+
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+            &[],
+        );
+        let changed = extract_session_memories(
+            &f.db,
+            &sid,
+            &*model,
+            &MemoryTurnCfg::default(),
+            None,
+            &ExtractLocks::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("空集是成功，不是错误");
+        assert_eq!(changed, 0);
+        assert!(
+            model.calls().is_empty(),
+            "游标之后没有内容 ⇒ 一次模型调用都不该发生"
+        );
+    }
+
+    /// 画像写入不计入「变更条数」：它是覆盖写，不是一条新记忆。设置页用它显示
+    /// 「这次抽到几条」，把画像算进来会让数字对不上账。
+    #[tokio::test]
+    async fn the_idle_extraction_count_excludes_the_profile_upsert() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.append_message(&sid, &user_says("我在学日语"))
+            .unwrap();
+        let model = FakeModel::with_profile(
+            FakeModel::extracting(
+                &[&format!("[{}]", profile_candidate("用户在学日语"))],
+                &[],
+            ),
+            &["用户在学日语"],
+        );
+        let changed = extract_session_memories(
+            &f.db,
+            &sid,
+            &*model,
+            &MemoryTurnCfg::default(),
+            None,
+            &ExtractLocks::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("抽取成功");
+        assert_eq!(changed, 0, "画像不算一条记忆变更");
+        assert_eq!(f.db.profile().unwrap(), "用户在学日语");
+        assert_eq!(
+            f.db.memory_cursor(&sid).unwrap(),
+            1,
+            "画像写成功也要推进游标"
+        );
+    }
+
+    // ==== T16(P0)：user_edited 保护 ====
+
+    /// 种一条**用户改过**的记忆。先按模型路径落一行（必须有 subject+predicate，
+    /// 否则 `find_active_by_key` 捞不到它，保护集就会是空的），再走用户的编辑入口
+    /// 打上 `user_edited`。返回行 id。
+    fn seed_user_edited_row(db: &Db, sid: &str, body: &str) -> i64 {
+        let ids = db
+            .apply_memories_and_advance_cursor(
+                sid,
+                &[MemoryWrite::Add(NewMemory {
+                    session_id: Some(sid.to_string()),
+                    kind: "fact".into(),
+                    subject: Some("用户".into()),
+                    predicate: Some("住在".into()),
+                    object: Some("北京".into()),
+                    body: body.into(),
+                    confidence: 0.95,
+                    due_at: None,
+                })],
+                0,
+            )
+            .unwrap();
+        let id = ids[0];
+        db.update_memory_body_by_user(id, "用户亲手改过的正文")
+            .unwrap();
+        id
+    }
+
+    /// 模型说 UPDATE，但那一行被用户改过 → 降级成 ADD（并存），用户正文不变。
+    #[tokio::test]
+    async fn an_update_aimed_at_a_user_edited_row_is_downgraded_to_an_add() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let id = seed_user_edited_row(&f.db, &sid, "用户住在北京");
+        let model = FakeModel::with_consolidation(
+            FakeModel::extracting(
+                &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+                &[],
+            ),
+            &[&format!(
+                r#"{{"action":"UPDATE","id":{id},"body":"用户住在上海"}}"#
+            )],
+        );
+        let writes = plan_memory_writes(
+            &f.db,
+            &sid,
+            &*model,
+            &[user_says("我搬到上海了")],
+            500,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(writes.len(), 1, "一条候选只产出一条写入：{writes:?}");
+        assert!(
+            matches!(&writes[0], MemoryWrite::Add(m) if m.body == "用户搬到上海"),
+            "UPDATE 必须降级成 ADD，而不是改写保护行：{writes:?}"
+        );
+
+        f.db.apply_memories_and_advance_cursor(&sid, &writes, 1)
+            .unwrap();
+        let valid = f.db.valid_memories().unwrap();
+        assert!(
+            valid
+                .iter()
+                .any(|r| r.id == id && r.body == "用户亲手改过的正文" && r.user_edited),
+            "用户改过的正文一个字都不许动：{valid:?}"
+        );
+        assert!(
+            valid.iter().any(|r| r.body == "用户搬到上海"),
+            "新候选必须并存入库：{valid:?}"
+        );
+    }
+
+    /// 模型说 INVALIDATE，但那一行被用户改过 → 同样降级成 ADD；**旧行保持有效**。
+    /// 这是「用户权威优先于系统自洽」最直接的一条：模型认为它过时了，但那是用户写的。
+    #[tokio::test]
+    async fn an_invalidate_aimed_at_a_user_edited_row_is_downgraded_and_the_row_stays_valid() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let id = seed_user_edited_row(&f.db, &sid, "用户住在北京");
+        let model = FakeModel::with_consolidation(
+            FakeModel::extracting(
+                &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+                &[],
+            ),
+            &[&format!(r#"{{"action":"INVALIDATE","id":{id}}}"#)],
+        );
+        let writes = plan_memory_writes(
+            &f.db,
+            &sid,
+            &*model,
+            &[user_says("我搬到上海了")],
+            500,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(&writes[..], [MemoryWrite::Add(m)] if m.body == "用户搬到上海"),
+            "INVALIDATE 必须降级成 ADD：{writes:?}"
+        );
+
+        f.db.apply_memories_and_advance_cursor(&sid, &writes, 1)
+            .unwrap();
+        let valid = f.db.valid_memories().unwrap();
+        assert!(
+            valid.iter().any(|r| r.id == id),
+            "用户编辑过的行在模型说 INVALIDATE 之后仍然有效：{valid:?}"
+        );
+        assert!(
+            valid.iter().any(|r| r.body == "用户搬到上海"),
+            "新候选并存：{valid:?}"
+        );
+    }
+
+    /// 单独钉住「失效之后它还在」：上面那条测的是**降级动作**，这条测的是**结果状态**。
+    /// `valid_memories` 是检索/注入的唯一口径（`invalid_at IS NULL`），只要它还在，
+    /// 「用户写下的东西仍然能用」就成立。
+    #[tokio::test]
+    async fn a_user_edited_row_stays_valid_after_the_model_invalidates_it() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let id = seed_user_edited_row(&f.db, &sid, "用户住在北京");
+        let model = FakeModel::with_consolidation(
+            FakeModel::extracting(
+                &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+                &[],
+            ),
+            &[&format!(r#"{{"action":"INVALIDATE","id":{id}}}"#)],
+        );
+        let writes = plan_memory_writes(
+            &f.db,
+            &sid,
+            &*model,
+            &[user_says("我搬到上海了")],
+            500,
+            &CancellationToken::new(),
+        )
+        .await;
+        f.db.apply_memories_and_advance_cursor(&sid, &writes, 1)
+            .unwrap();
+
+        let valid = f.db.valid_memories().unwrap();
+        assert!(
+            valid.iter().any(|r| r.id == id && r.invalid_at.is_none()),
+            "用户编辑过的行不许被模型软删：{valid:?}"
+        );
+        // 反向断言让「根本没写进去」也不至于假绿:同一批里必须有一条新记忆。
+        assert!(
+            valid.iter().any(|r| r.body == "用户搬到上海"),
+            "新旧必须并存：{valid:?}"
+        );
+    }
+
+    /// REINFORCE 指向保护行**允许**：它不改正文，只把「同一件事又被说了一遍」的
+    /// 计数加一。用户写的句子被再说一遍而变强，是正确语义，没有内容需要保护。
+    #[tokio::test]
+    async fn a_reinforce_aimed_at_a_user_edited_row_still_counts() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let id = seed_user_edited_row(&f.db, &sid, "用户住在北京");
+        let model = FakeModel::with_consolidation(
+            FakeModel::extracting(
+                &[&format!("[{}]", fact_candidate("北京", "用户还住在北京"))],
+                &[],
+            ),
+            &[&format!(r#"{{"action":"REINFORCE","id":{id}}}"#)],
+        );
+        let writes = plan_memory_writes(
+            &f.db,
+            &sid,
+            &*model,
+            &[user_says("我还是住在北京")],
+            500,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            writes,
+            vec![MemoryWrite::Reinforce { id }],
+            "强化保护行必须原样放行：{writes:?}"
+        );
+
+        f.db.apply_memories_and_advance_cursor(&sid, &writes, 1)
+            .unwrap();
+        let row = f
+            .db
+            .valid_memories()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("保护行仍然有效");
+        assert_eq!(row.reinforcements, 1, "确认计数必须加一");
+        assert_eq!(
+            row.body, "用户亲手改过的正文",
+            "强化不许碰正文（这正是它可以指向保护行的理由）"
+        );
+    }
+
+    // ==== T15：空闲 tick + 装配接线 ====
+
+    #[tokio::test]
+    async fn the_idle_tick_does_nothing_when_the_user_turned_it_off() {
+        let locks = ExtractLocks::default();
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.append_message(&sid, &user_says("该被抽但关闭了"))
+            .unwrap();
+        backdate_session(&f.db, &sid, Db::now_ms() - 60 * 60 * 1_000);
+
+        let settings = Settings {
+            memory_idle_extract_minutes: 0,
+            ..Default::default()
+        };
+        let running = Arc::new(Mutex::new(None));
+        let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = factories.clone();
+        let factory = move |_s: &Settings| -> Option<(
+            Arc<dyn ModelProvider>,
+            Option<Arc<dyn EmbedProvider>>,
+        )> {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+
+        let n = idle_extract_tick(&f.db, &settings, &running, &factory, &locks).await;
+        assert_eq!(n, 0);
+        assert_eq!(
+            factories.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "关闭档下连模型工厂都不许被调用"
+        );
+        assert_eq!(f.db.memory_cursor(&sid).unwrap(), 0, "游标不许动");
+    }
+
+    #[tokio::test]
+    async fn the_idle_tick_does_nothing_when_memory_is_disabled() {
+        let locks = ExtractLocks::default();
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.append_message(&sid, &user_says("记忆总开关关了"))
+            .unwrap();
+        backdate_session(&f.db, &sid, Db::now_ms() - 60 * 60 * 1_000);
+
+        let settings = Settings {
+            memory_enabled: false,
+            ..Default::default()
+        };
+        let running = Arc::new(Mutex::new(None));
+        let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = factories.clone();
+        let factory = move |_s: &Settings| -> Option<(
+            Arc<dyn ModelProvider>,
+            Option<Arc<dyn EmbedProvider>>,
+        )> {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+        assert_eq!(idle_extract_tick(&f.db, &settings, &running, &factory, &locks).await, 0);
+        assert_eq!(
+            factories.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "总开关关了 ⇒ 零模型调用（与压缩路径同一条纪律）"
+        );
+    }
+
+    /// 「绝不并发同一会话」：running 槽里是它时跳过，连模型工厂都不调。
+    #[tokio::test]
+    async fn the_idle_tick_skips_the_session_that_is_currently_running() {
+        let locks = ExtractLocks::default();
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.append_message(&sid, &user_says("正在跑的一轮"))
+            .unwrap();
+        backdate_session(&f.db, &sid, Db::now_ms() - 60 * 60 * 1_000);
+
+        let settings = Settings::default();
+        let running = Arc::new(Mutex::new(Some(sid.clone())));
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+            &[],
+        );
+        let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = factories.clone();
+        let fake = model.clone();
+        let factory = move |_s: &Settings| -> Option<(
+            Arc<dyn ModelProvider>,
+            Option<Arc<dyn EmbedProvider>>,
+        )> {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some((fake.clone() as Arc<dyn ModelProvider>, None))
+        };
+
+        assert_eq!(idle_extract_tick(&f.db, &settings, &running, &factory, &locks).await, 0);
+        assert_eq!(
+            factories.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "正在跑的会话必须整个跳过（连客户端都不构造）"
+        );
+        assert!(model.calls().is_empty(), "一次模型调用都不许发生");
+        assert_eq!(f.db.memory_cursor(&sid).unwrap(), 0);
+    }
+
+    // ==== 并发缺口(spec §12.5 缺口 1):同一会话只许一条抽取路径 ====
+
+    /// 锁的三条性质:认领、释放后可用、跨会话不互斥。
+    /// 第三条是「按会话」这个设计的全部理由:全局锁会让 A 会话的抽取挡住 B 会话。
+    #[test]
+    fn the_extract_lock_is_per_session_and_released_on_drop() {
+        let locks = ExtractLocks::default();
+        let guard = locks.try_acquire("A").expect("第一次认领必须成功");
+        assert!(
+            locks.try_acquire("A").is_none(),
+            "同一会话的第二条路径必须被挡下"
+        );
+        assert!(
+            locks.try_acquire("B").is_some(),
+            "不同会话之间没有冲突的理由"
+        );
+        drop(guard);
+        assert!(
+            locks.try_acquire("A").is_some(),
+            "guard 析构即释放,失败的抽取不该把会话永久钉死"
+        );
+    }
+
+    /// 端到端:idle 抽取进行中时,同一会话的另一次抽取必须**放弃**而不是排队,
+    /// 且游标只推进一次 —— 这正是「两条路径同时抽同一段、堆出重复记忆」那个缺口的反面。
+    #[tokio::test]
+    async fn a_concurrent_extraction_of_the_same_session_is_dropped_not_queued() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.append_message(&sid, &user_says("我在上海工作")).unwrap();
+        backdate_session(&f.db, &sid, Db::now_ms() - 60 * 60 * 1_000);
+
+        // 先占住这个会话的抽取权(模拟「另一条路径正在抽」)。
+        let locks = ExtractLocks::default();
+        let held = locks.try_acquire(&sid).expect("主路径先认领");
+
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户在上海工作"))],
+            &[],
+        );
+        let got = extract_session_memories(
+            &f.db,
+            &sid,
+            &*model,
+            &MemoryTurnCfg::default(),
+            None,
+            &locks,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("被放弃不是失败");
+        assert_eq!(got, 0, "第二条路径必须安静放弃");
+        assert_eq!(
+            model.calls().len(),
+            0,
+            "放弃发生在模型调用之前 —— 否则「放弃」也照样烧钱"
+        );
+        assert_eq!(f.db.memory_cursor(&sid).unwrap(), 0, "游标不许动");
+
+        // 主路径释放之后,再抽就正常。
+        drop(held);
+        let model2 = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户在上海工作"))],
+            &[],
+        );
+        let got = extract_session_memories(
+            &f.db,
+            &sid,
+            &*model2,
+            &MemoryTurnCfg::default(),
+            None,
+            &locks,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, 1);
+        assert_eq!(f.db.valid_memories().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_skills_dir_sits_beside_the_persona_on_a_portable_stick() {
+        // U 盘布局：<根>\LFTTDO\lfttdo.exe + portable.txt ⇒ 技能在 <根>\skills
+        // （与人设.txt 同层，用户打开 U 盘就能看见，不用钻进应用目录）。
+        let stick = tempfile::tempdir().unwrap();
+        let app_dir = stick.path().join("LFTTDO");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("portable.txt"), "portable\n").unwrap();
+        assert_eq!(
+            resolve_skills_dir(Some(&app_dir), &app_dir.join("data")),
+            stick.path().join("skills")
+        );
+
+        // 常规安装 / 没有便携标记：落在数据目录下。
+        let data = tempfile::tempdir().unwrap();
+        let exe_dir = data.path().join("Programs").join("LFTTDO");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        assert_eq!(
+            resolve_skills_dir(Some(&exe_dir), data.path()),
+            data.path().join("skills")
+        );
+        assert_eq!(
+            resolve_skills_dir(None, data.path()),
+            data.path().join("skills"),
+            "拿不到 exe 路径时也要有一个确定的兜底"
+        );
+    }
+
+    /// 压缩段同样认领:拿不到就跳过抽取、压缩照常(内容归另一条路径,不丢)。
+    #[tokio::test]
+    async fn a_compaction_skips_extraction_when_another_path_holds_the_lock() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        seed(&f.db, &sid, &long_history());
+        let before = f.db.messages(&sid).unwrap();
+
+        let locks = ExtractLocks::default();
+        let held = locks.try_acquire(&sid).expect("占住抽取权");
+
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+            &["好的"],
+        );
+        let (history, event, saved) = compact_before_turn(
+            &f.db,
+            &sid,
+            &*model,
+            &ContextBuilder::new(compacting_cfg()),
+            before,
+            &MemoryTurnCfg::default(),
+            None,
+            &locks,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("压缩段不许被锁挡住");
+
+        assert!(event.is_some(), "压缩照常发生");
+        assert_eq!(saved, 0, "本轮没有抽取,自然没有「记住了几条」");
+        assert_eq!(history.len(), 21, "压缩结果不受影响");
+        assert!(
+            f.db.valid_memories().unwrap().is_empty(),
+            "跳过抽取时不许写半条记忆"
+        );
+        // 只调了摘要那一次:抽取的模型调用根本没发起。
+        assert_eq!(
+            model.calls().len(),
+            1,
+            "跳过的抽取不许烧掉一次模型调用,实际 {:?}",
+            model.calls().len()
+        );
+        drop(held);
+    }
+
+    /// 空闲 tick 的成本(spec §12.5 缺口 3):没有待抽会话时,它只是**一次 SELECT**。
+    /// 这条给出量级承诺而不是精确值 —— 60 秒一次、亚毫秒量级,才对得起「永远在跑的后台任务」。
+    /// 100 个会话 × 100 条消息的库上,一次 tick 的守卫部分必须远低于 60ms。
+    #[tokio::test]
+    async fn an_idle_tick_with_nothing_to_do_costs_one_cheap_query() {
+        let f = Fixture::new();
+        // 100 个会话,每个 100 条消息,全部刚活动过(都不该被抽)。
+        for s in 0..100 {
+            let sid = f.db.create_session(&format!("会话 {s}")).unwrap();
+            for i in 0..100 {
+                f.db.append_message(&sid, &user_says(&format!("消息 {i}")))
+                    .unwrap();
+            }
+        }
+        let settings = Settings::default(); // 5 分钟档
+        let running = Arc::new(Mutex::new(None));
+        let locks = ExtractLocks::default();
+        let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = factories.clone();
+        let factory = move |_s: &Settings| -> Option<(
+            Arc<dyn ModelProvider>,
+            Option<Arc<dyn EmbedProvider>>,
+        )> {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        };
+
+        let started = std::time::Instant::now();
+        let n = idle_extract_tick(&f.db, &settings, &running, &factory, &locks).await;
+        let elapsed = started.elapsed();
+        assert_eq!(n, 0, "刚活动过的会话不该被抽");
+        assert_eq!(
+            factories.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "无待抽会话时连模型工厂都不该被调用"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(60),
+            "一次 tick 的守卫部分必须远低于 60ms(实际 {elapsed:?});\
+             60 秒一次的常驻任务不该有可感知的开销"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_idle_tick_extracts_an_idle_session_and_advances_its_cursor() {
+        let f = Fixture::new();
+        let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
+        for text in ["我在上海工作", "我最近在学日语"] {
+            f.db.append_message(&sid, &user_says(text)).unwrap();
+        }
+        backdate_session(&f.db, &sid, Db::now_ms() - 60 * 60 * 1_000);
+
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户在上海工作"))],
+            &[],
+        );
+        let fake = model.clone();
+        let factory = move |_s: &Settings| -> Option<(
+            Arc<dyn ModelProvider>,
+            Option<Arc<dyn EmbedProvider>>,
+        )> { Some((fake.clone() as Arc<dyn ModelProvider>, None)) };
+
+        let n = idle_extract_tick(
+            &f.db,
+            &Settings::default(),
+            &Arc::new(Mutex::new(None)),
+            &factory,
+            &ExtractLocks::default(),
+        )
+        .await;
+        assert_eq!(n, 1, "一个空闲会话被处理");
+        assert_eq!(f.db.memory_cursor(&sid).unwrap(), 2);
+        assert!(
+            f.db.valid_memories()
+                .unwrap()
+                .iter()
+                .any(|r| r.body == "用户在上海工作"),
+            "抽取产物必须落库"
+        );
+    }
+
+    /// 多会话按**最后活动升序**处理（store 的 SQL 已排序，这条钉的是 tick 没有
+    /// 自己再排一遍/乱序取）。用抽取请求里第一段用户文本识别是哪个会话。
+    #[tokio::test]
+    async fn the_idle_tick_processes_sessions_in_last_active_order() {
+        let f = Fixture::new();
+        let now = Db::now_ms();
+        let older = f.db.create_session(DEFAULT_TITLE).unwrap();
+        let newer = f.db.create_session(DEFAULT_TITLE).unwrap();
+        f.db.append_message(&older, &user_says("会话 A 的话"))
+            .unwrap();
+        f.db.append_message(&newer, &user_says("会话 B 的话"))
+            .unwrap();
+        backdate_session(&f.db, &older, now - 2 * 60 * 60 * 1_000);
+        backdate_session(&f.db, &newer, now - 90 * 60 * 1_000);
+
+        let model = FakeModel::extracting(
+            &[&format!("[{}]", fact_candidate("上海", "用户搬到上海"))],
+            &[],
+        );
+        let fake = model.clone();
+        let factory = move |_s: &Settings| -> Option<(
+            Arc<dyn ModelProvider>,
+            Option<Arc<dyn EmbedProvider>>,
+        )> { Some((fake.clone() as Arc<dyn ModelProvider>, None)) };
+
+        let n = idle_extract_tick(
+            &f.db,
+            &Settings::default(),
+            &Arc::new(Mutex::new(None)),
+            &factory,
+            &ExtractLocks::default(),
+        )
+        .await;
+        assert_eq!(n, 2, "两个空闲会话都处理");
+        let seen: Vec<String> = extraction_requests(&model)
+            .into_iter()
+            .map(|r| r.messages[1].text_of())
+            .collect();
+        assert_eq!(
+            seen,
+            vec!["会话 A 的话".to_string(), "会话 B 的话".to_string()],
+            "最久没动的先抽"
+        );
+    }
+
+    /// 用户手写记忆的 kind 白名单：不认识的值回落 `fact`，**不**在这一层报错。
+    /// 用户手写的内容比模型的分类意图更可信，拼错一个标签不该让「我想记一件事」失败。
+    #[test]
+    fn an_unknown_user_memory_kind_falls_back_to_fact_instead_of_rejecting() {
+        for (input, want) in [
+            ("fact", "fact"),
+            ("preference", "preference"),
+            ("prospective", "prospective"),
+            (" preference ", "preference"),
+            ("entity_rel", "fact"),
+            ("Fact", "fact"),
+            ("", "fact"),
+        ] {
+            assert_eq!(normalize_user_memory_kind(input), want, "输入 {input:?}");
+        }
+    }
+
+    /// 空闲 worker 的接线判据。`spawn_memory_idle_worker` 在 `run()` 的 setup 闭包里，
+    /// 单测进不去那个闭包（与 `the_assembly_wires_the_production_registry` 同一类问题），
+    /// 所以读自己的源码：调用点必须在 `app.manage(AppState {` 之后、窗口几何恢复之前。
+    /// 只取 `#[cfg(test)]` 之前的部分 —— 否则 `include_str!` 会把本测试里的字符串也算进去。
+    #[test]
+    fn the_idle_extract_worker_is_wired_after_manage_and_before_window_restore() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ipc.rs"));
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("找不到 #[cfg(test)] 边界");
+        let manage_at = production
+            .find("app.manage(AppState {")
+            .expect("找不到 app.manage 装配段");
+        let worker_at = production
+            .rfind("spawn_memory_idle_worker(")
+            .expect("空闲 worker 写了但没在装配段调用：它永远不会跑");
+        let restore_at = production
+            .find("restore_window_geometry(app.handle());")
+            .expect("找不到窗口几何恢复那一行");
+        assert!(
+            worker_at > manage_at,
+            "worker 必须在 `app.manage` 之后启动（它要的四个 Arc 那时才存在）"
+        );
+        assert!(
+            worker_at < restore_at,
+            "worker 的启动点必须在 setup 收尾之前，否则它压根不会被执行"
+        );
     }
 }

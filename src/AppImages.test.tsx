@@ -60,6 +60,16 @@ const view = (): SettingsView => ({
   // T26 的 `roots`：空数组 = 生产默认值 = 「read_file 一律拒绝」（理由写在 `App.test.tsx`
   // 那同款夹具的注释里）。本文件不断言保存载荷，键在这里的作用只有一个：少写就编译不过。
   roots: [],
+  // 长期记忆四键（Rust 默认 true/5/600/500）：作用与上面的 `roots` 同一条 ——
+  // 镜像多一键、夹具少一键就当场编译不过。仅补键，本文件的用例一行未动（R216②）。
+  memory_enabled: true,
+  memory_recall_k: 5,
+  memory_note_token_cap: 600,
+  memory_profile_char_cap: 500,
+  memory_decay_half_life_days: 60,
+  memory_prospective_window_hours: 24,
+  memory_embedding_source: "endpoint",
+  memory_embedding_model: "text-embedding-v3",
   api_key_masked: "…abcd",
   corrupt_backup: null,
 });

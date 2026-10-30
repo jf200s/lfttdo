@@ -23,6 +23,16 @@ const h = vi.hoisted(() => {
     skillsList: vi.fn(),
     skillsOpenFolder: vi.fn(),
     skillsSetEnabled: vi.fn(),
+    // P1：切会话时的收尾抽取 + 面板里的记忆写入口。App 的 switch 路径**会真的调**
+    // `flushMemory`（fire-and-forget），mock 工厂里缺这一支的话，下面那两条切换用例
+    // 会在 `openSession` 里抛 `flushMemory is not a function`，红的还是「不该动的测试」。
+    flushMemory: vi.fn(),
+    listMemories: vi.fn(),
+    deleteMemory: vi.fn(),
+    clearMemories: vi.fn(),
+    memoryProfile: vi.fn(),
+    updateMemoryBody: vi.fn(),
+    addMemory: vi.fn(),
     subscribeAgent: (cb: (sessionId: string, e: AgentEvent) => void) => {
       listeners.push(cb);
       return () => {
@@ -65,6 +75,16 @@ const view = (over: Partial<SettingsView> = {}): SettingsView => ({
   // `AppSettings.test.tsx` 与 `SettingsPanel.test.tsx` 里那两条用非空值断言的测试管，
   // 空数组在这儿只承担一件事：让这份镜像少一键就当场编译不过。
   roots: [],
+  // 长期记忆四键（Rust 默认 true/5/600/500）：作用与上面的 `roots` 同一条 —— 镜像多一键、
+  // 夹具少一键就当场编译不过。仅补键，本文件的用例一行未动（R216②）。
+  memory_enabled: true,
+  memory_recall_k: 5,
+  memory_note_token_cap: 600,
+  memory_profile_char_cap: 500,
+  memory_decay_half_life_days: 60,
+  memory_prospective_window_hours: 24,
+  memory_embedding_source: "endpoint",
+  memory_embedding_model: "text-embedding-v3",
   api_key_masked: "…abcd",
   corrupt_backup: null,
   ...over,
@@ -101,6 +121,14 @@ beforeEach(() => {
   h.getSettings.mockReset().mockResolvedValue(view());
   // R131 的默认答案：pending 里没有这一笔。卡片状态只由事件驱动。
   h.respond.mockReset().mockResolvedValue(false);
+  // P1：默认「这一轮没记住新东西」（后端零条时就是 Ok(0)），切换用例关心别的值再覆写。
+  h.flushMemory.mockReset().mockResolvedValue(0);
+  h.listMemories.mockReset().mockResolvedValue([]);
+  h.deleteMemory.mockReset().mockResolvedValue(undefined);
+  h.clearMemories.mockReset().mockResolvedValue(undefined);
+  h.memoryProfile.mockReset().mockResolvedValue("");
+  h.updateMemoryBody.mockReset().mockResolvedValue(undefined);
+  h.addMemory.mockReset().mockResolvedValue(1);
   h.listeners.length = 0;
 });
 
@@ -475,5 +503,134 @@ describe("App", () => {
     expect(h.subCount()).toBe(1);
     unmount();
     await waitFor(() => expect(h.subCount()).toBe(0));
+  });
+
+  // ==== P1：记忆写入的轻提示与切换前的收尾抽取 ====
+
+  it("announces how many memories were saved, politely and without stealing focus", async () => {
+    // `role="status"` + `aria-live="polite"` 是这条提示的无障碍合同：它不该抢焦点
+    // （用户可能正在打字），只该排到当前朗读之后播一次。
+    render(<App />);
+    await settled();
+    act(() => h.emit("B", { t: "memory_saved", count: 3 }));
+    const status = screen.getByRole("status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(await screen.findByText("已记住 3 条")).toBeInTheDocument();
+    // 与 text_delta 同一条跨会话闸门：A 的事件不许在 B 的界面上冒出来。
+    act(() => h.emit("A", { t: "memory_saved", count: 9 }));
+    expect(screen.queryByText("已记住 9 条")).toBeNull();
+  });
+
+  it("keeps only the newest toast and gives it a fresh eight seconds", async () => {
+    // 两条纪律在同一条用例里：连续事件只留最后一条（旧文案消失），
+    // 以及计时是**重置**而不是共享 —— 否则第二条只剩第一条剩下的零头时间。
+    render(<App />);
+    await settled();
+    vi.useFakeTimers();
+    try {
+      act(() => h.emit("B", { t: "memory_saved", count: 2 }));
+      expect(screen.getByText("已记住 2 条")).toBeInTheDocument();
+      act(() => h.emit("B", { t: "memory_saved", count: 5 }));
+      expect(screen.queryByText("已记住 2 条")).toBeNull();
+      expect(screen.getByText("已记住 5 条")).toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(7_500);
+      });
+      expect(screen.getByText("已记住 5 条")).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(screen.queryByText(/已记住/)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens the settings panel at the memory group when the toast is clicked", async () => {
+    // 轻提示的价值一半在「点得进去」：只弹一句「已记住 3 条」而没有任何入口，
+    // 用户想知道记住了什么时还得自己想起来去侧栏点设置。
+    const scroll = vi.fn();
+    // jsdom 没有实现 scrollIntoView；面板里用的是可选调用，这里补上才能断言「真的滚了」。
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true,
+      value: scroll,
+    });
+    try {
+      render(<App />);
+      await settled();
+      act(() => h.emit("B", { t: "memory_saved", count: 3 }));
+      fireEvent.click(await screen.findByRole("button", { name: /已记住 3 条/ }));
+      const dialog = await screen.findByRole("dialog");
+      expect(within(dialog).getByText("长期记忆")).toBeInTheDocument();
+      // 滚动发生在面板挂载之后：App 只递「去记忆区」这个意图，DOM 位置的知识留在面板里。
+      await waitFor(() => expect(scroll).toHaveBeenCalled());
+    } finally {
+      delete (HTMLElement.prototype as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+
+  it("flushes the session it is leaving before rebuilding the next one", async () => {
+    h.sessions.mockResolvedValue([row("A", 9), row("B", 2)]);
+    h.replaySession.mockImplementation(async (id: string) =>
+      id === "A"
+        ? ([{ t: "user_message", blocks: [{ type: "text", text: "A 的历史" }] }] as AgentEvent[])
+        : ([{ t: "user_message", blocks: [{ type: "text", text: "B 的历史" }] }] as AgentEvent[]),
+    );
+    render(<App />);
+    await settled();
+    await screen.findByText("A 的历史");
+    fireEvent.click(
+      within(screen.getByTestId("session-row-B")).getByRole("button", {
+        name: /会话 B/,
+      }),
+    );
+    await waitFor(() => expect(h.flushMemory).toHaveBeenCalledWith("A"));
+    expect(await screen.findByText("B 的历史")).toBeInTheDocument();
+    // 「切走前」不是修辞：收尾抽取必须发生在重建新会话之前，否则游标已经错过了
+    // 用户最后那次手势（而空闲 worker 要等到下一个 tick）。
+    const replayB = h.replaySession.mock.calls.findIndex((c) => c[0] === "B");
+    expect(
+      h.flushMemory.mock.invocationCallOrder[0],
+    ).toBeLessThan(h.replaySession.mock.invocationCallOrder[replayB]);
+  });
+
+  it("does not block or complain when the flush before a switch fails", async () => {
+    // 切换会话是主路径。一次后台抽取失败不该让用户卡在原地，也不该给他一条
+    // 他无法处理的错误 —— 后端本来就把它收成 Ok(0)，这里兜的是 IPC 层。
+    h.sessions.mockResolvedValue([row("A", 9), row("B", 2)]);
+    h.replaySession.mockImplementation(async (id: string) =>
+      id === "A"
+        ? ([{ t: "user_message", blocks: [{ type: "text", text: "A 的历史" }] }] as AgentEvent[])
+        : ([{ t: "user_message", blocks: [{ type: "text", text: "B 的历史" }] }] as AgentEvent[]),
+    );
+    h.flushMemory.mockRejectedValue("抽取挂了：端点 500");
+    render(<App />);
+    await settled();
+    await screen.findByText("A 的历史");
+    fireEvent.click(
+      within(screen.getByTestId("session-row-B")).getByRole("button", {
+        name: /会话 B/,
+      }),
+    );
+    await waitFor(() => expect(h.flushMemory).toHaveBeenCalledWith("A"));
+    expect(await screen.findByText("B 的历史")).toBeInTheDocument();
+    expect(screen.queryByText(/抽取挂了/)).toBeNull();
+  });
+
+  it("shows the same toast for what the pre-switch flush saved", async () => {
+    // 收尾抽取的 `memory_saved` 事件永远到不了（那时已经在 B 的界面里），
+    // 所以这条路径必须自己把返回值说出来 —— 复用同一个提示槽，未免两套文案。
+    h.sessions.mockResolvedValue([row("A", 9), row("B", 2)]);
+    h.flushMemory.mockResolvedValue(4);
+    render(<App />);
+    await settled();
+    await waitFor(() => expect(h.replaySession).toHaveBeenCalledWith("A"));
+    fireEvent.click(
+      within(screen.getByTestId("session-row-B")).getByRole("button", {
+        name: /会话 B/,
+      }),
+    );
+    expect(await screen.findByText("已记住 4 条")).toBeInTheDocument();
   });
 });

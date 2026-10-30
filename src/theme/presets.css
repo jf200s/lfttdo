@@ -130,3 +130,49 @@
   --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
   --bubble-max-w: 76ch;
 }
+
+/* dusk（暮褐，2026-10-25 追加，业主批准的第 4 套预设）：iOS 质感的暮色暖褐。
+   夜幕档：深焙咖底 + 铜色强调；暮光档：暖沙底 + 焦栗强调。
+   圆角比另外三套大一档（16/10），是这套「iOS 材质」识别度的一部分。
+   色值先过 tokens.test.ts 全部对比度闸（muted ≥4.5 × 四底、hover 严格高于 accent × 两底、
+   surface 亮于 raised 的按下关系），闸的实测余量见提交信息。 */
+
+[data-theme="dusk"][data-mode="dark"] {
+  --bg-surface: #221812;
+  --bg-raised: #2f231a;
+  --bg-input: #1a120d;
+  --text-primary: #f0e4d6;
+  --text-muted: #a89684;
+  --accent: #c98b5e;
+  --accent-hover: #dca777;
+  --accent-text: #241812;
+  --border: #46362a;
+  --danger: #e0776a;
+  --code-bg: #170f0a;
+  --radius: 16px;
+  --radius-sm: 10px;
+  --shadow: rgb(12 7 4 / 55%);
+  --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --bubble-max-w: 72ch;
+}
+
+[data-theme="dusk"][data-mode="light"] {
+  --bg-surface: #efe3d3;
+  --bg-raised: #faf3ea;
+  --bg-input: #e4d5c1;
+  --text-primary: #3b2a1e;
+  --text-muted: #6a5643;
+  --accent: #7e4b2a;
+  --accent-hover: #6a3c1f;
+  --accent-text: #fdf9f4;
+  --border: #d8c8b4;
+  --danger: #a83c22;
+  --code-bg: #ece1d0;
+  --radius: 16px;
+  --radius-sm: 10px;
+  --shadow: rgb(74 58 32 / 20%);
+  --font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --font-code: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --bubble-max-w: 72ch;
+}

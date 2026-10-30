@@ -2,21 +2,25 @@
 // 这里只是让前端不必跨语言推断形状。核对基线：HEAD 7db0439。
 //
 //   src-tauri/src/agent/events.rs:18-72   `pub enum AgentEvent`，tag 字段 `t`，`rename_all = "snake_case"`
-//   src-tauri/src/agent/events.rs:358-421 `every_agent_event_variant_serializes_its_t_tag`（11 个标签的权威名单）
+//   src-tauri/src/agent/events.rs:358-421 `every_agent_event_variant_serializes_its_t_tag`（12 个标签的权威名单）
 //   src-tauri/src/agent/events.rs:103-151 `ErrorWhere`/`StopReason`/`Scope`/`Decision`（Decision 是手写序列化，R98）
 //   src-tauri/src/agent/types.rs:4-38     `ContentBlock`（tag 字段 `type`）/`ImageMime`/`ToolOutput`（tag 字段 `kind`）
 //   src-tauri/src/agent/types.rs:158-173  `ToolCallView`/`Risk`
 //   src-tauri/src/ipc.rs:24-32,146        `AgentPayload`（唯一 camelCase 的一层）+ 通道名 `"agent"`
 //   src-tauri/src/ipc.rs:630-641          `SettingsView`（`#[serde(flatten)]` ⇒ 线上拍平一层）
 //   src-tauri/src/settings.rs:251-255     `Mode`（`rename_all = "lowercase"`）
-//   src-tauri/src/settings.rs:261-284     `Settings` 的 13 个键（T43 起含 `accent`，T26 起含 `roots`）
+//   src-tauri/src/settings.rs:261-284     `Settings` 的 22 个键（T43 起含 `accent`，T26 起含 `roots`；
+//                                         长期记忆切片起再含 6 个 `memory_*` 键，T12 补了
+//                                         `memory_decay_half_life_days` /
+//                                         `memory_prospective_window_hours`，见该接口的注释）
 //   src-tauri/src/store/db.rs:239-246     `SessionRow`（无 `rename_all` ⇒ snake_case，R128）
 //
 // 本文件除类型外**只导出一个运行期值**：通道名 `AGENT_CHANNEL`（:115）。
 // Rust 侧它是 `const AGENT_CHANNEL: &str = "agent";`（ipc.rs:146），**私有、没有 `pub`**，
 // 跨语言根本取不到 ⇒ 前端只能硬编码这一处，不构成第二套真相。之所以留在镜像里而不是挪去
 // T16 的 IPC 层：它和线格式同属「Rust 说了算的字符串」，放在这里才会在核对表时被一起看到
-// （评审 F7）。除它以外本文件不产生任何运行期代码。
+// （评审 F7）。除它以外本文件不产生任何运行期代码 —— 长期记忆切片追加的 `MemoryView`
+// 也只是 interface，同样零运行期产物。
 //
 // Task 17 手测时还要对一次真实帧。若 Rust 加了第 12 支，前端这份镜像的缺口会被**机器**喊出来
 // （R118；本轮修复后不再只是注释，评审 F1）：
@@ -129,7 +133,8 @@ export interface SessionRow {
 }
 
 /**
- * `Settings`（settings.rs:261-284）：13 个键，`serde` 无 `rename_all` ⇒ 全 snake_case；
+ * `Settings`（settings.rs:261-284）：22 个键（其中 6 个是长期记忆切片的 `memory_*` 键），
+ * `serde` 无 `rename_all` ⇒ 全 snake_case；
  * `mode` 是 `rename_all = "lowercase"` 的 `"light"|"dark"`（settings.rs:250-253），
  * 和 `applyTheme` 收的那个 `Mode` 是同一支，所以这里**引用**它而不是再抄一份字面量。
  * 数值一律 `number`：Rust 侧是 `u32`/`usize`/`f32`，钳位只有 `settings.rs` 的
@@ -181,6 +186,51 @@ export interface Settings {
    * 不是「设置没了」，是「read_file 突然什么都读不到」。
    */
   roots: string[];
+  /**
+   * 长期记忆总开关（设计文档 §7）：`false` = 写入侧不抽取、读取侧不注入。默认 `true`。
+   * 与其余三键同走 `settings_set` 全表，面板有控件（复选框），所以它**不是** carry-through 键。
+   */
+  memory_enabled: boolean;
+  /**
+   * 长期记忆三个数值旋钮（设计文档 §7）：
+   * - `memory_recall_k`：每轮发送前混合召回注入的最大条数，Rust 夹 `1..=20`；
+   * - `memory_note_token_cap`：画像 + 检索两条 system note 合计的 token 硬顶，
+   *   Rust 夹 `200..=2000` 且 ≤ `budget_tokens` 的 1/5（防记忆挤垮对话预算）；
+   * - `memory_profile_char_cap`：常驻画像单行的字符上限，Rust 夹 `100..=2000`（画像永不膨胀）。
+   *
+   * 钳制与预算约束**只有 Rust `normalize()` 那一处定义**（R123：两处边界会漂移），TS 侧
+   * 不钳第二遍、不校验 —— 消费方是 Rust 的 normalize，这里的数只是线上形状的镜像。
+   */
+  memory_recall_k: number;
+  memory_note_token_cap: number;
+  memory_profile_char_cap: number;
+  /**
+   * T12：事实记忆的衰减半衰期（天），Rust 夹 `1..=3650`。召回排序里时间衰减的唯一旋钮：
+   * 越短，旧事实沉得越快（`prospective` 待办不衰减，它的价值与 `due_at` 绑定）。
+   * 偏好的半衰期按它的 3 倍在 Rust 侧推导，**不是**第二个设置键。
+   */
+  memory_decay_half_life_days: number;
+  /**
+   * T12：待办提醒的前瞻窗口（小时），Rust 夹 `1..=168`。到期时刻落在
+   * 「现在 + 窗口」内的待办会在本轮被提醒一次；这一项**不受**备注 token 预算约束
+   * （「必须说的事」与可选召回不同类）。
+   */
+  memory_prospective_window_hours: number;
+  /**
+   * T6：嵌入来源，白名单值 `"endpoint" | "off"`（Rust 默认 `"endpoint"`；normalize 里
+   * 不认识的值回落 `"endpoint"`，模仿 accent 的回落纪律 —— 不存在第三态）。
+   * `"off"` = 写入侧不建向量、读取侧不嵌查询，召回退化为纯 2-gram 关键词。
+   * **面板无控件**：值经 `settingsOf` 结构化展开原样携带（carry-through 既有机制），
+   * 手改 `settings.json` 不丢；要改就是手改文件这一条路。
+   */
+  memory_embedding_source: string;
+  /**
+   * T6：嵌入请求体里的 model 名（Rust 默认 `"text-embedding-v3"`，与默认 chat 模型
+   * 同源的 Qwen 生态常用 embedding 模型）。Rust normalize 只 trim 不校验 —— 端点
+   * 支不支持只有端点知道；配错的症状是端点 400 → 嵌入失败降级纯关键词。
+   * 同样是 carry-through 键，面板无控件。
+   */
+  memory_embedding_model: string;
 }
 
 /**
@@ -201,14 +251,71 @@ export interface SettingsView extends Settings {
 }
 
 /**
- * `AgentEvent` 的 11 个 `t` 标签，源头是 events.rs:400-412 的
+ * `memories` 表一行的读视图（设计文档 §3；Rust 侧 `MemoryView`，与 `SessionRow` 同一分工：
+ * 形状镜像住 types，`commands.ts` 只放函数）。线上 snake_case。
+ *
+ * - **失效不删除**（Graphiti，§3）：`invalid_at` 非空 = 已失效，但行还在、历史可追溯。
+ *   `valid` 是 Rust 侧按 `invalid_at IS NULL` 现算出的布尔 —— 检索唯一口径（§8.4），
+ *   前端**不复算第二遍**（同 `font_size` 的 R123 规矩：两处边界会漂移），设置页只渲染它。
+ * - `body` 与三元组并存：注入与设置页展示都用 `body`（人读的完整句子）；`subject`/
+ *   `predicate`/`object` 只服务将来的多跳查询（§9 三期），带在视图里只是镜面的诚实。
+ * - 可空键在线上是 `null`（不是缺省）：`session_id` 空 = 画像合并出的记忆、无单一来源。
+ * - 时间戳一律毫秒数（同 `SessionRow.updated_at` 的 R72 口径），前端只展示不换算。
+ */
+export interface MemoryView {
+  id: number;
+  session_id: string | null;
+  /** `'fact' | 'preference' | 'entity_rel'` 之一，但镜像成 `string`：名单只有 Rust 说了算。 */
+  kind: string;
+  subject: string | null;
+  predicate: string | null;
+  object: string | null;
+  body: string;
+  confidence: number;
+  valid_from: number;
+  invalid_at: number | null;
+  updated_at: number;
+  valid: boolean;
+  /**
+   * T12：同一事实被再次确认的次数。设置页在 `> 0` 时显示「确认 N 次」——
+   * 用户强调过五遍的事与只说过一遍的事，在库里确实不是一个分量。
+   * `0` 不显示（从未确认过不带任何标价）。
+   */
+  reinforcements: number;
+  /**
+   * T12：待办的到期时刻（ms，`prospective` 才有值）。`null` = 非待办或没解析出时间。
+   * 日期格式化在**前端**按本地时区做（Rust 只给毫秒数，前端手工拼 `YYYY-MM-DD`，
+   * 不用 `toLocaleDateString`：后者的输出随 ICU/语言环境漂移，测试里会不稳定）。
+   */
+  due_at: number | null;
+  /**
+   * T12：`due_at` 非空且 `<= now`。**由 Rust 现算**（`MemoryView::from`），前端直接渲染，
+   * 不再与 `Date.now()` 比第二遍 —— 比较口径只有一处，两处会漂移。
+   */
+  is_due: boolean;
+  /**
+   * P1：这一行是用户亲手改过/亲手写下的（`memories.user_edited`）。行上显示「· 已编辑」，
+   * 让用户认得出哪一条是自己的说法 —— 从这一刻起模型侧的下一次合并只会降级成「并存」，
+   * 不再改写它（`update_memory_body_by_user` 的存储层语义）。
+   *
+   * ⚠️ 核对记录（写进注释而不是悄悄改）：本次前端切片核对 `ipc.rs` 的 `MemoryView` 时，
+   * 结构体里**还没有**搬这一个字段（`MemoryRow` 有；`MemoryView::from` 没带出来）。
+   * 这里按 P1 的合同先补上镜像，标注占位的行为是「缺席即不显示」：线上取到 `undefined`
+   * 时 `m.user_edited ? … : null` 走 falsy 分支，界面不会崩、也不会谎称已编辑。
+   * 后端把 `r.user_edited` 加进视图那一天，这个标记自动生效，前端不必再改。
+   */
+  user_edited: boolean;
+}
+
+/**
+ * `AgentEvent` 的 12 个 `t` 标签，源头是 events.rs:400-412 的
  * `every_agent_event_variant_serializes_its_t_tag`（名单本身定义在 events.rs:358 那条测试里）：
  *
  *   "turn_start", "text_delta", "user_message", "tool_call",
  *   "permission_request", "permission_resolved", "tool_result",
- *   "usage", "context_compacted", "error", "done"
+ *   "usage", "context_compacted", "memory_saved", "error", "done"
  *
- * 本表是镜像：union 必须与那 11 支**逐一对应**，少一支就会让 reducer 的
+ * 本表是镜像：union 必须与那 12 支**逐一对应**，少一支就会让 reducer 的
  * `default` 静默丢数据（R111 漏 `user_message` 就是活例子）。
  *
  * 下面这份字面量清单只是**人读的注释**：`reducer.test.ts` 的 `WIRE_TAGS` 由 `AgentEvent`
@@ -228,6 +335,14 @@ export type AgentEvent =
   | { t: "tool_result"; call_id: string; is_error: boolean; ms: number; preview: string }
   | { t: "usage"; input_tokens: number; output_tokens: number }
   | { t: "context_compacted"; dropped: number; summary_chars: number }
+  /**
+   * P1：这一轮**新记住了几条**（events.rs 的 `MemorySaved { count }`）。它是「记忆在
+   * 后台真的工作」的唯一可见证据 —— 没有它，整条写入管线对用户完全静默（spec §11 的
+   * 元记忆取向）。`count` 不含画像：画像不是一条条的记忆。
+   * 位置与 Rust 的 tags 表一致（`context_compacted` 与 `error` 之间）：跨语言用例比的是
+   * **集合**（顺序不参与判定），所以挪位置不会制造假红；保持同序只是为了读镜像时一眼对得上。
+   */
+  | { t: "memory_saved"; count: number }
   | { t: "error"; where: ErrorWhere; message: string; fatal: boolean }
   | { t: "done"; stop_reason: StopReason };
 
@@ -355,6 +470,22 @@ export interface UiState {
   streaming: boolean;
   /** 瞬时事件，重放路径不会重建它（R114）。 */
   usage: { input: number; output: number } | null;
+  /**
+   * P1：最近一次 `memory_saved` 的条数与一个**本地递增序号** `at`。
+   *
+   * - 只留最新一条：同一轮连续几次写入不需要排队，用户要的是「刚才记了几条」。
+   * - `at` 不是时钟。`reducer` 是纯函数（R119，源码扫描钉着「正文里不许出现 Date.now」），
+   *   所以序号只能从状态自己推：`(上一个 at ?? 0) + 1`。它不是身份、不参与渲染文案，
+   *   唯一作用是让「连续两次同 count」也是两个不同的值 —— 界面靠依赖变化重开 8 秒计时，
+   *   拿 count 当键的话第二声轻提示会被 React 当成没变化而哑掉。
+   * - 会话切换时随 `initialState()` 归零：它属于这一次会话的即时反馈，不是历史。
+   *
+   * **为什么是可选的**：`initialState()` 永远填 `null`，reducer 也永远写它；可选只服务
+   * 「外部手工构造的 `UiState`」—— `MessageList.test.tsx` 那类夹具用 `Partial<UiState>`
+   * 展开并集，多一个必填键就会让它们当场 TS2322，而那一份测试不在本切片的改动范围里。
+   * 消费方因此把 `undefined` 与 `null` 读成同一件事（`App.tsx` 用 `if (!… ) return`）。
+   */
+  memorySaved?: { count: number; at: number } | null;
   /** 致命错误横幅。非致命错误走 `notices`，两者不互相降级。 */
   fatal: { message: string; where: ErrorWhere } | null;
   /**

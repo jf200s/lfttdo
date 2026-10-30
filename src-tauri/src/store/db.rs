@@ -20,7 +20,22 @@ use std::sync::{Mutex, MutexGuard};
 /// 所以这个库的格式和协议格式是同一条演进线：Plan B/C 加表加列时要靠它认库
 /// （T12 的 settings 是同目录下的**另一个文件**，不占这里的版本号）。
 /// **schema 变了就 +1，旧库不自动迁移** —— 这里只标记，不搬数据；谁要迁移，读到的就是这一行的值。
-const SCHEMA_VERSION: i64 = 1;
+/// v2（长期记忆，spec 2026-10-25）：新增 memories / memory_profile 两张表。纯增量 ——
+/// v1 库被新二进制打开时靠下面的 `CREATE TABLE IF NOT EXISTS` 自动补上**空表**，
+/// 不搬数据也不拒绝打开；版本戳的既定政策不变（只给 user_version==0 的新库盖章）。
+/// v3（类人记忆升级，spec 2026-10-25 §11）：memories 加四列 —— `reinforcements`
+/// （同一事实被再次确认的次数）、`last_accessed`（上次被召回：访问即再巩固）、
+/// `due_at`（待办的到期时刻）、`notified_at`（已提醒时刻，防每轮重复提醒）。
+/// `CREATE TABLE IF NOT EXISTS` 对**已存在**的表一个字都不改，所以老库的四列由
+/// `attach_memory_columns` 显式补（ALTER TABLE ADD COLUMN 是纯增量：老行拿默认值，
+/// 不搬数据、不拒绝打开）。版本戳政策不变。
+/// v4（P0 抽取游标 + 用户编辑，spec 2026-10-25 §12）：
+/// - `sessions.memory_extracted_upto`：该会话已抽取到的 `messages.id`。没有它，
+///   「空闲时抽取」与「压缩时抽取」会重复处理同一段对话 —— 重复抽取不只烧调用，
+///   还会把同一件事反复 ADD 成一堆近似重复的记忆。压缩路径也必须推进它。
+/// - `memories.user_edited`：用户亲手改过正文。模型的下一次合并**不许**改写这样的行
+///   （候选并存、用户自己删）—— 用户权威优先于系统自洽，这是业主拍板的方向。
+const SCHEMA_VERSION: i64 = 4;
 
 /// 会话标题上限（字符）。这是**标题**规则（40），不是工具输出预览（200，见
 /// `ToolOutput::preview()`）：两个槽位、各自一处计算，别让它们互相「复用」出一个第三种形状。
@@ -37,7 +52,8 @@ CREATE TABLE IF NOT EXISTS sessions(
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL);
+    updated_at INTEGER NOT NULL,
+    memory_extracted_upto INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS messages(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -45,6 +61,29 @@ CREATE TABLE IF NOT EXISTS messages(
     blocks_json TEXT NOT NULL,
     created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session_id, id);
+CREATE TABLE IF NOT EXISTS memories(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    kind TEXT NOT NULL,
+    subject TEXT,
+    predicate TEXT,
+    object TEXT,
+    body TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    valid_from INTEGER NOT NULL,
+    invalid_at INTEGER,
+    embedding BLOB,
+    reinforcements INTEGER NOT NULL DEFAULT 0,
+    last_accessed INTEGER,
+    due_at INTEGER,
+    notified_at INTEGER,
+    user_edited INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS memory_profile(
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    body TEXT NOT NULL,
+    updated_at INTEGER NOT NULL);
 PRAGMA foreign_keys = ON;
 ";
 
@@ -79,6 +118,11 @@ impl Db {
         // （T12 的 settings 是**独立文件**存储、不落这个库，所以这里不存在日常的第二条连接。）
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA_SQL)?;
+        // v3 的纯增量迁移：`CREATE TABLE IF NOT EXISTS` 不会给**已存在**的 memories 加列,
+        // 所以 v2 库这里补四列。新建库走到这里时列已经在（`table_info` 里查得到），
+        // 这一步是空转 —— 两条路径共用同一个函数,「缺什么补什么」只有一处判据。
+        attach_memory_columns(&conn)?;
+        attach_session_columns(&conn)?;
         // 只给**未标记**的库（0 = 这个钩子之前的库，其 schema 与本版本一致）盖章。
         // 已有版本号的一律不覆盖：无条件写 1 会让每次打开都把 T12 推上去的标记抹回原点，
         // 那正是这个钩子要防的「静默改格式」。反过来（版本号比本实现更高 = 新库被旧程序打开）
@@ -103,7 +147,9 @@ impl Db {
     /// 这层 `Mutex` 不可重入：`Db` 的方法都是「先取锁再碰连接」，将来谁在持锁期间
     /// 再调一个 `Db` 方法，就是自己等自己 —— 表现是界面卡死而不是报错，所以别试。
     /// （`compact_session` 全程只取一次锁、内部只调自由函数 `insert_message_row`，不碰 `&self`。）
-    fn lock(&self) -> MutexGuard<'_, Connection> {
+    /// `pub(crate)`（长期记忆）：`store::memory` 的同款方法簇与压缩同事务入口要用它;
+    /// 可见性放宽不是开第二个真相 —— 连接仍只有这一把锁。
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Connection> {
         crate::lock::guard(&self.conn)
     }
 
@@ -126,7 +172,9 @@ impl Db {
 
     /// 毫秒时间戳（R72）。秒级粒度下，同一秒内建的两个会话 `updated_at` 相同，
     /// 「最新的排最前」就变成 SQLite 的自由裁量，brief 那条排序测试是 flaky 的。
-    fn now_ms() -> i64 {
+    /// `pub(crate)`（长期记忆）：memories 的 valid_from/updated_at 与会话表用**同一个钟**,
+    /// 排序与审计的时间口径只许有一处。
+    pub(crate) fn now_ms() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
@@ -213,37 +261,20 @@ impl Db {
     /// `ContextBuilder::build()` 把 `Role::System` 整行摘出来当 `notes` 拼在 head 之后，
     /// `events_from_messages` 的 `Role::System => {}` 又让它对用户不可见。这条不变量由
     /// 测试里的 `build()` 断言钉住，而不是钉在一条写不出来的 SQL 上。
+    ///
+    /// 实现经 `store::memory` 的 [`Db::compact_session_with_memories`](crate::store::memory::Db::compact_session_with_memories)
+    /// （长期记忆把「压缩+记忆写入」并进了同一个事务,本方法 = 那个入口的空写入形态;
+    /// 删行、越界裁定、备注 SQL 的唯一真相都在那边）。
     pub fn compact_session(
         &self,
         session_id: &str,
         plan: &CompactionPlan,
         note_text: &str,
     ) -> Result<(), rusqlite::Error> {
-        let mut c = self.lock();
-        let tx = c.transaction()?;
-        let ids = conversation_ids(&tx, session_id)?;
-        // 越界意味着 plan 与库已经分叉（单轮闸门之外的写入、或将来有人把读历史与压缩拆开）。
-        // 这里必须**报错**而不是 `ids[from..to]` 当场 slice panic：panic 会把 `Mutex` 打成
-        // 中毒态，症状是「此后每条命令都打不开」。
-        if plan.drop_from > plan.drop_to || plan.drop_to > ids.len() {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_RANGE),
-                Some(format!(
-                    "压缩区间 [{}, {}) 越界：会话 {session_id} 现在只有 {} 条对话消息（超出计划要删的行数）",
-                    plan.drop_from,
-                    plan.drop_to,
-                    ids.len()
-                )),
-            ));
-        }
-        for id in &ids[plan.drop_from..plan.drop_to] {
-            tx.execute("DELETE FROM messages WHERE id=?1", params![id])?;
-        }
-        // 同一条 append 路径：备注是一行普通消息，role 由 `Message::system_note` 决定，
-        // 这里不新写 INSERT（`blocks_json` 的编码必须只有一个来源）。
-        insert_message_row(&tx, session_id, &Message::system_note(note_text))?;
-        tx.commit()?;
-        Ok(())
+        // 返回值(本事务新增记忆行的 id)只对嵌入补写有意义,本方法零写入 ⇒ 恒空表,
+        // 忽略之 —— 「删除 + 备注」这条老入口的签名与语义都保持原样。
+        self.compact_session_with_memories(session_id, plan, note_text, &[], None)
+            .map(|_| ())
     }
 
     /// 读回一个会话的全部消息，顺序 == 写入顺序（`ORDER BY id`，不是时间戳：
@@ -292,6 +323,51 @@ pub struct SessionRow {
     pub updated_at: i64,
 }
 
+/// v3 的列补齐（见 `SCHEMA_VERSION` 的 v3 段）。**只做 ALTER ADD COLUMN**，
+/// 不改既有列、不搬数据 —— 所以它对「已经很新的库」是空转，对 v2 库是补四列。
+/// 用 `PRAGMA table_info` 而不是「ALTER 一次吞错误」：后者会把真正的失败
+/// （磁盘满、库被别处锁住）也当成「列已存在」静默吞掉。
+fn attach_memory_columns(c: &Connection) -> Result<(), rusqlite::Error> {
+    let mut st = c.prepare("PRAGMA table_info(memories)")?;
+    let existing: Vec<String> = st
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    // (列名, DDL 尾巴)。顺序固定，便于日志与测试逐条核对。
+    let wanted = [
+        (
+            "reinforcements",
+            "reinforcements INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("last_accessed", "last_accessed INTEGER"),
+        ("due_at", "due_at INTEGER"),
+        ("notified_at", "notified_at INTEGER"),
+        ("user_edited", "user_edited INTEGER NOT NULL DEFAULT 0"),
+    ];
+    for (name, ddl) in wanted {
+        if !existing.iter().any(|c| c == name) {
+            c.execute(&format!("ALTER TABLE memories ADD COLUMN {ddl}"), [])?;
+        }
+    }
+    Ok(())
+}
+
+/// v4 的 sessions 列补齐。与 [`attach_memory_columns`] 同一套判据（查 `table_info`、
+/// 缺才 ALTER），只是目标表不同 —— 分成两个函数而不是一个带表名的:表名一旦拼进 SQL，
+/// 「只有字面量进 SQL」这条纪律就破了个口子。
+fn attach_session_columns(c: &Connection) -> Result<(), rusqlite::Error> {
+    let mut st = c.prepare("PRAGMA table_info(sessions)")?;
+    let existing: Vec<String> = st
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    if !existing.iter().any(|c| c == "memory_extracted_upto") {
+        c.execute(
+            "ALTER TABLE sessions ADD COLUMN memory_extracted_upto INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn pragma_i64(c: &Connection, name: &str) -> Result<i64, rusqlite::Error> {
     // `name` 只来自本文件里的字面量，没有拼接外部输入的路径。
     c.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
@@ -306,7 +382,9 @@ fn pragma_i64(c: &Connection, name: &str) -> Result<i64, rusqlite::Error> {
 /// `compact_session` 在事务里直接把 `&tx` 递进来，两处共用同一条语句。
 /// `session_id` 不存在时由外键报错（`a_row_for_an_unknown_session_is_rejected_by_the_foreign_key`），
 /// 这里不另做一次存在性检查 —— 那是第二份真相。
-fn insert_message_row(
+/// `pub(crate)`（长期记忆）：`store::memory` 的压缩同事务入口要落同一条备注,
+/// 「一行消息长什么样」仍然只有这一处 SQL。
+pub(crate) fn insert_message_row(
     c: &Connection,
     session_id: &str,
     m: &Message,
@@ -334,7 +412,9 @@ fn insert_message_row(
 /// `'system'` 那个字面量来自 [`role_code`]（口径只有一处）：把 `role<>'system'` 改成硬编码
 /// 字符串，将来 `role_code` 换名就会让备注被当成对话消息删掉
 /// （`the_second_compaction_does_not_count_the_note_as_a_conversation_row` 盯这一点）。
-fn conversation_ids(c: &Connection, session_id: &str) -> Result<Vec<i64>, rusqlite::Error> {
+/// `pub(crate)`（长期记忆）：压缩同事务入口与这里共用**同一条**下标映射,
+/// 第二份「第几条对话消息是哪行」的答案迟早删错用户的原话。
+pub(crate) fn conversation_ids(c: &Connection, session_id: &str) -> Result<Vec<i64>, rusqlite::Error> {
     let mut st =
         c.prepare("SELECT id FROM messages WHERE session_id=?1 AND role<>?2 ORDER BY id")?;
     let ids = st
@@ -366,7 +446,7 @@ fn from_sql_failure(col: usize, reason: &'static str, detail: String) -> rusqlit
     )
 }
 
-fn decode_blocks(raw: &str, col: usize) -> Result<Vec<ContentBlock>, rusqlite::Error> {
+pub(crate) fn decode_blocks(raw: &str, col: usize) -> Result<Vec<ContentBlock>, rusqlite::Error> {
     serde_json::from_str(raw).map_err(|e| {
         from_sql_failure(
             col,
@@ -380,7 +460,7 @@ fn decode_blocks(raw: &str, col: usize) -> Result<Vec<ContentBlock>, rusqlite::E
 /// 那是把序列化格式当字符串刮一遍，`Role` 一旦变成带数据的变体就静默产出垃圾。
 /// 读回来也不许兜底成 `User`：那是把库里一行损坏伪装成「用户说过一句话」。
 /// 新增 `Role` 变体时这两个 `match` 都会编译失败 —— 那正是想要的提醒。
-fn role_code(role: &Role) -> &'static str {
+pub(crate) fn role_code(role: &Role) -> &'static str {
     match role {
         Role::System => "system",
         Role::User => "user",
@@ -388,7 +468,7 @@ fn role_code(role: &Role) -> &'static str {
     }
 }
 
-fn role_from_code(raw: &str, col: usize) -> Result<Role, rusqlite::Error> {
+pub(crate) fn role_from_code(raw: &str, col: usize) -> Result<Role, rusqlite::Error> {
     match raw {
         "system" => Ok(Role::System),
         "user" => Ok(Role::User),
@@ -738,7 +818,11 @@ mod tests {
             1,
             "foreign_keys 没生效 = CASCADE 静默失效，孤儿行谁也看不见"
         );
-        assert_eq!(db.user_version().unwrap(), 1, "R74：迁移钩子要有初值");
+        assert_eq!(
+            db.user_version().unwrap(),
+            4,
+            "R74：迁移钩子要有初值。v4 = 抽取游标(sessions.memory_extracted_upto) + 用户编辑标记(memories.user_edited),见 SCHEMA_VERSION"
+        );
     }
 
     /// R74 的钩子只对**未标记**的库成立：已有版本号的一律不覆盖。

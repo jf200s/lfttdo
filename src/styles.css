@@ -246,6 +246,31 @@ a:hover {
   color: var(--text-muted);
 }
 
+/* ==== P1 轻提示 ====
+   固定在底部居中，`fixed` 已经脱离文档流，所以挂在 `.app` 的最后一个子位也不参与 grid。
+   容器 `pointer-events: none`：它铺的是整条底部带，挡住背后的输入区就等于为了
+   让一个提示可见而让主路径不可用；只有按钮本身接事件。
+   色值一律 `var(--token)`（文件头第 ② 条），不复用 `.app-notice` 的 `--danger` 描边 ——
+   那是「出错了」的语义，而这条是成功反馈。 */
+.toast-region {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 10;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  padding: 8px 12px;
+  border-color: var(--border);
+  border-radius: var(--radius);
+  background-color: var(--bg-raised);
+  color: var(--text-primary);
+  box-shadow: 0 2px 4px var(--shadow);
+}
+
 /* ==== 气泡 ==== */
 
 /* 正文行距比全站基线（`:root` 的 1.5）松一档：气泡是这份界面里唯一成段读人话的地方，
@@ -672,7 +697,24 @@ a:hover {
 }
 
 .panel-row input,
-.panel-row select {
+.panel-row select,
+.panel-row textarea {
+  min-width: 0;
+  background-color: var(--bg-input);
+}
+
+/* P1 手动新增那一行：select + 正文输入 + 按钮横向排，放不下就换行。
+   不复用 `.panel-row` 的两列网格 —— 它是**三个**控件，塞进 1fr/160px 会让按钮掉到
+   下一行且正文框只剩一个字符宽。`flex: 1 1 160px` 让正文框吃掉剩余宽度。 */
+.panel-memory-add {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-memory-add input {
+  flex: 1 1 160px;
   min-width: 0;
   background-color: var(--bg-input);
 }

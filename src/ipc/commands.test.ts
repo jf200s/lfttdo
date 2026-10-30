@@ -52,9 +52,10 @@ describe("ipc commands", () => {
   it("asks for the flat settings view and writes the whole table back untouched", async () => {
     // 键数不是这条的判据（`SettingsPanel.test.tsx` 里那条才管「少带一键」），
     // 这里钉的是**信封形状**：`settings_set` 收 `{ settings: … }`，且 body 原样透传、
-    // 不掺进 `api_key_masked` 那两只只读键。写满 14 键是因为 `Settings` 现在就是 14 键（新增 `system_prompt`）
-    // （T26 加了 `roots`：Rust 侧 `Vec<PathBuf>` 的线上形状是字符串数组，由
-    // `ipc.rs::tests::the_settings_view_carries_roots_at_the_top_level_as_strings` 钉着）。
+    // 不掺进 `api_key_masked` 那两只只读键。写满 18 键是因为 `Settings` 现在就是 18 键
+    // （新增 `system_prompt`；T26 加了 `roots`：Rust 侧 `Vec<PathBuf>` 的线上形状是字符串数组，
+    // 由 `ipc.rs::tests::the_settings_view_carries_roots_at_the_top_level_as_strings` 钉着；
+    // 长期记忆切片再加 `memory_*` 四键）。
     await api.getSettings();
     await api.setSettings({
       base_url: "u",
@@ -71,6 +72,14 @@ describe("ipc commands", () => {
       keep_turns: 10,
       accent: "",
       roots: ["C:\\notes"],
+      memory_enabled: true,
+      memory_recall_k: 5,
+      memory_note_token_cap: 600,
+      memory_profile_char_cap: 500,
+      memory_decay_half_life_days: 60,
+      memory_prospective_window_hours: 24,
+      memory_embedding_source: "endpoint",
+      memory_embedding_model: "text-embedding-v3",
     });
     expect(invoke).toHaveBeenNthCalledWith(1, "settings_get");
     expect(invoke).toHaveBeenNthCalledWith(2, "settings_set", {
@@ -89,6 +98,14 @@ describe("ipc commands", () => {
         keep_turns: 10,
         accent: "",
         roots: ["C:\\notes"],
+        memory_enabled: true,
+        memory_recall_k: 5,
+        memory_note_token_cap: 600,
+        memory_profile_char_cap: 500,
+        memory_decay_half_life_days: 60,
+        memory_prospective_window_hours: 24,
+        memory_embedding_source: "endpoint",
+        memory_embedding_model: "text-embedding-v3",
       },
     });
   });
@@ -96,6 +113,80 @@ describe("ipc commands", () => {
   it("hands the api key to the only command that may carry it", async () => {
     await api.setApiKey("sk-1");
     expect(invoke).toHaveBeenCalledWith("settings_set_api_key", { apiKey: "sk-1" });
+  });
+
+  // ==== 长期记忆的管理命令（设计文档 §7：记忆对用户必须可审计）====
+  // 与 sessions/deleteSession 同一判据：命令名 + 参数对象原样钉住。命令名写错时 Rust 侧
+  // 收不到（Tauri 按名字路由），界面只会看见一次无声的失败 —— UI 测试看不出，只有这层能钉。
+  it("lists memories without arguments", async () => {
+    invoke.mockResolvedValueOnce([]);
+    const rows = await api.listMemories();
+    expect(rows).toEqual([]);
+    expect(invoke).toHaveBeenCalledWith("memories_list");
+  });
+
+  it("passes the memory id the delete command expects", async () => {
+    await api.deleteMemory(7);
+    expect(invoke).toHaveBeenCalledWith("memories_delete", { id: 7 });
+  });
+
+  it("clears every memory without arguments", async () => {
+    await api.clearMemories();
+    expect(invoke).toHaveBeenCalledWith("memories_clear");
+  });
+
+  it("asks for the resident profile as one string", async () => {
+    invoke.mockResolvedValueOnce("");
+    const body = await api.memoryProfile();
+    expect(body).toBe("");
+    expect(invoke).toHaveBeenCalledWith("memory_profile");
+  });
+
+  // ==== P1：会话切换的收尾抽取 + 用户编辑/新增 ====
+  // 三个命令都是 `session_id` / `id` / `kind` 这类 Rust 形参。Tauri v2 按 camelCase 收
+  // JS 侧的键（本仓 `send_message` 对 `session_id` 就是这么写的，见 commands.ts 顶部），
+  // 所以这里必须抄同一条惯例：写成 `session_id` 反而收不到值。
+  it("flushes the session being left, keyed the same way send_message keys session_id", async () => {
+    invoke.mockResolvedValueOnce(2);
+    const saved = await api.flushMemory("s1");
+    // 返回的是「这次新记住了几条」：调用方用它决定要不要弹轻提示，所以必须原样交回。
+    expect(saved).toBe(2);
+    expect(invoke).toHaveBeenCalledWith("memory_flush_session", { sessionId: "s1" });
+  });
+
+  it("updates one memory's body through memory_update_body", async () => {
+    await api.updateMemoryBody(7, "用户住在上海");
+    expect(invoke).toHaveBeenCalledWith("memory_update_body", {
+      id: 7,
+      body: "用户住在上海",
+    });
+  });
+
+  it("adds a memory with its kind and body and returns the new row id", async () => {
+    invoke.mockResolvedValueOnce(11);
+    const id = await api.addMemory("preference", "用户喜欢深色主题", null);
+    expect(id).toBe(11);
+    // 参数名是 `kind` / `body` / `dueAt`（ipc.rs 的 command 形参 `kind`/`body`/`due_at`，
+    // 第三键按 Tauri v2 的 camelCase 映射），不是 `memoryKind` 之类的别名。
+    // 非待办也必须显式带 `dueAt: null`：省略与 null 在线上虽然都解成 None，
+    // 但命令层的形状只有一处可断言，这里写全才看得见「谁负责给这一格赋值」。
+    expect(invoke).toHaveBeenCalledWith("memory_add", {
+      kind: "preference",
+      body: "用户喜欢深色主题",
+      dueAt: null,
+    });
+  });
+
+  it("forwards a prospective memory's due date as UTC milliseconds", async () => {
+    // 值本身由面板按 UTC 算好（`Date.UTC(2026, 10, 1, 9, 0)`，与 Rust
+    // `parse_iso8601_ms` 的 1_793_523_600_000 同口径）；命令层只负责原样递过去。
+    invoke.mockResolvedValueOnce(12);
+    await api.addMemory("prospective", "2026 年 11 月 1 日交周报", 1_793_523_600_000);
+    expect(invoke).toHaveBeenCalledWith("memory_add", {
+      kind: "prospective",
+      body: "2026 年 11 月 1 日交周报",
+      dueAt: 1_793_523_600_000,
+    });
   });
 
   it("interrupts without arguments", async () => {
