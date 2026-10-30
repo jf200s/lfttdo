@@ -1,7 +1,7 @@
 // T29：`mcp.json` 的只读配置层。
 //
 // 边界（简报 :9）：本文件**不**建连接、**不** spawn、**不**接调用点，也**不**产出任何
-// 写文件的 API / `Serialize` / `to_json_string()` —— 写入者是 T35（管理界面）。
+// 写文件的 API / `Serialize` / `to_json_string()` —— 写入者是 `mcp/editor.rs`（应用内 JSON 编辑器）；本文件只做纯解析。
 // `load` 的目录参数就是设置文件所在的那个目录（R293）：这里只做一次 `join(MCP_FILE)`，
 // 不去找 `app_data_dir()`（那个 helper 今天只在 examples 里）。签名相对 R293 的 `&Path`
 // 放宽为 `&impl AsRef<Path>`，原因见 `load` 上的冲突记录。
@@ -225,13 +225,13 @@ struct RawServer {
 /// `serde_json::Map` 默认虽是 BTreeMap（无 `preserve_order`），但反序列化进 map 时
 /// 同名重复键会 last-wins 覆盖 ⇒ R292 的「同名重复」永远不可达（Step 2 实测红：
 /// 留下来的是第二条 `"second"` 而不是第一条）。这里用自定义 `Visitor` 经 `MapAccess`
-/// 逐对收集**每一个**键值对（重复键都在），再由 `load` 做一次按名字的**稳定排序**：
+/// 逐对收集**每一个**键值对（重复键都在），再由 `parse_text` 做一次按名字的**稳定排序**：
 /// 唯一名时结果与 BTreeMap 遍历序逐字相同（简报 §三·3 钉的字典序语义不变，
 /// `servers_follow_alphabetical_order_not_written_order` 仍绿），重复名时保留出现序
 /// （稳定排序不动第一条 ⇒ 「留第一条」）。冲突与取舍详见 task-29 报告。
 ///
 /// R296：值这一侧存 `serde_json::Value` 而**不是** `RawServer` —— 逐对收集时就把类型转换
-/// 推迟给 `load` 里的**逐条** `from_value`，这样「某一条的字段类型写错」只杀掉那一条
+/// 推迟给 `parse_text` 里的**逐条** `from_value`，这样「某一条的字段类型写错」只杀掉那一条
 /// （进 `skipped`），不会像整体 `from_str::<RawFile>` 那样把整份文件的条目一起清零。
 #[derive(Deserialize)]
 struct RawFile {
@@ -263,7 +263,7 @@ where
             mut map: A,
         ) -> Result<Self::Value, A::Error> {
             let mut entries = Vec::new();
-            // 值先收成 `Value`：类型对不对是**条目级**的事，交给 `load` 逐条判（R296），
+            // 值先收成 `Value`：类型对不对是**条目级**的事，交给 `parse_text` 逐条判（R296），
             // 这一层只管「`mcpServers` 是不是对象」与「重复键也要留下」。
             while let Some(entry) = map.next_entry::<String, serde_json::Value>()? {
                 entries.push(entry);
@@ -275,42 +275,22 @@ where
     deserializer.deserialize_map(ServersVisitor)
 }
 
-/// 读取 `dir` 下的 `mcp.json`。文件不存在 ⇒ 三条全空，**不报错、不返回 Result**（R293）。
-///
-/// 签名冲突记录（详见 task-29 报告）：R293 给的是 `dir: &Path`，但 plan 逐字测试写的是
-/// `load(&dir)`（`dir` 是 `TempDir`），而 tempfile 3.27 的 `TempDir` 只实现 `AsRef<Path>`、
-/// **没有** `Deref<Target = Path>`（dir.rs:484 实测）⇒ 二者不可能同时成立。这里放宽成
-/// `&impl AsRef<Path>`：逐字测试与未来 `&Path` 调用点都原样可传，函数体仍只做一次
-/// `join(MCP_FILE)`，不引入其他权力。
-pub fn load(dir: &impl AsRef<Path>) -> McpConfig {
-    // R293 负半边：文件**不存在** ⇒ 三条全空、不报错、不返回 Result，也不动目录里任何东西
-    // （不改名、不搬走 —— 配置读这一层没有任何改文件的权力）。
-    // 其他读失败（权限、路径是目录）不是简报钉过的形态：这里给空 servers + `parse_error`
-    // 摘要，**不 panic**（自己的判断，报告里提请裁）。
-    let content = match std::fs::read_to_string(dir.as_ref().join(MCP_FILE)) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return McpConfig {
-                servers: Vec::new(),
-                skipped: Vec::new(),
-                parse_error: None,
-            };
-        }
-        Err(e) => {
-            return McpConfig {
-                servers: Vec::new(),
-                skipped: Vec::new(),
-                parse_error: Some(format!("读取 {MCP_FILE} 失败: {e}")),
-            };
-        }
-    };
-    let raw = match serde_json::from_str::<RawFile>(&content) {
+/// 把一份 JSON 文本解析成 server 列表 / 跳过台账 / 文件级错误。
+/// `load` 与 `mcp/editor.rs` 的严格校验共用这一份判定，禁止另起一套规则。
+pub(crate) fn parse_text(content: &str) -> McpConfig {
+    let raw = match serde_json::from_str::<RawFile>(content) {
         Ok(raw) => raw,
         Err(e) => {
             return McpConfig {
                 servers: Vec::new(),
                 skipped: Vec::new(),
-                parse_error: Some(e.to_string()),
+                // 只留位置：serde 的完整文案可能把输入里的字符串值（有时是密钥）带出来，
+                // 而 `mcp_config_status` 会展示 parse_error。
+                parse_error: Some(format!(
+                    "JSON 解析失败：第 {} 行第 {} 列",
+                    e.line(),
+                    e.column()
+                )),
             };
         }
     };
@@ -385,6 +365,38 @@ pub fn load(dir: &impl AsRef<Path>) -> McpConfig {
     }
 }
 
+/// 读取 `dir` 下的 `mcp.json`。文件不存在 ⇒ 三条全空，**不报错、不返回 Result**（R293）。
+///
+/// 签名冲突记录（详见 task-29 报告）：R293 给的是 `dir: &Path`，但 plan 逐字测试写的是
+/// `load(&dir)`（`dir` 是 `TempDir`），而 tempfile 3.27 的 `TempDir` 只实现 `AsRef<Path>`、
+/// **没有** `Deref<Target = Path>`（dir.rs:484 实测）⇒ 二者不可能同时成立。这里放宽成
+/// `&impl AsRef<Path>`：逐字测试与未来 `&Path` 调用点都原样可传，函数体仍只做一次
+/// `join(MCP_FILE)`，不引入其他权力。
+pub fn load(dir: &impl AsRef<Path>) -> McpConfig {
+    // R293 负半边：文件**不存在** ⇒ 三条全空、不报错、不返回 Result，也不动目录里任何东西
+    // （不改名、不搬走 —— 配置读这一层没有任何改文件的权力）。
+    // 其他读失败（权限、路径是目录）不是简报钉过的形态：这里给空 servers + `parse_error`
+    // 摘要，**不 panic**（自己的判断，报告里提请裁）。
+    let content = match std::fs::read_to_string(dir.as_ref().join(MCP_FILE)) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return McpConfig {
+                servers: Vec::new(),
+                skipped: Vec::new(),
+                parse_error: None,
+            };
+        }
+        Err(e) => {
+            return McpConfig {
+                servers: Vec::new(),
+                skipped: Vec::new(),
+                parse_error: Some(format!("读取 {MCP_FILE} 失败: {e}")),
+            };
+        }
+    };
+    parse_text(&content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +437,70 @@ mod tests {
             c.servers.iter().map(|s| s.name()).collect::<Vec<_>>(),
             vec!["alpha", "zeta"]
         );
+    }
+
+    #[test]
+    fn parse_text_reports_the_same_servers_and_skips_as_load() {
+        let raw = r#"{ "mcpServers": {
+            "ok": {"command":"npx"},
+            "bad": {"args":"-y"},
+            "dup": {"command":"a"},
+            "dup": {"command":"b"}
+        } }"#;
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(MCP_FILE), raw).unwrap();
+
+        let from_file = load(&dir);
+        let from_text = parse_text(raw);
+
+        assert_eq!(
+            from_file
+                .servers
+                .iter()
+                .map(|s| s.name())
+                .collect::<Vec<_>>(),
+            from_text
+                .servers
+                .iter()
+                .map(|s| s.name())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            from_file
+                .skipped
+                .iter()
+                .map(|s| (s.name.as_str(), s.reason))
+                .collect::<Vec<_>>(),
+            from_text
+                .skipped
+                .iter()
+                .map(|s| (s.name.as_str(), s.reason))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            from_file.parse_error.is_some(),
+            from_text.parse_error.is_some()
+        );
+    }
+
+    #[test]
+    fn parse_text_keeps_the_file_level_error_separate_from_entry_skips() {
+        let broken = parse_text("{ not json");
+        assert!(broken.servers.is_empty());
+        assert!(broken.skipped.is_empty());
+        assert!(broken.parse_error.is_some());
+
+        let bad_entry = parse_text(r#"{ "mcpServers": { "x": {} } }"#);
+        assert!(bad_entry.servers.is_empty());
+        assert_eq!(bad_entry.skipped.len(), 1);
+        assert!(bad_entry.parse_error.is_none());
+    }
+
+    #[test]
+    fn file_level_parse_errors_do_not_echo_the_input() {
+        let c = parse_text("\"sk-REAL-SECRET\"");
+        let e = c.parse_error.expect("根是字符串 ⇒ 文件级错误");
+        assert!(!e.contains("sk-REAL-SECRET"), "解析错误泄密：{e}");
     }
 
     // —— 测试内联辅助（简报 Step 2：不是 `Produces` 的一部分，别 `pub`）——
@@ -576,7 +652,7 @@ mod tests {
     // R296 把 `parse_error` 的职责收窄成「整份文件坏」，那这三种文件级形态就要各有各的判据
     // （条目级坏已经由 `one_bad_field_type_does_not_sink_the_other_servers` 钉住了）。
     // 断言只钉「不 panic + servers 空 + parse_error 非空 + 不进 skipped」四件事，不比文案：
-    // 根为数组时 serde 会把我们 `expecting()` 那句一起带进摘要，文案不是接口。
+    // 摘要只有 serde_json 给的行/列位置（完整文案会回显输入值，已弃用），行号列号不是接口。
     #[test]
     fn a_non_object_root_is_a_file_level_error_not_a_panic() {
         let c = load_raw(r#"[ "mcpServers", { "ok": {"command":"x"} } ]"#);
