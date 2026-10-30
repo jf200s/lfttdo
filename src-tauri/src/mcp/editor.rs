@@ -221,6 +221,29 @@ mod tests {
         );
     }
 
+    // Windows 的 `rename` 覆盖已存在文件行为与 Unix 不同，必须在真实存在的
+    // mcp.json 上跑一次，否则"编辑 → 保存 → 原子替换"这条主路径无人看守。
+    #[test]
+    fn save_replaces_an_existing_file_and_leaves_no_temp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(MCP_FILE);
+        let old_text = r#"{"mcpServers":{"old":{"command":"npx"}}}"#;
+        std::fs::write(&path, old_text).unwrap();
+
+        let new_text = "{\n  \"mcpServers\": {\n    \"new\": {\n      \"command\": \"node\"\n    }\n  }\n}\n";
+        save(dir.path(), new_text).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), new_text);
+        assert!(
+            !dir.path().join(TEMP_FILE).exists(),
+            "成功保存后不许留下 .tmp"
+        );
+
+        let cfg = crate::mcp::config::load(&dir);
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(cfg.servers[0].name(), "new");
+    }
+
     #[test]
     fn a_file_level_error_leaves_an_existing_file_untouched() {
         let dir = tempdir().unwrap();

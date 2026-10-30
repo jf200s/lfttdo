@@ -72,11 +72,14 @@ describe("McpConfigEditor", () => {
     const onDone = vi.fn();
     render(<McpConfigEditor load={load} save={save} onDone={onDone} />);
 
-    await screen.findByLabelText("mcp.json 内容");
+    const box = await screen.findByLabelText("mcp.json 内容");
+    const edited = '{\n  "mcpServers": { "new": { "command": "npx" } }\n}\n';
+    fireEvent.change(box, { target: { value: edited } });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() => expect(onDone).toHaveBeenCalledWith(true));
-    expect(save).toHaveBeenCalledWith(snapshot().text);
+    expect(save).toHaveBeenCalledWith(edited);
+    expect(save).not.toHaveBeenCalledWith(snapshot().text);
   });
 
   it("asks before discarding edits and can keep editing", async () => {
