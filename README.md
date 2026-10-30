@@ -12,7 +12,7 @@ Windows 桌面 AI 助理：聊天、看图、联网抓取、MCP 工具调用，�
 - **聊天**：流式输出、多会话、长对话自动摘要压缩、上下文预算可调。
 - **看图**：粘贴 / 拖拽 / 选文件三种入口，统一走同一条图片归一化（缩放、转码、体积闸门）；视觉模型可描述图片。
 - **联网抓取**：内置 `fetch_url`，按内容抽取正文；每跳重定向都过 SSRF 判定（拒绝非 http(s)、本机、内网与元数据地址）。
-- **MCP 客户端**：stdio 传输，启动后台连接、工具命名走 `mcp__{server}__{tool}`、每台 server 可设信任档（全部允许 / 每次询问 / 禁止），信任设置持久化。
+- **MCP 客户端**：stdio 传输，启动后台连接、工具命名走 `mcp__{server}__{tool}`、每台 server 可设信任档（全部允许 / 每次询问 / 禁止），信任设置持久化；侧栏 MCP 面板可在应用内直接编辑 `mcp.json`（严格校验、重启生效）。
 - **长期记忆**：跨会话记住事实、偏好、画像与待办；在上下文压缩、空闲、切换会话时自动抽取，每轮按相关度召回；设置页可查看、编辑、新增、删除、清空。
 - **工具权限门**：Read 自动放行；Write/Exec 弹窗确认；MCP 工具默认每次询问；未知工具按最严一档处理。
 - **人设**：系统提示词是数据目录 `settings.json` 里的 `system_prompt`，应用内不提供编辑入口；改完重启、新建对话生效。
@@ -107,7 +107,7 @@ src-tauri/src/
   model/            OpenAI 兼容适配器（含 reasoning 流）
   tools/            内置工具与注册表（fetch_url、read_file、use_skill、memory_search）
   permission/       权限门与信任档
-  mcp/              mcp.json 读取、工具命名、stdio 桥、进程树回收
+  mcp/              mcp.json 读取/编辑、工具命名、stdio 桥、进程树回收
   store/            SQLite 会话与长期记忆持久化
   image_prep.rs     图片归一化
 docs/               设计、计划与验证记录
@@ -128,6 +128,7 @@ docs/               设计、计划与验证记录
 - 工具参数逐段传 argv，不拼 shell 命令行；MCP 子进程设置 `CREATE_NO_WINDOW`。
 - SSRF 判定在每一跳重定向上执行；内网与本机地址默认拒绝。
 - 前端无 shell / 文件系统权限，进程执行全部在 Rust 侧。
+- 应用内配置编辑器会把 `mcp.json` 原文（含 env/headers）显示在界面里；MCP 列表与状态命令始终不返回这些值。
 - Markdown 链接经 `open_url` 交给系统默认浏览器（只允许 http/https），不导航 WebView；
   WebView 顶层导航另有白名单（只放行应用自身来源与本机开发服务器）。
 
