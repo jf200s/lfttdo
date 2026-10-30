@@ -4,7 +4,13 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { McpPanel } from "./McpPanel";
 import type { McpConfigStatus, McpServerView } from "../types";
 
@@ -44,8 +50,9 @@ describe("McpPanel", () => {
     await waitFor(() => expect(setTrust).toHaveBeenCalledWith("search", "auto"));
   });
 
-  it("shows the failure reason for a disconnected server without a popup", () => {
+  it("shows the failure reason for a disconnected server without a popup", async () => {
     const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => {});
+    const status = statusOf();
     render(
       <McpPanel
         initial={[
@@ -58,9 +65,13 @@ describe("McpPanel", () => {
           },
         ]}
         onClose={() => {}}
-        loadConfigStatus={statusOf()}
+        loadConfigStatus={status}
       />,
     );
+    // 让挂载时发出的配置状态 promise 在 act 内落定，避免游离的 setState 警告。
+    await act(async () => {
+      await status.mock.results[0]?.value;
+    });
     expect(screen.getByText(/program not found/)).toBeInTheDocument();
     expect(alertSpy).not.toHaveBeenCalled();
     alertSpy.mockRestore();
@@ -203,10 +214,15 @@ describe("McpPanel", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  it("points the empty state at the in-app editor", () => {
+  it("points the empty state at the in-app editor", async () => {
+    const status = statusOf();
     render(
-      <McpPanel initial={[]} onClose={() => {}} loadConfigStatus={statusOf()} />,
+      <McpPanel initial={[]} onClose={() => {}} loadConfigStatus={status} />,
     );
+    // 让挂载时发出的配置状态 promise 在 act 内落定，避免游离的 setState 警告。
+    await act(async () => {
+      await status.mock.results[0]?.value;
+    });
     expect(
       screen.getByText(/点击「编辑配置」直接写 mcp.json/),
     ).toBeInTheDocument();
