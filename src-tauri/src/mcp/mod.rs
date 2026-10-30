@@ -6,10 +6,12 @@
 // `bridge.rs`（T31）是本目录里**第一个会真起进程**的一层：spawn 选型 + 并行连接 + 状态台账。
 // 它的边界止于「握手 + 数工具 + 状态」——**不**注册工具（T32）、**不**接 `ipc.rs`（T35 的
 // `mcp_connect` 才是第一个消费者）、**不**做进程树回收（T34 的 JobObject）。
-// HTTP 传输（T36）与管理界面（唯一的写入者，T35）都还没进来。
+// HTTP 传输（T36）仍未启用；mcp.json 的唯一写入者是 `editor.rs`（应用内 JSON 编辑器），
+// 它只做读取、严格校验与原子写入，不碰桥与工具表。
 
 pub mod bridge;
 pub mod config;
+pub mod editor;
 pub mod naming;
 pub mod process;
 pub mod trust;
