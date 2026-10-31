@@ -1844,11 +1844,31 @@ pub fn mcp_clear_tools(
         .collect()
 }
 
+/// 把一台 server 声明的全部工具注册进生产表，并把「注册名 → 真名」喂给 gate 的
+/// alias 表（T33）。alias 是 gate 查 per-server 信任档的唯一可靠通路：T30 兜底命名
+/// 把注册名的 server 段截到 8 个 char，`scope_of` 从注册名还原不出真名，而信任表
+/// 按真名存（`mcp_set_trust` / `mcp_trust.json` 都用真名）。与 [`mcp_clear_tools`]
+/// 成对：一个摘（按精确名）、一个挂（挂的同时喂 alias）。
+pub fn mcp_register_tools(
+    registry: &ToolRegistry,
+    gate: &PermissionGate,
+    bridge: &Arc<McpBridge>,
+    server: &str,
+    decls: &[rmcp::model::Tool],
+) {
+    for decl in decls {
+        let tool = McpTool::from_decl(server, decl, bridge.clone());
+        gate.rules().set_server_alias(tool.registered_name(), server);
+        registry.register(Arc::new(tool));
+    }
+}
+
 /// 重连一台 server 并把它声明的工具注册进生产表（T35 的 `mcp_reconnect` 的核心）。
 /// **先连、后换**：连不上就保持原来那批工具不动（失败不会让可用工具表缩水）。
 pub async fn mcp_reconnect_of(
     bridge: &Arc<McpBridge>,
     registry: &ToolRegistry,
+    gate: &PermissionGate,
     def: ServerDef,
 ) -> Result<usize, String> {
     let name = def.name().to_string();
@@ -1860,9 +1880,7 @@ pub async fn mcp_reconnect_of(
         None => return Err("连接没有返回结果".to_string()),
     };
     mcp_clear_tools(registry, &name, &old);
-    for decl in bridge.decls_of(&name) {
-        registry.register(Arc::new(McpTool::from_decl(&name, &decl, bridge.clone())));
-    }
+    mcp_register_tools(registry, gate, bridge, &name, &bridge.decls_of(&name));
     Ok(count)
 }
 
@@ -1875,12 +1893,13 @@ pub async fn mcp_reconnect_of(
 pub async fn mcp_bootstrap(
     bridge: &Arc<McpBridge>,
     registry: &ToolRegistry,
+    gate: &PermissionGate,
     servers: Vec<ServerDef>,
 ) -> Vec<(String, Result<usize, String>)> {
     let mut out = Vec::with_capacity(servers.len());
     for def in servers {
         let name = def.name().to_string();
-        let result = mcp_reconnect_of(bridge, registry, def).await;
+        let result = mcp_reconnect_of(bridge, registry, gate, def).await;
         out.push((name, result));
     }
     out
@@ -1909,7 +1928,7 @@ pub async fn mcp_reconnect(state: State<'_, AppState>, name: String) -> Result<u
         .into_iter()
         .find(|def| def.name() == name)
         .ok_or_else(|| format!("配置里没有 `{name}`"))?;
-    mcp_reconnect_of(&state.mcp, &state.registry, def).await
+    mcp_reconnect_of(&state.mcp, &state.registry, &state.gate, def).await
 }
 
 #[tauri::command]
@@ -2986,10 +3005,11 @@ pub fn run() {
             // 后台自举：句柄从刚装好的 State 里取（保持装配行仍是唯一一条
             // `registry: build_production_registry()` —— 那条守卫测试盯着它）。
             let managed = app.state::<AppState>();
-            let (bootstrap_bridge, bootstrap_registry, bootstrap_dir) = (
+            let (bootstrap_bridge, bootstrap_registry, bootstrap_dir, bootstrap_gate) = (
                 managed.mcp.clone(),
                 managed.registry.clone(),
                 managed.mcp_dir.clone(),
+                managed.gate.clone(),
             );
             // 不挡窗口出现（冷启动 110ms 那条线不受影响），失败只落状态台账。
             tauri::async_runtime::spawn(async move {
@@ -2997,7 +3017,13 @@ pub fn run() {
                 if cfg.servers.is_empty() {
                     return;
                 }
-                let _ = mcp_bootstrap(&bootstrap_bridge, &bootstrap_registry, cfg.servers).await;
+                let _ = mcp_bootstrap(
+                    &bootstrap_bridge,
+                    &bootstrap_registry,
+                    &bootstrap_gate,
+                    cfg.servers,
+                )
+                .await;
             });
             // T15(P0)：空闲记忆抽取 worker。放在 `manage` 之后、几何恢复之前 ——
             // 它要的四个东西（app/db/settings/running）这时都已是托管实例。
@@ -7638,8 +7664,57 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_mcp_config_bootstraps_to_nothing() {
-        let out = mcp_bootstrap(&Arc::new(McpBridge::new()), &ToolRegistry::new(), vec![]).await;
+        let out = mcp_bootstrap(
+            &Arc::new(McpBridge::new()),
+            &ToolRegistry::new(),
+            &PermissionGate::new(),
+            vec![],
+        )
+        .await;
         assert!(out.is_empty(), "没有配置就不许 spawn 任何东西");
+    }
+
+    /// 注册期必须把「注册名 → 真名」喂进 gate 的 alias 表：这是兜底命名 server 的
+    /// 信任档（Block/Auto）能生效的唯一通路（T33 按真名存、T30 注册名还原不出真名）。
+    /// 走真注册函数 + 真 gate.check 全链验证：alias 没喂上，Block 就落空。
+    #[tokio::test]
+    async fn mcp_registration_feeds_the_gate_the_registered_to_real_name_alias() {
+        let bridge = Arc::new(McpBridge::new());
+        let registry = ToolRegistry::new();
+        let gate = PermissionGate::new();
+        let server = "a-very-long-community-server-name-that-goes-on";
+        let decl = rmcp::model::Tool::new(
+            "get_the_current_weather_forecast_for_a_location",
+            "查天气",
+            serde_json::Map::new(),
+        );
+        mcp_register_tools(&registry, &gate, &bridge, server, std::slice::from_ref(&decl));
+
+        // 前提：这条工具名确实是兜底形状（截断的 server 段，还原不出真名）。
+        let registered = registry.defs()[0].name.clone();
+        assert!(
+            !registered.starts_with(&format!("mcp__{server}__")),
+            "前提：注册名是兜底形状（server 段被截断）：{registered}"
+        );
+        gate.rules().set_server_trust(server, Verdict::Block);
+
+        let view = ToolCallView {
+            id: "c1".into(),
+            name: registered,
+            risk: Risk::Read,
+            input: json!({}),
+        };
+        let d = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            gate.check(&view, &tokio_util::sync::CancellationToken::new()),
+        )
+        .await
+        .expect("Block 必须当场拒绝");
+        assert!(
+            matches!(&d, crate::agent::events::Decision::Deny { reason }
+                if reason.contains("被设为 Block") && reason.contains(server)),
+            "Block 必须经 alias 命中真名并压下来（alias 没喂上时这里落空成默认 Ask）：{d:?}"
+        );
     }
 
     #[test]
