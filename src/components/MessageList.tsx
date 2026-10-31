@@ -22,14 +22,16 @@ const WHERE_LABEL: Record<ErrorWhere, string> = {
  *   ② 折叠后仍超过 `COLLAPSED_MAX` 条时只露最近的那几条，其余收进「展开」；
  *   ③ 不许每条都渲染成独立横幅。
  */
-const COLLAPSED_MAX = 5;
+// export：App 侧的 appNotices 渲染共用同一份「合并 ×n + 超上限折叠」逻辑 ——
+// 两条通知通道若是各写一份，「×n」的口径迟早漂成两个。
+export const COLLAPSED_MAX = 5;
 
 interface Group {
   text: string;
   count: number;
 }
 
-function groupRuns(notices: string[]): Group[] {
+export function groupRuns(notices: string[]): Group[] {
   const out: Group[] = [];
   for (const n of notices) {
     const last = out[out.length - 1];

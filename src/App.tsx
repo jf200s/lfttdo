@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Composer } from "./components/Composer";
-import { MessageList } from "./components/MessageList";
+import { MessageList, COLLAPSED_MAX, groupRuns } from "./components/MessageList";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { McpPanel } from "./components/McpPanel";
 import { SkillsPanel } from "./components/SkillsPanel";
@@ -31,6 +31,47 @@ function newest(rows: SessionRow[]): SessionRow | undefined {
   return rows.reduce<SessionRow | undefined>(
     (acc, r) => (acc === undefined || r.updated_at > acc.updated_at ? r : acc),
     undefined,
+  );
+}
+
+/**
+ * App 侧通知（`appNotices`）的渲染，与 MessageList 的 NoticeStrip 同一条设计：
+ * 状态那份真相只增不减，合并 ×n 与超过 `COLLAPSED_MAX` 组收进「展开」全归渲染层。
+ * 之前是全量逐条渲染，IPC 持续失败的长会话里横幅随失败次数一条条往上摞、无限增长。
+ * 逻辑直接复用 `groupRuns`：两条通知通道各写一份的话，「×n」的口径迟早漂成两个。
+ */
+function AppNotices({ notices }: { notices: string[] }) {
+  const [open, setOpen] = useState(false);
+  if (notices.length === 0) return null;
+  const groups = groupRuns(notices);
+  const collapsed = !open && groups.length > COLLAPSED_MAX;
+  const shown = collapsed
+    ? groups.slice(groups.length - COLLAPSED_MAX)
+    : groups;
+  const hidden = groups.length - shown.length;
+  return (
+    <ul className="app-notices" data-testid="app-notices">
+      {collapsed ? (
+        <li className="app-notice">
+          <button type="button" onClick={() => setOpen(true)}>
+            展开（另有 {hidden} 条）
+          </button>
+        </li>
+      ) : null}
+      {open && groups.length > COLLAPSED_MAX ? (
+        <li className="app-notice">
+          <button type="button" onClick={() => setOpen(false)}>
+            收起
+          </button>
+        </li>
+      ) : null}
+      {shown.map((g, i) => (
+        <li className="app-notice" data-testid="app-notice" key={`${g.text}-${i}`}>
+          {g.text}
+          {g.count > 1 ? <span className="notice-count"> ×{g.count}</span> : null}
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -84,6 +125,16 @@ export default function App() {
    * 合法快照，把更晚的那一次重放覆盖掉。
    */
   const genRef = useRef(0);
+  /**
+   * 首启建会话的互斥闸。StrictMode（仅 dev）把启动 effect 跑两遍，两条异步链各自看到
+   * 空列表、各发一次 `session_create`（后端无条件建），冷启动便多出一条空会话。
+   * ref 里存的是**正在进行的 createSession promise**：并发进来的第二条链 await 同一个
+   * promise，而不是跳过 —— 跳过会让它带着空列表提前 return，界面停在无会话的空壳上。
+   * 只有失败才复位（放行迟到的链重试）；成功留下的已决 promise 挡住一切迟到的
+   * 第二条链。effect 的依赖是两个恒稳的 useCallback，一个挂载期内不会重跑，
+   * 这个闸因此不会过期。
+   */
+  const bootCreateRef = useRef<Promise<string> | null>(null);
 
   /**
    * 界面自己的提示通道。和 `UiState.notices` 分开：那一支是** reducer 的事实**
@@ -285,7 +336,13 @@ export default function App() {
       try {
         let rs = await api.sessions();
         if (rs.length === 0) {
-          await api.createSession();
+          // 互斥见 bootCreateRef：并发的第二条链共享同一次 createSession（去重），
+          // 而不是各自发一条 session_create。
+          bootCreateRef.current ??= api.createSession().catch((e) => {
+            bootCreateRef.current = null; // 失败复位：迟到的链允许重试
+            throw e;
+          });
+          await bootCreateRef.current;
           rs = await api.sessions();
         }
         if (!alive || rs.length === 0) return;
@@ -638,15 +695,7 @@ export default function App() {
         }}
       />
       <main className="pane">
-        {appNotices.length > 0 ? (
-          <ul className="app-notices" data-testid="app-notices">
-            {appNotices.map((n, i) => (
-              <li className="app-notice" data-testid="app-notice" key={`${n}-${i}`}>
-                {n}
-              </li>
-            ))}
-          </ul>
-        ) : null}
+        <AppNotices notices={appNotices} />
         {activeId === null ? null : (
           <div className="workspace-bar" data-testid="workspace-bar">
             <span className="workspace-kind">
