@@ -98,6 +98,11 @@ npx tsc --noEmit
 npm run lint:css
 ```
 
+Rust 侧需 MSVC 工具链：默认工具链不是 MSVC 的机器，用 `rustup default stable-msvc` 设为默认，
+或 `cargo +stable-x86_64-pc-windows-msvc test --all-targets` 显式指定（GNU 工具链在含非 ASCII
+字符的仓库路径下链接器会崩）。仓库路径含非 ASCII 字符时，aws-lc-sys 的 NASM 构建步骤也会失败，
+可设 `AWS_LC_SYS_PREBUILT_NASM=1` 改用预编译汇编，或把仓库放到纯 ASCII 路径。
+
 当前读数：Rust 760 passed / 1 ignored + 集成 3 passed；前端 282 passed；clippy 无新增。
 
 ## 目录结构
