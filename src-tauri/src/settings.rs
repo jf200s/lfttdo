@@ -328,20 +328,18 @@ pub struct Settings {
     /// （`base_url` 归一形态、`model` 由端点报错兜底，都挡不住「把 `tomato` 写进 `--accent`」）。
     /// 校验只有 `normalize_accent` 一处定义，读写两侧各过一次（R86 同规）。
     pub accent: String,
-    /// T26：`read_file` 能读的范围 —— **由用户自己列出的目录表**。
     ///
     /// **默认空，而空表意味着一律拒绝**（`ToolCtx::resolve_within_roots` 拿到空表是全拒、
     /// 不是全放行，`registry.rs::no_roots_denies_everything` 钉着）。这不是没做完：它和 R90 的
     /// 空 `base_url` 是同一个取向 —— 「允许读哪些目录」是用户的决定，程序替他挑一个
     /// （HOME？Documents？）就是把 roots 外的东西交出去，而那正是这把工具唯一的用途所在。
-    /// 本切片**没有**界面控件（任务明确不许加），所以这个键目前只能由用户手改
-    /// `settings.json` 填上；填不上就是「read_file 什么都读不到」—— 真话比替用户编一个好。
     ///
     /// 落点唯一（R276）：`ipc.rs::run_turn` 每轮从 `Settings` 现取，经
     /// `AgentSession::with_roots` 送进 `ToolCtx`；不在 `SessionDeps` 上再开第二个入口。
     /// 归一分两处（R284）：`dedupe_roots` 只管用户写的那份（读写两侧各过一次，同 R86，
     /// 不碰盘、一条都不丢），`effective_roots` 只管这一轮能用哪几条（使用点，每轮一次）。
     pub roots: Vec<PathBuf>,
+    pub storage_dir: String,
     /// T5（spec §7）：长期记忆的总开关。`false` = 压缩段零抽取（记忆侧的模型调用
     /// 一个都不发起）且请求头零备注（连召回读库都不做）。记忆数据**不**因此清除：
     /// 开回来还在 —— 关闭是「停用功能」，不是「抹掉历史」，后者的入口在设置页的清空。
@@ -417,6 +415,7 @@ impl Default for Settings {
             // 任何「先给个常用目录试试看」的写法都会让一把只读工具在用户没同意的前提下
             // 读到用户没打算给的东西，而那正是 spec 5.1「内置工具零弹窗」兑不兑现的前提。
             roots: Vec::new(),
+            storage_dir: String::new(),
             // T5：长期记忆默认开（spec §7 的表）。关是用户的决定，不是默认 —— 这个功能
             // 关着就等于不存在；默认开也不扩暴露面：注入的画像/召回进的是同一条聊天端点，
             // 入库只进本地 SQLite（spec §10 隐私条的口径）。
@@ -598,6 +597,7 @@ impl Settings {
     pub fn normalize(&mut self) {
         // R90：`normalize_base_url("")` 提前返回空串，这里因此**不会**给空 base_url 补默认端点。
         self.base_url = normalize_base_url(&self.base_url);
+        self.storage_dir = self.storage_dir.trim().to_string();
         if self.window_messages < 1 {
             self.window_messages = 1;
         }
@@ -632,22 +632,22 @@ impl Settings {
         // 所以纯粹的区间钳位就够,不存在第二条规则要维护。
         // 0 是这两种失效最安静的形状(0 天 ⇒ 记忆立刻沉底、0 小时 ⇒ 待办永不提醒),
         // 所以下限 1 不是装饰:`clamp` 的 min 参数就是它的唯一防线。
-        self.memory_decay_half_life_days = self
-            .memory_decay_half_life_days
-            .clamp(MIN_MEMORY_DECAY_HALF_LIFE_DAYS, MAX_MEMORY_DECAY_HALF_LIFE_DAYS);
-        self.memory_prospective_window_hours = self
-            .memory_prospective_window_hours
-            .clamp(
-                MIN_MEMORY_PROSPECTIVE_WINDOW_HOURS,
-                MAX_MEMORY_PROSPECTIVE_WINDOW_HOURS,
-            );
+        self.memory_decay_half_life_days = self.memory_decay_half_life_days.clamp(
+            MIN_MEMORY_DECAY_HALF_LIFE_DAYS,
+            MAX_MEMORY_DECAY_HALF_LIFE_DAYS,
+        );
+        self.memory_prospective_window_hours = self.memory_prospective_window_hours.clamp(
+            MIN_MEMORY_PROSPECTIVE_WINDOW_HOURS,
+            MAX_MEMORY_PROSPECTIVE_WINDOW_HOURS,
+        );
         // T15(P0):空闲抽取间隔夹 0..=120。下限 0 是**合法开关**,所以这里的 clamp
         // 与上面两项方向不同 —— 它只挡「负不了(u32)但可能大到没意义」的那一侧,
         // 让 0 原样穿过。写成 `clamp(0,..)` 而不是只写 `.min(MAX)` 是为了让读代码的人
         // 一眼看到「0 是被明确允许的」,而不是怀疑这里漏了半边钳位。
-        self.memory_idle_extract_minutes = self
-            .memory_idle_extract_minutes
-            .clamp(MIN_MEMORY_IDLE_EXTRACT_MINUTES, MAX_MEMORY_IDLE_EXTRACT_MINUTES);
+        self.memory_idle_extract_minutes = self.memory_idle_extract_minutes.clamp(
+            MIN_MEMORY_IDLE_EXTRACT_MINUTES,
+            MAX_MEMORY_IDLE_EXTRACT_MINUTES,
+        );
         // T6:嵌入两键 —— source 走白名单回落(脏值出不了读侧,同 accent 放在这里
         // 而不是只放 save 前的理由);model 只 trim 不校验(裁定 3:端点支不支持
         // 只有端点知道,这里是零知识通道)。
@@ -1807,7 +1807,10 @@ mod tests {
                 ..Default::default()
             }
             .normalized();
-            assert_eq!(n.memory_recall_k, want, "memory_recall_k={input} 应钳到 {want}");
+            assert_eq!(
+                n.memory_recall_k, want,
+                "memory_recall_k={input} 应钳到 {want}"
+            );
         }
         for (input, want) in [
             (0u32, 200),
@@ -1899,7 +1902,16 @@ mod tests {
         assert_eq!(normalize_memory_embedding_source("off"), "off");
         assert_eq!(normalize_memory_embedding_source("  off \n"), "off");
         assert_eq!(normalize_memory_embedding_source("endpoint"), "endpoint");
-        for bad in ["", "   ", "local", "Local", "OFF", "on", "endpoint2", "garbage"] {
+        for bad in [
+            "",
+            "   ",
+            "local",
+            "Local",
+            "OFF",
+            "on",
+            "endpoint2",
+            "garbage",
+        ] {
             assert_eq!(
                 normalize_memory_embedding_source(bad),
                 "endpoint",
@@ -1909,7 +1921,11 @@ mod tests {
         // 幂等:normalize 读写两侧各跑一次,输出必须是定点。
         for v in ["off", "endpoint", "local"] {
             let once = normalize_memory_embedding_source(v);
-            assert_eq!(normalize_memory_embedding_source(&once), once, "{v:?} 必须是定点");
+            assert_eq!(
+                normalize_memory_embedding_source(&once),
+                once,
+                "{v:?} 必须是定点"
+            );
         }
         // 经 `Settings::normalize` 也一样:磁盘上的脏值出不了读侧。
         let n = Settings {
@@ -2171,6 +2187,7 @@ mod tests {
         let file = d.path().join("note.txt");
         std::fs::write(&file, "真的想读我".as_bytes()).unwrap();
         let ctx = crate::tools::registry::ToolCtx {
+            write_root: None,
             http: reqwest::Client::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             roots: Settings::default().roots,
@@ -2473,7 +2490,7 @@ mod tests {
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_twenty_three_settings_fields() {
+    fn serialized_field_names_are_exactly_the_twenty_four_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -2504,6 +2521,7 @@ mod tests {
                 "model",
                 "reserve_output",
                 "roots",
+                "storage_dir",
                 "system_prompt",
                 "temperature",
                 "theme",

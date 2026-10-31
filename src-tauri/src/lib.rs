@@ -9,11 +9,13 @@
 
 pub mod agent;
 pub mod external_link;
+pub mod image_cache;
 pub mod image_prep;
 pub mod ipc;
 pub mod lock;
 pub mod mcp;
 pub mod model;
+pub mod path_reveal;
 pub mod permission;
 pub mod settings;
 pub mod skills;
@@ -22,6 +24,7 @@ pub mod text;
 pub mod tools;
 pub mod web_guard;
 pub mod window_state;
+pub mod workspace;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

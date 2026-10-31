@@ -15,6 +15,7 @@ import type {
   McpTrust,
   MemoryView,
   SendBlock,
+  SessionOutputView,
   SessionRow,
   Settings,
   SettingsView,
@@ -51,6 +52,17 @@ export const interrupt = () => invoke("interrupt");
 
 /** 打开外部链接；协议白名单在 Rust 侧（只允许 http/https），前端不直接导航 WebView。 */
 export const openUrl = (url: string) => invoke("open_url", { url });
+
+export const revealPath = (sessionId: string, path: string) =>
+  invoke("reveal_path", { sessionId, path });
+
+export const pickFolder = () => invoke<string | null>("pick_folder");
+
+export const sessionOutputView = (id: string) =>
+  invoke<SessionOutputView>("session_output_view", { id });
+
+export const setSessionWorkspace = (id: string, path: string | null) =>
+  invoke("session_workspace_set", { id, path });
 
 /** 会话列表。线上键是 `updated_at`（db.rs:239-246 无 `rename_all`，R128）——写错不会报错，只会静默乱序。 */
 export const sessions = () => invoke<SessionRow[]>("session_list");

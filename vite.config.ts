@@ -35,14 +35,14 @@ export default defineConfig(() => ({
     // R134：只允许为这一处改本文件 —— jest-dom 的匹配器要靠它注册，
     // 否则 `toBeInTheDocument` 一类断言全部报「invalid matcher」。
     setupFiles: "./src/setupTests.ts",
-    // `github-ouput/` 是本地发布产物（gitignored），里面有一份完整的 src 副本。
-    // 不排除的话本地 vitest 会把同一批测试跑两遍：读数与 CI 对不上，旧副本还会
-    // 掩盖真实失败。显式列全默认排除项，因为一旦写了 `exclude` 就替换掉默认值。
+    // `release/` 是本地发布产物（gitignored）：发布说明与源码归档。
+    // 排除它，避免将来临时放入的源码快照被 vitest 重复扫描；
+    // 显式列全默认排除项，因为一旦写了 `exclude` 就替换掉默认值。
     exclude: [
       "**/node_modules/**",
       "**/.git/**",
       "**/dist/**",
-      "**/github-ouput/**",
+      "**/release/**",
       "**/src-tauri/**",
     ],
   },

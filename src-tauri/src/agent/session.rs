@@ -11,9 +11,11 @@ use super::types::*;
 use crate::model::assistant_acc::AssistantAcc;
 use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider, ToolDef};
 use crate::permission::gate::PermissionGate;
+use crate::tools::edit_file;
 use crate::tools::read_file;
 use crate::tools::registry::{ToolCtx, ToolRegistry};
 use crate::tools::use_skill;
+use crate::tools::write_file;
 use futures::StreamExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,6 +68,7 @@ pub struct AgentSession {
     cancel: CancellationToken,
     http: reqwest::Client,
     roots: Vec<PathBuf>,
+    output_dir: Option<PathBuf>,
     /// 技能包目录（`skills/<名字>/SKILL.md`）。每轮请求现扫，用户改完文件不用重启。
     skills_dir: Option<PathBuf>,
     /// 用户在面板里停用的技能文件夹（按文件夹名，稳定键）。
@@ -121,15 +124,12 @@ fn image_followup(images: &[ContentBlock]) -> Option<Message> {
         return None;
     }
     let mut blocks = vec![ContentBlock::Text {
-        text: "上面的工具返回了图片，请结合图片回答用户刚才的问题。".to_string(),
+        text: TOOL_IMAGE_FOLLOWUP_NOTE.to_string(),
     }];
     blocks.extend(unique.into_iter().cloned());
     Some(Message::user(blocks))
 }
 
-/// 这一轮**真正**交给模型的工具声明：`read_file` 在 roots 为空时隐藏，
-/// `use_skill` 在没有任何启用技能时隐藏。
-///
 /// `request()` 与预算估算共用这一份，避免「算的是全量注册表、发的是过滤后的表」。
 /// 隐藏只影响声明表、省一轮注定失败的调用，**不是**授权：模型凭空喊这两个名字
 /// 照样会走到工具自己的拒绝路径。
@@ -141,6 +141,12 @@ fn filtered_tool_defs(
     let mut tools = registry.defs();
     if !read_file::usable_with_roots(roots) {
         tools.retain(|d| d.name != read_file::NAME);
+    }
+    if !write_file::usable_with_roots(roots) {
+        tools.retain(|d| d.name != write_file::NAME);
+    }
+    if !edit_file::usable_with_roots(roots) {
+        tools.retain(|d| d.name != edit_file::NAME);
     }
     if !has_skills {
         tools.retain(|d| d.name != use_skill::NAME);
@@ -176,6 +182,7 @@ impl AgentSession {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             roots: Vec::new(),
+            output_dir: None,
             skills_dir: None,
             skills_disabled: Vec::new(),
             turn_skills: Vec::new(),
@@ -195,6 +202,11 @@ impl AgentSession {
     /// `ToolCtx::resolve_within_roots` 拿到空表时是**全拒**，不是全放行）。
     pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.roots = roots;
+        self
+    }
+
+    pub fn with_output_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.output_dir = dir;
         self
     }
 
@@ -261,6 +273,7 @@ impl AgentSession {
         // 工具上下文建一次就够：三个字段整轮不变，而 `CancellationToken` 的克隆共享
         // 同一个状态，所以中途按下停止照样被 `ToolRegistry::execute` 的守卫看见。
         let ctx = ToolCtx {
+            write_root: self.output_dir.clone(),
             http: self.http.clone(),
             cancel: self.cancel.clone(),
             roots: self.roots.clone(),
@@ -440,12 +453,28 @@ impl AgentSession {
                         }
                     }
                 };
-                let preview = output.preview();
+                let (preview, images) = output.event_view();
+                // Cache images off the async worker; the event itself must keep its order,
+                // so only the disk part is moved to a blocking thread.
+                let images = if let Some(dir) = &self.output_dir {
+                    let call_id = id.clone();
+                    let cache = dir.join(crate::image_cache::CACHE_SUBDIR);
+                    tokio::task::spawn_blocking(move || {
+                        let mut images = images;
+                        crate::image_cache::enrich_images(&call_id, &mut images, &cache);
+                        images
+                    })
+                    .await
+                    .unwrap_or_default()
+                } else {
+                    images
+                };
                 self.deps.sink.emit(AgentEvent::ToolResult {
                     call_id: id.clone(),
                     is_error,
                     ms: started.elapsed().as_millis() as u64,
                     preview,
+                    images,
                 });
                 tool_images.extend(images_of(&output));
                 self.history.push(Message::tool(&id, output, is_error));
@@ -537,6 +566,11 @@ impl AgentSession {
         if let Some(block) = crate::skills::loaded_section(&loaded) {
             tail.push_str("\n\n");
             tail.push_str(&block);
+        }
+        if let Some(dir) = &self.output_dir {
+            tail.push_str("\n\n## 工作目录\n本次会话的输出目录是：");
+            tail.push_str(&crate::tools::fs_write::display_path(dir));
+            tail.push_str("。生成的图片、视频和文档都写到这里；不要写到别的目录。");
         }
         // 追加段交给 ContextBuilder 一起算预算：先 build 再往外贴会让请求凭空超线。
         let built = self.deps.context.build_with_extra(&self.history, &tail);
@@ -1099,7 +1133,6 @@ mod tests {
         out
     }
 
-    /// 生产那三把工具**本体**（不是替身）：R286 钉的是交给模型的声明表形状，
     /// 用替身的话名字和 `meta()` 都得由夹具自己编，那就变成夹具在测自己。
     /// 与 `ipc::build_production_registry` 是同一批类型，但这里不直接调它 ——
     /// `tools/` 与 `agent/` 整棵子树都不许依赖装配层（`lib.rs` 的边界约束），
@@ -1109,6 +1142,8 @@ mod tests {
             Arc::new(crate::tools::fetch::FetchTool::new()),
             Arc::new(crate::tools::read_file::ReadFileTool),
             Arc::new(crate::tools::use_skill::UseSkillTool),
+            Arc::new(crate::tools::write_file::WriteFileTool),
+            Arc::new(crate::tools::edit_file::EditFileTool),
         ]
     }
 
@@ -2317,14 +2352,9 @@ mod tests {
 
     // ---- R286：声明表按可用性过滤（只省 token，不是安全措施） ----
 
-    /// roots 为空时**不许**把 `read_file` 的声明交给模型。
     /// 危害是具体的而不是抽象的：`Settings.roots` 默认空（R276 明令不许替用户决定），
-    /// 这一片又还没有 roots 界面（R282），所以今天每一轮的 `effective_roots` 都是空表，
-    /// 而闸门规则 1 对空表**任何**路径都拒 —— 把这把注定失败的工具挂在请求里，
-    /// 症状是模型每被邀请读一次文件就多烧一轮 token、界面上多一张必然红色的卡，
-    /// 用户读到的是「这个助手读不了我的东西」，真话却是「还没配置可读目录」。
     #[tokio::test]
-    async fn read_file_is_not_offered_when_no_root_is_configured() {
+    async fn filesystem_tools_are_not_offered_when_no_root_is_configured() {
         let mut rig = Rig::with_only(
             vec![deltas(&["还没有可读的目录"])],
             Vec::new(),
@@ -2343,17 +2373,14 @@ mod tests {
         assert_eq!(
             declared_names(&reqs),
             vec![vec!["fetch_url".to_string()]],
-            "空 roots 这一轮的声明表里不该有 read_file（R286）"
+            "空 roots 这一轮的声明表里不该有任何文件工具（R286）"
         );
     }
 
-    /// 同一条线的**另一头**：配了一 root，`read_file` 就必须回来。
     /// 少了这一条，「藏工具」的实现可以退化成「永远藏住」，上面那条照样绿 ——
     /// 而用户配好目录之后会发现工具从此不再出现，症状和没修之前一样难查。
-    /// 名单是 `["fetch_url", "read_file"]` 这个字面顺序：注册表按名字典序交（BTreeMap），
-    /// 不是注册顺序，所以这里不加 `.sort()`。
     #[tokio::test]
-    async fn read_file_is_offered_once_a_root_is_configured() {
+    async fn filesystem_tools_are_offered_once_a_root_is_configured() {
         let dir = tempfile::tempdir().unwrap();
         let mut rig = Rig::with_only(
             vec![deltas(&["读到啦"])],
@@ -2365,8 +2392,13 @@ mod tests {
         let reqs = rig.reqs();
         assert_eq!(
             declared_names(&reqs),
-            vec![vec!["fetch_url".to_string(), "read_file".to_string()]],
-            "有一条可用 root ⇒ 声明表必须带上 read_file，否则这条工具对用户永久隐形"
+            vec![vec![
+                "edit_file".to_string(),
+                "fetch_url".to_string(),
+                "read_file".to_string(),
+                "write_file".to_string(),
+            ]],
+            "有一条可用 root ⇒ 读与写工具都必须出现，否则它们对用户永久隐形"
         );
     }
 
@@ -2436,11 +2468,7 @@ mod tests {
         let skills = skill_fixture("translate", "翻译助手", "中英互译", "先识别语言。");
         let dir = tempfile::tempdir().unwrap();
         let roots = vec![dir.path().to_path_buf()];
-        let mut rig = Rig::with_only(
-            vec![deltas(&["好的"])],
-            roots.clone(),
-            production_tools(),
-        );
+        let mut rig = Rig::with_only(vec![deltas(&["好的"])], roots.clone(), production_tools());
         rig.session = rig
             .session
             .with_skills_dir(Some(skills.path().to_path_buf()));
@@ -2454,11 +2482,10 @@ mod tests {
         for t in production_tools() {
             registry.register(t);
         }
-        let expected: Vec<String> =
-            tool_defs_for_turn(&registry, &roots, Some(skills.path()), &[])
-                .into_iter()
-                .map(|d| d.name)
-                .collect();
+        let expected: Vec<String> = tool_defs_for_turn(&registry, &roots, Some(skills.path()), &[])
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         assert_eq!(
             declared, expected,
             "预算里算的工具声明必须就是请求里发出去的那一批"
@@ -2467,8 +2494,12 @@ mod tests {
         assert!(declared.contains(&"use_skill".to_string()));
 
         // 停用唯一那份技能 ⇒ use_skill 与预算里的声明同时消失。
-        let disabled =
-            tool_defs_for_turn(&registry, &roots, Some(skills.path()), &["translate".to_string()]);
+        let disabled = tool_defs_for_turn(
+            &registry,
+            &roots,
+            Some(skills.path()),
+            &["translate".to_string()],
+        );
         assert!(
             !disabled.iter().any(|d| d.name == "use_skill"),
             "没有启用中的技能时，预算里也不许再算 use_skill"
@@ -2638,6 +2669,158 @@ mod tests {
             full[0].2
         );
         std::fs::remove_dir_all(skills.path()).ok();
+    }
+
+    #[tokio::test]
+    async fn the_system_prompt_names_the_session_output_directory() {
+        let out = tempfile::tempdir().unwrap();
+        let mut rig = Rig::with_only(vec![deltas(&["好"])], Vec::new(), Vec::new());
+        rig.session = rig.session.with_output_dir(Some(out.path().to_path_buf()));
+        assert_eq!(rig.run("你好").await, StopReason::EndTurn);
+        let reqs = rig.reqs();
+        let system = reqs[0].messages[0].text_of();
+        assert!(
+            system.contains("本次会话的输出目录是"),
+            "必须告诉模型产物该写哪里：{system}"
+        );
+        assert!(
+            system.contains(&out.path().display().to_string()),
+            "输出目录要写进提示词：{system}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_tool_result_reaches_the_ui_event() {
+        struct ImageTool;
+        #[async_trait]
+        impl Tool for ImageTool {
+            fn meta(&self) -> ToolMeta {
+                ToolMeta {
+                    name: "picture".into(),
+                    description: "回一张图".into(),
+                    input_schema: json!({"type": "object"}),
+                    risk: Risk::Read,
+                }
+            }
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &ToolCtx,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::Image {
+                    data: "QUJD".into(),
+                    mime: ImageMime::Png,
+                })
+            }
+        }
+
+        let out = tempfile::tempdir().unwrap();
+        let mut rig = Rig::with_only(
+            vec![tool_round(0, &[("picture", "{}")]), deltas(&["看到了"])],
+            Vec::new(),
+            vec![Arc::new(ImageTool)],
+        );
+        rig.session = rig.session.with_output_dir(Some(out.path().to_path_buf()));
+        assert_eq!(rig.run("来张图").await, StopReason::EndTurn);
+
+        let (images, preview) = rig
+            .sink
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolResult {
+                    images, preview, ..
+                } => Some((images, preview)),
+                _ => None,
+            })
+            .expect("这一轮必须有 tool_result 事件");
+        assert_eq!(images.len(), 1, "工具回的图片必须进 UI 事件");
+        assert_eq!(images[0].data, "QUJD");
+        assert_eq!(images[0].mime, ImageMime::Png);
+        let path = images[0].path.as_deref().expect("有输出目录时必须缓存图片");
+        assert!(
+            std::path::Path::new(path)
+                .canonicalize()
+                .unwrap()
+                .starts_with(out.path().join("images").canonicalize().unwrap()),
+            "图片必须落在输出目录的 images/：{path}"
+        );
+        assert!(std::path::Path::new(path).is_file());
+        assert!(
+            preview.contains("[图片 png]"),
+            "文本预览仍要说明结果里有一张图：{preview}"
+        );
+        assert!(
+            !preview.contains("QUJD"),
+            "base64 不许塞进文本预览：{preview}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ui_image_cap_does_not_change_the_model_retention_cap() {
+        struct ManyImages;
+        #[async_trait]
+        impl Tool for ManyImages {
+            fn meta(&self) -> ToolMeta {
+                ToolMeta {
+                    name: "pictures".into(),
+                    description: "回五张图".into(),
+                    input_schema: json!({"type": "object"}),
+                    risk: Risk::Read,
+                }
+            }
+            async fn execute(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &ToolCtx,
+            ) -> Result<ToolOutput, ToolError> {
+                Ok(ToolOutput::Multi {
+                    parts: (0..5)
+                        .map(|i| ToolOutput::Image {
+                            data: format!("IMG{i}"),
+                            mime: ImageMime::Png,
+                        })
+                        .collect(),
+                })
+            }
+        }
+
+        let mut rig = Rig::with_only(
+            vec![tool_round(0, &[("pictures", "{}")]), deltas(&["看到了"])],
+            Vec::new(),
+            vec![Arc::new(ManyImages)],
+        );
+        assert_eq!(rig.run("来五张图").await, StopReason::EndTurn);
+
+        let (images, preview) = rig
+            .sink
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolResult {
+                    images, preview, ..
+                } => Some((images, preview)),
+                _ => None,
+            })
+            .expect("这一轮必须有 tool_result 事件");
+        assert_eq!(images.len(), 4, "卡片只显示前四张");
+        assert!(
+            preview.contains("另有 1 张图片未在卡片中显示"),
+            "省略数量要写在预览里：{preview}"
+        );
+
+        let reqs = rig.reqs();
+        let model_images = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter(|b| matches!(b, ContentBlock::Image { .. }))
+            .count();
+        assert_eq!(
+            model_images,
+            crate::agent::context::KEEP_IMAGE_RECENT,
+            "界面限量不许反向改变模型侧的图片保留策略"
+        );
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ import type {
   Risk,
   ToolCallView,
   ToolCard,
+  ToolImage,
   UiBlock,
   UiState,
 } from "../types";
@@ -43,7 +44,8 @@ const toolResult = (
   preview: string,
   is_error = false,
   ms = 12,
-): AgentEvent => ({ t: "tool_result", call_id, is_error, ms, preview });
+  images: ToolImage[] = [],
+): AgentEvent => ({ t: "tool_result", call_id, is_error, ms, preview, images });
 const permRequest = (id: string, risk: Risk = "write"): AgentEvent => ({
   t: "permission_request",
   id,
@@ -234,6 +236,19 @@ describe("reducer", () => {
     expect(tool(selectActiveTurn(s)!.blocks[0]).status).toBe("ok");
     expect(tool(selectActiveTurn(s)!.blocks[0]).preview).toBe("hi");
     expect(tool(selectActiveTurn(s)!.blocks[0]).ms).toBe(12);
+  });
+
+  it("attaches images from a tool result to the card", () => {
+    let s = reduce(initialState(), start(1));
+    s = reduce(s, toolCall("c1"));
+    s = reduce(
+      s,
+      toolResult("c1", "[图片 png]", false, 12, [
+        { data: "QUJD", mime: "png" },
+      ]),
+    );
+    const card = tool(selectActiveTurn(s)!.blocks[0]);
+    expect(card.images).toEqual([{ data: "QUJD", mime: "png" }]);
   });
 
   it("marks an error tool result without dropping the card", () => {
@@ -739,7 +754,14 @@ describe("reducer", () => {
     expect(Object.keys(p).sort()).toEqual(["event", "sessionId"]); // camelCase 只在这一层
     expect(AGENT_CHANNEL).toBe("agent");
     expect(p.event.t).toBe("tool_result"); // 信封换键，事件内部仍是 snake_case
-    expect(Object.keys(probe.tool_result)).toEqual(["t", "call_id", "is_error", "ms", "preview"]);
+    expect(Object.keys(probe.tool_result)).toEqual([
+      "t",
+      "call_id",
+      "is_error",
+      "ms",
+      "preview",
+      "images",
+    ]);
     expect(Object.keys(probe.usage)).toEqual(["t", "input_tokens", "output_tokens"]);
     expect(Object.keys(probe.error)).toEqual(["t", "where", "message", "fatal"]);
     expect(Object.keys(contentProbe.image)).toEqual(["type", "data", "mime"]);

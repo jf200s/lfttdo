@@ -48,9 +48,69 @@ pub enum ToolOutput {
     },
 }
 
+pub const TOOL_IMAGE_FOLLOWUP_NOTE: &str = "上面的工具返回了图片，请结合图片回答用户刚才的问题。";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ToolImage {
+    pub data: String,
+    pub mime: ImageMime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+pub(crate) const MAX_EVENT_IMAGES: usize = 4;
+pub(crate) const MAX_EVENT_IMAGE_BASE64: usize = 8 * 1024 * 1024;
+
 impl ToolOutput {
     pub fn text(s: impl Into<String>) -> Self {
         Self::Text { text: s.into() }
+    }
+
+    pub fn event_view(&self) -> (String, Vec<ToolImage>) {
+        let mut images = Vec::new();
+        let mut total = 0usize;
+        let mut omitted = 0usize;
+        self.collect_event_images(&mut images, &mut total, &mut omitted);
+        let mut preview = self.preview();
+        if omitted > 0 {
+            preview.push_str(&format!("\n[另有 {omitted} 张图片未在卡片中显示]"));
+        }
+        (preview, images)
+    }
+
+    fn collect_event_images(
+        &self,
+        images: &mut Vec<ToolImage>,
+        total: &mut usize,
+        omitted: &mut usize,
+    ) {
+        match self {
+            ToolOutput::Image { data, mime } => {
+                if images
+                    .iter()
+                    .any(|kept| kept.data == *data && kept.mime == *mime)
+                {
+                    return;
+                }
+                if images.len() >= MAX_EVENT_IMAGES
+                    || total.saturating_add(data.len()) > MAX_EVENT_IMAGE_BASE64
+                {
+                    *omitted += 1;
+                    return;
+                }
+                *total += data.len();
+                images.push(ToolImage {
+                    data: data.clone(),
+                    mime: mime.clone(),
+                    path: None,
+                });
+            }
+            ToolOutput::Multi { parts } => {
+                for part in parts {
+                    part.collect_event_images(images, total, omitted);
+                }
+            }
+            ToolOutput::Text { .. } => {}
+        }
     }
 
     /// 工具输出面向**事件流**的预览。全仓库只此一份实现（R77）：
@@ -65,9 +125,6 @@ impl ToolOutput {
     pub fn preview(&self) -> String {
         match self {
             ToolOutput::Text { text } => crate::text::truncate_display(text, PREVIEW_CHARS),
-            // 图片不进事件流：前端要的是一张已经落盘的图的引用，而那是切片 2 的事，
-            // 这里先给一行可归因的占位描述，不把 base64 搬过 IPC 边界。
-            // mime 用小写线上名（与 `ImageMime` 的 serde 表示一致），不是 Debug 的 `Png`。
             ToolOutput::Image { mime, .. } => format!("[图片 {}]", mime_word(mime)),
             // R317：多块结果先逐块取预览、再整体截断一次 —— 只此一份实现（R77）。
             ToolOutput::Multi { parts } => {
@@ -168,6 +225,18 @@ impl Message {
             .collect::<Vec<_>>()
             .join("")
     }
+
+    pub fn is_tool_image_followup(&self) -> bool {
+        self.role == Role::User
+            && matches!(
+                self.blocks.first(),
+                Some(ContentBlock::Text { text }) if text == TOOL_IMAGE_FOLLOWUP_NOTE
+            )
+            && self
+                .blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. }))
+    }
 }
 
 /// 从 ContentBlock::ToolCall 派生的视图。risk 由 registry 补全，不来自消息本身。
@@ -199,6 +268,113 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&m).unwrap(),
             r#"{"role":"user","blocks":[{"type":"tool_result","call_id":"call_1","is_error":true,"output":{"kind":"text","text":"文件不存在"}}]}"#
+        );
+    }
+
+    fn img(data: &str) -> ToolOutput {
+        ToolOutput::Image {
+            data: data.into(),
+            mime: ImageMime::Png,
+        }
+    }
+
+    #[test]
+    fn event_view_carries_images_but_keeps_base64_out_of_the_text_preview() {
+        let out = ToolOutput::Multi {
+            parts: vec![
+                ToolOutput::text("截图如下"),
+                img("QUJD"),
+                ToolOutput::Image {
+                    data: "REVG".into(),
+                    mime: ImageMime::Jpeg,
+                },
+            ],
+        };
+        let (preview, images) = out.event_view();
+        assert_eq!(images.len(), 2, "两张图都要进事件");
+        assert_eq!(images[0].data, "QUJD");
+        assert_eq!(images[1].mime, ImageMime::Jpeg);
+        assert!(preview.contains("截图如下"), "{preview}");
+        assert!(
+            !preview.contains("QUJD"),
+            "base64 不许进文本预览：{preview}"
+        );
+
+        let (preview, images) = ToolOutput::text("没有图").event_view();
+        assert!(images.is_empty(), "纯文本结果不许凭空长出图片");
+        assert_eq!(preview, "没有图");
+    }
+
+    #[test]
+    fn event_view_dedupes_identical_images_without_calling_them_omitted() {
+        let out = ToolOutput::Multi {
+            parts: vec![img("QUJD"), img("QUJD"), ToolOutput::text("x")],
+        };
+        let (preview, images) = out.event_view();
+        assert_eq!(images.len(), 1, "同一张图只渲染一次");
+        assert!(
+            !preview.contains("未在卡片中显示"),
+            "去重不是遗漏，不该挂提示：{preview}"
+        );
+    }
+
+    #[test]
+    fn event_view_caps_the_number_of_images_and_says_how_many_were_omitted() {
+        let out = ToolOutput::Multi {
+            parts: (0..5).map(|i| img(&format!("IMG{i}"))).collect(),
+        };
+        let (preview, images) = out.event_view();
+        assert_eq!(images.len(), MAX_EVENT_IMAGES);
+        assert!(
+            preview.contains("另有 1 张图片未在卡片中显示"),
+            "被上限挡掉的图必须报数量：{preview}"
+        );
+    }
+
+    #[test]
+    fn event_view_caps_total_base64_bytes() {
+        let half = MAX_EVENT_IMAGE_BASE64 / 2 + 1;
+        let out = ToolOutput::Multi {
+            parts: vec![img(&"A".repeat(half)), img(&"B".repeat(half))],
+        };
+        let (preview, images) = out.event_view();
+        assert_eq!(images.len(), 1, "第二张会把总量顶过上限");
+        assert!(preview.contains("另有 1 张图片未在卡片中显示"), "{preview}");
+    }
+
+    #[test]
+    fn only_the_synthetic_tool_image_followup_is_recognized() {
+        let image = ContentBlock::Image {
+            data: "QUJD".into(),
+            mime: ImageMime::Png,
+        };
+        let synthetic = Message::user(vec![
+            ContentBlock::Text {
+                text: TOOL_IMAGE_FOLLOWUP_NOTE.into(),
+            },
+            image.clone(),
+        ]);
+        assert!(synthetic.is_tool_image_followup());
+        let real = Message::user(vec![
+            ContentBlock::Text {
+                text: "这张图里是什么".into(),
+            },
+            image.clone(),
+        ]);
+        assert!(
+            !real.is_tool_image_followup(),
+            "真实用户带图的那句不许被当成合成消息跳过"
+        );
+        assert!(
+            !Message::tool(
+                "c1",
+                ToolOutput::Image {
+                    data: "QUJD".into(),
+                    mime: ImageMime::Png
+                },
+                false
+            )
+            .is_tool_image_followup()
         );
     }
 

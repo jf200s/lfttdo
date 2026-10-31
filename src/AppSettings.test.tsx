@@ -30,6 +30,12 @@ const h = vi.hoisted(() => {
     setSettings: vi.fn(),
     setApiKey: vi.fn(),
     normalize: vi.fn(),
+    pickFolder: vi.fn(async () => null),
+    sessionOutputView: vi.fn(async () => ({
+      workspace: null,
+      output_dir: "C:\\out\\session",
+    })),
+    setSessionWorkspace: vi.fn(),
     // 长期记忆子区的三条命令：面板一挂载就要拉列表，mock 里没有这支的话，
     // 每一条开面板的用例都会走进面板的 error 通道（No "listMemories" export is defined
     // on the mock），把真正的失败淹没 —— 在这里给空表，与面板默认夹具同一口径。
@@ -91,6 +97,7 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   // 面板把它抹回默认 = 抹成空 = 下面那条 `toHaveBeenCalledWith` 照样绿，而用户手改进
   // settings.json 的目录表已经没了，症状是「read_file 什么都读不到」。
   roots: ["C:\\notes", "D:\\code"],
+  storage_dir: "",
   // 长期记忆四键给 Rust 默认值（true/5/600/500）：它们与 roots 不同，面板**渲染**它们，
   // 载荷断言只证明「App 没有重新拼表」，默认值在这个判据下够用。
   memory_enabled: true,
@@ -283,10 +290,6 @@ describe("App 设置接线", () => {
       target: { value: "17" },
     });
     fireEvent.click(within(dialog).getByRole("button", { name: /保存/ }));
-    // 载荷是**整表 13 键**：App 这一层不许重新拼一份「只发送编辑过的字段」，
-    // 也不许在把 view 交给面板的路上把 `temperature`/`compact_threshold`/`keep_turns`/`accent`/`roots`
-    // 这五只面板不渲染的键丢掉（丢了不报错，`serde(default)` 会替用户把它们抹回默认值；
-    // `roots` 的默认值是**空表**，抹上去的代价是 read_file 从此一律拒绝）。
     await waitFor(() =>
       expect(h.setSettings).toHaveBeenCalledWith({
         base_url: "https://example.invalid/v1",
@@ -303,6 +306,7 @@ describe("App 设置接线", () => {
         keep_turns: 10,
         accent: "",
         roots: ["C:\\notes", "D:\\code"],
+        storage_dir: "",
         memory_enabled: true,
         memory_recall_k: 5,
         memory_note_token_cap: 600,

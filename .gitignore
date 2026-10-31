@@ -12,6 +12,6 @@
 *.log
 .superpowers/
 .env
-github-ouput/
+release/
 
 src-tauri/.cargo/

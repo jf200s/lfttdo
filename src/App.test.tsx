@@ -23,6 +23,13 @@ const h = vi.hoisted(() => {
     skillsList: vi.fn(),
     skillsOpenFolder: vi.fn(),
     skillsSetEnabled: vi.fn(),
+    revealPath: vi.fn(),
+    pickFolder: vi.fn(async (): Promise<string | null> => null),
+    sessionOutputView: vi.fn(async () => ({
+      workspace: null,
+      output_dir: "C:\\out\\session",
+    })),
+    setSessionWorkspace: vi.fn(),
     // P1：切会话时的收尾抽取 + 面板里的记忆写入口。App 的 switch 路径**会真的调**
     // `flushMemory`（fire-and-forget），mock 工厂里缺这一支的话，下面那两条切换用例
     // 会在 `openSession` 里抛 `flushMemory is not a function`，红的还是「不该动的测试」。
@@ -75,6 +82,7 @@ const view = (over: Partial<SettingsView> = {}): SettingsView => ({
   // `AppSettings.test.tsx` 与 `SettingsPanel.test.tsx` 里那两条用非空值断言的测试管，
   // 空数组在这儿只承担一件事：让这份镜像少一键就当场编译不过。
   roots: [],
+  storage_dir: "",
   // 长期记忆四键（Rust 默认 true/5/600/500）：作用与上面的 `roots` 同一条 —— 镜像多一键、
   // 夹具少一键就当场编译不过。仅补键，本文件的用例一行未动（R216②）。
   memory_enabled: true,
@@ -119,6 +127,12 @@ beforeEach(() => {
   h.sessions.mockReset().mockResolvedValue([row("B", 2)]);
   h.createSession.mockReset().mockResolvedValue("N");
   h.getSettings.mockReset().mockResolvedValue(view());
+  h.pickFolder.mockReset().mockResolvedValue(null);
+  h.sessionOutputView.mockReset().mockResolvedValue({
+    workspace: null,
+    output_dir: "C:\\out\\session",
+  });
+  h.setSessionWorkspace.mockReset().mockResolvedValue(undefined);
   // R131 的默认答案：pending 里没有这一笔。卡片状态只由事件驱动。
   h.respond.mockReset().mockResolvedValue(false);
   // P1：默认「这一轮没记住新东西」（后端零条时就是 Ok(0)），切换用例关心别的值再覆写。
@@ -134,6 +148,8 @@ beforeEach(() => {
 
 const settled = async () => {
   await waitFor(() => expect(h.getSettings).toHaveBeenCalled());
+  await waitFor(() => expect(h.sessionOutputView).toHaveBeenCalled());
+  await act(async () => {});
 };
 
 describe("App", () => {
@@ -155,6 +171,19 @@ describe("App", () => {
     expect(
       within(screen.getByTestId("bubble-assistant")).getByText("上次答的"),
     ).toBeInTheDocument();
+  });
+
+  it("shows the session output directory and lets the user pick a workspace", async () => {
+    render(<App />);
+    await settled();
+    expect(screen.getByTestId("workspace-bar")).toHaveTextContent(
+      "C:\\out\\session",
+    );
+    h.pickFolder.mockResolvedValue("C:\\work");
+    fireEvent.click(screen.getByRole("button", { name: "选择文件夹" }));
+    await waitFor(() =>
+      expect(h.setSessionWorkspace).toHaveBeenCalledWith("B", "C:\\work"),
+    );
   });
 
   it("opens the skills panel from the sidebar", async () => {
@@ -287,7 +316,7 @@ describe("App", () => {
     h.respond.mockResolvedValue(true);
     fireEvent.click(
       within(screen.getByTestId("perm-p1")).getByRole("button", {
-        name: /本会话内都允许/,
+        name: /本会话内(该目录)?都允许/,
       }),
     );
     await waitFor(() => expect(h.respond).toHaveBeenCalledTimes(2));

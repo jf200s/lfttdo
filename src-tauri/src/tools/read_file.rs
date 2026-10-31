@@ -492,6 +492,7 @@ mod tests {
     // 前提检查两处一模一样，没必要留第二份。
     fn test_ctx(roots: Vec<PathBuf>) -> ToolCtx {
         ToolCtx {
+            write_root: None,
             http: reqwest::Client::new(),
             cancel: CancellationToken::new(),
             roots,

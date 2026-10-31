@@ -1,4 +1,4 @@
-// T31：stdio 桥 —— Windows spawn 选型、`-y` 注入、`CREATE_NO_WINDOW`、并行连接。
+// MCP bridge for stdio child processes and streamable-http clients.
 //
 // 边界（R310，简报 §二）：这一层做到「**握手 + 数工具 + 状态**」为止。
 // **不**实现 `tools::registry::Tool`、**不**调 `ToolRegistry::register`、**不**碰 `ipc.rs`：
@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 use futures::future::BoxFuture;
 use rmcp::service::RunningService;
-use rmcp::transport::{IntoTransport, TokioChildProcess};
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{IntoTransport, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 
 use crate::agent::types::ToolOutput;
@@ -134,12 +135,8 @@ pub fn spawn_command(
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Result<SpawnPlan, String> {
     let Some(command) = def.command() else {
-        // T36 的**显式降级**（R325）：`transport-streamable-http-client` 会再引入一层
-        // HTTP 栈（`sse-stream`/`http`/`bytes`，并可能要 `reqwest/stream`），本构建没有启用。
-        // 明确降级比悄悄拖大安装包好（plan :1374 的原话）；用户配了 url 会看到这句原因，
-        // 而不是一个难读的 connect 超时。
         return Err(format!(
-            "{} 是 HTTP 传输：此构建未启用 HTTP 传输（stdio 之外的 server 暂不可用）",
+            "{} 是 HTTP 传输：HTTP server 不走子进程（应由 connect_http 处理）",
             def.name()
         ));
     };
@@ -161,6 +158,42 @@ pub fn spawn_command(
         env,
         creation_flags: CREATE_NO_WINDOW,
     })
+}
+
+fn http_transport_config(def: &ServerDef) -> Result<StreamableHttpClientTransportConfig, String> {
+    let ServerDef::Http { url, headers, .. } = def else {
+        return Err("不是 HTTP server".to_string());
+    };
+    let url = url.trim();
+    let parsed =
+        url::Url::parse(url).map_err(|_| "URL 无效：需要完整的 http(s) 地址".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("URL 无效：只接受带主机名的 http(s) 地址".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL 不要带用户名/密码；凭据请放在 headers 里".to_string());
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    if parsed.scheme() == "http" && !headers.is_empty() && !loopback {
+        return Err("明文 http 只允许在回环地址携带 headers；远程 server 请改用 https".to_string());
+    }
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+    config.allow_stateless = true;
+    for (key, value) in headers {
+        let name = key
+            .parse()
+            .map_err(|_| format!("header `{key}` 名称无效"))?;
+        let value = value
+            .parse()
+            .map_err(|_| format!("header `{key}` 值无效"))?;
+        config.custom_headers.insert(name, value);
+    }
+    Ok(config)
 }
 
 /// 走查还是直接用（R305）：`def.command` 本身已含路径分隔符、或已带可执行扩展名 ⇒
@@ -604,7 +637,7 @@ impl McpBridge {
             .collect();
         let make = move |name: &str| -> BoxFuture<'static, Result<Handshake, String>> {
             match defs.get(name).cloned() {
-                Some(def) => Box::pin(async move { connect_stdio(&def).await }),
+                Some(def) => Box::pin(async move { connect_def(&def).await }),
                 None => Box::pin(async { Err("配置里没有这条 server".to_string()) }),
             }
         };
@@ -617,7 +650,6 @@ impl McpBridge {
     }
 
     /// `connect_all` 的可注入内核（R308/R305）：超时与「怎么建一条连接」都是参数。
-    /// T36 的 HTTP 传输只需要换掉 `make`，状态台账与并行/隔离语义原样复用。
     pub async fn connect_all_with(
         &self,
         names: &[String],
@@ -777,15 +809,32 @@ impl McpBridge {
     }
 }
 
+async fn connect_def(def: &ServerDef) -> Result<Handshake, String> {
+    match def {
+        ServerDef::Stdio { .. } => connect_stdio(def).await,
+        ServerDef::Http { .. } => connect_http(def).await,
+    }
+}
+
+async fn connect_http(def: &ServerDef) -> Result<Handshake, String> {
+    let config = http_transport_config(def)?;
+    let transport = StreamableHttpClientTransport::<reqwest::Client>::from_config(config);
+    let (tools, service) = handshake(transport).await?;
+    Ok(Handshake {
+        pid: None,
+        tools,
+        service,
+        job: None,
+    })
+}
+
 /// 真 stdio 连接（R309）：pid 必须在 `.serve()` **消费** transport 之前取出来
 /// （`TokioChildProcess::id()`，rmcp `transport/child_process.rs:72`；3.5.1 没有 `process_handle()`）。
 async fn connect_stdio(def: &ServerDef) -> Result<Handshake, String> {
     // 每台 server 一个 kill-on-close job：重连时换掉的是它自己的 job，不会连带
     // 关闭其他 server 共享的旧句柄（那会杀掉整片进程树）。建不出来 ⇒ 这条不连，
     // **绝不**退化成「不带 job 直接 spawn」（R323）。
-    let job = std::sync::Arc::new(
-        crate::mcp::process::create_kill_job().map_err(trim_reason)?,
-    );
+    let job = std::sync::Arc::new(crate::mcp::process::create_kill_job().map_err(trim_reason)?);
     let plan = spawn_command(def, &resolve_program_in_path)?;
     let child = TokioChildProcess::new(plan.into_command())
         .map_err(|e| trim_reason(format!("启动 `{}` 失败：{e}", def.name())))?;
@@ -1344,6 +1393,7 @@ mod tests {
         let decl = Tool::new("search", "查一查", serde_json::Map::new());
         let tool = McpTool::from_decl("web", &decl, bridge);
         let ctx = crate::tools::registry::ToolCtx {
+            write_root: None,
             http: reqwest::Client::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             roots: vec![],
@@ -1362,23 +1412,126 @@ mod tests {
     }
 
     #[test]
-    fn an_http_server_reports_the_explicit_http_degradation() {
-        // R325：本构建不启用 HTTP 传输 ⇒ 必须是「一条指名原因的 Disconnected」，
-        // 不是 panic、不是一个难读的 connect 超时。
+    fn http_entries_never_take_the_child_process_path() {
         let def = ServerDef::Http {
             name: "remote".into(),
             url: "https://example.test/mcp".into(),
             headers: HashMap::new(),
         };
-        let err = spawn_command(&def, &|_: &str| None).expect_err("HTTP 条目选型必须失败");
-        assert!(
-            err.contains("未启用 HTTP 传输"),
-            "原因要认得出来是构建能力问题：{err}"
-        );
+        let err = spawn_command(&def, &|_: &str| None).expect_err("HTTP 条目不能走子进程");
+        assert!(err.contains("HTTP"), "原因要认得出来是 HTTP：{err}");
         assert!(
             err.chars().count() <= 200,
             "仍然受 200 char 上限约束：{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn connect_def_routes_http_entries_to_the_http_leg() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定临时端口失败");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let def = ServerDef::Http {
+            name: "remote".into(),
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: HashMap::new(),
+        };
+        let err = match tokio::time::timeout(Duration::from_secs(10), connect_def(&def)).await {
+            Ok(Err(reason)) => reason,
+            Ok(Ok(_)) => panic!("关闭的端口必须连接失败"),
+            Err(_) => panic!("HTTP 连接失败必须快速返回，不能挂死"),
+        };
+        assert!(
+            !err.contains("子进程"),
+            "HTTP 条目被错误地送进了 stdio 子进程路径：{err}"
+        );
+        assert!(!err.is_empty(), "失败原因不能是空串");
+    }
+
+    #[test]
+    fn http_transport_config_parses_url_and_headers() {
+        let def = ServerDef::Http {
+            name: "remote".into(),
+            url: "http://127.0.0.1:9000/mcp".into(),
+            headers: HashMap::from([("Authorization".to_string(), "Bearer test".to_string())]),
+        };
+        let cfg = http_transport_config(&def).expect("合法 HTTP 配置必须能构造");
+        assert_eq!(&*cfg.uri, "http://127.0.0.1:9000/mcp");
+        assert!(cfg.allow_stateless, "无 session id 的 server 也要能连");
+        let (name, value) = cfg.custom_headers.iter().next().expect("header 要保留");
+        assert_eq!(name.as_str(), "authorization");
+        assert_eq!(value.to_str().unwrap(), "Bearer test");
+    }
+
+    #[test]
+    fn http_transport_config_rejects_invalid_endpoints() {
+        for url in ["", "   ", "ftp://example.test/mcp", "not a url"] {
+            let def = ServerDef::Http {
+                name: "remote".into(),
+                url: url.into(),
+                headers: HashMap::new(),
+            };
+            let err = http_transport_config(&def).expect_err("非法 URL 必须拒绝");
+            assert!(err.contains("URL"), "错误要指明 URL：{err}");
+        }
+    }
+
+    #[test]
+    fn http_transport_config_rejects_credentials_in_the_url() {
+        let def = ServerDef::Http {
+            name: "remote".into(),
+            url: "http://user:secret@127.0.0.1:9000/mcp".into(),
+            headers: HashMap::new(),
+        };
+        let err = http_transport_config(&def).expect_err("URL userinfo 必须拒绝");
+        assert!(
+            err.contains("headers"),
+            "要引导用户把凭据放进 headers：{err}"
+        );
+        assert!(!err.contains("secret"), "错误里不许回显密码：{err}");
+    }
+
+    #[test]
+    fn http_transport_config_rejects_cleartext_headers_to_non_loopback() {
+        let with_auth = |url: &str| {
+            http_transport_config(&ServerDef::Http {
+                name: "remote".into(),
+                url: url.into(),
+                headers: HashMap::from([("Authorization".to_string(), "Bearer t".to_string())]),
+            })
+        };
+        let err = with_auth("http://10.0.0.5:9000/mcp").expect_err("远程明文 + headers 必须拒绝");
+        assert!(err.contains("https"), "要提示改用 https：{err}");
+        assert!(
+            with_auth("http://127.0.0.1:9000/mcp").is_ok(),
+            "回环明文允许"
+        );
+        assert!(
+            with_auth("http://localhost:9000/mcp").is_ok(),
+            "localhost 明文允许"
+        );
+        let without_auth = http_transport_config(&ServerDef::Http {
+            name: "remote".into(),
+            url: "http://10.0.0.5:9000/mcp".into(),
+            headers: HashMap::new(),
+        });
+        assert!(without_auth.is_ok(), "无认证头的远程明文仍由用户自行决定");
+    }
+
+    #[test]
+    fn http_transport_config_rejects_invalid_headers() {
+        for (name, value) in [("bad header", "x"), ("x-test", "bad\nvalue")] {
+            let def = ServerDef::Http {
+                name: "remote".into(),
+                url: "http://127.0.0.1:9000/mcp".into(),
+                headers: HashMap::from([(name.to_string(), value.to_string())]),
+            };
+            let err = http_transport_config(&def).expect_err("非法 header 必须拒绝");
+            assert!(err.contains("header"), "错误要指明是哪一类问题：{err}");
+            assert!(!err.contains(value), "错误里不许回显 header 的值");
+        }
     }
 
     // —— 假对端（R310）：裸 `Transport<RoleServer>` 手搓 JSON-RPC，不实现 Handler ——
@@ -1492,9 +1645,7 @@ mod tests {
         let good = |_: &str| -> BoxFuture<'_, Result<Handshake, String>> {
             Box::pin(async {
                 let mut h = fake_handshake(2).await?;
-                h.job = Some(std::sync::Arc::new(
-                    crate::mcp::process::create_kill_job()?,
-                ));
+                h.job = Some(std::sync::Arc::new(crate::mcp::process::create_kill_job()?));
                 Ok(h)
             })
         };
@@ -1528,9 +1679,7 @@ mod tests {
         let make = |_: &str| -> BoxFuture<'_, Result<Handshake, String>> {
             Box::pin(async {
                 let mut h = fake_handshake(1).await?;
-                h.job = Some(std::sync::Arc::new(
-                    crate::mcp::process::create_kill_job()?,
-                ));
+                h.job = Some(std::sync::Arc::new(crate::mcp::process::create_kill_job()?));
                 Ok(h)
             })
         };

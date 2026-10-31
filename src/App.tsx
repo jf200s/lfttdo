@@ -19,6 +19,7 @@ import { applyTheme, resolveTheme } from "./theme/theme";
 import type {
   Decision,
   SendBlock,
+  SessionOutputView,
   SessionRow,
   Settings,
   SettingsView,
@@ -43,6 +44,7 @@ const MEMORY_TOAST_MS = 8_000;
 export default function App() {
   const [rows, setRows] = useState<SessionRow[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [sessionOutput, setSessionOutput] = useState<SessionOutputView | null>(null);
   const [ui, setUi] = useState<UiState>(initialState);
   const [appNotices, setAppNotices] = useState<string[]>([]);
   /**
@@ -389,6 +391,67 @@ export default function App() {
     [notice],
   );
 
+  const onRevealPath = useCallback(
+    (path: string) => {
+      if (activeId === null) return;
+      api
+        .revealPath(activeId, path)
+        .catch((e) => notice(`打开文件位置失败：${String(e)}`));
+    },
+    [activeId, notice],
+  );
+
+  useEffect(() => {
+    if (activeId === null) {
+      setSessionOutput(null);
+      return;
+    }
+    setSessionOutput(null);
+    let alive = true;
+    api
+      .sessionOutputView(activeId)
+      .then((view) => {
+        if (alive && activeRef.current === activeId) setSessionOutput(view);
+      })
+      .catch((e) => {
+        if (!alive || activeRef.current !== activeId) return;
+        setSessionOutput(null);
+        notice(`读取工作文件夹失败：${String(e)}`);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [activeId, notice]);
+
+  const reloadSessionOutput = useCallback(async (id: string) => {
+    const view = await api.sessionOutputView(id);
+    if (activeRef.current === id) setSessionOutput(view);
+  }, []);
+
+  const chooseWorkspace = useCallback(async () => {
+    if (activeId === null) return;
+    const id = activeId;
+    try {
+      const picked = await api.pickFolder();
+      if (picked === null || activeRef.current !== id) return;
+      await api.setSessionWorkspace(id, picked);
+      if (activeRef.current === id) await reloadSessionOutput(id);
+    } catch (e) {
+      if (activeRef.current === id) notice(`设置工作文件夹失败：${String(e)}`);
+    }
+  }, [activeId, notice, reloadSessionOutput]);
+
+  const clearWorkspace = useCallback(async () => {
+    if (activeId === null) return;
+    const id = activeId;
+    try {
+      await api.setSessionWorkspace(id, null);
+      if (activeRef.current === id) await reloadSessionOutput(id);
+    } catch (e) {
+      if (activeRef.current === id) notice(`清除工作文件夹失败：${String(e)}`);
+    }
+  }, [activeId, notice, reloadSessionOutput]);
+
   /**
    * T19：`Composer` 的归一化入口，接 `commands.ts` 平铺导出的 `normalize`（R206：不新造 `api` 对象）。
    *
@@ -452,8 +515,18 @@ export default function App() {
     async (s: Settings) => {
       await api.setSettings(s);
       applySettingsTheme(s);
+      // storage_dir may have changed; refresh the current session output dir.
+      const sid = activeRef.current;
+      if (sid !== null) {
+        void api
+          .sessionOutputView(sid)
+          .then((view) => {
+            if (activeRef.current === sid) setSessionOutput(view);
+          })
+          .catch((e) => notice(`读取工作文件夹失败：${String(e)}`));
+      }
     },
-    [applySettingsTheme],
+    [applySettingsTheme, notice],
   );
 
   // 明文只许走 `settings_set_api_key` 这一条命令；空串是命令侧「清除」的唯一编码（R88），
@@ -574,10 +647,45 @@ export default function App() {
             ))}
           </ul>
         ) : null}
+        {activeId === null ? null : (
+          <div className="workspace-bar" data-testid="workspace-bar">
+            <span className="workspace-kind">
+              {sessionOutput === null
+                ? "输出目录"
+                : sessionOutput.workspace === null
+                  ? "默认位置"
+                  : "工作文件夹"}
+            </span>
+            <button
+              type="button"
+              className="path-chip"
+              title={
+                sessionOutput === null
+                  ? "正在读取输出目录"
+                  : `在资源管理器中显示：${sessionOutput.output_dir}`
+              }
+              disabled={sessionOutput === null}
+              onClick={() => {
+                if (sessionOutput !== null) onRevealPath(sessionOutput.output_dir);
+              }}
+            >
+              {sessionOutput?.output_dir ?? "正在读取…"}
+            </button>
+            <div className="workspace-actions">
+              <button type="button" onClick={() => void chooseWorkspace()}>
+                选择文件夹
+              </button>
+              <button type="button" onClick={() => void clearWorkspace()}>
+                清除
+              </button>
+            </div>
+          </div>
+        )}
         <MessageList
           state={ui}
           onRespond={onRespond}
           onOpenLink={openLink}
+          onRevealPath={onRevealPath}
         />
         <Composer
           streaming={ui.streaming}
@@ -622,6 +730,7 @@ export default function App() {
           onLoadProfile={loadProfile}
           onUpdateMemory={updateMemory}
           onAddMemory={addMemory}
+          onPickFolder={api.pickFolder}
           scrollToMemories={scrollMemories}
         />
       ) : null}

@@ -36,6 +36,25 @@ describe("ipc commands", () => {
 
   // R131：第二参名必须是 `requestId`（`ipc.rs:423-428`）。写成 `id` 的话 Rust 收不到参数，
   // 而前端拿到的是一个 rejected promise，权限门那一笔永远 pending。
+  it("passes the session and path to reveal_path", async () => {
+    await api.revealPath("s1", "C:\\notes\\周报.md");
+    expect(invoke).toHaveBeenCalledWith("reveal_path", {
+      sessionId: "s1",
+      path: "C:\\notes\\周报.md",
+    });
+  });
+
+  it("wires the workspace storage commands", async () => {
+    await api.pickFolder();
+    await api.sessionOutputView("s1");
+    await api.setSessionWorkspace("s1", "C:\\work");
+    expect(invoke.mock.calls).toEqual([
+      ["pick_folder"],
+      ["session_output_view", { id: "s1" }],
+      ["session_workspace_set", { id: "s1", path: "C:\\work" }],
+    ]);
+  });
+
   it("names the permission decision by requestId, not id", async () => {
     invoke.mockResolvedValueOnce(true);
     const ok = await api.respond("p1", { allow: true, scope: "once" });
@@ -81,6 +100,7 @@ describe("ipc commands", () => {
       keep_turns: 10,
       accent: "",
       roots: ["C:\\notes"],
+      storage_dir: "",
       memory_enabled: true,
       memory_recall_k: 5,
       memory_note_token_cap: 600,
@@ -107,6 +127,7 @@ describe("ipc commands", () => {
         keep_turns: 10,
         accent: "",
         roots: ["C:\\notes"],
+        storage_dir: "",
         memory_enabled: true,
         memory_recall_k: 5,
         memory_note_token_cap: 600,

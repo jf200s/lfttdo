@@ -1,4 +1,4 @@
-// mcp 模块：MCP server 的**配置读取层**、**工具命名层**与 **stdio 桥**三个子模块。
+// MCP config, tool naming, and the stdio/HTTP bridge.
 //
 // `config.rs` 把 `mcp.json` 读成一份 server 列表：不建连接、不 spawn 子进程、不接任何调用点。
 // `naming.rs` 把 (server, tool) 拼成兼容端点能接受的工具名：纯字符串算术，同样不接任何调用点——
@@ -6,8 +6,8 @@
 // `bridge.rs`（T31）是本目录里**第一个会真起进程**的一层：spawn 选型 + 并行连接 + 状态台账。
 // 它的边界止于「握手 + 数工具 + 状态」——**不**注册工具（T32）、**不**接 `ipc.rs`（T35 的
 // `mcp_connect` 才是第一个消费者）、**不**做进程树回收（T34 的 JobObject）。
-// HTTP 传输（T36）仍未启用；mcp.json 的唯一写入者是 `editor.rs`（应用内 JSON 编辑器），
-// 它只做读取、严格校验与原子写入，不碰桥与工具表。
+// `mcp.json` is written only by `editor.rs` (the in-app JSON editor), which validates
+// strictly and writes atomically; it never touches the bridge or the tool registry.
 
 pub mod bridge;
 pub mod config;

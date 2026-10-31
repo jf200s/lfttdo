@@ -191,6 +191,7 @@ async fn turn_mode(args: &[String], prompt: &str) -> Result<(), Box<dyn std::err
 
     let reason = run_turn(
         TurnDeps {
+            output_dir: None,
             db: db.clone(),
             registry: build_production_registry(db.clone()),
             gate: Arc::new(PermissionGate::new()),
@@ -262,6 +263,7 @@ async fn direct_mode(
         )
     })?;
     let ctx = ToolCtx {
+        write_root: None,
         http: reqwest::Client::new(),
         cancel: CancellationToken::new(),
         roots: effective_roots(&roots),

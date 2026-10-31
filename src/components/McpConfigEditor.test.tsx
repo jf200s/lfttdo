@@ -23,7 +23,8 @@ describe("McpConfigEditor", () => {
       snapshot().text,
     );
     expect(screen.getByText("C:\\data\\mcp.json")).toBeInTheDocument();
-    expect(screen.getByText(/仅支持 stdio/)).toBeInTheDocument();
+    expect(screen.getByText(/可配置多个 server/)).toBeInTheDocument();
+    expect(screen.getByText(/streamable-http/)).toBeInTheDocument();
     expect(load).toHaveBeenCalledTimes(1);
   });
 

@@ -305,6 +305,43 @@ mod tests {
     }
 
     #[test]
+    fn save_accepts_multiple_servers_and_load_reads_both() {
+        let dir = tempdir().unwrap();
+        let text = r#"{
+  "mcpServers": {
+    "comfyui-local": { "type": "streamable-http", "url": "http://127.0.0.1:9000/mcp" },
+    "second": { "command": "npx", "args": ["-y", "@example/mcp"] }
+  }
+}
+"#;
+        save(dir.path(), text).unwrap();
+
+        let cfg = crate::mcp::config::load(&dir);
+        assert_eq!(cfg.servers.len(), 2, "两个 server 都必须保留");
+        assert!(cfg.skipped.is_empty(), "{:?}", cfg.skipped);
+        assert_eq!(
+            cfg.servers.iter().map(|s| s.name()).collect::<Vec<_>>(),
+            vec!["comfyui-local", "second"]
+        );
+    }
+
+    #[test]
+    fn save_rejects_a_server_outside_mcp_servers() {
+        let dir = tempdir().unwrap();
+        let err = save(
+            dir.path(),
+            r#"{ "mcpServers": { "ok": {"command":"x"} }, "second": {"url":"https://example.test/mcp"} }"#,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("second"), "要点名放错位置的条目：{err}");
+        assert!(
+            !dir.path().join(MCP_FILE).exists(),
+            "校验失败不许留下 mcp.json"
+        );
+    }
+
+    #[test]
     fn save_errors_never_echo_env_values() {
         let dir = tempdir().unwrap();
         let err = save(

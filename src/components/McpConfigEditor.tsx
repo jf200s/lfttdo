@@ -117,9 +117,9 @@ export function McpConfigEditor({
         <code>{snapshot.path}</code>
       </p>
       <p className="panel-hint">
-        配置中的 env/headers 会以明文显示。文件根必须是对象、mcpServers
-        必须是对象。当前构建仅支持 stdio；HTTP 条目可保存但无法连接；disabled
-        字段当前不识别。
+        配置中的 env/headers 会以明文显示。文件根必须是对象、mcpServers 必须是对象。
+        可配置多个 server，名称不能重复：stdio 用 command/args/env；HTTP（streamable-http）
+        用 url/headers。type 字段当前不参与判定；disabled 字段当前不识别。
       </p>
       {snapshot.exists ? null : (
         <p className="panel-hint">文件尚不存在，保存后创建。</p>

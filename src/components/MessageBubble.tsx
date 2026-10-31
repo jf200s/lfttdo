@@ -2,7 +2,15 @@ import { memo, useState } from "react";
 import Markdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
-import type { Decision, PermCard, Risk, ToolCard, Turn, UiBlock } from "../types";
+import type {
+  Decision,
+  PermCard,
+  Risk,
+  ToolCallView,
+  ToolCard,
+  Turn,
+  UiBlock,
+} from "../types";
 
 /** `risk` 只用来画徽章，不参与任何决策（R114：判定权在 Rust 的 PermissionGate）。 */
 const RISK_LABEL: Record<Risk, string> = { read: "只读", write: "写入", exec: "执行" };
@@ -33,7 +41,48 @@ export function readablePreview(text: string): string {
     .trim();
 }
 
-function ToolCardView({ card }: { card: ToolCard }) {
+function PathChip({
+  path,
+  onReveal,
+}: {
+  path: string;
+  onReveal?: (path: string) => void;
+}) {
+  if (onReveal === undefined) {
+    return (
+      <span className="path-chip" title={path}>
+        {path}
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="path-chip"
+      title={`在资源管理器中显示：${path}`}
+      onClick={() => onReveal(path)}
+    >
+      {path}
+    </button>
+  );
+}
+
+function toolPathOf(input: unknown): string | null {
+  const o = asRecord(input);
+  if (o === null || typeof o.path !== "string" || o.path.trim() === "") {
+    return null;
+  }
+  return o.path;
+}
+
+function ToolCardView({
+  card,
+  onRevealPath,
+}: {
+  card: ToolCard;
+  onRevealPath?: (path: string) => void;
+}) {
+  const path = toolPathOf(card.input);
   return (
     <div
       className="card tool"
@@ -46,6 +95,9 @@ function ToolCardView({ card }: { card: ToolCard }) {
         <span className="tool-status">{STATUS_LABEL[card.status]}</span>
         <span className="tool-ms">{fmtMs(card.ms)}</span>
       </div>
+      {path === null ? null : (
+        <PathChip path={path} onReveal={onRevealPath} />
+      )}
       <pre className="io">
         {JSON.stringify(card.input ?? {}, null, 2)}
       </pre>
@@ -53,6 +105,22 @@ function ToolCardView({ card }: { card: ToolCard }) {
         const shown = card.preview ? readablePreview(card.preview) : "";
         return shown !== "" ? <pre className="io preview">{shown}</pre> : null;
       })()}
+      {card.images.length > 0 ? (
+        <div className="tool-images" data-testid={`tool-images-${card.callId}`}>
+          {card.images.map((img, i) => (
+            <figure className="tool-image" key={`${img.mime}-${i}`}>
+              <img
+                className="thumb"
+                src={`data:image/${img.mime};base64,${img.data}`}
+                alt="工具返回的图片"
+              />
+              {img.path === undefined ? null : (
+                <PathChip path={img.path} onReveal={onRevealPath} />
+              )}
+            </figure>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -62,6 +130,75 @@ const DECISION_LABEL: Record<PermCard["state"], string> = {
   allowed: "已放行",
   denied: "已拒绝",
 };
+
+type WriteInput = { path: string; content: string };
+type EditInput = { path: string; old: string; new: string };
+
+function asRecord(input: unknown): Record<string, unknown> | null {
+  return typeof input === "object" && input !== null
+    ? (input as Record<string, unknown>)
+    : null;
+}
+
+function writeInputOf(input: unknown): WriteInput | null {
+  const o = asRecord(input);
+  if (o === null || typeof o.path !== "string" || typeof o.content !== "string") {
+    return null;
+  }
+  return { path: o.path, content: o.content };
+}
+
+function editInputOf(input: unknown): EditInput | null {
+  const o = asRecord(input);
+  if (
+    o === null ||
+    typeof o.path !== "string" ||
+    typeof o.old_string !== "string" ||
+    typeof o.new_string !== "string"
+  ) {
+    return null;
+  }
+  return { path: o.path, old: o.old_string, new: o.new_string };
+}
+
+function CallPreview({ call }: { call: ToolCallView }) {
+  const write = call.name === "write_file" ? writeInputOf(call.input) : null;
+  const edit = call.name === "edit_file" ? editInputOf(call.input) : null;
+
+  if (write !== null) {
+    return (
+      <div className="perm-preview" data-testid="write-preview">
+        <p className="perm-path">
+          <span>路径</span>
+          <code>{write.path}</code>
+        </p>
+        <p className="perm-note">完整内容（{write.content.length} 字符）</p>
+        <pre className="io preview" tabIndex={0} aria-label="写入内容预览">
+          {write.content}
+        </pre>
+      </div>
+    );
+  }
+  if (edit !== null) {
+    return (
+      <div className="perm-preview" data-testid="edit-preview">
+        <p className="perm-path">
+          <span>路径</span>
+          <code>{edit.path}</code>
+        </p>
+        <p className="perm-note">替换前</p>
+        <pre className="io preview" tabIndex={0} aria-label="替换前内容">
+          {edit.old}
+        </pre>
+        <p className="perm-note">替换后</p>
+        <pre className="io preview" tabIndex={0} aria-label="替换后内容">
+          {edit.new}
+        </pre>
+      </div>
+    );
+  }
+  return <pre className="io">{JSON.stringify(call.input ?? {}, null, 2)}</pre>;
+}
 
 function PermCardView({
   card,
@@ -99,7 +236,7 @@ function PermCardView({
       </div>
       <div className="perm-call">
         <span className="tool-name">{card.call.name}</span>
-        <pre className="io">{JSON.stringify(card.call.input ?? {}, null, 2)}</pre>
+        <CallPreview call={card.call} />
       </div>
 
       {card.state === "allowed" && card.scope ? (
@@ -120,7 +257,7 @@ function PermCardView({
           disabled={!pending}
           onClick={() => allow("session")}
         >
-          本会话内都允许
+          {card.risk === "write" ? "本会话内该目录都允许" : "本会话内都允许"}
         </button>
         <button
           type="button"
@@ -176,11 +313,13 @@ function BlockView({
   plain,
   onRespond,
   onOpenLink,
+  onRevealPath,
 }: {
   block: UiBlock;
   plain: boolean;
   onRespond: (id: string, d: Decision) => void;
   onOpenLink?: (url: string) => void;
+  onRevealPath?: (path: string) => void;
 }) {
   switch (block.kind) {
     case "text": {
@@ -247,7 +386,7 @@ function BlockView({
         />
       );
     case "tool":
-      return <ToolCardView card={block} />;
+      return <ToolCardView card={block} onRevealPath={onRevealPath} />;
     case "perm":
       return <PermCardView card={block} onRespond={onRespond} />;
   }
@@ -259,12 +398,14 @@ function MessageBubbleView({
   streaming,
   onRespond,
   onOpenLink,
+  onRevealPath,
 }: {
   turn: Turn;
   isLastTurn: boolean;
   streaming: boolean;
   onRespond: (id: string, d: Decision) => void;
   onOpenLink?: (url: string) => void;
+  onRevealPath?: (path: string) => void;
 }) {
   const lastIndexOf = turn.blocks.length - 1;
   // R234：空的助手气泡有两种来路 —— 等首字（该留着并看得出在等）与这一轮已结束
@@ -284,6 +425,7 @@ function MessageBubbleView({
           plain={streaming && isLastTurn && i === lastIndexOf}
           onRespond={onRespond}
           onOpenLink={onOpenLink}
+          onRevealPath={onRevealPath}
         />
       ))}
     </article>

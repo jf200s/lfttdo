@@ -35,7 +35,7 @@ use std::sync::{Mutex, MutexGuard};
 ///   还会把同一件事反复 ADD 成一堆近似重复的记忆。压缩路径也必须推进它。
 /// - `memories.user_edited`：用户亲手改过正文。模型的下一次合并**不许**改写这样的行
 ///   （候选并存、用户自己删）—— 用户权威优先于系统自洽，这是业主拍板的方向。
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// 会话标题上限（字符）。这是**标题**规则（40），不是工具输出预览（200，见
 /// `ToolOutput::preview()`）：两个槽位、各自一处计算，别让它们互相「复用」出一个第三种形状。
@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS sessions(
     title TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    memory_extracted_upto INTEGER NOT NULL DEFAULT 0);
+    memory_extracted_upto INTEGER NOT NULL DEFAULT 0,
+    workspace_dir TEXT);
 CREATE TABLE IF NOT EXISTS messages(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -215,6 +216,38 @@ impl Db {
         Ok(rows)
     }
 
+    pub fn session_exists(&self, id: &str) -> Result<bool, rusqlite::Error> {
+        let c = self.lock();
+        let mut st = c.prepare("SELECT 1 FROM sessions WHERE id=?1")?;
+        st.exists([id])
+    }
+
+    pub fn session_workspace(&self, id: &str) -> Result<Option<String>, rusqlite::Error> {
+        let c = self.lock();
+        let mut st = c.prepare("SELECT workspace_dir FROM sessions WHERE id=?1")?;
+        let mut rows = st.query([id])?;
+        match rows.next()? {
+            Some(row) => row.get(0),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_session_workspace(
+        &self,
+        id: &str,
+        dir: Option<&str>,
+    ) -> Result<(), rusqlite::Error> {
+        let c = self.lock();
+        let changed = c.execute(
+            "UPDATE sessions SET workspace_dir=?2 WHERE id=?1",
+            params![id, dir],
+        )?;
+        if changed == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
+    }
+
     /// 改名同时把会话顶到最新：用户刚动过的那条排在列表最前。
     pub fn rename_session(&self, id: &str, title: &str) -> Result<(), rusqlite::Error> {
         let c = self.lock();
@@ -324,7 +357,7 @@ impl Db {
             .messages(session_id)?
             .iter()
             .rev()
-            .filter(|m| m.role == Role::User && !is_tool_row(m))
+            .filter(|m| m.role == Role::User && !is_tool_row(m) && !m.is_tool_image_followup())
             .map(|m| m.text_of())
             .find(|t| !t.is_empty())
             .map(|t| crate::text::truncate_display(&t, TITLE_CHARS)))
@@ -381,6 +414,9 @@ fn attach_session_columns(c: &Connection) -> Result<(), rusqlite::Error> {
             [],
         )?;
     }
+    if !existing.iter().any(|c| c == "workspace_dir") {
+        c.execute("ALTER TABLE sessions ADD COLUMN workspace_dir TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -430,7 +466,10 @@ pub(crate) fn insert_message_row(
 /// （`the_second_compaction_does_not_count_the_note_as_a_conversation_row` 盯这一点）。
 /// `pub(crate)`（长期记忆）：压缩同事务入口与这里共用**同一条**下标映射,
 /// 第二份「第几条对话消息是哪行」的答案迟早删错用户的原话。
-pub(crate) fn conversation_ids(c: &Connection, session_id: &str) -> Result<Vec<i64>, rusqlite::Error> {
+pub(crate) fn conversation_ids(
+    c: &Connection,
+    session_id: &str,
+) -> Result<Vec<i64>, rusqlite::Error> {
     let mut st =
         c.prepare("SELECT id FROM messages WHERE session_id=?1 AND role<>?2 ORDER BY id")?;
     let ids = st
@@ -527,6 +566,9 @@ pub fn events_from_messages(msgs: &[Message], risk_of: &dyn Fn(&str) -> Risk) ->
             // 不是聊天记录。它们落库只为了让下一轮的上下文完整。
             Role::System => {}
             Role::User => {
+                if m.is_tool_image_followup() {
+                    continue;
+                }
                 if is_tool_row(m) {
                     // T10 从不用「Text + ToolResult 混在一行」的形状（结果一律 `Message::tool`
                     // 单块构造），所以这一臂只发结果事件、把同行的 Text 丢掉。
@@ -545,13 +587,15 @@ pub fn events_from_messages(msgs: &[Message], risk_of: &dyn Fn(&str) -> Risk) ->
                             output,
                         } = b
                         {
+                            let (preview, images) = output.event_view();
                             out.push(AgentEvent::ToolResult {
                                 call_id: call_id.clone(),
                                 // is_error 原样交回（T10 交接③）：库里失败就是失败，不许降级成成功。
                                 is_error: *is_error,
                                 // 重放不还原耗时（库里没这一列）。交 T14：0 别显示成「0 ms」。
                                 ms: 0,
-                                preview: output.preview(),
+                                preview,
+                                images,
                             });
                         }
                         // 工具行里混 Text 块在 Plan A 不可达（T10 用 `Message::tool` 单块构造）。
@@ -836,8 +880,8 @@ mod tests {
         );
         assert_eq!(
             db.user_version().unwrap(),
-            4,
-            "R74：迁移钩子要有初值。v4 = 抽取游标(sessions.memory_extracted_upto) + 用户编辑标记(memories.user_edited),见 SCHEMA_VERSION"
+            5,
+            "R74：迁移钩子要有初值。v5 = v4 的迁移再加 sessions.workspace_dir,见 SCHEMA_VERSION"
         );
     }
 
@@ -854,6 +898,55 @@ mod tests {
         }
         let db = Db::open(&path).unwrap();
         assert_eq!(db.user_version().unwrap(), 2);
+    }
+
+
+    #[test]
+    fn session_workspace_round_trips_and_clears() {
+        let (_d, db) = tmpdb();
+        let sid = db.create_session("新对话").unwrap();
+        assert!(db.session_exists(&sid).unwrap());
+        assert!(!db.session_exists("missing").unwrap());
+        assert_eq!(db.session_workspace(&sid).unwrap(), None);
+        db.set_session_workspace(&sid, Some("C:\\work")).unwrap();
+        assert_eq!(
+            db.session_workspace(&sid).unwrap().as_deref(),
+            Some("C:\\work")
+        );
+        db.set_session_workspace(&sid, None).unwrap();
+        assert_eq!(
+            db.session_workspace(&sid).unwrap(),
+            None,
+            "清除后必须回落到默认位置"
+        );
+        assert!(
+            db.set_session_workspace("missing", Some("C:\\work"))
+                .is_err(),
+            "不存在的会话不能被静默改"
+        );
+    }
+
+    #[test]
+    fn a_v4_database_gains_the_workspace_column() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("v4.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY,title TEXT NOT NULL,\
+                 created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);\
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let sid = db.create_session("旧库").unwrap();
+        assert_eq!(db.session_workspace(&sid).unwrap(), None);
+        db.set_session_workspace(&sid, Some("C:\\work")).unwrap();
+        assert_eq!(
+            db.session_workspace(&sid).unwrap().as_deref(),
+            Some("C:\\work")
+        );
     }
 
     // ---------- 标题 ----------
@@ -1187,6 +1280,7 @@ mod tests {
                 is_error,
                 ms,
                 preview,
+                images: _,
             } => {
                 assert_eq!(call_id, "c1");
                 assert!(is_error, "失败被降级成成功");
@@ -1195,6 +1289,103 @@ mod tests {
             }
             other => panic!("工具结果行必须重放成 tool_result，拿到的是 {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_tool_result_with_images_replays_the_images_into_the_event() {
+        let evts = events_from_messages(
+            &[Message::tool(
+                "c1",
+                ToolOutput::Multi {
+                    parts: vec![
+                        ToolOutput::text("截图如下"),
+                        ToolOutput::Image {
+                            data: "QUJD".into(),
+                            mime: ImageMime::Png,
+                        },
+                    ],
+                },
+                false,
+            )],
+            &read_of,
+        );
+        match &evts[0] {
+            AgentEvent::ToolResult {
+                images, preview, ..
+            } => {
+                assert_eq!(images.len(), 1, "重放必须把图片带回界面");
+                assert_eq!(images[0].data, "QUJD");
+                assert_eq!(images[0].mime, ImageMime::Png);
+                assert!(preview.contains("[图片 png]"), "{preview}");
+            }
+            other => panic!("工具结果行必须重放成 tool_result，拿到的是 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_skips_the_synthetic_tool_image_followup() {
+        let evts = events_from_messages(
+            &[
+                user_text("看图"),
+                Message::tool(
+                    "c1",
+                    ToolOutput::Image {
+                        data: "QUJD".into(),
+                        mime: ImageMime::Png,
+                    },
+                    false,
+                ),
+                Message::user(vec![
+                    ContentBlock::Text {
+                        text: crate::agent::types::TOOL_IMAGE_FOLLOWUP_NOTE.into(),
+                    },
+                    ContentBlock::Image {
+                        data: "QUJD".into(),
+                        mime: ImageMime::Png,
+                    },
+                ]),
+            ],
+            &read_of,
+        );
+        let user_events: Vec<_> = evts
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::UserMessage { .. }))
+            .collect();
+        assert_eq!(
+            user_events.len(),
+            1,
+            "只有真实用户那句可以重放成 user_message"
+        );
+        assert!(
+            evts.iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { images, .. } if images.len() == 1)),
+            "工具结果的图片仍要从 tool_result 事件交给卡片"
+        );
+    }
+
+    #[test]
+    fn latest_user_message_skips_the_synthetic_tool_image_followup() {
+        let (_d, db) = tmpdb();
+        let s = db.create_session("新对话").unwrap();
+        db.append_message(&s, &user_text("看图")).unwrap();
+        db.append_message(
+            &s,
+            &Message::user(vec![
+                ContentBlock::Text {
+                    text: crate::agent::types::TOOL_IMAGE_FOLLOWUP_NOTE.into(),
+                },
+                ContentBlock::Image {
+                    data: "QUJD".into(),
+                    mime: ImageMime::Png,
+                },
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            db.latest_user_message(&s).unwrap().as_deref(),
+            Some("看图"),
+            "自动标题不能采用模型专用的图片说明"
+        );
     }
 
     // ---------- 解码失败必须报错（R71） ----------

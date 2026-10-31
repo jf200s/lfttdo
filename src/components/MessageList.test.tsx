@@ -127,6 +127,7 @@ describe("MessageList", () => {
               input: {},
               status: "running",
               preview: "",
+              images: [],
               ms: 0,
             },
           ],
@@ -153,6 +154,7 @@ describe("MessageList", () => {
               input: {},
               status: "ok",
               preview: "hi",
+              images: [],
               ms: 123,
             },
           ],
@@ -162,6 +164,7 @@ describe("MessageList", () => {
     render(<MessageList state={s} onRespond={() => {}} />);
     expect(screen.getByText("hi")).toBeInTheDocument();
     expect(screen.getByText(/123\s*ms/)).toBeInTheDocument();
+    expect(screen.getByTestId("tool-c1").querySelector("img")).toBeNull();
   });
 
   // T27（更正 2）：卡片本体 Plan A T16 就交付了，这里只补**没人钉过**的那一半 ——
@@ -182,6 +185,7 @@ describe("MessageList", () => {
               input: { url: "https://a.test" },
               status: "error",
               preview: "上游返回 403，内容可能受限",
+              images: [],
               ms: 812,
             },
           ],
@@ -219,6 +223,7 @@ describe("MessageList", () => {
               input: { path: "D:\\notes\\a.md" },
               status: "error",
               preview: "只接受绝对路径",
+              images: [],
               ms: 0,
             },
           ],
@@ -340,6 +345,7 @@ describe("MessageList", () => {
               input: {},
               status: "ok",
               preview: "done",
+              images: [],
               ms: 0,
             },
           ],
@@ -366,6 +372,7 @@ describe("MessageList", () => {
               input: {},
               status: "ok",
               preview: "done",
+              images: [],
               ms: 7,
             },
           ],
@@ -377,6 +384,89 @@ describe("MessageList", () => {
     );
     expect(c2.textContent).toContain("7 ms");
     expect(c2.textContent).not.toContain("—");
+  });
+
+  it("renders images returned by a tool inside the tool card", () => {
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "tool",
+              callId: "c1",
+              name: "mcp__shot__capture",
+              risk: "read",
+              input: {},
+              status: "ok",
+              preview: "[图片 png]\n[另有 1 张图片未在卡片中显示]",
+              ms: 12,
+              images: [
+                {
+                  data: "QUJD",
+                  mime: "png",
+                  path: "C:\\cache\\pic.png",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    const onRevealPath = vi.fn();
+    const { container } = render(
+      <MessageList
+        state={s}
+        onRespond={() => {}}
+        onRevealPath={onRevealPath}
+      />,
+    );
+    const img = container.querySelector(
+      '[data-testid="tool-c1"] img',
+    ) as HTMLImageElement | null;
+    expect(img).not.toBeNull();
+    expect(img?.src).toBe("data:image/png;base64,QUJD");
+    expect(img?.alt).toBe("工具返回的图片");
+    expect(container.textContent).toContain("另有 1 张图片未在卡片中显示");
+    fireEvent.click(screen.getByRole("button", { name: "C:\\cache\\pic.png" }));
+    expect(onRevealPath).toHaveBeenCalledWith("C:\\cache\\pic.png");
+  });
+
+  it("shows a clickable path for tools with a file argument", () => {
+    const onRevealPath = vi.fn();
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "tool",
+              callId: "c1",
+              name: "write_file",
+              risk: "write",
+              input: { path: "C:\\notes\\周报.md", content: "x" },
+              status: "ok",
+              preview: "已写入",
+              images: [],
+              ms: 5,
+            },
+          ],
+        },
+      ],
+    });
+    render(
+      <MessageList
+        state={s}
+        onRespond={() => {}}
+        onRevealPath={onRevealPath}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "C:\\notes\\周报.md" }),
+    );
+    expect(onRevealPath).toHaveBeenCalledWith("C:\\notes\\周报.md");
   });
 
   // 第 10 条 = 硬性要求 7 的渲染侧：助手文本不许落进用户气泡。
@@ -432,6 +522,91 @@ describe("MessageList", () => {
     fireEvent.change(input, { target: { value: "别删我的文件" } });
     fireEvent.click(screen.getByRole("button", { name: /提交拒绝理由/ }));
     expect(calls).toEqual([["p1", { allow: false, reason: "别删我的文件" }]]);
+  });
+
+  it("previews the path and full content of a write_file request", () => {
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "perm",
+              id: "w1",
+              risk: "write",
+              state: "pending",
+              call: {
+                id: "c",
+                name: "write_file",
+                risk: "write",
+                input: {
+                  path: "C:\\notes\\周报.md",
+                  content: "第一行\n第二行",
+                },
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const { container } = render(
+      <MessageList state={s} onRespond={() => {}} />,
+    );
+    expect(screen.getByTestId("write-preview").textContent).toContain(
+      "C:\\notes\\周报.md",
+    );
+    expect(container.textContent).toContain("第一行");
+    expect(container.textContent).toContain("第二行");
+    expect(container.textContent).not.toContain('"content"');
+    expect(screen.getByRole("button", { name: "仅本次" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "本会话内该目录都允许" }),
+    ).toBeEnabled();
+    expect(screen.getByLabelText("写入内容预览")).toHaveAttribute(
+      "tabindex",
+      "0",
+    );
+  });
+
+  it("previews both sides of an edit_file request", () => {
+    const s = state({
+      turns: [
+        {
+          id: 1,
+          role: "assistant",
+          blocks: [
+            {
+              kind: "perm",
+              id: "e1",
+              risk: "write",
+              state: "pending",
+              call: {
+                id: "c",
+                name: "edit_file",
+                risk: "write",
+                input: {
+                  path: "C:\\notes\\周报.md",
+                  old_string: "旧的一行",
+                  new_string: "新的一行",
+                },
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const { container } = render(
+      <MessageList state={s} onRespond={() => {}} />,
+    );
+    expect(container.textContent).toContain("C:\\notes\\周报.md");
+    expect(container.textContent).toContain("替换前");
+    expect(container.textContent).toContain("旧的一行");
+    expect(container.textContent).toContain("替换后");
+    expect(container.textContent).toContain("新的一行");
+    expect(container.textContent).not.toContain('"old_string"');
+    expect(screen.getByLabelText("替换前内容")).toHaveAttribute("tabindex", "0");
+    expect(screen.getByLabelText("替换后内容")).toHaveAttribute("tabindex", "0");
   });
 
   it("falls back to the default deny wording when the reason is left blank", () => {

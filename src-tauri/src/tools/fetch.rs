@@ -1579,6 +1579,7 @@ mod tests {
     /// `reqwest::Client::new()` 不联网。
     fn test_ctx() -> ToolCtx {
         ToolCtx {
+            write_root: None,
             http: reqwest::Client::new(),
             cancel: CancellationToken::new(),
             roots: vec![],

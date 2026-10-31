@@ -22,6 +22,12 @@ const h = vi.hoisted(() => {
     setSettings: vi.fn(),
     setApiKey: vi.fn(),
     normalize: vi.fn(),
+    pickFolder: vi.fn(async () => null),
+    sessionOutputView: vi.fn(async () => ({
+      workspace: null,
+      output_dir: "C:\\out\\session",
+    })),
+    setSessionWorkspace: vi.fn(),
     // App 订阅的是 `subscribeAgent`（不是 `listen`）：mock 工厂里缺这一支，渲染期就会抛
     // 「No "subscribeAgent" export is defined on the mock」，十三条一起红 —— 红的是接线不是行为。
     subscribeAgent: (cb: (sessionId: string, e: never) => void) => {
@@ -60,6 +66,7 @@ const view = (): SettingsView => ({
   // T26 的 `roots`：空数组 = 生产默认值 = 「read_file 一律拒绝」（理由写在 `App.test.tsx`
   // 那同款夹具的注释里）。本文件不断言保存载荷，键在这里的作用只有一个：少写就编译不过。
   roots: [],
+  storage_dir: "",
   // 长期记忆四键（Rust 默认 true/5/600/500）：作用与上面的 `roots` 同一条 ——
   // 镜像多一键、夹具少一键就当场编译不过。仅补键，本文件的用例一行未动（R216②）。
   memory_enabled: true,

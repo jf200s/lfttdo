@@ -50,6 +50,23 @@ describe("McpPanel", () => {
     await waitFor(() => expect(setTrust).toHaveBeenCalledWith("search", "auto"));
   });
 
+  it("renders every configured server", async () => {
+    const status = statusOf();
+    const second = { ...ready, name: "second", tools: 2 };
+    render(
+      <McpPanel
+        initial={[ready, second]}
+        onClose={() => {}}
+        loadConfigStatus={status}
+      />,
+    );
+    await act(async () => {
+      await status.mock.results[0]?.value;
+    });
+    expect(screen.getByText("search 提供 4 个工具")).toBeInTheDocument();
+    expect(screen.getByText("second 提供 2 个工具")).toBeInTheDocument();
+  });
+
   it("shows the failure reason for a disconnected server without a popup", async () => {
     const alertSpy = vi.spyOn(window, "alert").mockImplementation(() => {});
     const status = statusOf();

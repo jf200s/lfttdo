@@ -1,4 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
+import {
+  MAX_PERSONA_CHARS,
+  downloadPersonaText,
+  normalizePersonaText,
+} from "../persona";
 import { THEME_NAMES, type Mode } from "../theme/theme";
 import type { MemoryView, Settings, SettingsView } from "../types";
 
@@ -34,6 +39,7 @@ interface SettingsPanelProps {
    */
   onUpdateMemory: (id: number, body: string) => Promise<void>;
   onAddMemory: (kind: string, body: string, dueAt: number | null) => Promise<number>;
+  onPickFolder: () => Promise<string | null>;
   /**
    * P1：轻提示点击「已记住 N 条」时由 App 置真：面板打开后把长期记忆那一组滚进视野。
    * 为什么不在 App 里 `scrollIntoView`：那一刻面板还没挂载（`setSettingsView` 是异步的），
@@ -163,11 +169,13 @@ export function SettingsPanel({
   onLoadProfile,
   onUpdateMemory,
   onAddMemory,
+  onPickFolder,
   scrollToMemories = false,
 }: SettingsPanelProps) {
   // 从 `initial` 拷一份本地草稿：面板活着的时候用户改的是这一份，
   // 保存失败不许把草稿也一起回滚掉（那等于让用户重打一遍）。
   const [form, setForm] = useState<Settings>(() => settingsOf(initial));
+  const [rootsDraft, setRootsDraft] = useState(() => initial.roots.join("\n"));
   const [keyDraft, setKeyDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -220,6 +228,7 @@ export function SettingsPanel({
     initial.accent === "" ? null : initial.accent,
   );
   const boxRef = useRef<HTMLDivElement>(null);
+  const personaFileRef = useRef<HTMLInputElement>(null);
 
   // 打开即把焦点收进对话框：`aria-modal` 承诺了「这是当前唯一的操作面」，
   // 焦点却留在背后的界面上，键盘用户就看不见这个承诺；Escape 也才按得掉。
@@ -229,6 +238,37 @@ export function SettingsPanel({
 
   const setField = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     setForm((f) => ({ ...f, [key]: value }));
+
+  const pickStorage = async () => {
+    try {
+      const picked = await onPickFolder();
+      if (picked !== null) setField("storage_dir", picked);
+    } catch (err) {
+      setError(`选择默认储存位置失败：${String(err)}`);
+    }
+  };
+
+  const importPersona = async (e: ChangeEvent<HTMLInputElement>) => {
+    const input = e.currentTarget;
+    const file = input.files?.[0];
+    if (file === undefined) return;
+    try {
+      const raw = await file.text();
+      const text = normalizePersonaText(raw);
+      if (text.length > MAX_PERSONA_CHARS) {
+        setError(
+          `人设不能超过 ${MAX_PERSONA_CHARS.toLocaleString("en-US")} 字符（当前 ${text.length.toLocaleString("en-US")} 字符）`,
+        );
+        return;
+      }
+      setField("system_prompt", text);
+      setError(null);
+    } catch (err) {
+      setError(`读取人设文件失败：${String(err)}`);
+    } finally {
+      input.value = "";
+    }
+  };
 
   // 记忆列表的一份实现、三个入口（挂载拉取 / 删除后重拉 / 清空后重拉，R117 的口径）。
   // 失败进**既有** error 通道：列表拉不到是面板级的事故，不该为它另开一个通知位。
@@ -362,11 +402,15 @@ export function SettingsPanel({
       }
     }
     const typedKey = keyDraft.trim();
+    const roots = rootsDraft
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line !== "");
     // `accent` 的唯一判据（见上面 `customHex` 那段）：`null`（勾选跟随预设）和 `""`（取消勾选
-    // 但没选过色）都发空串回 Rust 默认，只有真选过色才发那支 hex。其余十一键**照原样带过**，
     // 不重新拼名单 —— `settingsOf` 的减法形状守的就是这件事（上面那条 carry-through 测试）。
     const payload: Settings = {
       ...form,
+      roots,
       accent: customHex === null || customHex === "" ? "" : customHex,
     };
     try {
@@ -547,6 +591,100 @@ export function SettingsPanel({
                 aria-hidden="true"
               />
             </span>
+          </div>
+        </fieldset>
+
+        <fieldset className="panel-group">
+          <legend>文件访问</legend>
+          <label className="panel-row panel-roots">
+            <span>可访问目录</span>
+            <textarea
+              rows={4}
+              spellCheck={false}
+              placeholder={"C:\\Users\\你\\Documents\nD:\\notes"}
+              value={rootsDraft}
+              onChange={(e) => setRootsDraft(e.target.value)}
+            />
+          </label>
+          <p className="panel-hint">
+            一行一个绝对路径，只作为读取范围；写入/编辑只允许发生在当前工作文件夹或默认
+            输出目录。留空 = 不允许读取任何目录。保存后下一条消息生效。
+          </p>
+        </fieldset>
+
+        <fieldset className="panel-group">
+          <legend>储存</legend>
+          <label className="panel-row">
+            <span>默认储存位置</span>
+            <input
+              type="text"
+              value={form.storage_dir}
+              placeholder="留空 = 文档\\LFTTDO"
+              onChange={(e) => setField("storage_dir", e.target.value)}
+            />
+          </label>
+          <div className="panel-actions">
+            <button type="button" onClick={() => void pickStorage()}>
+              选择文件夹
+            </button>
+            <button
+              type="button"
+              disabled={form.storage_dir === ""}
+              onClick={() => setField("storage_dir", "")}
+            >
+              恢复默认
+            </button>
+          </div>
+          <p className="panel-hint">
+            会话没有设置工作文件夹时，生成的图片和文件会写到这里的会话子目录
+            （视频尚未支持）。留空 = 系统文档目录下的 LFTTDO；工作文件夹优先。
+            保存后下一条消息生效。
+          </p>
+        </fieldset>
+
+        <fieldset className="panel-group">
+          <legend>人设</legend>
+          <label className="panel-row">
+            <span>人设（系统提示词）</span>
+            <textarea
+              rows={7}
+              maxLength={MAX_PERSONA_CHARS}
+              value={form.system_prompt}
+              onChange={(e) => setField("system_prompt", e.target.value)}
+            />
+          </label>
+          <input
+            ref={personaFileRef}
+            type="file"
+            accept=".txt,text/plain"
+            aria-label="导入人设文件"
+            style={{ display: "none" }}
+            onChange={(e) => void importPersona(e)}
+          />
+          <p className="panel-hint">
+            留空 = 使用内置提示词；导入按 UTF-8 读取。只保存在本机 settings.json，保存后下一条消息生效。
+          </p>
+          <div className="panel-actions">
+            <button type="button" onClick={() => personaFileRef.current?.click()}>
+              从 .txt 导入
+            </button>
+            <button
+              type="button"
+              disabled={form.system_prompt.trim() === ""}
+              onClick={() => downloadPersonaText(form.system_prompt)}
+            >
+              导出 .txt
+            </button>
+            <button
+              type="button"
+              disabled={form.system_prompt === ""}
+              onClick={() => {
+                setError(null);
+                setField("system_prompt", "");
+              }}
+            >
+              恢复内置
+            </button>
           </div>
         </fieldset>
 

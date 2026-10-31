@@ -12,10 +12,12 @@ Windows 桌面 AI 助理：聊天、看图、联网抓取、MCP 工具调用，�
 - **聊天**：流式输出、多会话、长对话自动摘要压缩、上下文预算可调。
 - **看图**：粘贴 / 拖拽 / 选文件三种入口，统一走同一条图片归一化（缩放、转码、体积闸门）；视觉模型可描述图片。
 - **联网抓取**：内置 `fetch_url`，按内容抽取正文；每跳重定向都过 SSRF 判定（拒绝非 http(s)、本机、内网与元数据地址）。
-- **MCP 客户端**：stdio 传输，启动后台连接、工具命名走 `mcp__{server}__{tool}`、每台 server 可设信任档（全部允许 / 每次询问 / 禁止），信任设置持久化；侧栏 MCP 面板可在应用内直接编辑 `mcp.json`（严格校验、重启生效）。
+- **本地文件**：设置页「文件访问」列出的目录作为**只读**范围；生成/修改文件写到当前输出目录（工作文件夹或默认储存位置），写入走权限弹窗、可放行本会话。路径逐次校验（绝对路径、junction/越界一律拒绝），非 UTF-8 文件明确拒绝而不是静默转码。
+- **工作文件夹**：每个会话可选择一个工作文件夹；没选时用设置里的「默认储存位置」（默认是文档目录下的 `LFTTDO`，按会话建子目录）。生成的图片和文件落在输出目录：图片在 `images/`、文件在根目录；写入只允许发生在该输出目录，全局 roots 只读。工具卡会显示文件和图片的绝对路径，点击可在资源管理器中选中。
+- **MCP 客户端**：stdio 与 streamable-http 两种传输，启动后台连接、工具命名走 `mcp__{server}__{tool}`、每台 server 可设信任档（全部允许 / 每次询问 / 禁止），信任设置持久化；侧栏 MCP 面板可在应用内直接编辑 `mcp.json`，可配置多个 stdio / streamable-http server（严格校验、重启生效）。工具返回的图片会直接显示在工具卡片里（最多 4 张、合计 base64 ≤ 8 MB；超出的在预览里注明），模型侧按既有的最近 3 张保留上限接收图片。
 - **长期记忆**：跨会话记住事实、偏好、画像与待办；在上下文压缩、空闲、切换会话时自动抽取，每轮按相关度召回；设置页可查看、编辑、新增、删除、清空。
 - **工具权限门**：Read 自动放行；Write/Exec 弹窗确认；MCP 工具默认每次询问；未知工具按最严一档处理。
-- **人设**：系统提示词是数据目录 `settings.json` 里的 `system_prompt`，应用内不提供编辑入口；改完重启、新建对话生效。
+- **人设**：设置页可直接编辑系统提示词，支持从 `.txt`（UTF-8）导入、导出 `.txt`、恢复内置；留空使用内置提示词，内容只保存在本机 `settings.json`，保存后下一条消息生效。
 - **技能包**：`skills/<名字>/SKILL.md` 放一份说明，索引自动进系统提示；模型需要时调用
   `use_skill` 读取正文，用户这句话里带到技能名或 `keywords` 时正文直接自动加载。
   只读本地文本，不执行脚本；加/改技能不用重启（下一条消息生效）。
@@ -96,7 +98,7 @@ npx tsc --noEmit
 npm run lint:css
 ```
 
-当前读数：Rust 687 passed / 1 ignored + 集成 3 passed；前端 262 passed；clippy 无新增。
+当前读数：Rust 760 passed / 1 ignored + 集成 3 passed；前端 282 passed；clippy 无新增。
 
 ## 目录结构
 
@@ -105,21 +107,27 @@ src/                前端（组件、IPC 封装、状态 reducer、主题 token
 src-tauri/src/
   agent/            会话循环、上下文组装、摘要压缩、长期记忆、事件类型
   model/            OpenAI 兼容适配器（含 reasoning 流）
-  tools/            内置工具与注册表（fetch_url、read_file、use_skill、memory_search）
+  tools/            内置工具与注册表（fetch_url、read_file、use_skill、memory_search、write_file、edit_file）
   permission/       权限门与信任档
-  mcp/              mcp.json 读取/编辑、工具命名、stdio 桥、进程树回收
+  mcp/              mcp.json 读取/编辑、工具命名、stdio / HTTP 桥、进程树回收
   store/            SQLite 会话与长期记忆持久化
   image_prep.rs     图片归一化
 docs/               设计、计划与验证记录
+release/            本地发布说明与各版本源码归档（gitignored，不参与构建）
 ```
 
 ## 已知限制
 
 - **仅 Windows x64**：进程树回收与凭据存储都用了 Win32。
 - **只有常规安装版**：数据固定在 `%APPDATA%\com.qwa.do\`，不提供 U 盘便携模式。
-- **HTTP 类型 MCP 未启用**：会明确提示「此构建未启用 HTTP 传输」。
+- **HTTP MCP 需要服务端支持 streamable-http**：URL 需可达；不返回 `Mcp-Session-Id` 的 server 也能连（客户端按 stateless 处理），stdio 专属的 server 仍按原方式配置。
+- MCP 配置里的每个 server 必须是 `mcpServers` 的直接子项；放在根对象或另一个 server 内部会被编辑器拒绝并指出条目，不会静默丢弃。
 - **常驻内存约 400 MB**：大头是 WebView2 的多进程运行时，不是泄漏。
+- **人设导出不能选路径**：走 WebView 下载，默认落到系统下载目录；暂不支持“另存为”。
 - 内置联网抓取只抓公开网页，需要登录的页面抓不到。
+- 写文件只处理 UTF-8 文本：单次写入 ≤ 256 KiB，已有目标与编辑结果 ≤ 4 MiB；GBK 等编码、含 NUL 的内容、以及 `edit_file` 遇到 LF/CRLF 混用的文件都会被拒绝，不做转码。
+- 工具图片缓存只增不减：缓存现在写在各会话的输出目录（`<输出目录>/images/`），可手工清理；重开旧会话时会按需从会话库重建。打开文件位置只允许 roots 或该会话输出目录内的已存在路径。
+- **视频产物尚未处理**：当前只识别工具返回的文本和图片；ComfyUI 返回的视频（URL/文件/Blob）还不会自动落盘或播放，等拿到真实返回样例后再补。
 - 思考过程的展示依赖模型把 reasoning 放进增量的 `reasoning_content`（或正文内联 `<think>`）。
 
 ## 安全说明
@@ -127,6 +135,7 @@ docs/               设计、计划与验证记录
 - API Key 只写 Windows 凭据管理器；不写 `settings.json`、不进日志、不出现在导出里。
 - 工具参数逐段传 argv，不拼 shell 命令行；MCP 子进程设置 `CREATE_NO_WINDOW`。
 - SSRF 判定在每一跳重定向上执行；内网与本机地址默认拒绝。
+- 文件工具只接受 roots 或当前会话输出目录内的绝对路径；写盘走同目录临时文件 + 原子替换，非 UTF-8 目标不会被静默转码。写工具只允许写当前会话输出目录，想编辑其它目录请把它设为工作文件夹。
 - 前端无 shell / 文件系统权限，进程执行全部在 Rust 侧。
 - 应用内配置编辑器会把 `mcp.json` 原文（含 env/headers）显示在界面里；MCP 列表与状态命令始终不返回这些值。
 - Markdown 链接经 `open_url` 交给系统默认浏览器（只允许 http/https），不导航 WebView；

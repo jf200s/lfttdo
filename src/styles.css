@@ -184,6 +184,26 @@ a:hover {
   background-color: var(--bg-surface);
 }
 
+.workspace-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.workspace-kind {
+  color: var(--text-muted);
+  font-size: 0.8em;
+  white-space: nowrap;
+}
+
+.workspace-actions {
+  display: flex;
+  gap: 6px;
+}
+
 .message-list {
   flex: 1 1 auto;
   min-height: 0;
@@ -422,6 +442,62 @@ a:hover {
   margin: 0;
 }
 
+.tool-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tool-image {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: min(100%, 320px);
+}
+
+.tool-images .thumb {
+  max-width: min(100%, 320px);
+  max-height: 220px;
+  object-fit: contain;
+}
+
+.path-chip {
+  display: block;
+  max-width: 100%;
+  margin: 0;
+  padding: 4px 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background-color: var(--code-bg);
+  color: var(--text-primary);
+  font-family: var(--font-code);
+  font-size: 0.8em;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+button.path-chip:hover {
+  border-color: var(--accent);
+}
+
+button.path-chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.workspace-bar .path-chip {
+  flex: 1 1 240px;
+}
+
+button.path-chip:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 .io {
   margin: 0;
   padding: 8px 12px;
@@ -432,6 +508,29 @@ a:hover {
   color: var(--text-primary);
   font-family: var(--font-code);
   font-size: 0.9em;
+}
+
+.perm-preview {
+  display: grid;
+  gap: 6px;
+}
+
+.perm-path {
+  margin: 0;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  overflow-wrap: anywhere;
+}
+
+.perm-path > span {
+  color: var(--text-muted);
+  font-size: 0.8em;
+}
+
+.perm-preview .io.preview {
+  max-height: 220px;
+  overflow: auto;
 }
 
 .perm-actions,
@@ -701,6 +800,17 @@ a:hover {
 .panel-row textarea {
   min-width: 0;
   background-color: var(--bg-input);
+}
+
+.panel-row.panel-roots {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+}
+
+.panel-row.panel-roots textarea {
+  min-height: 88px;
+  font-family: var(--font-code);
+  font-size: 0.85em;
 }
 
 /* P1 手动新增那一行：select + 正文输入 + 按钮横向排，放不下就换行。

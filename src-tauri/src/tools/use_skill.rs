@@ -87,6 +87,7 @@ mod tests {
 
     fn ctx_with_disabled(skills_dir: Option<PathBuf>, skills_disabled: Vec<String>) -> ToolCtx {
         ToolCtx {
+            write_root: None,
             http: reqwest::Client::new(),
             cancel: CancellationToken::new(),
             roots: Vec::new(),

@@ -151,6 +151,11 @@ export interface SessionRow {
   updated_at: number;
 }
 
+export interface SessionOutputView {
+  workspace: string | null;
+  output_dir: string;
+}
+
 /**
  * `Settings`（settings.rs:261-284）：22 个键（其中 6 个是长期记忆切片的 `memory_*` 键），
  * `serde` 无 `rename_all` ⇒ 全 snake_case；
@@ -189,7 +194,6 @@ export interface Settings {
    */
   accent: string;
   /**
-   * T26（R276）：`read_file` 被允许读的目录表，**由用户自己列出**。默认 `[]`，
    * 而**空表意味着一律拒绝** —— 这不是没做完：Rust 侧的 `roots_default_empty_and_read_file_therefore_refuses_everything`
    * 与 `registry.rs::no_roots_denies_everything` 一起把它钉成设计（R90 取向：不替用户决定）。
    *
@@ -199,12 +203,10 @@ export interface Settings {
    * （U 盘拔了、`\\nas` 没上线）—— 「这一轮能用哪几条」由 Rust 在每轮的使用点
    * `effective_roots()` 现算。TS 侧两样都不做第二遍（同 `font_size` 的 R123 规矩）。
    *
-   * 本切片**没有**界面控件：`SettingsPanel` 不渲染它，但必须原样带走它
-   * （`SettingsPanel.test.tsx` 的 carry-through 那条盯着），否则用户手改进
    * `settings.json` 的目录表会在下一次点「保存」时被静默抹回空表 —— 而抹回空表的症状
-   * 不是「设置没了」，是「read_file 突然什么都读不到」。
    */
   roots: string[];
+  storage_dir: string;
   /**
    * 长期记忆总开关（设计文档 §7）：`false` = 写入侧不抽取、读取侧不注入。默认 `true`。
    * 与其余三键同走 `settings_set` 全表，面板有控件（复选框），所以它**不是** carry-through 键。
@@ -351,7 +353,14 @@ export type AgentEvent =
   | { t: "tool_call"; call: ToolCallView; risk: Risk }
   | { t: "permission_request"; id: string; call: ToolCallView; risk: Risk }
   | { t: "permission_resolved"; id: string; decision: Decision }
-  | { t: "tool_result"; call_id: string; is_error: boolean; ms: number; preview: string }
+  | {
+      t: "tool_result";
+      call_id: string;
+      is_error: boolean;
+      ms: number;
+      preview: string;
+      images: ToolImage[];
+    }
   | { t: "usage"; input_tokens: number; output_tokens: number }
   | { t: "context_compacted"; dropped: number; summary_chars: number }
   /**
@@ -402,6 +411,12 @@ export type ToolStatus = "running" | "ok" | "error";
  * 编译得干干净净 —— 所以「`Extract` 写法不可能」这个说法过宽，准确的说法只有「(a) 与 (b) 不能并存」。
  * 本文件的取舍：名字住在变体上、`UiBlock` 引用名字，末尾用编译期断言把两个方向钉回等价。
  */
+export interface ToolImage {
+  data: string;
+  mime: ImageMime;
+  path?: string;
+}
+
 export interface ToolCard {
   kind: "tool";
   callId: string;
@@ -410,6 +425,7 @@ export interface ToolCard {
   input: unknown;
   status: ToolStatus;
   preview: string;
+  images: ToolImage[];
   /**
    * 毫秒。`ms === 0` 在重放路径里表示「库里没记这一列」（db.rs:370），
    * 不是「跑了 0 毫秒」；reducer 原样透传，由 T16 渲染成「—」（R115）。

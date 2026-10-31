@@ -136,6 +136,7 @@ mod tests {
 
     fn ctx() -> ToolCtx {
         ToolCtx {
+            write_root: None,
             http: reqwest::Client::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             roots: Vec::new(),

@@ -223,6 +223,7 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
           input: e.call.input,
           status: "running",
           preview: "",
+          images: [],
           ms: 0, // 0 = 还没记录，别替线格式发明区分（R115）
         },
         e.call.id,
@@ -247,6 +248,7 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
         ...block,
         status: e.is_error ? "error" : "ok",
         preview: e.preview,
+        images: e.images,
         ms: e.ms, // 原样透传，重放里的 0 意思是「库里没记」（R115）
       };
       const next = mapTurn(state, index, (t) => ({

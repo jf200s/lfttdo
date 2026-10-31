@@ -13,6 +13,12 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { SettingsPanel } from "./SettingsPanel";
 import type { MemoryView, SettingsView } from "../types";
 
+const downloadPersonaText = vi.hoisted(() => vi.fn());
+vi.mock("../persona", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../persona")>();
+  return { ...actual, downloadPersonaText };
+});
+
 const pathOf = (relative: string): string =>
   fileURLToPath(new URL(relative, import.meta.url).href);
 
@@ -42,6 +48,7 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   // 空表 = `read_file` 一律拒绝，「漏带」与「带对」在断言里会长得一模一样。
   // 两条目录而不是一个字符串数组字面量：也顺手钉住「它是数组、不是被 stringify 过的整串」。
   roots: ["C:\\notes", "D:\\code"],
+  storage_dir: "",
   // 长期记忆四键取 **Rust 默认值**（true/5/600/500）：它们与 accent/roots 不同，面板**渲染**它们，
   // 「漏带」会在渲染层先露馅（复选框与数值框读到 undefined），所以默认值在这里够用；
   // 「带成别的值」由下面那条 carry-through 用非默认覆盖值另钉。
@@ -107,6 +114,7 @@ const setup = async (over: Partial<SettingsView> = {}, props: Partial<PanelProps
   // 失败进面板的 error 通道；默认成功，只有关心失败路径的用例才覆写。
   const onUpdateMemory = vi.fn<PanelProps["onUpdateMemory"]>(async () => {});
   const onAddMemory = vi.fn<PanelProps["onAddMemory"]>(async () => 1);
+  const onPickFolder = vi.fn<PanelProps["onPickFolder"]>(async () => null);
   render(
     <SettingsPanel
       initial={view(over)}
@@ -120,6 +128,7 @@ const setup = async (over: Partial<SettingsView> = {}, props: Partial<PanelProps
       onLoadProfile={onLoadProfile}
       onUpdateMemory={onUpdateMemory}
       onAddMemory={onAddMemory}
+      onPickFolder={onPickFolder}
       {...props}
     />,
   );
@@ -140,18 +149,69 @@ const setup = async (over: Partial<SettingsView> = {}, props: Partial<PanelProps
     onLoadProfile,
     onUpdateMemory,
     onAddMemory,
+    onPickFolder,
   };
 };
 
 describe("SettingsPanel", () => {
-  it("does not render a system prompt field but must not wipe the externally set one", async () => {
-    // 人设是 settings.json 里的 `system_prompt`；面板**不渲染**这一栏。
-    // 但它保存的是整张表：漏带这个键 = 用户点一次保存就把人设抹成空。
-    expect(screen.queryByLabelText(/系统提示词/)).toBeNull();
-    const p = await setup({ system_prompt: "你是小宋祺。" });
+  it("renders the persona textarea and saves the edited prompt", async () => {
+    const p = await setup({ system_prompt: "旧的人设" });
+    const box = screen.getByLabelText(/人设（系统提示词）/) as HTMLTextAreaElement;
+    expect(box.value).toBe("旧的人设");
+    fireEvent.change(box, { target: { value: "新的人设" } });
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
     await waitFor(() => expect(p.onSave).toHaveBeenCalled());
-    expect(p.onSave.mock.calls[0][0].system_prompt).toBe("你是小宋祺。");
+    expect(p.onSave.mock.calls[0][0].system_prompt).toBe("新的人设");
+  });
+
+  it("imports a persona file with BOM and CRLF normalized", async () => {
+    const p = await setup({ system_prompt: "旧的人设" });
+    const file = new File(["\uFEFF第一行\r\n第二行\r第三行"], "人设.txt", {
+      type: "text/plain",
+    });
+    fireEvent.change(screen.getByLabelText("导入人设文件"), {
+      target: { files: [file] },
+    });
+    const box = screen.getByLabelText(/人设（系统提示词）/) as HTMLTextAreaElement;
+    await waitFor(() => expect(box.value).toBe("第一行\n第二行\n第三行"));
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].system_prompt).toBe("第一行\n第二行\n第三行");
+  });
+
+  it("rejects a persona file over 64,000 characters without replacing the draft", async () => {
+    await setup({ system_prompt: "保留我" });
+    const file = new File(["x".repeat(64_001)], "big.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("导入人设文件"), {
+      target: { files: [file] },
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(/64,000/),
+    );
+    const box = screen.getByLabelText(/人设（系统提示词）/) as HTMLTextAreaElement;
+    expect(box.value).toBe("保留我");
+  });
+
+  it("disables export until the persona has content, then exports the draft", async () => {
+    await setup({ system_prompt: "" });
+    const exportButton = screen.getByRole("button", { name: "导出 .txt" });
+    expect(exportButton).toBeDisabled();
+    fireEvent.change(screen.getByLabelText(/人设（系统提示词）/), {
+      target: { value: "新的人设" },
+    });
+    expect(exportButton).toBeEnabled();
+    fireEvent.click(exportButton);
+    expect(downloadPersonaText).toHaveBeenCalledWith("新的人设");
+  });
+
+  it("clears the persona back to the built-in prompt", async () => {
+    const p = await setup({ system_prompt: "旧的人设" });
+    fireEvent.click(screen.getByRole("button", { name: "恢复内置" }));
+    const box = screen.getByLabelText(/人设（系统提示词）/) as HTMLTextAreaElement;
+    expect(box.value).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].system_prompt).toBe("");
   });
 
   it("saves the whole settings table with only the edited field changed", async () => {
@@ -174,6 +234,7 @@ describe("SettingsPanel", () => {
       keep_turns: 3,
       accent: "#aa00ff",
       roots: ["C:\\notes", "D:\\code"],
+      storage_dir: "",
       memory_enabled: true,
       memory_recall_k: 5,
       memory_note_token_cap: 600,
@@ -185,12 +246,51 @@ describe("SettingsPanel", () => {
     });
   });
 
+  it("renders the configured roots as one path per line", async () => {
+    await setup();
+    const box = screen.getByLabelText(/可访问目录/) as HTMLTextAreaElement;
+    expect(box.tagName).toBe("TEXTAREA");
+    expect(box.value).toBe("C:\\notes\nD:\\code");
+  });
+
+  it("saves the roots draft with blank lines and surrounding spaces removed", async () => {
+    const p = await setup({ roots: [] });
+    fireEvent.change(screen.getByLabelText(/可访问目录/), {
+      target: { value: "  C:\\notes  \n\nD:\\code\n" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].roots).toEqual(["C:\\notes", "D:\\code"]);
+  });
+
+  it("fills the default storage location from the folder picker", async () => {
+    const p = await setup();
+    p.onPickFolder.mockResolvedValue("D:\\LFTTDO-output");
+    fireEvent.click(screen.getByRole("button", { name: "选择文件夹" }));
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText(/默认储存位置/) as HTMLInputElement).value,
+      ).toBe("D:\\LFTTDO-output"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].storage_dir).toBe("D:\\LFTTDO-output");
+  });
+
+  it("sends an empty roots list when the box is cleared", async () => {
+    const p = await setup();
+    fireEvent.change(screen.getByLabelText(/可访问目录/), {
+      target: { value: "\n  \n" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].roots).toEqual([]);
+  });
+
   it("carries the fields it does not render through a save", async () => {
     // T39 给 Rust 的 `Settings` 加了 `temperature`/`compact_threshold`/`keep_turns`，
-    // T43 又加了 `accent`，T26 加了 `roots`：面板**不渲染**这五键（渲染一个存不进去的输入框才是 bug，见下面那条），
     // 于是逐字段列名单的 `settingsOf` 会少带它们。少带不报错：`settings.rs:260` 的结构体级
     // `#[serde(default)]` 会把它们抹回 Rust 默认值 ⇒ **一次普通的点保存，就把用户手改进
-    // settings.json 的温度、压缩阈值、K、强调色和目录表全数清零**。这条测试存在的理由就是这个静默路径。
     const p = await setup();
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
     await waitFor(() => expect(p.onSave).toHaveBeenCalled());
@@ -201,8 +301,6 @@ describe("SettingsPanel", () => {
     // T43：`accent` 是第四只「面板不渲染但必须带走」的键。夹具里它不等于 Rust 默认值 `""`，
     // 所以「漏带」和「带成默认」在这里是两种都看得出来的错。
     expect(sent.accent).toBe("#aa00ff");
-    // T26：第五只。这里断的是**整串数组**而不是 `length`：`settingsOf` 若哪天把 roots
-    // 拼成一个字符串（或者反过来把 `[]` 当成「没有」而删键），长度断言都还是绿的，
     // 而落盘的那份已经不是用户列出的那张表了。
     expect(sent.roots).toEqual(["C:\\notes", "D:\\code"]);
     // 同一次展开不许把 `SettingsView` 那两只只读键一起带进 body：
@@ -267,7 +365,7 @@ describe("SettingsPanel", () => {
     // 有确认次数的行显示「确认 N 次」，0 次的那行什么都不显示 —— 从未确认过不带标价。
     expect(screen.getByText(/确认 3 次/)).toBeInTheDocument();
     expect(screen.queryByText(/确认 0 次/)).toBeNull();
-    expect(screen.queryAllByText(/确认/)).toHaveLength(1);
+    expect(screen.queryAllByText(/确认 \d+ 次/)).toHaveLength(1);
   });
 
   it("shows a prospective memory's due date as a local YYYY-MM-DD string", async () => {
@@ -645,12 +743,8 @@ describe("SettingsPanel", () => {
     // `/强调色/` `/accent/i` 两项预告；任务 #64（计划 :942）把控件补上了 ⇒ **这两项今天删掉**，
     // 面板从此渲染强调色那一行（上面那四条取色器用例就是它的判据）。
     // 剩下四项继续禁：它们的后端字段存在、面板**有意**不渲染，那是「有意的不渲染」不是遗漏。
-    // `/目录|roots/i` 这一项从 T26 起也在名单里：brief 没给 roots 控件，任务裁定也明说
-    // 「本任务不加 UI 控件」（R282）—— 目录表要能改，得先有一个「选目录 + 列表 + 删除」的
-    // 形状，那是另一件事，不在这一片里半拉子地开一个输入框。
     // 这里钉的从来不是「存不存得进」，而是「不许半拉子地先加一个没有校验、没有说明的输入框」——
-    // 上面那条 carry-through 测试保证「不渲染」不等于「不带上」：那五键照样得原样回到 `settings_set`。
-    for (const label of [/温度/, /temperature/i, /压缩|阈值|keep_turns/i, /目录|roots/i, /MCP/i]) {
+    for (const label of [/温度/, /temperature/i, /压缩|阈值|keep_turns/i, /MCP/i]) {
       expect(screen.queryByLabelText(label)).toBeNull();
     }
   });

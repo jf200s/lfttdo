@@ -80,11 +80,13 @@ export function MessageList({
   state,
   onRespond,
   onOpenLink,
+  onRevealPath,
 }: {
   state: UiState;
   onRespond: (id: string, d: Decision) => void;
   /** Markdown 链接的出口（App 接 `open_url`）；测试与纯展示场景可以不传。 */
   onOpenLink?: (url: string) => void;
+  onRevealPath?: (path: string) => void;
 }) {
   const lastTurn = state.turns.length - 1;
 
@@ -131,6 +133,7 @@ export function MessageList({
             streaming={state.streaming}
             onRespond={onRespond}
             onOpenLink={onOpenLink}
+            onRevealPath={onRevealPath}
           />
         ))}
       </div>

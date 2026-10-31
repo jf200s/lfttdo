@@ -1,10 +1,5 @@
 // 工具层：`Tool` 抽象 + 注册表 + 执行上下文。
 //
-// Plan A 的生产工具表是**空的**（plan:1854：`echo` 仅测试与循环验证用、不注册进生产），
-// 于是 spec 5.1「MVP 内置工具全为 Read，因此全程零弹窗」为真。Task 27 起生产表里有
-// `fetch_url` + `read_file` + `use_skill`（`ipc.rs::build_production_registry`，三把都是 `Risk::Read`，
-// 所以那句话**仍然**为真），本文件的机制一行没改 —— 这句是它当初的承诺，现在是事实。
-//
 // 风险的唯一真相源是 `risk_of`（= 注册表里那份 `ToolMeta.risk`）。`ToolDef` 里没有 risk
 // 字段，模型看不到也改不了自己的权限级别；未知工具按 `Risk::Exec`（最严的一档）处理，
 // 未知即 Read 会让「没注册的工具」静默自动放行。
@@ -40,6 +35,7 @@ pub struct ToolCtx {
     pub http: reqwest::Client,
     pub cancel: CancellationToken,
     pub roots: Vec<PathBuf>,
+    pub write_root: Option<PathBuf>,
     /// `use_skill` 读技能包用的目录；`None` = 当前没有技能目录（该工具会明确失败）。
     /// 与 `roots` 同一条取向：由会话每轮现构，工具自己不去猜路径。
     pub skills_dir: Option<PathBuf>,
@@ -74,6 +70,23 @@ impl ToolCtx {
     /// （新建文件仍要放行）由 `a_new_file_in_an_existing_root_dir_still_resolves` 钉住。
     /// **文件级符号链接**需开发者模式、本机建不了（实测报「没有足够的权限」）⇒ 该子形态
     /// **未实测**（同形状的目录 junction 已实测）。
+    pub fn ensure_within_write_root(&self, path: &Path) -> Result<(), ToolError> {
+        let Some(root) = &self.write_root else {
+            return Ok(());
+        };
+        let root = root.canonicalize().map_err(|e| {
+            ToolError::BadInput(format!("工作目录无法解析: {}: {e}", root.display()))
+        })?;
+        if path.starts_with(&root) {
+            Ok(())
+        } else {
+            Err(ToolError::BadInput(format!(
+                "只允许写入当前工作文件夹: {}",
+                root.display()
+            )))
+        }
+    }
+
     pub fn resolve_within_roots(&self, raw: &str) -> Result<PathBuf, ToolError> {
         // 规则 4：先整体校验 root 表。
         let mut roots: Vec<PathBuf> = Vec::with_capacity(self.roots.len());
@@ -264,6 +277,7 @@ mod tests {
 
     fn ctx_with_roots(roots: Vec<PathBuf>) -> ToolCtx {
         ToolCtx {
+            write_root: None,
             http: reqwest::Client::new(),
             cancel: CancellationToken::new(),
             roots,

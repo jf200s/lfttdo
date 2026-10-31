@@ -219,6 +219,8 @@ struct RawServer {
     env: Option<BTreeMap<String, String>>,
     url: Option<String>,
     headers: Option<BTreeMap<String, String>>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// `mcpServers` 的容器**不能**直接用 `BTreeMap<String, RawServer>`：
@@ -241,6 +243,8 @@ struct RawFile {
         deserialize_with = "deserialize_servers"
     )]
     servers: Vec<(String, serde_json::Value)>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn deserialize_servers<'de, D>(
@@ -275,6 +279,49 @@ where
     deserializer.deserialize_map(ServersVisitor)
 }
 
+fn looks_like_server(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|map| {
+        map.get("command").is_some_and(serde_json::Value::is_string)
+            || map.get("url").is_some_and(serde_json::Value::is_string)
+    })
+}
+
+fn misplaced_server_issues(name: &str, value: &serde_json::Value, nested: bool) -> Vec<Skipped> {
+    let reason = if nested {
+        "服务器条目不能嵌套在另一个服务器里"
+    } else {
+        "服务器条目必须放在 mcpServers 下面"
+    };
+    if looks_like_server(value) {
+        return vec![Skipped {
+            name: name.to_string(),
+            reason,
+        }];
+    }
+    let mut out = Vec::new();
+    if let Some(map) = value.as_object() {
+        for (key, child) in map {
+            if looks_like_server(child) {
+                out.push(Skipped {
+                    name: format!("{name}.{key}"),
+                    reason,
+                });
+            }
+        }
+    }
+    if let Some(items) = value.as_array() {
+        for (index, child) in items.iter().enumerate() {
+            if looks_like_server(child) {
+                out.push(Skipped {
+                    name: format!("{name}[{index}]"),
+                    reason,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// 把一份 JSON 文本解析成 server 列表 / 跳过台账 / 文件级错误。
 /// `load` 与 `mcp/editor.rs` 的严格校验共用这一份判定，禁止另起一套规则。
 pub(crate) fn parse_text(content: &str) -> McpConfig {
@@ -296,6 +343,9 @@ pub(crate) fn parse_text(content: &str) -> McpConfig {
     };
     let mut servers: Vec<ServerDef> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
+    for (key, value) in &raw.extra {
+        skipped.extend(misplaced_server_issues(key, value, false));
+    }
     let mut entries = raw.servers;
     // 按名字做**稳定**字典序排序：与 §三·3 描述的 BTreeMap 遍历序对唯一名逐字一致，
     // 重复名时保留出现序 ⇒ 「留第一条」成立（见 RawFile 上的冲突记录）。
@@ -321,6 +371,13 @@ pub(crate) fn parse_text(content: &str) -> McpConfig {
             });
             continue;
         };
+        for (key, value) in &entry.extra {
+            skipped.extend(misplaced_server_issues(
+                &format!("{name}.{key}"),
+                value,
+                true,
+            ));
+        }
         let def = if let Some(command) = entry.command {
             if command.is_empty() {
                 skipped.push(Skipped {
@@ -684,5 +741,44 @@ mod tests {
                 .unwrap_or_else(|| panic!("{raw} 要有摘要，不许静默"));
             assert!(!e.is_empty(), "{raw} ⇒ 摘要不许是空串：{e:?}");
         }
+    }
+
+    #[test]
+    fn a_server_outside_mcp_servers_is_reported_not_silently_ignored() {
+        let c = load_json(
+            r#"{ "mcpServers": { "ok": {"command":"x"} }, "second": {"url":"https://example.test/mcp"} }"#,
+        );
+        assert_eq!(c.servers.len(), 1, "有效的 server 仍要加载");
+        assert_eq!(c.skipped.len(), 1, "放错位置的 server 必须可见");
+        assert_eq!(c.skipped[0].name, "second");
+        assert!(
+            c.skipped[0].reason.contains("mcpServers"),
+            "原因要指向正确层级：{}",
+            c.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn non_server_top_level_metadata_is_still_ignored() {
+        let c = load_json(
+            r#"{ "mcpServers": { "ok": {"command":"x"} }, "custom": {"note": "kept"}, "theme": "dark" }"#,
+        );
+        assert_eq!(c.servers.len(), 1);
+        assert!(c.skipped.is_empty(), "普通未知字段要继续兼容：{:?}", c.skipped);
+    }
+
+    #[test]
+    fn a_server_nested_inside_another_server_is_reported() {
+        let c = load_json(
+            r#"{ "mcpServers": { "outer": { "command": "x", "inner": { "url": "https://example.test/mcp" } } } }"#,
+        );
+        assert_eq!(c.servers.len(), 1);
+        assert_eq!(c.skipped.len(), 1);
+        assert_eq!(c.skipped[0].name, "outer.inner");
+        assert!(
+            c.skipped[0].reason.contains("嵌套"),
+            "原因要说清是嵌套：{}",
+            c.skipped[0].reason
+        );
     }
 }

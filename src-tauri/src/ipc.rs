@@ -23,11 +23,13 @@ use crate::permission::gate::{PermissionGate, Verdict};
 use crate::settings::{Settings, SettingsStore, effective_roots};
 use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::store::memory::{MemoryRow, MemoryWrite, RecallCfg};
+use crate::tools::edit_file::EditFileTool;
 use crate::tools::fetch::FetchTool;
 use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::use_skill::UseSkillTool;
+use crate::tools::write_file::WriteFileTool;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
 use serde::Serialize;
 use std::collections::HashSet;
@@ -124,6 +126,7 @@ pub struct TauriEmitter {
     out: Arc<dyn Publish>,
     session_id: String,
     coalescer: Coalescer,
+    images_dir: Option<PathBuf>,
 }
 
 impl TauriEmitter {
@@ -132,7 +135,13 @@ impl TauriEmitter {
             out,
             session_id,
             coalescer: Coalescer::new(),
+            images_dir: None,
         }
+    }
+
+    pub fn with_images_dir(mut self, dir: PathBuf) -> Self {
+        self.images_dir = Some(dir);
+        self
     }
 
     fn send(&self, event: AgentEvent) {
@@ -162,7 +171,11 @@ impl EventSink for TauriEmitter {
             // 否则 `tool_call` 会跑到未落地的文本之前到达，前端时间线倒序。
             other => {
                 self.flush();
-                self.send(other);
+                let mut event = other;
+                if let Some(dir) = &self.images_dir {
+                    crate::image_cache::enrich_event(&mut event, dir);
+                }
+                self.send(event);
             }
         }
     }
@@ -264,12 +277,12 @@ pub struct AppState {
     /// 日志文件路径（R107：GUI 没有控制台，路径看不见等于日志不存在）。
     /// 装配期才知道 app data 目录，所以是 `Option`；建不出日志文件时给 `None` 而不是失败。
     pub log_path: Option<PathBuf>,
-    /// MCP 的 stdio 桥与配置目录（T35）。桥是进程级单例：工具注册与信任档位都挂在它上面。
     pub mcp: Arc<McpBridge>,
     pub mcp_dir: PathBuf,
     /// 技能包目录：固定为数据目录下的 `skills/`；装配期建出来，用户把
     /// `SKILL.md` 丢进子目录即可。
     pub skills_dir: PathBuf,
+    pub data_dir: PathBuf,
     /// 按会话的抽取互斥(spec §12.5 缺口 1)。空闲 worker 与切换回补都经它,
     /// 避免同一会话被两条路径同时抽取、堆出重复记忆。
     pub extracting: ExtractLocks,
@@ -399,6 +412,7 @@ pub struct TurnDeps {
     /// 空表是**允许值**而且是默认值：那时 `read_file` 一律拒绝，那是设计（R90 取向），
     /// 不是这一层漏了什么。
     pub roots: Vec<PathBuf>,
+    pub output_dir: Option<PathBuf>,
     /// 技能包目录（`use_skill` + 系统提示里的技能索引）。与 roots 一样每轮交给会话，
     /// 会话再原样放进 `ToolCtx` —— 工具层不自己去猜路径。
     pub skills_dir: Option<PathBuf>,
@@ -1045,6 +1059,7 @@ pub(crate) fn recall_query(history: &[Message], current: &str) -> String {
                 .blocks
                 .iter()
                 .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+            && !m.is_tool_image_followup()
     });
     let Some(m) = prior else {
         return current.to_string();
@@ -1274,12 +1289,18 @@ pub async fn run_turn(
         temperature,
         memory,
         embed,
-        roots,
+        mut roots,
+        output_dir,
         skills_dir,
         skills_disabled,
         cancel,
         extract_locks,
     } = deps;
+    if let Some(dir) = &output_dir
+        && !roots.contains(dir)
+    {
+        roots.push(dir.clone());
+    }
     let sid = session_id.to_string();
 
     // 读库失败（含 R71 的「某一行解不开」）直接报错，不返回「看起来完整」的历史。
@@ -1431,6 +1452,7 @@ pub async fn run_turn(
     // 闸门用的 roots 仍然在压缩之后现算（R276 的「每轮现取」语义不变）；
     // 上面那份只是估算工具声明用的快照，不参与授权。
     .with_roots(effective_roots(&roots))
+    .with_output_dir(output_dir)
     .with_skills_dir(skills_dir)
     .with_skills_disabled(skills_disabled);
     session.defer_done();
@@ -1449,10 +1471,8 @@ pub async fn run_turn(
     let fresh = session.history()[prior..].to_vec();
     let writer = db.clone();
     let write_sid = sid.clone();
-    match blocking(move || {
-        append_rows(&writer, &write_sid, &fresh).map_err(|e| e.to_string())
-    })
-    .await
+    match blocking(move || append_rows(&writer, &write_sid, &fresh).map_err(|e| e.to_string()))
+        .await
     {
         Ok(()) => {}
         Err(reason) => {
@@ -1523,6 +1543,43 @@ fn auto_title(db: &Db, session_id: &str) -> Result<(), rusqlite::Error> {
 /// 判据**只能窄到回环**：放错的代价是把一个无凭据的推理端点交给任意网络（SSRF 同一条
 /// 红线）。非回环分支保持与抽函数之前逐字一致，包括「`Some("")` 也照样放行」这一条 ——
 /// 那是既有行为，收紧它是另一件事，不在本轮范围。
+fn documents_dir(app: &AppHandle) -> Option<PathBuf> {
+    app.path().document_dir().ok()
+}
+
+fn resolve_storage_root(
+    app: &AppHandle,
+    settings: &Settings,
+    data_dir: &Path,
+) -> Result<PathBuf, String> {
+    crate::workspace::resolve_storage_root(
+        &settings.storage_dir,
+        data_dir,
+        documents_dir(app).as_deref(),
+    )
+}
+
+fn resolve_session_output(
+    app: &AppHandle,
+    state: &AppState,
+    settings: &Settings,
+    session_id: &str,
+) -> Result<PathBuf, String> {
+    if !state
+        .db
+        .session_exists(session_id)
+        .map_err(|e| format!("读取会话失败：{e}"))?
+    {
+        return Err("会话不存在".to_string());
+    }
+    let workspace = state
+        .db
+        .session_workspace(session_id)
+        .map_err(|e| format!("读取工作文件夹失败：{e}"))?;
+    let storage = resolve_storage_root(app, settings, &state.data_dir)?;
+    crate::workspace::session_output_dir(workspace.as_deref(), &storage, session_id)
+}
+
 fn resolve_api_key(api_key: Option<String>, base_url: &str) -> Result<String, String> {
     match api_key {
         Some(key) => Ok(key),
@@ -1577,15 +1634,18 @@ pub async fn send_message(
     };
     drop(api_key);
 
-    let emitter = Arc::new(TauriEmitter::new(
-        Arc::new(AppPublisher { app }),
-        session_id.clone(),
-    ));
+    let output_dir = resolve_session_output(&app, &state, &settings, &session_id)?;
+    let image_dir = output_dir.join(crate::image_cache::CACHE_SUBDIR);
+    let emitter = Arc::new(
+        TauriEmitter::new(Arc::new(AppPublisher { app }), session_id.clone())
+            .with_images_dir(image_dir),
+    );
     // 会话作用域在**真正开跑**之前对齐：配置/凭据失败的那次发送没有开跑，
     // 不该顺手清掉上一轮用户答过的授权。
     enter_session_scope(&state.last_session, &state.gate, &session_id);
     let out = run_turn(
         TurnDeps {
+            output_dir: Some(output_dir),
             db: state.db.clone(),
             registry: state.registry.clone(),
             gate: state.gate.clone(),
@@ -2005,6 +2065,21 @@ pub fn skills_open_folder(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn reveal_path(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
+    let settings = state.settings.load().map_err(|e| e.to_string())?;
+    let roots = effective_roots(&settings.roots);
+    let output_dir = resolve_session_output(&app, &state, &settings, &session_id)
+        .unwrap_or_else(|_| PathBuf::new());
+    let target = crate::path_reveal::validate_target(&path, &roots, &output_dir)?;
+    crate::path_reveal::reveal(&target)
+}
+
+#[tauri::command]
 pub async fn session_create(state: State<'_, AppState>) -> Result<String, String> {
     let db = state.db.clone();
     blocking(move || db.create_session(DEFAULT_TITLE).map_err(|e| e.to_string())).await
@@ -2038,18 +2113,96 @@ pub async fn session_delete(state: State<'_, AppState>, id: String) -> Result<()
 
 #[tauri::command]
 pub async fn session_messages(
+    app: AppHandle,
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<AgentEvent>, String> {
+    let store = state.settings.clone();
+    let settings = blocking(move || store.load().map_err(|e| e.to_string())).await?;
+    let images_dir = resolve_session_output(&app, &state, &settings, &id)
+        .ok()
+        .map(|dir| dir.join(crate::image_cache::CACHE_SUBDIR));
     let db = state.db.clone();
     let registry = state.registry.clone();
     blocking(move || {
         let msgs = db.messages(&id).map_err(|e| e.to_string())?;
         // R99：第二参必须是注册表的真查表。写死 `Risk::Read` 会让 Plan B 的写工具
         // 重开后显示「自动允许」，那是界面替用户撒谎（db.rs:329）。
-        Ok(events_from_messages(&msgs, &|name| registry.risk_of(name)))
+        let mut events = events_from_messages(&msgs, &|name| registry.risk_of(name));
+        if let Some(images_dir) = images_dir {
+            for event in &mut events {
+                crate::image_cache::enrich_event(event, &images_dir);
+            }
+        }
+        Ok(events)
     })
     .await
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct SessionOutputView {
+    pub workspace: Option<String>,
+    pub output_dir: String,
+}
+
+#[tauri::command]
+pub async fn session_output_view(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<SessionOutputView, String> {
+    let store = state.settings.clone();
+    let settings = blocking(move || store.load().map_err(|e| e.to_string())).await?;
+    let db = state.db.clone();
+    let sid = id.clone();
+    let workspace = blocking(move || {
+        db.session_workspace(&sid).map_err(|e| e.to_string())
+    })
+    .await?;
+    let output_dir = resolve_session_output(&app, &state, &settings, &id)?;
+    Ok(SessionOutputView {
+        workspace,
+        output_dir: crate::tools::fs_write::display_path(&output_dir),
+    })
+}
+
+#[tauri::command]
+pub async fn session_workspace_set(
+    state: State<'_, AppState>,
+    id: String,
+    path: Option<String>,
+) -> Result<(), String> {
+    let stored = match path {
+        Some(raw) => {
+            let path = PathBuf::from(raw.trim());
+            if !path.is_absolute() {
+                return Err("工作文件夹必须是绝对路径".to_string());
+            }
+            let canonical = path
+                .canonicalize()
+                .map_err(|e| format!("工作文件夹无法解析：{}: {e}", path.display()))?;
+            if !canonical.is_dir() {
+                return Err(format!("工作文件夹不是目录：{}", canonical.display()));
+            }
+            Some(crate::tools::fs_write::display_path(&canonical))
+        }
+        None => None,
+    };
+    let db = state.db.clone();
+    blocking(move || {
+        db.set_session_workspace(&id, stored.as_deref())
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn pick_folder() -> Result<Option<String>, String> {
+    let picked = blocking(|| {
+        Ok::<_, String>(rfd::FileDialog::new().pick_folder())
+    })
+    .await?;
+    Ok(picked.map(|path| crate::tools::fs_write::display_path(&path)))
 }
 
 // ───────────────────────── T5：长期记忆的审计与清空（设置页） ─────────────────────────
@@ -2349,6 +2502,9 @@ pub async fn settings_get(state: State<'_, AppState>) -> Result<SettingsView, St
 
 #[tauri::command]
 pub async fn settings_set(state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
+    if !settings.storage_dir.trim().is_empty() {
+        crate::workspace::resolve_storage_root(&settings.storage_dir, &state.data_dir, None)?;
+    }
     let store = state.settings.clone();
     blocking(move || store.save(&settings).map_err(|e| e.to_string())).await
 }
@@ -2577,27 +2733,21 @@ fn persist_window_geometry(window: &tauri::Window) {
 
 /// 生产工具表的**唯一**装配点（Task 27）。
 ///
-/// 零参是刻意的：三把工具都不需要 `AppState`，运行期要的东西（`http`、`cancel`、`roots`、
 /// `skills_dir`）由会话每轮现构的 `ToolCtx` 给（R276 的单一入口）。一旦它开始收参数，「全进程装配一次」
 /// 就退化成「每个调用点各装配一次」，而 `R101` 那条「一个目录只许一个 `SettingsStore`」
 /// 的教训说的正是这种重复。
 ///
 /// 名字序由 `ToolRegistry` 里的 `BTreeMap` 决定（字典序），**不是**这里的注册顺序；
-/// `production_registry_ships_the_three_read_tools` 钉的是那份字面名单。
 ///
-/// 三把都是 `Risk::Read`，spec 5.1「内置工具全为 Read ⇒ 全程零弹窗」到这一轮仍然成立。
 ///
-/// 与 R286 的分工：这里**只管注册**，roots 为空时 `read_file` 照样在表里 —— 模型真喊它
-/// 就走闸门被拒。要不要把它的**声明**交给模型，由 `agent/session.rs::request()` 按
-/// `read_file::usable_with_roots` 决定（那是省 token 的事，不是授权的事）。
 pub fn build_production_registry(db: Arc<Db>) -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     registry.register(Arc::new(FetchTool::new()));
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(UseSkillTool));
-    // T11:记忆检索是元记忆的出口 —— 三把工具都是 `Risk::Read`,
-    // 「内置工具零弹窗」的承诺仍然成立。
     registry.register(Arc::new(MemorySearchTool::new(db)));
+    registry.register(Arc::new(WriteFileTool));
+    registry.register(Arc::new(EditFileTool));
     registry
 }
 
@@ -2812,9 +2962,6 @@ pub fn run() {
             // R105：装配期还没有 session_id，所以 gate 先不带 sink，由 `run_turn` 每轮开头
             // `set_sink(emitter)`（`gate.rs:77` 的可换内核就是为这一刻准备的）。
             // 这里**不留** brief Step 3 的 `NoopSink`：空 sink 意味着 Plan B 的弹窗静默不发事件。
-            // 生产表里三把工具（见 `build_production_registry`），三把都是
-            // `Risk::Read` ⇒ 自动放行仍然成立、用户侧仍然零弹窗；而 sink 还没换上的窗口里
-            // `check` 给的是 deny（R44：headless ≠ 全授权）。
             let mcp = Arc::new(McpBridge::new());
             // 注册表要 clone 一份 db,而 `db` 字段本身会被 move 进 AppState ——
             // 先单独克隆一次避开 E0382(字面量里既 move 又借用不合法)。
@@ -2833,6 +2980,7 @@ pub fn run() {
                 mcp,
                 mcp_dir: dir.clone(),
                 skills_dir,
+                data_dir: dir.clone(),
                 extracting: ExtractLocks::default(),
             });
             // 后台自举：句柄从刚装好的 State 里取（保持装配行仍是唯一一条
@@ -2901,11 +3049,15 @@ pub fn run() {
             respond,
             interrupt,
             open_url,
+            reveal_path,
+            pick_folder,
             session_list,
             session_create,
             session_rename,
             session_delete,
             session_messages,
+            session_output_view,
+            session_workspace_set,
             memories_list,
             memories_delete,
             memories_clear,
@@ -3013,6 +3165,36 @@ mod tests {
         AgentEvent::TextDelta {
             text: text.to_string(),
         }
+    }
+
+    #[test]
+    fn the_emitter_attaches_cached_image_paths() {
+        let rec = Arc::new(Recorded::default());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("images");
+        let e = TauriEmitter::new(rec.clone(), "s".into()).with_images_dir(cache.clone());
+        e.emit(AgentEvent::ToolResult {
+            call_id: "c1".into(),
+            is_error: false,
+            ms: 1,
+            preview: "[图片 png]".into(),
+            images: vec![crate::agent::types::ToolImage {
+                data: "QUJD".into(),
+                mime: crate::agent::types::ImageMime::Png,
+                path: None,
+            }],
+        });
+        let images = rec
+            .frames()
+            .into_iter()
+            .find_map(|e| match e {
+                AgentEvent::ToolResult { images, .. } => Some(images),
+                _ => None,
+            })
+            .expect("必须有 tool_result 帧");
+        let path = images[0].path.as_deref().expect("事件出口必须补图片路径");
+        assert!(std::path::Path::new(path).is_file(), "{path}");
+        assert!(std::path::Path::new(path).starts_with(cache));
     }
 
     /// R106 断言①：30ms 内的多个 delta 合成一帧，且合成后内容一字不差。
@@ -3208,6 +3390,7 @@ mod tests {
             let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.to_string()));
             let reason = run_turn(
                 TurnDeps {
+                    output_dir: None,
                     db: self.db.clone(),
                     registry: self.registry.clone(),
                     gate: self.gate.clone(),
@@ -3219,7 +3402,6 @@ mod tests {
                     // `the_session_temperature_reaches_the_chat_request` 钉）。
                     temperature: None,
                     // 夹具默认不带 roots：除了那条专门量 roots 的测试（它自己搭 `TurnDeps`），
-                    // 其余测试走的是生产的空表形状 —— 表空时 `read_file` 会拒。
                     // T27（R286）之后这里还要多说一句：`build_production_registry()` 的表里
                     // **有** `read_file`，但空 roots 那一轮交给模型的声明表里没有它，
                     // 而夹具的 registry 本来就是空的 —— 两件事各自成立，别混着读。
@@ -3589,6 +3771,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         let reason = run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -3663,6 +3846,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -3703,10 +3887,11 @@ mod tests {
     /// `echo` / `guarded` 这类替身只该活在 `#[cfg(test)]` 里 —— 它们的名字一旦进生产，
     /// 请求体里就多出一条用户看不懂、实现也不是给用户的工具。
     #[test]
-    fn production_registry_ships_fetch_url_read_file_memory_search_and_use_skill() {
-        let (_dir, db) = (tempfile::tempdir().unwrap(), Arc::new(Db::open(
-            &tempfile::tempdir().unwrap().path().join("r.db"),
-        ).unwrap()));
+    fn production_registry_ships_the_six_builtin_tools() {
+        let (_dir, db) = (
+            tempfile::tempdir().unwrap(),
+            Arc::new(Db::open(&tempfile::tempdir().unwrap().path().join("r.db")).unwrap()),
+        );
         let r = build_production_registry(db);
         let names: Vec<String> = r.defs().into_iter().map(|d| d.name).collect();
         // 这个字面顺序由 `ToolRegistry` 的 `BTreeMap`（字典序）决定，**不是**注册顺序。
@@ -3714,14 +3899,21 @@ mod tests {
         // 保证界面与模型侧的工具列表不因重连而抖动，把这条性质藏起来就没法发现它被改坏。
         assert_eq!(
             names,
-            vec!["fetch_url", "memory_search", "read_file", "use_skill"],
+            vec![
+                "edit_file",
+                "fetch_url",
+                "memory_search",
+                "read_file",
+                "use_skill",
+                "write_file",
+            ],
             "模型看到的工具集必须是这份名单；echo/guarded 这类测试工具绝不能进生产（它们只活在 #[cfg(test)]）"
         );
         for name in ["fetch_url", "read_file", "use_skill"] {
             assert_eq!(
                 r.risk_of(name),
                 Risk::Read,
-                "{name} 进生产的前提就是它仍是只读档（spec 5.1）；它变成 Write 就会开始弹窗"
+                "{name} 是只读档（spec 5.1）；它变成 Write 就会开始弹窗"
             );
         }
         assert_eq!(
@@ -3729,6 +3921,13 @@ mod tests {
             Risk::Read,
             "记忆检索只读本机库,与 fs.read 同档 ⇒ 零弹窗"
         );
+        for name in ["write_file", "edit_file"] {
+            assert_eq!(
+                r.risk_of(name),
+                Risk::Write,
+                "{name} 必须走 Write 档，权限门才会弹窗；降成 Read 等于绕开用户"
+            );
+        }
         assert_eq!(
             r.risk_of("delete_everything"),
             Risk::Exec,
@@ -4143,6 +4342,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -4207,6 +4407,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -4548,7 +4749,14 @@ mod tests {
             .expect("必须发一条 fatal 的 Store 错误");
         let done_at = frames
             .iter()
-            .rposition(|e| matches!(e, AgentEvent::Done { stop_reason: StopReason::Error }))
+            .rposition(|e| {
+                matches!(
+                    e,
+                    AgentEvent::Done {
+                        stop_reason: StopReason::Error
+                    }
+                )
+            })
             .expect("必须发 Done{Error} 收口");
         assert!(err_at < done_at, "错误必须先于 Done：{frames:?}");
     }
@@ -4570,6 +4778,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         let reason = run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -5150,6 +5359,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         let reason = run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -5324,6 +5534,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -5386,6 +5597,7 @@ mod tests {
         let sink2 = Arc::new(TauriEmitter::new(rec2.clone(), sid.clone()));
         run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -5453,6 +5665,7 @@ mod tests {
             .execute(
                 serde_json::json!({"query": "桌面助手"}),
                 &crate::tools::registry::ToolCtx {
+                    write_root: None,
                     http: reqwest::Client::new(),
                     cancel: CancellationToken::new(),
                     roots: Vec::new(),
@@ -5527,6 +5740,7 @@ mod tests {
         let rows_before_turn = f.db.messages(&sid).unwrap().len();
         let reason = run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -5683,6 +5897,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -5823,6 +6038,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         let reason = run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -5878,6 +6094,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -6203,6 +6420,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
         let reason = run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -6597,6 +6815,29 @@ mod tests {
         assert_eq!(recall_query(&history, "那它呢"), "那它呢");
     }
 
+    #[test]
+    fn recall_query_skips_the_synthetic_tool_image_followup() {
+        let history = vec![
+            Message::user(vec![ContentBlock::Text {
+                text: "这张图里是什么".into(),
+            }]),
+            Message::user(vec![
+                ContentBlock::Text {
+                    text: crate::agent::types::TOOL_IMAGE_FOLLOWUP_NOTE.into(),
+                },
+                ContentBlock::Image {
+                    data: "QUJD".into(),
+                    mime: crate::agent::types::ImageMime::Png,
+                },
+            ]),
+        ];
+        assert_eq!(
+            recall_query(&history, "那它呢"),
+            "这张图里是什么\n那它呢",
+            "内部图片说明不能冒充上一句用户话"
+        );
+    }
+
     /// 工具结果消息的 role 也是 User,但它不是用户说的话 —— 跳过它,继续往前找。
     /// 只剩工具结果时退化为「没有上一轮」。
     #[test]
@@ -6662,6 +6903,7 @@ mod tests {
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.to_string()));
         run_turn(
             TurnDeps {
+                output_dir: None,
                 db: f.db.clone(),
                 registry: f.registry.clone(),
                 gate: f.gate.clone(),
@@ -7049,6 +7291,28 @@ mod tests {
             head_note(&calls[0], "[记忆库]").is_none(),
             "概览计入 cap,这里也该被砍掉"
         );
+    }
+
+    #[test]
+    fn workspace_commands_are_registered_in_the_handler_list() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ipc.rs"));
+        let list = src
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split("]").next())
+            .expect("找不到 generate_handler 的登记表");
+        let registered: Vec<&str> = list.split(',').map(str::trim).collect();
+        for cmd in [
+            "reveal_path",
+            "pick_folder",
+            "session_output_view",
+            "session_workspace_set",
+        ] {
+            assert!(
+                registered.contains(&cmd),
+                "{cmd} 没登记，前端只会拿到 not found"
+            );
+        }
     }
 
     /// T5 的四条记忆命令与 `normalize_image` 同一个坑（`generate_handler!` 是宏）：
@@ -7500,6 +7764,7 @@ mod tests {
             let sink = Arc::new(TauriEmitter::new(rec, sid.clone()));
             let reason = run_turn(
                 TurnDeps {
+                    output_dir: None,
                     db: f.db.clone(),
                     registry: f.registry.clone(),
                     gate: f.gate.clone(),

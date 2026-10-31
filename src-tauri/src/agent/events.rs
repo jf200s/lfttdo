@@ -51,6 +51,7 @@ pub enum AgentEvent {
         is_error: bool,
         ms: u64,
         preview: String,
+        images: Vec<ToolImage>,
     },
     Usage {
         input_tokens: u32,
@@ -388,6 +389,7 @@ mod tests {
                 is_error: false,
                 ms: 0,
                 preview: String::new(),
+                images: Vec::new(),
             },
             AgentEvent::Usage {
                 input_tokens: 0,
@@ -557,9 +559,15 @@ mod tests {
                     is_error: false,
                     ms: 1234,
                     preview: "抓到 42 字".into(),
+                    images: vec![ToolImage {
+                        data: "QUJD".into(),
+                        mime: ImageMime::Png,
+                        path: None,
+                    }],
                 },
                 json!({ "t": "tool_result", "call_id": "c1", "is_error": false, "ms": 1234,
-                        "preview": "抓到 42 字" }),
+                        "preview": "抓到 42 字",
+                        "images": [{ "data": "QUJD", "mime": "png" }] }),
             ),
             (
                 AgentEvent::Usage {
