@@ -193,6 +193,55 @@ describe("Composer 图片入口", () => {
     expect(screen.queryByTestId("thumb-4")).toBeNull();
   });
 
+  // 并发竞态回归（审计发现 Composer.tsx:143）：`addFiles` 的四个入口都是 fire-and-forget，
+  // 而归一化是异步的 —— 旧代码两批交叠时，后一批在**前一批任何一张落定之前**就从同一份
+  // `pendingRef` 快照算 `room`，两批各得 4 张额度，6 张能全部上屏。修复后后一批排队，
+  // 等前一批落定（该推的都推进 `pendingRef`）之后才轮到自己算额度。
+  // 受控双 promise：第一批的归一化悬着不 resolve，此刻投第二批 —— 修复前 normalize 会被
+  // 第 2 次调用（第二批立刻开跑），修复后必须等到第一批全部落定。
+  it("caps overlapping batches at the same per-message limit", async () => {
+    const resolvers: Array<(b: ContentBlock) => void> = [];
+    const onNormalize = vi.fn(
+      (_bytes: ArrayBuffer) =>
+        new Promise<ContentBlock>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+    render(
+      <Composer
+        streaming={false}
+        onSend={okSend()}
+        onStop={vi.fn()}
+        onNormalize={onNormalize}
+      />,
+    );
+    // 第一批 3 张：归一化故意悬着。
+    dropOn([png(1, "批1.png"), png(2, "批2.png"), png(3, "批3.png")]);
+    await waitFor(() => expect(onNormalize).toHaveBeenCalledTimes(1));
+    // 第二批 3 张与第一批交叠：此刻待发区还是空的，room 若现在算就是 4。
+    dropOn([png(4, "批4.png"), png(5, "批5.png"), png(6, "批6.png")]);
+    // 等一个宏任务：修复前第二批的 arrayBuffer 微任务里就绪，normalize 已第 2 次被调。
+    await new Promise((r) => setTimeout(r, 10));
+    expect(onNormalize).toHaveBeenCalledTimes(1);
+
+    // 第一批逐张放行：每 resolve 一张，批内循环推进到下一张。
+    for (let i = 0; i < 3; i++) {
+      resolvers[i](okBlock);
+      await waitFor(() => expect(onNormalize).toHaveBeenCalledTimes(i + 2));
+    }
+    // 第一批 3 张落定之后 room 才轮到第二批算：3 已占，只放 1 张、忽略 2 张。
+    expect(await screen.findByTestId("image-overflow")).toHaveTextContent(
+      "已忽略 2 张",
+    );
+    resolvers[3](okBlock);
+    await screen.findByTestId("thumb-3");
+    // 终态恰好 4 张：前三张来自第一批，第 4 张是第二批的第一张。
+    expect(screen.getByTestId("thumb-0")).toHaveAccessibleName("批1.png");
+    expect(screen.getByTestId("thumb-3")).toHaveAccessibleName("批4.png");
+    expect(screen.queryByTestId("thumb-4")).toBeNull();
+    expect(onNormalize).toHaveBeenCalledTimes(4);
+  });
+
   // R195：错误行只做「文件名 + Rust 原文逐字上屏」两件事，前端不解释文案。
   // fixture 用的是 T18 裁定（R184/R185）真实可达的那句超限文案。
   it("names the file and echoes the rejection verbatim when a normalize fails", async () => {
