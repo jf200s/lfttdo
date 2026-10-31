@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import App from "./App";
@@ -237,6 +238,26 @@ describe("App", () => {
     render(<App />);
     await waitFor(() => expect(h.createSession).toHaveBeenCalled());
     await waitFor(() => expect(h.replaySession).toHaveBeenCalledWith("N"));
+  });
+
+  // StrictMode（仅 dev）把启动 effect 跑两遍：两条异步链各自看到空列表、各发一次
+  // `session_create`（后端无条件建），症状是每次 dev 冷启动多出一条空会话。
+  // mock 必须有状态 —— 两条链的第一次 `sessions()` 都要拿到 []，去重后才谈得上「只建一条」；
+  // 用 `mockResolvedValueOnce([])` 的话第二条链会拿到非空列表，缺陷根本不会被走到。
+  it("creates only one session when StrictMode runs the startup effect twice", async () => {
+    let created = 0;
+    h.sessions.mockImplementation(async () => (created > 0 ? [row("N", 1)] : []));
+    h.createSession.mockImplementation(async () => {
+      created += 1;
+      return "N";
+    });
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+    await waitFor(() => expect(h.replaySession).toHaveBeenCalledWith("N"));
+    expect(h.createSession).toHaveBeenCalledTimes(1);
   });
 
   // ---- Step 0 第 12 条 / 硬性要求 10：主题接线 ----
@@ -714,5 +735,33 @@ describe("App", () => {
       }),
     );
     expect(await screen.findByText("已记住 4 条")).toBeInTheDocument();
+  });
+
+  // App 侧通知通道对齐 MessageList 的 notices（要求 11 的同一份设计）：
+  // 连续重复合并 ×n、超过上限折叠。之前是纯追加 + 全量逐条渲染，
+  // IPC 持续失败的长会话里横幅一条条往上摞、无限增长。
+  it("folds repeated app notices into one counted row instead of stacking them", async () => {
+    h.respond.mockRejectedValue("磁盘已满");
+    render(<App />);
+    await settled();
+    act(() =>
+      h.emit("B", {
+        t: "permission_request",
+        id: "p1",
+        risk: "write",
+        call: { id: "c", name: "write_file", risk: "write", input: {} },
+      }),
+    );
+    // 卡片最终态只由 permission_resolved 驱动（R131），连点 6 次都还在 pending，
+    // 每次 respond 失败各攒一条同文案 notice —— 恰好构成「连发同文案 6 次」。
+    const allow = await screen.findByRole("button", { name: /仅本次/ });
+    for (let i = 0; i < 6; i++) fireEvent.click(allow);
+    await waitFor(() =>
+      expect(screen.getByTestId("app-notice")).toHaveTextContent(
+        "提交许可决定失败：磁盘已满 ×6",
+      ),
+    );
+    // 6 次失败只占一行：渲染出来的列表不再随失败次数线性增长。
+    expect(screen.getAllByTestId("app-notice")).toHaveLength(1);
   });
 });
