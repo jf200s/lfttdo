@@ -118,7 +118,8 @@ release/            本地发布说明与各版本源码归档（gitignored，�
 
 ## 已知限制
 
-- **仅 Windows x64**：进程树回收与凭据存储都用了 Win32。
+- **Windows x64 为一级支持**：进程树回收（JobObject）与凭据存储（凭据管理器）走 Win32。
+- **Linux 目前仅到「可编译」**：keyring（secret-service / zbus）、进程组回收（libc `kill(-pgid)`）、rfd（xdg-portal）的在途移植让 `cargo test` 在 Linux 全绿；GUI 与日常使用未验证。
 - **只有常规安装版**：数据固定在 `%APPDATA%\com.qwa.do\`，不提供 U 盘便携模式。
 - **HTTP MCP 需要服务端支持 streamable-http**：URL 需可达；不返回 `Mcp-Session-Id` 的 server 也能连（客户端按 stateless 处理），stdio 专属的 server 仍按原方式配置。
 - MCP 配置里的每个 server 必须是 `mcpServers` 的直接子项；放在根对象或另一个 server 内部会被编辑器拒绝并指出条目，不会静默丢弃。
