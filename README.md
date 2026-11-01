@@ -108,7 +108,7 @@ src/                前端（组件、IPC 封装、状态 reducer、主题 token
 src-tauri/src/
   agent/            会话循环、上下文组装、摘要压缩、长期记忆、事件类型
   model/            OpenAI 兼容适配器（含 reasoning 流）
-  tools/            内置工具与注册表（fetch_url、read_file、use_skill、memory_search、write_file、edit_file）
+  tools/            内置工具与注册表（fetch_url、read_file、use_skill、memory_search、write_file、edit_file、run_command〔可选 shell 后端〕）
   permission/       权限门与信任档
   mcp/              mcp.json 读取/编辑、工具命名、stdio / HTTP 桥、进程树回收
   store/            SQLite 会话与长期记忆持久化

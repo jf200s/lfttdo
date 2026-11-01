@@ -6,9 +6,10 @@
 // key「不写 settings 表、不进导出、不写日志」，三条里最容易失守的是第一条，而靠纪律
 // （「记得别写」）守的规矩一定会被下一次加字段破掉；字段不存在才是结构性防线：
 // serde 写不出一个不存在的字段，`{:?}` 打不出它，导出也就无从带上它。
-// `serialized_field_names_are_exactly_the_twenty_three_settings_fields` 那条测试钉的正是这件事，
+// `serialized_field_names_are_exactly_the_twenty_six_settings_fields` 那条测试钉的正是这件事，
 // 它同时也是 R89 的防线：加字段必须先给出它的消费者，否则 Plan A 里多一个没人读的键。
-// （T26 落 `roots` 时它的名字从 `twelve` 变成 `thirteen` —— 名字里的数字就是这条防线的读数。）
+// （T26 落 `roots` 时它的名字从 `twelve` 变成 `thirteen`，shell 选择功能落
+// `default_shell`/`shells` 时变到 `twenty_six` —— 名字里的数字就是这条防线的读数。）
 //
 // 「不写日志」那一条还有第二道闸，而且不在结构体上：`SettingsError` 的 `Debug` 是**手写**的
 // （R94，见 `impl fmt::Debug`）。`keyring_core::Error` 自己 derive 了 `Debug`，而它的
@@ -181,7 +182,7 @@ pub enum SettingsError {
 /// 打成十进制转储 —— spec :473 说的「不写日志」在这种形态下守不住，而且 spec :543 计划的
 /// 「全文搜索 key 字符串」根本查不到十进制转储。Display 侧本来就安全（那两个变体的 Display
 /// 只说 "Password data is not valid UTF-8"），所以这里每一支都借 Display 落地。
-/// `serialized_field_names_are_exactly_the_twenty_three_settings_fields` 同族的
+/// `serialized_field_names_are_exactly_the_twenty_six_settings_fields` 同族的
 /// `credential_debug_never_prints_the_secret_bytes` 钉住它。
 impl std::fmt::Debug for SettingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
