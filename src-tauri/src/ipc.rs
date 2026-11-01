@@ -28,13 +28,14 @@ use crate::tools::fetch::FetchTool;
 use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::shell::{ShellCatalog, ShellTool};
 use crate::tools::use_skill::UseSkillTool;
 use crate::tools::write_file::WriteFileTool;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tauri::ipc::InvokeBody;
 use tauri::{
@@ -286,6 +287,11 @@ pub struct AppState {
     /// 按会话的抽取互斥(spec §12.5 缺口 1)。空闲 worker 与切换回补都经它,
     /// 避免同一会话被两条路径同时抽取、堆出重复记忆。
     pub extracting: ExtractLocks,
+    /// Agent Shell（spec §2/§5.5）：这一轮可用的 shell 全集（预设 + 自定义 + 默认 id）。
+    /// `ShellTool` 与 `AppState` 持**同一个** `Arc`（注册表是进程级单例，catalog 不能
+    /// 留在某一轮的 `ToolCtx` 里）；`send_message` 每轮开头现刷（spec §2「生效时机」：
+    /// 改设置下一条消息生效，无缓存可过期）。锁走 `crate::lock` 的中毒容忍入口。
+    pub shells: Arc<RwLock<ShellCatalog>>,
 }
 
 /// 单轮并发闸门。guard 一析构就释放槽位，所以 `?` 的每条早退路径（读设置失败、
@@ -1599,6 +1605,13 @@ pub async fn send_message(
 
     let store = state.settings.clone();
     let settings = blocking(move || store.load().map_err(|e| e.to_string())).await?;
+    // Agent Shell（spec §2「生效时机」）：每轮开头用**本轮现取**的设置刷 shell catalog，
+    // 与下面的 roots / temperature 同一条线 —— 用户改完设置发下一条消息就生效，
+    // 没有任何缓存可以过期（轮内不变：正在流式的那一轮不换后端）。
+    // 锁走 `crate::lock` 的中毒容忍入口；`ShellTool` 持同一个 Arc，本轮 run_turn 里的
+    // 每次执行看到的都是这份。这一行没法单测（`#[tauri::command]` 在单测里调不动），
+    // 「值真的可解析」由 `shell_catalog_of` 的纯函数测试与 settings 侧 normalize 钉着。
+    *crate::lock::write(&state.shells) = shell_catalog_of(&settings);
     // R90：`normalize_base_url("")` 返回空串，settings.rs 不替用户编一个默认端点，
     // 所以这道守卫必须住在装配层 —— 空 base_url 到这里就停。
     if settings.base_url.trim().is_empty() {
@@ -2745,8 +2758,13 @@ fn persist_window_geometry(window: &tauri::Window) {
 ///
 /// 名字序由 `ToolRegistry` 里的 `BTreeMap` 决定（字典序），**不是**这里的注册顺序；
 ///
-///
-pub fn build_production_registry(db: Arc<Db>) -> Arc<ToolRegistry> {
+/// Agent Shell（spec §2/§5.5）：`run_command` 在这里注册。catalog 经 `shells` 注入 ——
+/// 调用方把**同一个** `Arc` 装进 `AppState`，`send_message` 每轮开头现刷它的内容；
+/// 工具不自取设置（「装配层注入、工具不自取」的既有取向）。
+pub fn build_production_registry(
+    db: Arc<Db>,
+    shells: Arc<RwLock<ShellCatalog>>,
+) -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     registry.register(Arc::new(FetchTool::new()));
     registry.register(Arc::new(ReadFileTool));
@@ -2754,7 +2772,17 @@ pub fn build_production_registry(db: Arc<Db>) -> Arc<ToolRegistry> {
     registry.register(Arc::new(MemorySearchTool::new(db)));
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
+    registry.register(Arc::new(ShellTool::new(shells)));
     registry
+}
+
+/// 这一轮的 shell catalog（spec §2「生效时机」的纯函数面）：从本轮现取的 `Settings`
+/// 拼出「自定义表 + 默认 id」。`send_message` 在 `store.load()` 之后调它并刷进
+/// `AppState.shells` —— 与 roots / temperature 同一条「本轮现取、下一条消息生效」线，
+/// 这里没有任何缓存可以过期。`default_shell` 的 trim 与空回落由 `from_parts`/`resolve`
+/// 的既有语义承担（settings 侧 `normalize()` 已先行回落过一次）。
+fn shell_catalog_of(settings: &Settings) -> ShellCatalog {
+    ShellCatalog::from_parts(settings.shells.clone(), settings.default_shell.trim())
 }
 
 /// 数据目录的唯一解析点：`%APPDATA%\<identifier>`。
@@ -2972,10 +3000,15 @@ pub fn run() {
             // 注册表要 clone 一份 db,而 `db` 字段本身会被 move 进 AppState ——
             // 先单独克隆一次避开 E0382(字面量里既 move 又借用不合法)。
             let db_for_registry = db.clone();
+            // Agent Shell（spec §5.5）：shell catalog 的共享句柄在装配期建一次，
+            // `ShellTool`（经 build_production_registry）与 `AppState.shells` 持同一个 Arc；
+            // 装配期占位为空 catalog，第一条消息前 `send_message` 会现刷。
+            let shells = Arc::new(RwLock::new(ShellCatalog::new()));
+            let shells_for_registry = shells.clone();
             app.manage(AppState {
                 db,
                 settings,
-                registry: build_production_registry(db_for_registry),
+                registry: build_production_registry(db_for_registry, shells_for_registry),
                 gate,
                 cancel: Arc::new(Mutex::new(None)),
                 running: Arc::new(Mutex::new(None)),
@@ -2988,6 +3021,7 @@ pub fn run() {
                 skills_dir,
                 data_dir: dir.clone(),
                 extracting: ExtractLocks::default(),
+                shells,
             });
             // 后台自举：句柄从刚装好的 State 里取（保持装配行仍是唯一一条
             // `registry: build_production_registry()` —— 那条守卫测试盯着它）。
@@ -3893,12 +3927,12 @@ mod tests {
     /// `echo` / `guarded` 这类替身只该活在 `#[cfg(test)]` 里 —— 它们的名字一旦进生产，
     /// 请求体里就多出一条用户看不懂、实现也不是给用户的工具。
     #[test]
-    fn production_registry_ships_the_six_builtin_tools() {
+    fn production_registry_ships_the_seven_builtin_tools() {
         let (_dir, db) = (
             tempfile::tempdir().unwrap(),
             Arc::new(Db::open(&tempfile::tempdir().unwrap().path().join("r.db")).unwrap()),
         );
-        let r = build_production_registry(db);
+        let r = build_production_registry(db, Arc::new(RwLock::new(ShellCatalog::new())));
         let names: Vec<String> = r.defs().into_iter().map(|d| d.name).collect();
         // 这个字面顺序由 `ToolRegistry` 的 `BTreeMap`（字典序）决定，**不是**注册顺序。
         // 刻意不加 `.sort()`、也不换成集合比较：T33 的 MCP 工具重挂之后仍然靠「名字序不变」
@@ -3910,6 +3944,7 @@ mod tests {
                 "fetch_url",
                 "memory_search",
                 "read_file",
+                "run_command",
                 "use_skill",
                 "write_file",
             ],
@@ -3934,10 +3969,56 @@ mod tests {
                 "{name} 必须走 Write 档，权限门才会弹窗；降成 Read 等于绕开用户"
             );
         }
+        // Agent Shell（spec §2/§8）：`run_command` 是第一把内置 Exec 工具，风险唯一真相源
+        // 是 `ShellTool::meta()`（经 `risk_of` 出）。它降档就等于绕开权限门的每次弹窗。
+        assert_eq!(
+            r.risk_of("run_command"),
+            Risk::Exec,
+            "run_command 必须走 Exec 档：每次调用弹窗，会话级放行的粒度是整条命令文本"
+        );
         assert_eq!(
             r.risk_of("delete_everything"),
             Risk::Exec,
             "未知工具按最严一档（R158）"
+        );
+    }
+
+    /// Agent Shell（spec §2/§5.5）：`send_message` 每轮开头用它把本轮设置变成 catalog。
+    /// 纯函数：settings 的 shells / default_shell 原样进 catalog；default 空白时
+    /// `from_parts` 只做 trim（catalog 里就是空串），真正的回落发生在 `resolve(None)`
+    /// —— 落到 `DEFAULT_PRESET_ID`（桩的既有语义；这条钉的是接线面别把它弄丢）。
+    #[test]
+    fn shell_catalog_of_passes_settings_through_and_resolves_a_blank_default_to_the_preset() {
+        let settings = Settings {
+            shells: vec![crate::tools::shell::ShellProfile {
+                id: "mine".into(),
+                label: String::new(),
+                program: "/opt/mine".into(),
+                args: vec!["-c".into()],
+            }],
+            default_shell: "  mine  ".into(),
+            ..Default::default()
+        };
+        let catalog = shell_catalog_of(&settings);
+        assert_eq!(catalog.customs, settings.shells, "自定义表原样进 catalog");
+        assert_eq!(catalog.default_id, "mine", "default_shell trim 后进 catalog");
+        assert_eq!(
+            catalog.resolve(None).unwrap().program,
+            "/opt/mine",
+            "默认 shell 指向自定义 profile 时按它解析"
+        );
+        let blank = shell_catalog_of(&Settings {
+            default_shell: "   ".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            blank.default_id, "",
+            "空白 default 进 catalog 只是空串（from_parts 只 trim）"
+        );
+        assert_eq!(
+            blank.resolve(None).unwrap().id,
+            crate::tools::shell::DEFAULT_PRESET_ID,
+            "空 default 在 resolve 时回落默认预设"
         );
     }
 
@@ -5664,7 +5745,10 @@ mod tests {
             due_at: None,
         })
         .unwrap();
-        let registry = build_production_registry(f.db.clone());
+        let registry = build_production_registry(
+            f.db.clone(),
+            Arc::new(RwLock::new(ShellCatalog::new())),
+        );
         let out = registry
             .get("memory_search")
             .expect("生产工具表里必须有 memory_search")
@@ -7576,6 +7660,31 @@ mod tests {
             "那唯一一处空构造必须是 `build_production_registry` 的第一行，不是别处的第二条装配路径；\
              实得 {:?}",
             empty_constructions[0]
+        );
+        // Agent Shell（spec §5.5）：装配段还必须把 `shells` 字段接进 `AppState` ——
+        // `ShellTool` 经 `build_production_registry` 拿到的是同一个共享句柄，漏接这一半
+        // 就等于工具表里有一把永远解析不到自定义 profile 的 run_command（每轮现刷的
+        // 另一半由 `send_message` 那行做，单测调不动，见该行注释）。按同一取法逐行取：
+        // 字段初始化若写成简写 `shells,`（无冒号）也认得 —— 按**前缀**匹配「shells」，
+        // 不硬钉 `shells:` 的写法（F6-N4 同一教训：不依赖具体拼写形状）。
+        let shells_wired: Vec<&str> = manage
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("shells"))
+            .map(|line| line.split("//").next().unwrap_or("").trim())
+            .map(|line| line.trim_end_matches(',').trim())
+            .collect();
+        assert_eq!(
+            shells_wired.len(),
+            1,
+            "装配段里 `shells` 那一行必须**恰好一条**（0 条=没接线，2 条=两条接线路径）；\
+             实得 {shells_wired:?}"
+        );
+        assert_eq!(
+            shells_wired[0], "shells",
+            "`AppState.shells` 必须接到共享句柄上（字段初始化 `shells`/`shells: shells` 均可）；\
+             实得 {:?}",
+            shells_wired[0]
         );
     }
 
