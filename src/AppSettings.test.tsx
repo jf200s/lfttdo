@@ -108,6 +108,12 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   memory_prospective_window_hours: 24,
   memory_embedding_source: "endpoint",
   memory_embedding_model: "text-embedding-v3",
+  // Shell 两键给**非默认**值（Rust 默认 shells: [] / default_shell: "bash"），与上面 roots
+  // 的非默认取向同一条：下面 `settings_set` 那条 `toHaveBeenCalledWith` 载荷断言，要能
+  // 区分「App 原样转交整张表」与「App 重拼了一份默认表」—— 默认值在这里是看不出来的错值。
+  // label 留空顺带钉住「自定义 profile 的显示名可空」这条线上语义（types.ts / spec §5.2）。
+  shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }],
+  default_shell: "pwsh",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -315,6 +321,9 @@ describe("App 设置接线", () => {
         memory_prospective_window_hours: 24,
         memory_embedding_source: "endpoint",
         memory_embedding_model: "text-embedding-v3",
+        // Shell 两键原样转交：App 不重拼默认表（夹具给的是非默认值，重拼了这里当场红）。
+        shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }],
+        default_shell: "pwsh",
       }),
     );
     // 保存成功才改界面：这三项是 `applyTheme` 唯一的三个可见后果。

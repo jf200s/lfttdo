@@ -62,6 +62,11 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   memory_prospective_window_hours: 24,
   memory_embedding_source: "endpoint",
   memory_embedding_model: "text-embedding-v3",
+  // Shell 两键（Rust serde 恒序列化，线上没有可选形态）：生产默认值（无自定义 profile、
+  // 默认 bash），与 `App.test.tsx` 夹具的 `roots` 同一条注释逻辑 —— 「少一键就编译不过」；
+  // 「带成别的值」由 Shell 切片的用例用非默认值另钉。
+  shells: [],
+  default_shell: "bash",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -243,6 +248,8 @@ describe("SettingsPanel", () => {
       memory_prospective_window_hours: 24,
       memory_embedding_source: "endpoint",
       memory_embedding_model: "text-embedding-v3",
+      shells: [],
+      default_shell: "bash",
     });
   });
 

@@ -93,6 +93,11 @@ const view = (over: Partial<SettingsView> = {}): SettingsView => ({
   memory_prospective_window_hours: 24,
   memory_embedding_source: "endpoint",
   memory_embedding_model: "text-embedding-v3",
+  // Shell 两键（Rust serde 恒序列化，线上没有可选形态）：与上面的 `roots` 同一条注释逻辑 ——
+  // 本文件不断言保存载荷，键只承担「少一键就编译不过」。这里给生产默认值：
+  // 无自定义 profile、默认 shell 为 bash（Rust `DEFAULT_PRESET_ID`）。
+  shells: [],
+  default_shell: "bash",
   api_key_masked: "…abcd",
   corrupt_backup: null,
   ...over,

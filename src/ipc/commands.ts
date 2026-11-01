@@ -19,6 +19,7 @@ import type {
   SessionRow,
   Settings,
   SettingsView,
+  ShellProfile,
   SkillsView,
 } from "../types";
 
@@ -234,4 +235,24 @@ export function skillsSetEnabled(
   enabled: boolean,
 ): Promise<void> {
   return invoke<void>("skills_set_enabled", { folder, enabled });
+}
+
+/**
+ * Shell 预设表（spec §5.5 的 `shell_presets`）。**只读副本**：8 条内置预设是 Rust
+ * `tools/shell.rs` 里的编译期常量，前端不抄第二份 —— 界面只展示，没有任何可编辑控件；
+ * 自定义 profile 走 `settings_set` 的 `shells` 键，不经过这里。
+ */
+export function shellPresets(): Promise<ShellProfile[]> {
+  return invoke<ShellProfile[]>("shell_presets");
+}
+
+/**
+ * 校验一条（自定义）shell profile（spec §5.5 的 `shell_profile_validate`）：
+ * Rust 侧 `validate_custom`（形状）+ `ensure_executable`（程序存在且可执行）。
+ * 失败 `Err`（中文原因，可直接上屏），成功 `Ok(())`。**真校验只有 Rust 这一处**：
+ * 前端只做「程序路径为空时按钮禁用」级别的使能，保存时不调用它（R284 同规）。
+ * 参数键 `profile` 两端同名，无 camelCase 映射问题。
+ */
+export function shellProfileValidate(profile: ShellProfile): Promise<void> {
+  return invoke<void>("shell_profile_validate", { profile });
 }

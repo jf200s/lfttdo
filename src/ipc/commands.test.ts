@@ -109,6 +109,9 @@ describe("ipc commands", () => {
       memory_prospective_window_hours: 24,
       memory_embedding_source: "endpoint",
       memory_embedding_model: "text-embedding-v3",
+      // Shell 两键（Shell 切片）：Settings 的必填键随类型镜像加进来，取生产默认值。
+      shells: [],
+      default_shell: "bash",
     });
     expect(invoke).toHaveBeenNthCalledWith(1, "settings_get");
     expect(invoke).toHaveBeenNthCalledWith(2, "settings_set", {
@@ -136,6 +139,8 @@ describe("ipc commands", () => {
         memory_prospective_window_hours: 24,
         memory_embedding_source: "endpoint",
         memory_embedding_model: "text-embedding-v3",
+        shells: [],
+        default_shell: "bash",
       },
     });
   });
