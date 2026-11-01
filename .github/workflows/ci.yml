@@ -5,10 +5,19 @@ on:
     branches: [main]
   pull_request:
 
+# 同一分支的快速连推只跑最新一次，省 Windows runner 分钟数
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   frontend:
-    name: Frontend (vitest + tsc + build + lint)
-    runs-on: windows-latest
+    name: Frontend (vitest + tsc + build + lint, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,10 +34,21 @@ jobs:
         run: npm run lint:css
 
   rust:
-    name: Rust (cargo test)
-    runs-on: windows-latest
+    name: Rust (cargo test, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # Linux 侧守护 keyring(zbus)/libc/rfd(xdg-portal) 这条移植线：
+      # rfd 无后端 feature 时在 Linux 上 build.rs 直接 panic，没有这个 job 就没人拦
+      - name: Install Tauri Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
