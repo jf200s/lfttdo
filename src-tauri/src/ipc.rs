@@ -334,11 +334,7 @@ impl Drop for RunningGuard {
 /// 多发一条 IPC 命令，代价是 A→B→A 且在 B 不发送时授权会保留到下一次发送。
 /// 安全上关键的那一半（server 改成 Block 必须压过旧授权）由 `check` 的优先级保证，
 /// 不依赖这里。
-fn enter_session_scope(
-    last: &Mutex<Option<String>>,
-    gate: &PermissionGate,
-    session_id: &str,
-) {
+fn enter_session_scope(last: &Mutex<Option<String>>, gate: &PermissionGate, session_id: &str) {
     let switched = {
         let mut slot = guard(last);
         if slot.as_deref() == Some(session_id) {
@@ -479,15 +475,8 @@ async fn plan_memory_writes(
     profile_char_cap: usize,
     cancel: &CancellationToken,
 ) -> Vec<MemoryWrite> {
-    match plan_memory_writes_for_source(
-        db,
-        session_id,
-        model,
-        source,
-        profile_char_cap,
-        cancel,
-    )
-    .await
+    match plan_memory_writes_for_source(db, session_id, model, source, profile_char_cap, cancel)
+        .await
     {
         Ok(writes) => writes,
         // 取消不是故障:用户按了停止,压缩段随后整段放弃(调用方还会再查一次令牌),
@@ -554,7 +543,9 @@ async fn plan_memory_writes_from_candidates(
                 let reader = db.clone();
                 let (rs, rp) = (s.to_string(), p.to_string());
                 match blocking(move || {
-                    reader.find_active_by_key(&rs, &rp).map_err(|e| e.to_string())
+                    reader
+                        .find_active_by_key(&rs, &rp)
+                        .map_err(|e| e.to_string())
                 })
                 .await
                 {
@@ -712,9 +703,7 @@ pub(crate) async fn compact_before_turn(
                 .await
             }
             None => {
-                tracing::info!(
-                    "会话 {session_id} 正被另一条路径抽取记忆,本轮压缩段跳过抽取"
-                );
+                tracing::info!("会话 {session_id} 正被另一条路径抽取记忆,本轮压缩段跳过抽取");
                 Vec::new()
             }
         }
@@ -1209,9 +1198,10 @@ pub(crate) fn memory_notes_for_turn(
     // 标记失败不影响注入(见上面的取向说明)。
     let (due, due_ids) = due_notes(db, window_hours)?;
     if !due_ids.is_empty()
-        && let Err(reason) = db.mark_notified(&due_ids, Db::now_ms()) {
-            tracing::warn!("待办提醒标记失败,本轮仍然注入(宁可重复一次,不可丢失):{reason}");
-        }
+        && let Err(reason) = db.mark_notified(&due_ids, Db::now_ms())
+    {
+        tracing::warn!("待办提醒标记失败,本轮仍然注入(宁可重复一次,不可丢失):{reason}");
+    }
     notes.extend(due);
 
     // ② 画像:常驻,不受超限影响。
@@ -1262,9 +1252,10 @@ pub(crate) fn memory_notes_for_turn(
 
     // ④ 概览:最后一条,也是最先被 cap 砍掉的一条(它最「元」、最不紧急)。
     if let Some(overview) = overview_note(db)?
-        && used + crate::agent::context::note_tokens(&overview) <= cap {
-            notes.push(overview);
-        }
+        && used + crate::agent::context::note_tokens(&overview) <= cap
+    {
+        notes.push(overview);
+    }
 
     Ok(notes)
 }
@@ -1504,12 +1495,15 @@ pub async fn run_turn(
     // （否则前端会回滚用户气泡，而这一轮其实已经存下来了）。
     let typer = db.clone();
     let title_sid = sid.clone();
-    if let Err(reason) = blocking(move || auto_title(&typer, &title_sid).map_err(|e| e.to_string())).await
+    if let Err(reason) =
+        blocking(move || auto_title(&typer, &title_sid).map_err(|e| e.to_string())).await
     {
         tracing::warn!("会话 {sid} 自动改名失败（本轮已落库，不影响发送结果）：{reason}");
     }
 
-    finish_sink.emit(AgentEvent::Done { stop_reason: reason });
+    finish_sink.emit(AgentEvent::Done {
+        stop_reason: reason,
+    });
     Ok(reason)
 }
 
@@ -1638,7 +1632,11 @@ pub async fn send_message(
     // base_url 的非空守卫在上面已经收过。构造失败 warn 后降 None:检索退化为纯关键词,
     // 发送照常(裁定 4)。明文 key 在 drop(api_key) 之前装进客户端,此后无人再持它。
     let embed: Option<Arc<dyn EmbedProvider>> = if settings.memory_embedding_source == "endpoint" {
-        match EmbedEndpoint::new(&settings.base_url, &settings.memory_embedding_model, &api_key) {
+        match EmbedEndpoint::new(
+            &settings.base_url,
+            &settings.memory_embedding_model,
+            &api_key,
+        ) {
             Ok(e) => Some(Arc::new(e)),
             Err(reason) => {
                 tracing::warn!("嵌入端点构造失败,记忆检索退化为纯关键词召回:{reason}");
@@ -2177,10 +2175,7 @@ pub async fn session_output_view(
     let settings = blocking(move || store.load().map_err(|e| e.to_string())).await?;
     let db = state.db.clone();
     let sid = id.clone();
-    let workspace = blocking(move || {
-        db.session_workspace(&sid).map_err(|e| e.to_string())
-    })
-    .await?;
+    let workspace = blocking(move || db.session_workspace(&sid).map_err(|e| e.to_string())).await?;
     let output_dir = resolve_session_output(&app, &state, &settings, &id)?;
     Ok(SessionOutputView {
         workspace,
@@ -2220,10 +2215,7 @@ pub async fn session_workspace_set(
 
 #[tauri::command]
 pub async fn pick_folder() -> Result<Option<String>, String> {
-    let picked = blocking(|| {
-        Ok::<_, String>(rfd::FileDialog::new().pick_folder())
-    })
-    .await?;
+    let picked = blocking(|| Ok::<_, String>(rfd::FileDialog::new().pick_folder())).await?;
     Ok(picked.map(|path| crate::tools::fs_write::display_path(&path)))
 }
 
@@ -2426,8 +2418,7 @@ pub async fn memory_flush_session(
     // 以下装配与 `send_message` 逐段同线(同一份 Settings、同一个 resolve_api_key、
     // 同一个 EmbedEndpoint 构造);差别只在失败一律降级成 Ok(0)。
     let key_store = state.settings.clone();
-    let stored_key = match blocking(move || key_store.api_key().map_err(|e| e.to_string())).await
-    {
+    let stored_key = match blocking(move || key_store.api_key().map_err(|e| e.to_string())).await {
         Ok(k) => k,
         Err(reason) => {
             tracing::warn!("切换会话时读取 API key 失败,跳过记忆抽取:{reason}");
@@ -2449,7 +2440,11 @@ pub async fn memory_flush_session(
         }
     };
     let embed: Option<Arc<dyn EmbedProvider>> = if settings.memory_embedding_source == "endpoint" {
-        match EmbedEndpoint::new(&settings.base_url, &settings.memory_embedding_model, &api_key) {
+        match EmbedEndpoint::new(
+            &settings.base_url,
+            &settings.memory_embedding_model,
+            &api_key,
+        ) {
             Ok(e) => Some(Arc::new(e)),
             Err(reason) => {
                 tracing::warn!("切换会话时嵌入端点构造失败,本次抽取不建向量:{reason}");
@@ -2852,20 +2847,17 @@ pub(crate) async fn idle_extract_tick(
     db: &Arc<Db>,
     settings: &Settings,
     running: &Arc<Mutex<Option<String>>>,
-    model_factory: &(dyn Fn(
-        &Settings,
-    ) -> Option<(
-        Arc<dyn ModelProvider>,
-        Option<Arc<dyn EmbedProvider>>,
-    )> + Send
-              + Sync),
+    model_factory: &(
+         dyn Fn(&Settings) -> Option<(Arc<dyn ModelProvider>, Option<Arc<dyn EmbedProvider>>)>
+             + Send
+             + Sync
+     ),
     locks: &ExtractLocks,
 ) -> usize {
     if !settings.memory_enabled || settings.memory_idle_extract_minutes == 0 {
         return 0;
     }
-    let idle_before =
-        Db::now_ms() - settings.memory_idle_extract_minutes as i64 * 60 * 1_000;
+    let idle_before = Db::now_ms() - settings.memory_idle_extract_minutes as i64 * 60 * 1_000;
     let reader = db.clone();
     let due = match blocking(move || {
         reader
@@ -2905,7 +2897,9 @@ pub(crate) async fn idle_extract_tick(
         let (model, embed) = built.as_ref().expect("上一行刚保证它有值");
         // 每个会话一条独立令牌:后台抽取不该被用户按下的「停止」波及(那是前台 turn 的令牌)。
         let cancel = CancellationToken::new();
-        match extract_session_memories(db, &sid, &**model, &memory, embed.clone(), locks, &cancel).await {
+        match extract_session_memories(db, &sid, &**model, &memory, embed.clone(), locks, &cancel)
+            .await
+        {
             Ok(_) => processed += 1,
             Err(reason) => {
                 tracing::warn!("会话 {sid} 的空闲记忆抽取失败,游标保持原位:{reason}");
@@ -2955,7 +2949,11 @@ fn build_idle_model(
         }
     };
     let embed: Option<Arc<dyn EmbedProvider>> = if settings.memory_embedding_source == "endpoint" {
-        match EmbedEndpoint::new(&settings.base_url, &settings.memory_embedding_model, &api_key) {
+        match EmbedEndpoint::new(
+            &settings.base_url,
+            &settings.memory_embedding_model,
+            &api_key,
+        ) {
             Ok(e) => Some(Arc::new(e)),
             Err(reason) => {
                 tracing::warn!("空闲记忆抽取:嵌入端点构造失败,本次不建向量:{reason}");
@@ -4635,8 +4633,10 @@ mod tests {
         seed(&f.db, &sid, &long_history());
         // 两条**不同键**的候选:同键会走合并(夹具没配合并支),只剩一条。
         let model = FakeModel::extracting(
-            &[r#"[{"kind":"fact","subject":"用户","predicate":"住在","object":"上海","body":"用户搬到上海了","confidence":0.95},
-                 {"kind":"preference","subject":"用户","predicate":"偏好","object":"简洁","body":"用户喜欢简洁回答","confidence":0.9}]"#],
+            &[
+                r#"[{"kind":"fact","subject":"用户","predicate":"住在","object":"上海","body":"用户搬到上海了","confidence":0.95},
+                 {"kind":"preference","subject":"用户","predicate":"偏好","object":"简洁","body":"用户喜欢简洁回答","confidence":0.9}]"#,
+            ],
             &["好的"],
         );
         let rec = Arc::new(Recorded::default());
@@ -4679,7 +4679,8 @@ mod tests {
             .position(|t| *t == "memory_saved")
             .unwrap_or_else(|| panic!("记住了两条却没有 memory_saved:{tags:?}"));
         assert_eq!(
-            tags[saved_at - 1], "context_compacted",
+            tags[saved_at - 1],
+            "context_compacted",
             "先说忘了多少,再说记住了多少:{tags:?}"
         );
         assert!(
@@ -4733,8 +4734,7 @@ mod tests {
         .unwrap();
         sink.flush();
         assert!(
-            !rec
-                .frames()
+            !rec.frames()
                 .iter()
                 .any(|e| matches!(e, AgentEvent::MemorySaved { .. })),
             "零条时不许发 MemorySaved"
@@ -4944,7 +4944,17 @@ mod tests {
         // 临时值必须落成 let:join! 的两个 future 都借它,语句结束就失效。
         let locks = ExtractLocks::default();
         let (got, _) = tokio::join!(
-            compact_before_turn(&f.db, &sid, &*model, &builder, before.clone(), &memory, None, &locks, &cancel),
+            compact_before_turn(
+                &f.db,
+                &sid,
+                &*model,
+                &builder,
+                before.clone(),
+                &memory,
+                None,
+                &locks,
+                &cancel
+            ),
             async {
                 while !ready.load(Ordering::SeqCst) {
                     tokio::task::yield_now().await;
@@ -5154,9 +5164,7 @@ mod tests {
 
     // ==== 长期记忆:压缩钩子的抽取/合并/画像(T4)====
 
-    use crate::agent::memory::{
-        CONSOLIDATE_INSTRUCTION, EXTRACT_INSTRUCTION, PROFILE_INSTRUCTION,
-    };
+    use crate::agent::memory::{CONSOLIDATE_INSTRUCTION, EXTRACT_INSTRUCTION, PROFILE_INSTRUCTION};
     use crate::store::memory::NewMemory;
 
     fn fact_candidate(object: &str, body: &str) -> String {
@@ -5166,7 +5174,9 @@ mod tests {
     }
 
     fn profile_candidate(body: &str) -> String {
-        format!(r#"{{"kind":"profile","subject":null,"predicate":null,"object":null,"body":"{body}","confidence":0.9}}"#)
+        format!(
+            r#"{{"kind":"profile","subject":null,"predicate":null,"object":null,"body":"{body}","confidence":0.9}}"#
+        )
     }
 
     /// 抽取产物真的落了库,而且输入逐字等于被删的那段(R57 同款取证)。
@@ -5270,7 +5280,17 @@ mod tests {
         // 临时值必须落成 let:join! 的两个 future 都借它,语句结束就失效。
         let locks = ExtractLocks::default();
         let (got, _) = tokio::join!(
-            compact_before_turn(&f.db, &sid, &*model, &builder, before.clone(), &memory, None, &locks, &cancel),
+            compact_before_turn(
+                &f.db,
+                &sid,
+                &*model,
+                &builder,
+                before.clone(),
+                &memory,
+                None,
+                &locks,
+                &cancel
+            ),
             async {
                 // 超时护栏:抽取侧永远不被调用时(实现缺失)不许把测试挂死,超时即按停止。
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -5407,9 +5427,8 @@ mod tests {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
         seed(&f.db, &sid, &long_history());
-        let old_id = f
-            .db
-            .add_memory(&NewMemory {
+        let old_id =
+            f.db.add_memory(&NewMemory {
                 session_id: Some(sid.clone()),
                 kind: "fact".into(),
                 subject: Some("用户".into()),
@@ -5463,9 +5482,8 @@ mod tests {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
         seed(&f.db, &sid, &long_history());
-        let old_id = f
-            .db
-            .add_memory(&NewMemory {
+        let old_id =
+            f.db.add_memory(&NewMemory {
                 session_id: Some(sid.clone()),
                 kind: "fact".into(),
                 subject: Some("用户".into()),
@@ -5500,7 +5518,10 @@ mod tests {
         assert_eq!(audit.len(), 1, "强化不添新行");
         assert_eq!(audit[0].id, old_id);
         assert_eq!(audit[0].reinforcements, 1, "同一事实再说一遍必须记一次强度");
-        assert_eq!(audit[0].body, "用户住在北京", "强化不许动正文(改正文是 UPDATE 的事)");
+        assert_eq!(
+            audit[0].body, "用户住在北京",
+            "强化不许动正文(改正文是 UPDATE 的事)"
+        );
         assert!(audit[0].invalid_at.is_none(), "强化不等于失效");
         let calls = model.calls();
         assert_eq!(calls.len(), 3, "摘要 + 抽取 + 合并");
@@ -5517,9 +5538,8 @@ mod tests {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
         seed(&f.db, &sid, &long_history());
-        let old_id = f
-            .db
-            .add_memory(&NewMemory {
+        let old_id =
+            f.db.add_memory(&NewMemory {
                 session_id: Some(sid.clone()),
                 kind: "fact".into(),
                 subject: Some("用户".into()),
@@ -5537,7 +5557,10 @@ mod tests {
                 &[],
             ),
             // 存在的行是 old_id,模型却报了一个不存在的 id(常见于它自己编序号)。
-            &[&format!(r#"{{"action":"REINFORCE","id":{}}}"#, old_id + 999)],
+            &[&format!(
+                r#"{{"action":"REINFORCE","id":{}}}"#,
+                old_id + 999
+            )],
         );
         let (_, event, _) = compact_once(
             &f,
@@ -5566,18 +5589,17 @@ mod tests {
         let f = Fixture::new();
         f.db.set_profile("用户是 Rust 开发者").unwrap();
         for (object, body) in [("北京", "用户住在北京"), ("咖啡", "用户喜欢咖啡")] {
-            f.db
-                .add_memory(&NewMemory {
-                    session_id: None,
-                    kind: "fact".into(),
-                    subject: Some("用户".into()),
-                    predicate: Some("住在".into()),
-                    object: Some(object.into()),
-                    body: body.into(),
-                    confidence: 0.9,
-                    due_at: None,
-                })
-                .unwrap();
+            f.db.add_memory(&NewMemory {
+                session_id: None,
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在".into()),
+                object: Some(object.into()),
+                body: body.into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
         }
 
         let notes =
@@ -5607,12 +5629,14 @@ mod tests {
         );
 
         // 上限砍的是召回与概览,不是画像:cap 收到只够画像时,两条都让路。
-        let tight = memory_notes_for_turn(&f.db, "北京有什么好玩的", None, 5, 20, 24, 60.0).unwrap();
+        let tight =
+            memory_notes_for_turn(&f.db, "北京有什么好玩的", None, 5, 20, 24, 60.0).unwrap();
         assert_eq!(tight.len(), 1, "画像永不因超限丢失");
         assert!(tight[0].starts_with("[用户画像]"));
 
         // k=0 = 召回关闭;画像与概览仍在(概览不依赖召回)。
-        let no_recall = memory_notes_for_turn(&f.db, "北京有什么好玩的", None, 0, 600, 24, 60.0).unwrap();
+        let no_recall =
+            memory_notes_for_turn(&f.db, "北京有什么好玩的", None, 0, 600, 24, 60.0).unwrap();
         assert_eq!(no_recall.len(), 2, "画像 + 概览");
         assert!(no_recall[1].starts_with("[记忆库]"));
 
@@ -5632,26 +5656,29 @@ mod tests {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
         f.db.set_profile("用户是 Rust 开发者").unwrap();
-        f.db
-            .add_memory(&NewMemory {
-                session_id: None,
-                kind: "fact".into(),
-                subject: Some("用户".into()),
-                predicate: Some("住在".into()),
-                object: Some("北京".into()),
-                body: "用户住在北京".into(),
-                confidence: 0.9,
-                due_at: None,
-            })
-            .unwrap();
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "fact".into(),
+            subject: Some("用户".into()),
+            predicate: Some("住在".into()),
+            object: Some("北京".into()),
+            body: "用户住在北京".into(),
+            confidence: 0.9,
+            due_at: None,
+        })
+        .unwrap();
         seed(
             &f.db,
             &sid,
             &[
-                Message::user(vec![ContentBlock::Text { text: "上一轮".into() }]),
+                Message::user(vec![ContentBlock::Text {
+                    text: "上一轮".into(),
+                }]),
                 Message {
                     role: Role::Assistant,
-                    blocks: vec![ContentBlock::Text { text: "上一答".into() }],
+                    blocks: vec![ContentBlock::Text {
+                        text: "上一答".into(),
+                    }],
                 },
             ],
         );
@@ -5748,7 +5775,11 @@ mod tests {
         // 第二次:再来一轮长历史并压缩,模型认出「是同一件事」→ REINFORCE。
         let more: Vec<Message> = (0..40)
             .map(|i| Message {
-                role: if i % 2 == 0 { Role::User } else { Role::Assistant },
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
                 blocks: vec![ContentBlock::Text {
                     text: format!("第二轮历史 {i:0>800}"),
                 }],
@@ -5784,9 +5815,8 @@ mod tests {
         );
 
         // ---- ② 一条很久以前的事:衰减让它排在后面,但绝不消失 ----
-        let old = f
-            .db
-            .add_memory(&NewMemory {
+        let old =
+            f.db.add_memory(&NewMemory {
                 session_id: None,
                 kind: "fact".into(),
                 subject: Some("用户".into()),
@@ -5806,10 +5836,9 @@ mod tests {
             )
             .unwrap();
         }
-        let hits = f
-            .db
-            .search_memories("上海", None, 10, &RecallCfg::default())
-            .unwrap();
+        let hits =
+            f.db.search_memories("上海", None, 10, &RecallCfg::default())
+                .unwrap();
         let ids: Vec<i64> = hits.iter().map(|m| m.id).collect();
         assert!(
             ids.contains(&memory_id) && ids.contains(&old),
@@ -5959,10 +5988,8 @@ mod tests {
             due_at: None,
         })
         .unwrap();
-        let registry = build_production_registry(
-            f.db.clone(),
-            Arc::new(RwLock::new(ShellCatalog::new())),
-        );
+        let registry =
+            build_production_registry(f.db.clone(), Arc::new(RwLock::new(ShellCatalog::new())));
         let out = registry
             .get("memory_search")
             .expect("生产工具表里必须有 memory_search")
@@ -6085,7 +6112,10 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "上一轮抽取的记忆没有回到请求头:{:?}",
-                    head.messages.iter().map(|m| m.text_of()).collect::<Vec<_>>()
+                    head.messages
+                        .iter()
+                        .map(|m| m.text_of())
+                        .collect::<Vec<_>>()
                 )
             });
         assert!(
@@ -6119,7 +6149,11 @@ mod tests {
 
         // ---- 不变量 6:注入是易失的,库里只多本轮两行 ----
         let after = f.db.messages(&sid).unwrap();
-        assert_eq!(after.len(), rows_before_turn + 2, "只多 user + assistant 两行");
+        assert_eq!(
+            after.len(),
+            rows_before_turn + 2,
+            "只多 user + assistant 两行"
+        );
         assert!(
             !after.iter().any(|m| m.role == Role::System
                 && (m.text_of().starts_with("[长期记忆") || m.text_of().starts_with("[用户画像]"))),
@@ -6150,7 +6184,11 @@ mod tests {
             &CancellationToken::new(),
         )
         .await;
-        assert_eq!(f.db.valid_memories().unwrap().len(), 1, "夹具前提:先有一条记忆");
+        assert_eq!(
+            f.db.valid_memories().unwrap().len(),
+            1,
+            "夹具前提:先有一条记忆"
+        );
 
         f.db.delete_session(&sid).unwrap();
 
@@ -6175,18 +6213,17 @@ mod tests {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
         f.db.set_profile("用户是 Rust 开发者").unwrap();
-        f.db
-            .add_memory(&NewMemory {
-                session_id: None,
-                kind: "fact".into(),
-                subject: Some("用户".into()),
-                predicate: Some("住在".into()),
-                object: Some("上海".into()),
-                body: "用户住在上海".into(),
-                confidence: 0.9,
-                due_at: None,
-            })
-            .unwrap();
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "fact".into(),
+            subject: Some("用户".into()),
+            predicate: Some("住在".into()),
+            object: Some("上海".into()),
+            body: "用户住在上海".into(),
+            confidence: 0.9,
+            due_at: None,
+        })
+        .unwrap();
         seed(&f.db, &sid, &long_history());
 
         // 抽取支也配一条真候选:这一轮因此同时覆盖「压缩时新抽出并落库的记忆」与
@@ -6195,7 +6232,9 @@ mod tests {
         // 而本夹具没配合并支的模型答复 —— 那条路归 T4 的专测,这里要的只是「真的落了一条」。
         let model = FakeModel::with_extraction(
             FakeModel::summarizing_and_replying(&["早期要点:搬到了上海"], &["好的"]),
-            &[r#"[{"kind":"fact","subject":"用户","predicate":"常去","object":"杭州","body":"用户也常去杭州","confidence":0.95}]"#],
+            &[
+                r#"[{"kind":"fact","subject":"用户","predicate":"常去","object":"杭州","body":"用户也常去杭州","confidence":0.95}]"#,
+            ],
         );
         let rec = Arc::new(Recorded::default());
         let sink = Arc::new(TauriEmitter::new(rec.clone(), sid.clone()));
@@ -6300,11 +6339,7 @@ mod tests {
         );
         assert!(f.db.valid_memories().unwrap().is_empty(), "零记忆写入");
         assert!(f.db.profile().unwrap().is_empty(), "画像也不许动");
-        assert_eq!(
-            f.db.messages(&sid).unwrap().len(),
-            21,
-            "压缩本体一个字不少"
-        );
+        assert_eq!(f.db.messages(&sid).unwrap().len(), 21, "压缩本体一个字不少");
         assert_eq!(history, f.db.messages(&sid).unwrap());
     }
 
@@ -6314,26 +6349,29 @@ mod tests {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
         f.db.set_profile("用户是 Rust 开发者").unwrap();
-        f.db
-            .add_memory(&NewMemory {
-                session_id: None,
-                kind: "fact".into(),
-                subject: Some("用户".into()),
-                predicate: Some("住在".into()),
-                object: Some("北京".into()),
-                body: "用户住在北京".into(),
-                confidence: 0.9,
-                due_at: None,
-            })
-            .unwrap();
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "fact".into(),
+            subject: Some("用户".into()),
+            predicate: Some("住在".into()),
+            object: Some("北京".into()),
+            body: "用户住在北京".into(),
+            confidence: 0.9,
+            due_at: None,
+        })
+        .unwrap();
         seed(
             &f.db,
             &sid,
             &[
-                Message::user(vec![ContentBlock::Text { text: "上一轮".into() }]),
+                Message::user(vec![ContentBlock::Text {
+                    text: "上一轮".into(),
+                }]),
                 Message {
                     role: Role::Assistant,
-                    blocks: vec![ContentBlock::Text { text: "上一答".into() }],
+                    blocks: vec![ContentBlock::Text {
+                        text: "上一答".into(),
+                    }],
                 },
             ],
         );
@@ -6433,18 +6471,17 @@ mod tests {
             ("出差", "用户去北京出差"),
             ("秋天", "用户喜欢北京的秋天"),
         ] {
-            f.db
-                .add_memory(&NewMemory {
-                    session_id: None,
-                    kind: "fact".into(),
-                    subject: Some("用户".into()),
-                    predicate: Some("住在北京".into()),
-                    object: Some(object.into()),
-                    body: body.into(),
-                    confidence: 0.9,
-                    due_at: None,
-                })
-                .unwrap();
+            f.db.add_memory(&NewMemory {
+                session_id: None,
+                kind: "fact".into(),
+                subject: Some("用户".into()),
+                predicate: Some("住在北京".into()),
+                object: Some(object.into()),
+                body: body.into(),
+                confidence: 0.9,
+                due_at: None,
+            })
+            .unwrap();
         }
     }
 
@@ -6474,7 +6511,8 @@ mod tests {
             .filter(|l| l.starts_with("- "))
             .count();
         assert_eq!(
-            lines, 2,
+            lines,
+            2,
             "recall_k=2 必须生效（默认 5 会是三条），实得:{}",
             recall.text_of()
         );
@@ -6523,10 +6561,16 @@ mod tests {
         assert_eq!(c.prospective_window_hours, 24);
         // T12:两个节奏旋钮也必须在默认值上对齐 —— 这一对是「同一条线」在默认值层面的证明:
         // `Send_message` 与 `MemoryTurnCfg::default` 任何一侧偷偷写死别的数,这里当场红。
-        assert_eq!(c.prospective_window_hours, s.memory_prospective_window_hours);
+        assert_eq!(
+            c.prospective_window_hours,
+            s.memory_prospective_window_hours
+        );
         assert_eq!(c.fact_half_life_days, s.memory_decay_half_life_days as f64);
         // T6 两键:布尔是 source=="endpoint" 的现算形态;模型名逐字透传。
-        assert_eq!(c.embedding_endpoint, s.memory_embedding_source == "endpoint");
+        assert_eq!(
+            c.embedding_endpoint,
+            s.memory_embedding_source == "endpoint"
+        );
         assert_eq!(c.embedding_model, s.memory_embedding_model);
         // source 归一后只有两种取值,布尔与字符串的换算因此是精确的(没有第三态可漏)。
         assert_eq!(s.memory_embedding_source, "endpoint");
@@ -6546,7 +6590,10 @@ mod tests {
         };
         let c = memory_turn_cfg(&s);
         assert_eq!(c.fact_half_life_days, 7.0, "半衰期必须原样转成 f64");
-        assert_eq!(c.prospective_window_hours, 72, "待办窗口必须读设置,不许写死 24");
+        assert_eq!(
+            c.prospective_window_hours, 72,
+            "待办窗口必须读设置,不许写死 24"
+        );
         // 其余键不许被这次转换顺手改掉(一个装配函数改两项,别的项必须原样)。
         assert_eq!(c.recall_k, s.memory_recall_k as usize);
         assert_eq!(c.note_token_cap, s.memory_note_token_cap as usize);
@@ -6578,9 +6625,8 @@ mod tests {
                 due_at: None,
             })
             .unwrap();
-            let old = f
-                .db
-                .add_memory(&NewMemory {
+            let old =
+                f.db.add_memory(&NewMemory {
                     session_id: None,
                     kind: "fact".into(),
                     subject: Some("用户".into()),
@@ -6644,10 +6690,7 @@ mod tests {
             !recall.contains("朝阳区"),
             "半衰期 60 天 ⇒ 900 天掉到下限,更相关的旧行必须沉到新的后面:{recall}"
         );
-        assert!(
-            recall.contains("用户住在北京"),
-            "新的那条必须在:{recall}"
-        );
+        assert!(recall.contains("用户住在北京"), "新的那条必须在:{recall}");
     }
 
     // ==== T6:嵌入端点客户端 + 混合召回(读/写两条路径) ====
@@ -6668,7 +6711,12 @@ mod tests {
             Ok(texts
                 .iter()
                 .map(|t| {
-                    (if t.contains(self.keyword) { self.hit } else { self.miss }).to_vec()
+                    (if t.contains(self.keyword) {
+                        self.hit
+                    } else {
+                        self.miss
+                    })
+                    .to_vec()
                 })
                 .collect())
         }
@@ -6692,21 +6740,19 @@ mod tests {
     async fn a_fake_embedder_reranks_the_recall_head_by_hybrid_score() {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
-        f.db
-            .add_memory(&NewMemory {
-                session_id: None,
-                kind: "fact".into(),
-                subject: Some("用户".into()),
-                predicate: Some("住在".into()),
-                object: Some("北京".into()),
-                body: "用户住在北京".into(),
-                confidence: 0.9,
-                due_at: None,
-            })
-            .unwrap();
-        let semantic = f
-            .db
-            .add_memory(&NewMemory {
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "fact".into(),
+            subject: Some("用户".into()),
+            predicate: Some("住在".into()),
+            object: Some("北京".into()),
+            body: "用户住在北京".into(),
+            confidence: 0.9,
+            due_at: None,
+        })
+        .unwrap();
+        let semantic =
+            f.db.add_memory(&NewMemory {
                 session_id: None,
                 kind: "fact".into(),
                 subject: None,
@@ -6764,7 +6810,10 @@ mod tests {
             .into_iter()
             .find(|m| m.text_of().starts_with("[长期记忆"))
             .expect("带嵌入的查询必须召回出结果");
-        let beijing = recall.text_of().find("用户住在北京").expect("gram 命中的行必须在");
+        let beijing = recall
+            .text_of()
+            .find("用户住在北京")
+            .expect("gram 命中的行必须在");
         let dudu = recall.text_of().find("帝都日常").expect("向量行必须进召回");
         assert!(
             dudu < beijing,
@@ -6797,8 +6846,12 @@ mod tests {
     async fn a_failing_query_embed_degrades_to_keyword_recall_without_blocking() {
         let f = Fixture::new();
         seed_beijing_memories(&f);
-        let calls = run_one_memory_turn(&f, MemoryTurnCfg::default(), Some(Arc::new(FailingEmbedder)))
-            .await;
+        let calls = run_one_memory_turn(
+            &f,
+            MemoryTurnCfg::default(),
+            Some(Arc::new(FailingEmbedder)),
+        )
+        .await;
         let recall = calls[0]
             .messages
             .iter()
@@ -6905,7 +6958,9 @@ mod tests {
             .unwrap();
         drop(c);
         assert!(blob.is_none(), "失败不许写出半截向量");
-        let hits = f.db.search_memories("上海", None, 10, &RecallCfg::default()).unwrap();
+        let hits =
+            f.db.search_memories("上海", None, 10, &RecallCfg::default())
+                .unwrap();
         assert_eq!(hits.len(), 1, "关键词召回照常工作");
     }
 
@@ -6915,9 +6970,8 @@ mod tests {
     #[test]
     fn the_memory_view_keeps_the_row_shape_and_marks_validity() {
         let f = Fixture::new();
-        let dead = f
-            .db
-            .add_memory(&NewMemory {
+        let dead =
+            f.db.add_memory(&NewMemory {
                 session_id: Some("s1".into()),
                 kind: "fact".into(),
                 subject: Some("用户".into()),
@@ -6928,27 +6982,25 @@ mod tests {
                 due_at: None,
             })
             .unwrap();
-        f.db
-            .add_memory(&NewMemory {
-                session_id: None,
-                kind: "preference".into(),
-                subject: None,
-                predicate: None,
-                object: None,
-                body: "用户喜欢咖啡".into(),
-                confidence: 0.9,
-                due_at: None,
-            })
-            .unwrap();
+        f.db.add_memory(&NewMemory {
+            session_id: None,
+            kind: "preference".into(),
+            subject: None,
+            predicate: None,
+            object: None,
+            body: "用户喜欢咖啡".into(),
+            confidence: 0.9,
+            due_at: None,
+        })
+        .unwrap();
         f.db.invalidate_memory(dead).unwrap();
 
-        let views: Vec<MemoryView> = f
-            .db
-            .all_memories()
-            .unwrap()
-            .into_iter()
-            .map(MemoryView::from)
-            .collect();
+        let views: Vec<MemoryView> =
+            f.db.all_memories()
+                .unwrap()
+                .into_iter()
+                .map(MemoryView::from)
+                .collect();
         assert_eq!(views.len(), 2);
         let by_id: std::collections::HashMap<i64, &MemoryView> =
             views.iter().map(|v| (v.id, v)).collect();
@@ -6995,9 +7047,8 @@ mod tests {
         let f = Fixture::new();
         const DAY_MS: i64 = 86_400_000;
         let overdue = Db::now_ms() - DAY_MS;
-        let id = f
-            .db
-            .add_memory(&NewMemory {
+        let id =
+            f.db.add_memory(&NewMemory {
                 session_id: None,
                 kind: "prospective".into(),
                 subject: Some("用户".into()),
@@ -7010,9 +7061,8 @@ mod tests {
             .unwrap();
         f.db.reinforce_memory(id).unwrap();
         f.db.reinforce_memory(id).unwrap();
-        let up = f
-            .db
-            .add_memory(&NewMemory {
+        let up =
+            f.db.add_memory(&NewMemory {
                 session_id: None,
                 kind: "prospective".into(),
                 subject: Some("用户".into()),
@@ -7023,9 +7073,8 @@ mod tests {
                 due_at: Some(Db::now_ms() + DAY_MS),
             })
             .unwrap();
-        let fact = f
-            .db
-            .add_memory(&NewMemory {
+        let fact =
+            f.db.add_memory(&NewMemory {
                 session_id: None,
                 kind: "fact".into(),
                 subject: None,
@@ -7037,13 +7086,12 @@ mod tests {
             })
             .unwrap();
 
-        let views: std::collections::HashMap<i64, MemoryView> = f
-            .db
-            .all_memories()
-            .unwrap()
-            .into_iter()
-            .map(|r| (r.id, MemoryView::from(r)))
-            .collect();
+        let views: std::collections::HashMap<i64, MemoryView> =
+            f.db.all_memories()
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, MemoryView::from(r)))
+                .collect();
         let v = &views[&id];
         assert_eq!(v.reinforcements, 2, "确认次数必须原样出现在视图里");
         assert_eq!(v.due_at, Some(overdue), "到期时刻原样透传");
@@ -7178,7 +7226,11 @@ mod tests {
         let history = vec![Message::user(vec![ContentBlock::Text { text: long }])];
         let got = recall_query(&history, "那它呢");
         let (prior, current) = got.split_once('\n').expect("换行分隔");
-        assert_eq!(prior.chars().count(), RECALL_QUERY_PRIOR_CHARS, "截到 200 字符");
+        assert_eq!(
+            prior.chars().count(),
+            RECALL_QUERY_PRIOR_CHARS,
+            "截到 200 字符"
+        );
         assert_eq!(current, "那它呢");
         assert_eq!(RECALL_QUERY_PRIOR_CHARS, 200);
     }
@@ -7289,8 +7341,7 @@ mod tests {
         // 第一轮:把「我在上海工作」写进历史(压缩后历史里它就是上一轮)。
         run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "我在上海工作").await;
         // 第二轮:只有指代词。
-        let calls =
-            run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "那它呢").await;
+        let calls = run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "那它呢").await;
         assert_eq!(calls.len(), 2, "短历史 ⇒ 每轮只有回答一次调用");
 
         let recall = head_note(&calls[1], "[长期记忆")
@@ -7322,8 +7373,7 @@ mod tests {
             "注入之后必须立刻标记 notified_at"
         );
 
-        let calls =
-            run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "又一句").await;
+        let calls = run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "又一句").await;
         assert!(
             head_note(&calls[1], "[待办提醒]").is_none(),
             "提醒过的不许每轮重复:notified_at 是唯一闸门"
@@ -7336,9 +7386,7 @@ mod tests {
     async fn at_most_five_due_prospectives_are_reminded_and_the_rest_wait_for_the_next_turn() {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
-        let bodies = [
-            "待办一", "待办二", "待办三", "待办四", "待办五", "待办六",
-        ];
+        let bodies = ["待办一", "待办二", "待办三", "待办四", "待办五", "待办六"];
         for (i, body) in bodies.iter().enumerate() {
             seed_prospective(&f, body, i as i64 + 1);
         }
@@ -7353,23 +7401,20 @@ mod tests {
             !due.contains("待办六"),
             "第 6 条这一轮不许提醒(否则 5 条上限没有意义):{due}"
         );
-        let notified: Vec<bool> = f
-            .db
-            .all_memories()
-            .unwrap()
-            .iter()
-            .map(|m| m.notified_at.is_some())
-            .collect();
+        let notified: Vec<bool> =
+            f.db.all_memories()
+                .unwrap()
+                .iter()
+                .map(|m| m.notified_at.is_some())
+                .collect();
         assert_eq!(
             notified,
             vec![true, true, true, true, true, false],
             "只标记真正注入过的那 5 条"
         );
 
-        let calls =
-            run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "继续").await;
-        let due = head_note(&calls[1], "[待办提醒]")
-            .expect("上一轮留下的第 6 条必须在下一轮提醒");
+        let calls = run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "继续").await;
+        let due = head_note(&calls[1], "[待办提醒]").expect("上一轮留下的第 6 条必须在下一轮提醒");
         assert!(due.contains("待办六"), "轮到第 6 条了:{due}");
         for body in &bodies[..5] {
             assert!(!due.contains(body), "前 5 条已经提醒过,不许再来一次:{due}");
@@ -7410,11 +7455,7 @@ mod tests {
     #[test]
     fn overview_note_counts_valid_memories_by_kind_with_chinese_labels() {
         let f = Fixture::new();
-        assert_eq!(
-            overview_note(&f.db).unwrap(),
-            None,
-            "没有记忆就不注入概览"
-        );
+        assert_eq!(overview_note(&f.db).unwrap(), None, "没有记忆就不注入概览");
         for kind in ["fact", "fact", "fact", "preference", "preference"] {
             f.db.add_memory(&NewMemory {
                 session_id: None,
@@ -7459,10 +7500,7 @@ mod tests {
         let emodel = FakeModel::build(&[], &["好的"]);
         let calls =
             run_memory_turn(&empty, &esid, &emodel, MemoryTurnCfg::default(), "今天天气").await;
-        assert!(
-            head_note(&calls[0], "[记忆库]").is_none(),
-            "空库不注入概览"
-        );
+        assert!(head_note(&calls[0], "[记忆库]").is_none(), "空库不注入概览");
 
         // 有记忆:3 条事实 + 2 条偏好,概览条数必须对得上。
         let f = Fixture::new();
@@ -7487,7 +7525,10 @@ mod tests {
             overview.contains("你有 5 条长期记忆(事实 3、偏好 2)"),
             "概览条数与分布必须正确:{overview}"
         );
-        assert!(overview.contains("memory_search"), "概览要告诉模型去查:{overview}");
+        assert!(
+            overview.contains("memory_search"),
+            "概览要告诉模型去查:{overview}"
+        );
     }
 
     /// 机制顺序(硬性):待办 → 画像 → 召回 → 概览 → 历史摘要。一条测试同时钉住
@@ -7527,7 +7568,14 @@ mod tests {
             ],
         );
         let model = FakeModel::build(&[], &["好的"]);
-        let calls = run_memory_turn(&f, &sid, &model, MemoryTurnCfg::default(), "北京有什么好玩的").await;
+        let calls = run_memory_turn(
+            &f,
+            &sid,
+            &model,
+            MemoryTurnCfg::default(),
+            "北京有什么好玩的",
+        )
+        .await;
 
         let msgs = &calls[0].messages;
         let index_of = |prefix: &str| {
@@ -7540,7 +7588,10 @@ mod tests {
         let recall = index_of("[长期记忆");
         let overview = index_of("[记忆库]");
         let summary = index_of("早期对话摘要：");
-        assert!(due < profile, "待办必须最先被看到:due={due} profile={profile}");
+        assert!(
+            due < profile,
+            "待办必须最先被看到:due={due} profile={profile}"
+        );
         assert!(profile < recall, "画像是常驻背景,排在召回之前");
         assert!(recall < overview, "概览是最后一条记忆备注");
         assert!(
@@ -8431,13 +8482,9 @@ mod tests {
     async fn the_idle_extraction_count_excludes_the_profile_upsert() {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
-        f.db.append_message(&sid, &user_says("我在学日语"))
-            .unwrap();
+        f.db.append_message(&sid, &user_says("我在学日语")).unwrap();
         let model = FakeModel::with_profile(
-            FakeModel::extracting(
-                &[&format!("[{}]", profile_candidate("用户在学日语"))],
-                &[],
-            ),
+            FakeModel::extracting(&[&format!("[{}]", profile_candidate("用户在学日语"))], &[]),
             &["用户在学日语"],
         );
         let changed = extract_session_memories(
@@ -8571,17 +8618,15 @@ mod tests {
             confidence: 0.95,
             due_at: None,
         };
-        let beijing = f
-            .db
-            .apply_memories_and_advance_cursor(
+        let beijing =
+            f.db.apply_memories_and_advance_cursor(
                 &sid,
                 &[MemoryWrite::Add(add("住在", "北京", "用户住在北京"))],
                 0,
             )
             .unwrap()[0];
-        let other = f
-            .db
-            .apply_memories_and_advance_cursor(
+        let other =
+            f.db.apply_memories_and_advance_cursor(
                 &sid,
                 &[MemoryWrite::Add(add("喜欢", "咖啡", "用户喜欢咖啡"))],
                 0,
@@ -8641,9 +8686,8 @@ mod tests {
     async fn duplicate_invalidate_for_one_id_is_idempotent() {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
-        let id = f
-            .db
-            .apply_memories_and_advance_cursor(
+        let id =
+            f.db.apply_memories_and_advance_cursor(
                 &sid,
                 &[MemoryWrite::Add(NewMemory {
                     session_id: Some(sid.clone()),
@@ -8813,13 +8857,12 @@ mod tests {
 
         f.db.apply_memories_and_advance_cursor(&sid, &writes, 1)
             .unwrap();
-        let row = f
-            .db
-            .valid_memories()
-            .unwrap()
-            .into_iter()
-            .find(|r| r.id == id)
-            .expect("保护行仍然有效");
+        let row =
+            f.db.valid_memories()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == id)
+                .expect("保护行仍然有效");
         assert_eq!(row.reinforcements, 1, "确认计数必须加一");
         assert_eq!(
             row.body, "用户亲手改过的正文",
@@ -8890,7 +8933,10 @@ mod tests {
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             None
         };
-        assert_eq!(idle_extract_tick(&f.db, &settings, &running, &factory, &locks).await, 0);
+        assert_eq!(
+            idle_extract_tick(&f.db, &settings, &running, &factory, &locks).await,
+            0
+        );
         assert_eq!(
             factories.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -8927,7 +8973,10 @@ mod tests {
             Some((fake.clone() as Arc<dyn ModelProvider>, None))
         };
 
-        assert_eq!(idle_extract_tick(&f.db, &settings, &running, &factory, &locks).await, 0);
+        assert_eq!(
+            idle_extract_tick(&f.db, &settings, &running, &factory, &locks).await,
+            0
+        );
         assert_eq!(
             factories.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -8966,7 +9015,8 @@ mod tests {
     async fn a_concurrent_extraction_of_the_same_session_is_dropped_not_queued() {
         let f = Fixture::new();
         let sid = f.db.create_session(DEFAULT_TITLE).unwrap();
-        f.db.append_message(&sid, &user_says("我在上海工作")).unwrap();
+        f.db.append_message(&sid, &user_says("我在上海工作"))
+            .unwrap();
         backdate_session(&f.db, &sid, Db::now_ms() - 60 * 60 * 1_000);
 
         // 先占住这个会话的抽取权(模拟「另一条路径正在抽」)。

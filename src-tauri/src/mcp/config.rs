@@ -764,7 +764,11 @@ mod tests {
             r#"{ "mcpServers": { "ok": {"command":"x"} }, "custom": {"note": "kept"}, "theme": "dark" }"#,
         );
         assert_eq!(c.servers.len(), 1);
-        assert!(c.skipped.is_empty(), "普通未知字段要继续兼容：{:?}", c.skipped);
+        assert!(
+            c.skipped.is_empty(),
+            "普通未知字段要继续兼容：{:?}",
+            c.skipped
+        );
     }
 
     #[test]

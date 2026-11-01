@@ -288,7 +288,9 @@ mod unix_tests {
         }
         if !matches!(child.try_wait(), Ok(Some(_))) {
             // 清扫：SIGKILL 没到组里，用测试自己的 kill 收场再如实上报。
-            let _ = StdCommand::new("kill").args(["-9", &format!("-{pgid}")]).output();
+            let _ = StdCommand::new("kill")
+                .args(["-9", &format!("-{pgid}")])
+                .output();
             let _ = child.wait();
             panic!("drop(job) 之后 sh 未死：SIGKILL 没有投到组 -{pgid} 里");
         }
@@ -303,7 +305,9 @@ mod unix_tests {
         }
         // 请神容易送神难：这里失败说明组回收没带走孙进程，要如实上报（R324）。
         // 测试自己的清扫：别把 sleep 120 留在机器上。
-        let _ = StdCommand::new("kill").args(["-9", &format!("-{pgid}")]).output();
+        let _ = StdCommand::new("kill")
+            .args(["-9", &format!("-{pgid}")])
+            .output();
         panic!("drop(job) 之后组 -{pgid} 仍有活口：进程组回收没有带走整棵树");
     }
 }

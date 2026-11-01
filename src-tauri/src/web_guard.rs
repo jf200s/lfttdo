@@ -24,8 +24,7 @@ pub fn navigation_allowed(url: &url::Url) -> bool {
                 return true;
             }
             // `url` 对 IPv6 的 host_str 会带方括号（`[::1]`），两种形态都认。
-            matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
-                && url.port() == Some(1420)
+            matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") && url.port() == Some(1420)
         }
         _ => false,
     }

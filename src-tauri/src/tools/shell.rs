@@ -27,7 +27,7 @@
 // 回收（T34 设施；mcp/bridge.rs 本就反向引用 tools::registry::ToolError，这个方向的
 // 依赖是既有事实）。
 use crate::agent::types::{Risk, ToolOutput};
-use crate::mcp::process::{create_kill_job, KillOnCloseJob};
+use crate::mcp::process::{KillOnCloseJob, create_kill_job};
 use crate::tools::registry::{Tool, ToolCtx, ToolError, ToolMeta};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -671,8 +671,7 @@ fn compose_output(
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
         }
-        let mut note =
-            "[输出含非 UTF-8 字节，已按替换字符（U+FFFD）转换".to_string();
+        let mut note = "[输出含非 UTF-8 字节，已按替换字符（U+FFFD）转换".to_string();
         if trimmed {
             note.push_str("；替换使文本膨胀，已再按字符截到上限内");
         }
@@ -734,10 +733,11 @@ async fn run_with_job_factory(
     // pid 的时刻。失败就亲手杀掉，不留一个没有兜底的孩子（R323 同一失败策略）。
     // pid 为 None 只可能是「spawn 后立刻被收尸」，此时已无事可回收（bridge.rs 同判读）。
     if let Some(pid) = child.id()
-        && let Err(e) = job.assign(pid) {
-            let _ = child.kill().await;
-            return Err(ToolError::Failed(e));
-        }
+        && let Err(e) = job.assign(pid)
+    {
+        let _ = child.kill().await;
+        return Err(ToolError::Failed(e));
+    }
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -781,8 +781,7 @@ async fn run_with_job_factory(
             stderr,
             status,
         } => {
-            let status =
-                status.map_err(|e| ToolError::Failed(format!("等待命令退出失败：{e}")))?;
+            let status = status.map_err(|e| ToolError::Failed(format!("等待命令退出失败：{e}")))?;
             let exit_line = exit_note(&status);
             let dropped_bytes = dropped.load(Ordering::Relaxed);
             Ok(ToolOutput::text(compose_output(
@@ -876,12 +875,13 @@ impl Tool for ShellTool {
             // 缺省取会话输出目录（生产装配恒有值）；两者都没有就明确报错——
             // 回落到应用进程 cwd 是不可复现的行为，不做。
             None => ctx.write_root.clone().ok_or_else(|| {
-                ToolError::BadInput("没有指定 cwd，且当前会话没有输出目录：请显式给 cwd".to_string())
+                ToolError::BadInput(
+                    "没有指定 cwd，且当前会话没有输出目录：请显式给 cwd".to_string(),
+                )
             })?,
         };
-        let cwd_meta = std::fs::metadata(&cwd).map_err(|e| {
-            ToolError::BadInput(format!("cwd 无法访问: {}: {e}", cwd.display()))
-        })?;
+        let cwd_meta = std::fs::metadata(&cwd)
+            .map_err(|e| ToolError::BadInput(format!("cwd 无法访问: {}: {e}", cwd.display())))?;
         if !cwd_meta.is_dir() {
             return Err(ToolError::BadInput(format!(
                 "cwd 不是目录: {}",
@@ -940,7 +940,14 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "bash", "sh", "zsh", "fish", "git-bash", "pwsh", "powershell", "cmd"
+                "bash",
+                "sh",
+                "zsh",
+                "fish",
+                "git-bash",
+                "pwsh",
+                "powershell",
+                "cmd"
             ],
             "候选表与 spec §5.2 逐项对齐（顺序即展示顺序）"
         );
@@ -987,7 +994,14 @@ mod tests {
         assert_eq!(
             ids,
             [
-                "bash", "sh", "zsh", "fish", "git-bash", "pwsh", "powershell", "cmd"
+                "bash",
+                "sh",
+                "zsh",
+                "fish",
+                "git-bash",
+                "pwsh",
+                "powershell",
+                "cmd"
             ],
             "全部在 ⇒ 8 条按 spec §5.2 展示顺序全出"
         );
@@ -1167,7 +1181,10 @@ mod tests {
         // customs 先于 presets，检测与否不影响命中 —— 沿用真构造即可。
         let c = ShellCatalog::from_parts(vec![custom("bash", "/opt/my/bash")], "");
         let got = c.resolve(Some("bash")).expect("同名自定义必须可解析");
-        assert_eq!(got.program, "/opt/my/bash", "自定义覆盖同名预设（有意语义）");
+        assert_eq!(
+            got.program, "/opt/my/bash",
+            "自定义覆盖同名预设（有意语义）"
+        );
     }
 
     #[test]
@@ -1228,10 +1245,42 @@ mod tests {
     #[test]
     fn validate_custom_rejects_bad_shapes_without_touching_the_filesystem() {
         for (bad, why) in [
-            (ShellProfile { id: "  ".into(), label: String::new(), program: "x".into(), args: vec![] }, "空 id"),
-            (ShellProfile { id: "a".into(), label: String::new(), program: "  ".into(), args: vec![] }, "空 program"),
-            (ShellProfile { id: "a".into(), label: String::new(), program: "x".into(), args: vec!["  ".into()] }, "空参数项"),
-            (ShellProfile { id: "a".into(), label: String::new(), program: "x".into(), args: vec!["-c extra".into()] }, "含空白的参数项"),
+            (
+                ShellProfile {
+                    id: "  ".into(),
+                    label: String::new(),
+                    program: "x".into(),
+                    args: vec![],
+                },
+                "空 id",
+            ),
+            (
+                ShellProfile {
+                    id: "a".into(),
+                    label: String::new(),
+                    program: "  ".into(),
+                    args: vec![],
+                },
+                "空 program",
+            ),
+            (
+                ShellProfile {
+                    id: "a".into(),
+                    label: String::new(),
+                    program: "x".into(),
+                    args: vec!["  ".into()],
+                },
+                "空参数项",
+            ),
+            (
+                ShellProfile {
+                    id: "a".into(),
+                    label: String::new(),
+                    program: "x".into(),
+                    args: vec!["-c extra".into()],
+                },
+                "含空白的参数项",
+            ),
         ] {
             let e = validate_custom(bad).unwrap_err();
             assert!(!e.is_empty(), "{why} 必须给出原因，实得空错误");
@@ -1268,8 +1317,11 @@ mod tests {
         std::fs::set_permissions(&hit, std::fs::Permissions::from_mode(0o755)).unwrap();
         let empty = tempfile::tempdir().unwrap();
 
-        let found = ensure_executable("mysh", &[empty.path().to_path_buf(), dir.path().to_path_buf()])
-            .expect("第二个搜索目录里的命中必须被找到");
+        let found = ensure_executable(
+            "mysh",
+            &[empty.path().to_path_buf(), dir.path().to_path_buf()],
+        )
+        .expect("第二个搜索目录里的命中必须被找到");
         assert_eq!(found, hit);
         std::fs::remove_dir_all(dir).ok();
         std::fs::remove_dir_all(empty).ok();
@@ -1278,8 +1330,8 @@ mod tests {
     #[test]
     fn ensure_executable_reports_misses_fail_closed() {
         let empty = tempfile::tempdir().unwrap();
-        let e = ensure_executable("definitely-not-here", &[empty.path().to_path_buf()])
-            .unwrap_err();
+        let e =
+            ensure_executable("definitely-not-here", &[empty.path().to_path_buf()]).unwrap_err();
         assert!(
             e.contains("definitely-not-here") && e.contains("搜索目录"),
             "错误要点名 program 与搜索范围：{e}"
@@ -1340,7 +1392,11 @@ mod tests {
         assert_eq!(timeout_ms_of(&explicit_null).unwrap(), DEFAULT_TIMEOUT_MS);
 
         let big = json!({"timeout_ms": MAX_TIMEOUT_MS * 10});
-        assert_eq!(timeout_ms_of(&big).unwrap(), MAX_TIMEOUT_MS, "夸大时限按钳位");
+        assert_eq!(
+            timeout_ms_of(&big).unwrap(),
+            MAX_TIMEOUT_MS,
+            "夸大时限按钳位"
+        );
 
         for bad in [
             json!({"timeout_ms": 0}),
@@ -1371,7 +1427,10 @@ mod tests {
                 "{bad} 必须 BadInput，实得 {e:?}"
             );
         }
-        assert_eq!(required_command(&json!({"command": " ls "})).unwrap(), " ls ");
+        assert_eq!(
+            required_command(&json!({"command": " ls "})).unwrap(),
+            " ls "
+        );
     }
 
     // ———————— 入参/前置检查的失败面（形状错误发生在任何 spawn 之前） ————————
@@ -1391,17 +1450,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rejects_bad_shapes_before_spawning() {
-        let tool = ShellTool::new(catalog_with(
-            vec![executable_self_profile("self")],
-            "self",
-        ));
+        let tool = ShellTool::new(catalog_with(vec![executable_self_profile("self")], "self"));
         // 没有 write_root：默认 cwd 落空必须 BadInput，而不是悄悄用进程 cwd。
         let ctx = test_ctx(None);
         for input in [
-            json!({}),                                     // 缺 command
-            json!({"command": "x", "shell_id": "nope"}),   // 未知 shell_id
-            json!({"command": "x", "timeout_ms": 0}),      // 非法超时
-            json!({"command": "x", "cwd": "relative/dir"}),// 相对 cwd
+            json!({}),                                      // 缺 command
+            json!({"command": "x", "shell_id": "nope"}),    // 未知 shell_id
+            json!({"command": "x", "timeout_ms": 0}),       // 非法超时
+            json!({"command": "x", "cwd": "relative/dir"}), // 相对 cwd
         ] {
             let e = tool.execute(input.clone(), &ctx).await.unwrap_err();
             assert!(
@@ -1413,10 +1469,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rejects_a_missing_cwd_as_bad_input() {
-        let tool = ShellTool::new(catalog_with(
-            vec![executable_self_profile("self")],
-            "self",
-        ));
+        let tool = ShellTool::new(catalog_with(vec![executable_self_profile("self")], "self"));
         let ctx = test_ctx(Some(std::env::temp_dir().join("qwen-do-shell-no-such-dir")));
         let e = tool
             .execute(json!({"command": "x", "cwd": "/definitely/not/here"}), &ctx)
@@ -1521,7 +1574,9 @@ mod tests {
                 .expect("必须成功"),
         );
         let out_at = text.find("out-line").expect("stdout 要在：{text:?}");
-        let section_at = text.find("[stderr]").expect("stderr 非空要有 [stderr] 段：{text:?}");
+        let section_at = text
+            .find("[stderr]")
+            .expect("stderr 非空要有 [stderr] 段：{text:?}");
         let err_at = text.find("err-line").expect("stderr 内容要在：{text:?}");
         assert!(
             out_at < section_at && section_at < err_at,
@@ -1594,9 +1649,16 @@ mod tests {
             factory_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             Err("工厂不该被调到".to_string())
         };
-        let e = run_with_job_factory(&factory, &sh_profile(), "echo hi", dir.path(), 1_000, &token)
-            .await
-            .unwrap_err();
+        let e = run_with_job_factory(
+            &factory,
+            &sh_profile(),
+            "echo hi",
+            dir.path(),
+            1_000,
+            &token,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(e, ToolError::Cancelled),
             "spawn 前取消必须 Cancelled，实得 {e:?}"
@@ -1620,9 +1682,16 @@ mod tests {
         let ok_factory = || -> Result<KillOnCloseJob, String> {
             Ok(create_kill_job().expect("unix 支建 job 恒成功"))
         };
-        let e = run_with_job_factory(&ok_factory, &sh_profile(), "sleep 5", dir.path(), 30_000, &token)
-            .await
-            .unwrap_err();
+        let e = run_with_job_factory(
+            &ok_factory,
+            &sh_profile(),
+            "sleep 5",
+            dir.path(),
+            30_000,
+            &token,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(e, ToolError::Cancelled),
             "等待中的取消必须 Cancelled，实得 {e:?}"
@@ -1648,10 +1717,9 @@ mod tests {
         .await
         .unwrap_err();
         match &e {
-            ToolError::Failed(msg) => assert!(
-                msg.contains("进程回收"),
-                "错误要透传工厂的失败原因：{msg}"
-            ),
+            ToolError::Failed(msg) => {
+                assert!(msg.contains("进程回收"), "错误要透传工厂的失败原因：{msg}")
+            }
             other => panic!("工厂失败必须是 Failed，实得 {other:?}"),
         }
         assert!(
@@ -1724,7 +1792,14 @@ mod tests {
             text.len()
         );
         assert!(text.starts_with("aaaa"), "交出的应是产出的前缀");
-        let tail: String = text.chars().rev().take(200).collect::<String>().chars().rev().collect();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(200)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         assert!(
             text.contains("512 KiB"),
             "标记要写明上限（512 KiB）。文本尾部：…{tail}"
@@ -1753,7 +1828,10 @@ mod tests {
                 .await
                 .expect("非 UTF-8 输出不是错误（spec §8.5，与 read_file 的拒绝刻意不同）"),
         );
-        assert!(text.contains('\u{FFFD}'), "无效字节按替换字符转换：{text:?}");
+        assert!(
+            text.contains('\u{FFFD}'),
+            "无效字节按替换字符转换：{text:?}"
+        );
         assert!(text.contains("非 UTF-8"), "尾部要注明转换：{text:?}");
     }
 }

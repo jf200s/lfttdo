@@ -89,7 +89,10 @@ fn parse_embeddings_response(raw: &str, expected: usize) -> Result<Vec<Vec<f32>>
         .iter()
         .enumerate()
         .map(|(pos, item)| {
-            let index = item.get("index").and_then(|i| i.as_i64()).unwrap_or(pos as i64);
+            let index = item
+                .get("index")
+                .and_then(|i| i.as_i64())
+                .unwrap_or(pos as i64);
             let arr = item
                 .get("embedding")
                 .and_then(|e| e.as_array())
@@ -135,7 +138,10 @@ impl EmbedProvider for EmbedEndpoint {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let mut req = self.http.post(&self.url).json(&request_body(&self.model, texts));
+        let mut req = self
+            .http
+            .post(&self.url)
+            .json(&request_body(&self.model, texts));
         // key 为空(本机 ollama 形态,resolve_api_key 对回环放行空 key)不发
         // Authorization:头里带一个空 Bearer 反而可能被严格端点拒掉。
         if !self.api_key.is_empty() {

@@ -76,12 +76,19 @@ pub struct NewMemory {
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemoryWrite {
     Add(NewMemory),
-    UpdateBody { id: i64, body: String },
-    Invalidate { id: i64 },
+    UpdateBody {
+        id: i64,
+        body: String,
+    },
+    Invalidate {
+        id: i64,
+    },
     /// 同一事实再次被确认(措辞不同、内容一致):不覆盖正文,只把强度加一。
     /// 这是「重复接触使记忆变强」的工程对应 —— 三选一的 ADD/UPDATE/INVALIDATE
     /// 只能表达「多一条/改写/否定」,表达不了「同一件事又说了一遍」。
-    Reinforce { id: i64 },
+    Reinforce {
+        id: i64,
+    },
     SetProfile(String),
 }
 
@@ -520,12 +527,14 @@ impl Db {
     /// 画像恒单行:返回正文,从未写过时是空串(空串 = 不注入,消费方据此跳过)。
     pub fn profile(&self) -> Result<String, rusqlite::Error> {
         let c = self.lock();
-        c.query_row("SELECT body FROM memory_profile WHERE id=1", [], |r| r.get(0))
-            .or_else(|e| match e {
-                // 「从没写过」不是错误:画像的空串语义由消费方定义(不注入)。
-                rusqlite::Error::QueryReturnedNoRows => Ok(String::new()),
-                other => Err(other),
-            })
+        c.query_row("SELECT body FROM memory_profile WHERE id=1", [], |r| {
+            r.get(0)
+        })
+        .or_else(|e| match e {
+            // 「从没写过」不是错误:画像的空串语义由消费方定义(不注入)。
+            rusqlite::Error::QueryReturnedNoRows => Ok(String::new()),
+            other => Err(other),
+        })
     }
 
     pub fn set_profile(&self, body: &str) -> Result<(), rusqlite::Error> {
@@ -578,10 +587,7 @@ impl Db {
         };
         let c = self.lock();
         let id = insert_memory_row(&c, &m)?;
-        c.execute(
-            "UPDATE memories SET user_edited=1 WHERE id=?1",
-            params![id],
-        )?;
+        c.execute("UPDATE memories SET user_edited=1 WHERE id=?1", params![id])?;
         Ok(id)
     }
 
@@ -665,7 +671,11 @@ fn messages_for_extraction_on(
     )?;
     let rows = st
         .query_map(
-            params![session_id, after_id, crate::store::db::role_code(&Role::System)],
+            params![
+                session_id,
+                after_id,
+                crate::store::db::role_code(&Role::System)
+            ],
             |r| {
                 let id: i64 = r.get(0)?;
                 let role = crate::store::db::role_from_code(&r.get::<_, String>(1)?, 1)?;
@@ -788,7 +798,10 @@ fn set_profile_row(c: &Connection, body: &str) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-fn apply_memory_writes(c: &Connection, writes: &[MemoryWrite]) -> Result<Vec<i64>, rusqlite::Error> {
+fn apply_memory_writes(
+    c: &Connection,
+    writes: &[MemoryWrite],
+) -> Result<Vec<i64>, rusqlite::Error> {
     let mut added: Vec<i64> = Vec::new();
     for w in writes {
         match w {
@@ -819,11 +832,7 @@ fn apply_memory_writes(c: &Connection, writes: &[MemoryWrite]) -> Result<Vec<i64
 
 /// 模型 UPDATE 的宽松版本：只改**仍然有效**的行；0 行 = 已被别的路径失效/删除，
 /// 记一条日志继续，不返回错误。空正文同样跳过（不许用一次坏候选抹掉正文）。
-fn update_memory_body_lenient(
-    c: &Connection,
-    id: i64,
-    body: &str,
-) -> Result<(), rusqlite::Error> {
+fn update_memory_body_lenient(c: &Connection, id: i64, body: &str) -> Result<(), rusqlite::Error> {
     if body.trim().is_empty() {
         tracing::warn!("记忆 id={id} 的模型更新正文为空,跳过（不覆盖原正文）");
         return Ok(());
@@ -888,7 +897,9 @@ pub fn from_vec(b: &[u8]) -> Option<Vec<f32>> {
         return None;
     }
     Some(
-        b.as_chunks::<4>().0.iter()
+        b.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )
@@ -1070,10 +1081,16 @@ mod tests {
 
         let after = db.valid_memories().unwrap()[0].clone();
         assert_eq!(after.reinforcements, 2);
-        assert_eq!(after.body, before.body, "强化不许改正文(改写是 UPDATE 的事)");
+        assert_eq!(
+            after.body, before.body,
+            "强化不许改正文(改写是 UPDATE 的事)"
+        );
         assert_eq!(after.confidence, before.confidence, "置信度与强度是两个量");
         assert!(after.updated_at >= before.updated_at);
-        assert!(db.reinforce_memory(id + 999).is_err(), "强化不存在的行要报错");
+        assert!(
+            db.reinforce_memory(id + 999).is_err(),
+            "强化不存在的行要报错"
+        );
     }
 
     /// 强化与衰减的**因子本身**(直接测,不经排序)。经排序测有两个陷阱,
@@ -1142,8 +1159,11 @@ mod tests {
         {
             let c = db.lock();
             let now = Db::now_ms();
-            c.execute("UPDATE memories SET valid_from=?1, updated_at=?1", params![now])
-                .unwrap();
+            c.execute(
+                "UPDATE memories SET valid_from=?1, updated_at=?1",
+                params![now],
+            )
+            .unwrap();
         }
         let hits = db.search_memories("住在", None, 10, &cfg_now()).unwrap();
         assert_eq!(hits.len(), 2);
@@ -1161,9 +1181,7 @@ mod tests {
     fn decay_can_flip_the_order_against_a_higher_relevance_old_row() {
         let (_dir, db) = tmpdb();
         let fresh = db.add_memory(&fact("北京", "用户住在北京")).unwrap();
-        let old = db
-            .add_memory(&fact("北京", "用户住在北京朝阳区"))
-            .unwrap();
+        let old = db.add_memory(&fact("北京", "用户住在北京朝阳区")).unwrap();
         {
             let c = db.lock();
             let ancient = Db::now_ms() - 900 * DAY;
@@ -1180,7 +1198,9 @@ mod tests {
         assert!(
             hits[0].id == fresh,
             "旧行的相关性更高(含全部 gram),衰减必须把它压到新的后面;实际前两名 {:?}",
-            hits.iter().map(|m| (m.id, m.body.clone())).collect::<Vec<_>>()
+            hits.iter()
+                .map(|m| (m.id, m.body.clone()))
+                .collect::<Vec<_>>()
         );
         assert_eq!(hits[1].id, old);
     }
@@ -1199,7 +1219,9 @@ mod tests {
             )
             .unwrap();
         }
-        let hits = db.search_memories("用户住在北京", None, 10, &cfg_now()).unwrap();
+        let hits = db
+            .search_memories("用户住在北京", None, 10, &cfg_now())
+            .unwrap();
         assert_eq!(hits.len(), 1, "相关性 > 0 的行不许因为年龄被丢弃");
     }
 
@@ -1207,7 +1229,9 @@ mod tests {
     #[test]
     fn a_prospective_memory_does_not_decay() {
         let (_dir, db) = tmpdb();
-        let todo = db.add_memory(&prospective("下周把材料交给老王", -80)).unwrap();
+        let todo = db
+            .add_memory(&prospective("下周把材料交给老王", -80))
+            .unwrap();
         let normal = db.add_memory(&fact("北京", "下周把材料交给老王")).unwrap();
         {
             let c = db.lock();
@@ -1221,7 +1245,9 @@ mod tests {
             }
         }
         // 相关性相同（同一个 body），待办的衰减因子是 1.0，事实的掉到下限附近。
-        let hits = db.search_memories("下周把材料交给老王", None, 10, &cfg_now()).unwrap();
+        let hits = db
+            .search_memories("下周把材料交给老王", None, 10, &cfg_now())
+            .unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].id, todo, "待办不因年龄下沉");
         assert_eq!(hits[1].id, normal);
@@ -1245,7 +1271,8 @@ mod tests {
             }
         }
         // 先召回一次：两条都会被 touch。
-        db.search_memories("用户住在北京", None, 10, &cfg_now()).unwrap();
+        db.search_memories("用户住在北京", None, 10, &cfg_now())
+            .unwrap();
         let touched = db.all_memories().unwrap();
         assert!(
             touched.iter().all(|m| m.last_accessed.is_some()),
@@ -1285,10 +1312,7 @@ mod tests {
         // 失效的待办不提醒。
         db.invalidate_memory(soon).unwrap();
         assert!(db.due_prospective(now + DAY).unwrap().is_empty());
-        assert!(
-            far > 0,
-            "far 只是不该进窗口，不是被删了（夹具自我说明）"
-        );
+        assert!(far > 0, "far 只是不该进窗口，不是被删了（夹具自我说明）");
     }
 
     /// 概览：按 kind 计有效记忆的条数；失效与画像不计入。
@@ -1351,7 +1375,10 @@ mod tests {
         // spec §8 不变量 7:零信息永不落库 —— 这是「空摘要即 Err」同一条纪律的存储版。
         let (_dir, db) = tmpdb();
         for bad in ["", "   ", "\n\t "] {
-            assert!(db.add_memory(&fact("无", bad)).is_err(), "add({bad:?}) 必须拒绝");
+            assert!(
+                db.add_memory(&fact("无", bad)).is_err(),
+                "add({bad:?}) 必须拒绝"
+            );
         }
         assert!(db.set_profile("  ").is_err());
         let id = db.add_memory(&fact("上海", "用户住在上海")).unwrap();
@@ -1375,7 +1402,9 @@ mod tests {
         assert_eq!(valid.len(), 1);
         assert_eq!(valid[0].body, "用户养了一只猫");
         assert_eq!(
-            db.search_memories("北京", None, 10, &RecallCfg::default()).unwrap().len(),
+            db.search_memories("北京", None, 10, &RecallCfg::default())
+                .unwrap()
+                .len(),
             0,
             "失效记忆不许被召回"
         );
@@ -1407,21 +1436,31 @@ mod tests {
     #[test]
     fn search_ranks_by_gram_overlap_then_recency() {
         let (_dir, db) = tmpdb();
-        db.add_memory(&fact("北京", "用户住在北京,在国企上班")).unwrap(); // id 小,先插
+        db.add_memory(&fact("北京", "用户住在北京,在国企上班"))
+            .unwrap(); // id 小,先插
         db.add_memory(&fact("上海", "用户住在上海")).unwrap(); // id 大,后插
 
         // 「住在上海」与上海句全命中(score=1.0),与北京句只命中「住在」(2/4)
-        let hits = db.search_memories("住在上海", None, 10, &RecallCfg::default()).unwrap();
+        let hits = db
+            .search_memories("住在上海", None, 10, &RecallCfg::default())
+            .unwrap();
         assert_eq!(hits.len(), 2, "部分重叠也要出现,只是排后");
         assert_eq!(hits[0].body, "用户住在上海");
         assert_eq!(hits[1].body, "用户住在北京,在国企上班");
 
         // 同分(两边都含「住在」)→ 按 updated_at/id 倒序 → 后插的上海句在前
-        let tie = db.search_memories("住在", None, 10, &RecallCfg::default()).unwrap();
+        let tie = db
+            .search_memories("住在", None, 10, &RecallCfg::default())
+            .unwrap();
         assert_eq!(tie[0].body, "用户住在上海");
 
         // k 截断
-        assert_eq!(db.search_memories("住在", None, 1, &RecallCfg::default()).unwrap().len(), 1);
+        assert_eq!(
+            db.search_memories("住在", None, 1, &RecallCfg::default())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1429,17 +1468,35 @@ mod tests {
         let (_dir, db) = tmpdb();
         db.add_memory(&fact("北京", "用户住在北京")).unwrap();
         for blank in ["", "  ", "\n"] {
-            assert!(db.search_memories(blank, None, 10, &RecallCfg::default()).unwrap().is_empty());
+            assert!(
+                db.search_memories(blank, None, 10, &RecallCfg::default())
+                    .unwrap()
+                    .is_empty()
+            );
         }
-        assert!(db.search_memories("用户", None, 0, &RecallCfg::default()).unwrap().is_empty());
         assert!(
-            db.search_memories("量子力学", None, 10, &RecallCfg::default()).unwrap().is_empty(),
+            db.search_memories("用户", None, 0, &RecallCfg::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.search_memories("量子力学", None, 10, &RecallCfg::default())
+                .unwrap()
+                .is_empty(),
             "零重叠不入结果 —— 没有命中就不注入"
         );
         // 带向量也一样:空白 query 连向量路径都不召回 —— 空白文本没有可嵌的语义,
         // query_vec 不是「绕过 gram 守卫」的后门。
-        assert!(db.search_memories("", Some(&[1.0, 0.0]), 10, &RecallCfg::default()).unwrap().is_empty());
-        assert!(db.search_memories("量子力学", Some(&[1.0, 0.0]), 10, &RecallCfg::default()).unwrap().is_empty());
+        assert!(
+            db.search_memories("", Some(&[1.0, 0.0]), 10, &RecallCfg::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.search_memories("量子力学", Some(&[1.0, 0.0]), 10, &RecallCfg::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ==== T6:嵌入 BLOB 与混合召回(裁定 1:f32 小端 LE 裸存,Rust 侧余弦) ====
@@ -1476,12 +1533,23 @@ mod tests {
         {
             let c = db.lock();
             let blob: Vec<u8> = c
-                .query_row("SELECT embedding FROM memories WHERE id=?1", params![id], |r| r.get(0))
+                .query_row(
+                    "SELECT embedding FROM memories WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
                 .unwrap();
             assert_eq!(from_vec(&blob).unwrap(), vec![1.0f32, 0.0]);
         }
         // 查询同向 → 余弦 1: gram 只有一半命中(「住在」),向量路径把它顶到满分档。
-        let hits = db.search_memories("住在,还有别的事", Some(&[1.0, 0.0]), 10, &RecallCfg::default()).unwrap();
+        let hits = db
+            .search_memories(
+                "住在,还有别的事",
+                Some(&[1.0, 0.0]),
+                10,
+                &RecallCfg::default(),
+            )
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].body, "用户住在北京");
         // 对不存在的行写向量是错误(affected=0):静默成功会谎称「向量已写」,
@@ -1501,9 +1569,16 @@ mod tests {
         db.set_memory_embedding(beijing, &[1.0, 0.0]).unwrap();
 
         // 查询「住在」:两行 gram 都是 1.0,平局时(无向量路径)新插的上海在前。
-        assert_eq!(db.search_memories("住在", None, 10, &RecallCfg::default()).unwrap()[0].body, "用户住在上海");
+        assert_eq!(
+            db.search_memories("住在", None, 10, &RecallCfg::default())
+                .unwrap()[0]
+                .body,
+            "用户住在上海"
+        );
         // 带同向查询向量:北京 0.6*1 + 0.4*1 = 1.0,上海(NULL)0.4 → 北京胜出。
-        let hits = db.search_memories("住在", Some(&[1.0, 0.0]), 10, &RecallCfg::default()).unwrap();
+        let hits = db
+            .search_memories("住在", Some(&[1.0, 0.0]), 10, &RecallCfg::default())
+            .unwrap();
         assert_eq!(hits.len(), 2, "NULL 向量行靠 gram 留场,不许被丢");
         assert_eq!(hits[0].body, "用户住在北京", "同 gram 分下向量行必须胜出");
         assert_eq!(hits[1].body, "用户住在上海");
@@ -1521,7 +1596,9 @@ mod tests {
         // 查询「住在北京」的向量与这条记忆的向量完全反向(cos = -1)。
         db.set_memory_embedding(beijing, &[-1.0, 0.0]).unwrap();
 
-        let hits = db.search_memories("住在北京", Some(&[1.0, 0.0]), 10, &RecallCfg::default()).unwrap();
+        let hits = db
+            .search_memories("住在北京", Some(&[1.0, 0.0]), 10, &RecallCfg::default())
+            .unwrap();
         assert_eq!(
             hits.len(),
             1,
@@ -1542,7 +1619,9 @@ mod tests {
         db.set_memory_embedding(beijing, &[1.0, 2.0, 3.0]).unwrap(); // 3 维,查询 2 维
 
         // gram 平局 + 北京向量作废 → 纯 gram 平局 → updated_at/id 倒序 → 上海在前
-        let hits = db.search_memories("住在", Some(&[1.0, 0.0]), 10, &RecallCfg::default()).unwrap();
+        let hits = db
+            .search_memories("住在", Some(&[1.0, 0.0]), 10, &RecallCfg::default())
+            .unwrap();
         assert_eq!(hits.len(), 2, "降级是向量分记 0,不是把行丢掉");
         assert_eq!(hits[0].body, "用户住在上海", "维度不匹配的向量必须完全作废");
         assert_eq!(hits[1].body, "用户住在北京");
@@ -1550,7 +1629,9 @@ mod tests {
         // 零向量安全:余弦的分母为 0 → 记 0,不是 NaN —— NaN 会让 retain 的
         // `> 0.0` 判假把行**静默丢掉**,「零向量行消失」比「排序不对」更难查。
         db.set_memory_embedding(beijing, &[0.0, 0.0]).unwrap();
-        let hits = db.search_memories("住在", Some(&[1.0, 0.0]), 10, &RecallCfg::default()).unwrap();
+        let hits = db
+            .search_memories("住在", Some(&[1.0, 0.0]), 10, &RecallCfg::default())
+            .unwrap();
         assert_eq!(hits.len(), 2, "零向量行不许因 NaN 被丢");
         assert_eq!(hits[0].body, "用户住在上海");
         assert_eq!(hits[1].body, "用户住在北京");
@@ -1609,7 +1690,10 @@ mod tests {
                 "摘要",
                 &[
                     MemoryWrite::Add(fact("上海", "用户搬到上海")),
-                    MemoryWrite::UpdateBody { id: old, body: "用户住回北京".into() },
+                    MemoryWrite::UpdateBody {
+                        id: old,
+                        body: "用户住回北京".into(),
+                    },
                     MemoryWrite::Invalidate { id: old },
                     MemoryWrite::SetProfile("新画像".into()),
                 ],
@@ -1633,7 +1717,9 @@ mod tests {
             dropped: 0,
             source: vec![],
         };
-        let added = db.compact_session_with_memories(&sid, &plan2, "另一条摘要", &[], None).unwrap();
+        let added = db
+            .compact_session_with_memories(&sid, &plan2, "另一条摘要", &[], None)
+            .unwrap();
         assert!(added.is_empty());
     }
 
@@ -1670,8 +1756,14 @@ mod tests {
         let (_dir, db) = tmpdb();
         let id = db.add_memory(&fact("北京", "用户住在北京")).unwrap();
         db.update_memory_body(id, "用户搬到上海了").unwrap();
-        assert!(db.search_memories("北京", None, 10, &RecallCfg::default()).unwrap().is_empty());
-        let hits = db.search_memories("上海", None, 10, &RecallCfg::default()).unwrap();
+        assert!(
+            db.search_memories("北京", None, 10, &RecallCfg::default())
+                .unwrap()
+                .is_empty()
+        );
+        let hits = db
+            .search_memories("上海", None, 10, &RecallCfg::default())
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].body, "用户搬到上海了");
         assert!(
@@ -1792,7 +1884,8 @@ mod tests {
         let max_id = db.max_message_id(&sid).unwrap();
         assert_eq!(max_id, 3);
 
-        db.apply_memories_and_advance_cursor(&sid, &[], max_id).unwrap();
+        db.apply_memories_and_advance_cursor(&sid, &[], max_id)
+            .unwrap();
         assert_eq!(db.memory_cursor(&sid).unwrap(), 3);
 
         // 倒退尝试必须被忽略:并发路径(空闲 worker 与压缩)谁先提交都不该回退,
@@ -1816,10 +1909,15 @@ mod tests {
         let (_dir, db) = tmpdb();
         let sid = db.create_session("新对话").unwrap();
         db.append_message(&sid, &u("第一句用户的话")).unwrap();
-        db.append_message(&sid, &Message::system_note("早期对话摘要:压缩过")).unwrap();
+        db.append_message(&sid, &Message::system_note("早期对话摘要:压缩过"))
+            .unwrap();
         db.append_message(
             &sid,
-            &Message::tool("c1", crate::agent::types::ToolOutput::text("工具输出"), false),
+            &Message::tool(
+                "c1",
+                crate::agent::types::ToolOutput::text("工具输出"),
+                false,
+            ),
         )
         .unwrap();
         db.append_message(
@@ -1869,8 +1967,13 @@ mod tests {
 
         // 抽过了就不再有它。
         let max = db.max_message_id(&idle).unwrap();
-        db.apply_memories_and_advance_cursor(&idle, &[], max).unwrap();
-        assert!(db.sessions_needing_extraction(now - 5 * 60 * 1000).unwrap().is_empty());
+        db.apply_memories_and_advance_cursor(&idle, &[], max)
+            .unwrap();
+        assert!(
+            db.sessions_needing_extraction(now - 5 * 60 * 1000)
+                .unwrap()
+                .is_empty()
+        );
 
         // 空闲会话来了新消息 ⇒ 又需要抽。
         db.append_message(&idle, &u("又说了一句")).unwrap();
@@ -1910,7 +2013,9 @@ mod tests {
         );
 
         // 剩下的「第三轮」仍然可抽。
-        let left = db.messages_for_extraction(&sid, db.memory_cursor(&sid).unwrap()).unwrap();
+        let left = db
+            .messages_for_extraction(&sid, db.memory_cursor(&sid).unwrap())
+            .unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].1.text_of(), "第三轮");
     }
@@ -1923,8 +2028,11 @@ mod tests {
         let id = db.add_memory(&prospective("下周三交材料", 3)).unwrap();
         {
             let c = db.lock();
-            c.execute("UPDATE memories SET confidence=0.7 WHERE id=?1", params![id])
-                .unwrap();
+            c.execute(
+                "UPDATE memories SET confidence=0.7 WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
         }
         db.update_memory_body_by_user(id, "下周三下午三点前把材料交给老王")
             .unwrap();
@@ -1937,7 +2045,10 @@ mod tests {
             "用户亲手确认过的事不该被算法置信度打折"
         );
         assert!(row.due_at.is_some(), "改措辞不许把待办提醒弄丢");
-        assert!(db.update_memory_body_by_user(id, "  ").is_err(), "空正文仍要拒");
+        assert!(
+            db.update_memory_body_by_user(id, "  ").is_err(),
+            "空正文仍要拒"
+        );
         assert!(
             db.update_memory_body_by_user(id + 999, "x").is_err(),
             "改不存在的行要报错"
@@ -1956,7 +2067,10 @@ mod tests {
         assert!(row.session_id.is_none(), "手动新增没有来源会话");
         assert!(row.user_edited, "用户写的东西从出生起就是权威的");
         assert!((row.confidence - 1.0).abs() < 1e-9);
-        assert!(db.add_user_memory("fact", "   ", None).is_err(), "空正文要拒");
+        assert!(
+            db.add_user_memory("fact", "   ", None).is_err(),
+            "空正文要拒"
+        );
     }
 
     /// 手动新增一条**带到期时间**的待办:必须能被 `due_prospective` 捞到。
@@ -1989,7 +2103,9 @@ mod tests {
     fn a_manually_added_non_prospective_drops_its_due_at() {
         let (_dir, db) = tmpdb();
         let due = Db::now_ms() - 1_000;
-        let id = db.add_user_memory("fact", "用户搬到上海", Some(due)).unwrap();
+        let id = db
+            .add_user_memory("fact", "用户搬到上海", Some(due))
+            .unwrap();
 
         let row = &db.valid_memories().unwrap()[0];
         assert_eq!(row.id, id);

@@ -299,8 +299,8 @@ fn keep_valid(c: CandJson) -> Option<MemoryCandidate> {
 ///   (见 [`keep_valid`]);非 prospective 的 `due_at` 一律忽略;
 /// - `[]` → Ok(空表):「没什么值得记」是合法答案(spec §4.2)。
 pub fn parse_candidates(raw: &str) -> Result<Vec<MemoryCandidate>, String> {
-    let vals: Vec<serde_json::Value> =
-        serde_json::from_str(strip_json_fence(raw)).map_err(|e| format!("抽取输出不是 JSON 数组:{e}"))?;
+    let vals: Vec<serde_json::Value> = serde_json::from_str(strip_json_fence(raw))
+        .map_err(|e| format!("抽取输出不是 JSON 数组:{e}"))?;
     Ok(vals
         .into_iter()
         .filter_map(|v| match serde_json::from_value::<CandJson>(v) {
@@ -468,8 +468,8 @@ pub async fn merge_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::types::{ContentBlock, Role};
     use crate::agent::summarize::TextStreamOutcome;
+    use crate::agent::types::{ContentBlock, Role};
     use crate::store::memory::NewMemory;
     use async_stream::stream;
     use async_trait::async_trait;
@@ -518,8 +518,17 @@ mod tests {
         fn stream<'a>(
             &'a self,
             req: ChatRequest,
-        ) -> std::pin::Pin<Box<dyn Stream<Item = Result<crate::model::provider::ModelDelta, crate::model::provider::ModelError>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            crate::model::provider::ModelDelta,
+                            crate::model::provider::ModelError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
             self.recorder.push(&req);
             let deltas = self
                 .replies
@@ -541,8 +550,17 @@ mod tests {
         fn stream<'a>(
             &'a self,
             req: ChatRequest,
-        ) -> std::pin::Pin<Box<dyn Stream<Item = Result<crate::model::provider::ModelDelta, crate::model::provider::ModelError>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            crate::model::provider::ModelDelta,
+                            crate::model::provider::ModelError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
             self.recorder.push(&req);
             Box::pin(futures::stream::iter(vec![Err(
                 crate::model::provider::ModelError::Api("429 rate limited".into()),
@@ -560,8 +578,17 @@ mod tests {
         fn stream<'a>(
             &'a self,
             _req: ChatRequest,
-        ) -> std::pin::Pin<Box<dyn Stream<Item = Result<crate::model::provider::ModelDelta, crate::model::provider::ModelError>> + Send + 'a>>
-        {
+        ) -> std::pin::Pin<
+            Box<
+                dyn Stream<
+                        Item = Result<
+                            crate::model::provider::ModelDelta,
+                            crate::model::provider::ModelError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
             let ready = self.ready.clone();
             Box::pin(stream! {
                 yield Ok(crate::model::provider::ModelDelta::Text("[{\"kind\":".into()));
@@ -658,7 +685,10 @@ mod tests {
         let body = req.messages[1].text_of();
         assert!(body.contains("用户搬到上海"), "候选要在对照里:{body}");
         assert!(body.contains("用户住在北京"), "旧记忆要在对照里:{body}");
-        assert!(body.contains("\"id\": 7") || body.contains("\"id\":7"), "旧记忆要带 id:{body}");
+        assert!(
+            body.contains("\"id\": 7") || body.contains("\"id\":7"),
+            "旧记忆要带 id:{body}"
+        );
         assert!(req.tools.is_empty());
         assert_eq!(req.temperature, None);
     }
@@ -721,7 +751,10 @@ mod tests {
     #[test]
     fn parse_candidates_rejects_garbage_envelopes() {
         assert!(parse_candidates("今天聊聊天气").is_err());
-        assert!(parse_candidates("{\"kind\":\"fact\"}").is_err(), "单个对象不是数组");
+        assert!(
+            parse_candidates("{\"kind\":\"fact\"}").is_err(),
+            "单个对象不是数组"
+        );
         assert!(parse_candidates("[{").is_err());
     }
 
@@ -785,7 +818,10 @@ mod tests {
             Some(1_793_523_600_000),
             "近期日期:day 数算错一天就是 86_400_000 ms 的偏差"
         );
-        assert!(parse_iso8601_ms("2024-02-29").is_some(), "闰年 2 月 29 日合法");
+        assert!(
+            parse_iso8601_ms("2024-02-29").is_some(),
+            "闰年 2 月 29 日合法"
+        );
         assert_eq!(parse_iso8601_ms("2025-02-29"), None, "平年没有 2 月 29 日");
     }
 
@@ -887,13 +923,16 @@ mod tests {
             "工具输出不许以任何形式进入抽取请求"
         );
         assert!(
-            sent.iter().any(|m| m.text_of().contains("[图片已移除以节省上下文]")),
+            sent.iter()
+                .any(|m| m.text_of().contains("[图片已移除以节省上下文]")),
             "图片必须变成占位文本"
         );
         assert!(
             sent.iter().all(|m| m.blocks.iter().all(|b| !matches!(
                 b,
-                ContentBlock::Image { .. } | ContentBlock::ToolCall { .. } | ContentBlock::ToolResult { .. }
+                ContentBlock::Image { .. }
+                    | ContentBlock::ToolCall { .. }
+                    | ContentBlock::ToolResult { .. }
             ))),
             "图片与工具块都不许出现在抽取请求里"
         );
@@ -927,18 +966,17 @@ mod tests {
     #[tokio::test]
     async fn cancelling_extraction_returns_an_error() {
         let ready = Arc::new(AtomicBool::new(false));
-        let model = Arc::new(StallingModel { ready: ready.clone() });
+        let model = Arc::new(StallingModel {
+            ready: ready.clone(),
+        });
         let cancel = CancellationToken::new();
         let src = src_messages();
-        let (got, ()) = tokio::join!(
-            extract_memories(&*model, &src, &cancel),
-            async {
-                while !ready.load(Ordering::SeqCst) {
-                    tokio::task::yield_now().await;
-                }
-                cancel.cancel();
+        let (got, ()) = tokio::join!(extract_memories(&*model, &src, &cancel), async {
+            while !ready.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
             }
-        );
+            cancel.cancel();
+        });
         assert!(got.is_err(), "取消之后不许返回半批:{got:?}");
     }
 
@@ -963,7 +1001,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consolidation_with_conflict_asks_the_model_and_parses_its_choice() {        let model = TextModel::one(r#"{"action":"INVALIDATE","id":7}"#);
+    async fn consolidation_with_conflict_asks_the_model_and_parses_its_choice() {
+        let model = TextModel::one(r#"{"action":"INVALIDATE","id":7}"#);
         let cand = MemoryCandidate {
             kind: "fact".into(),
             subject: Some("用户".into()),

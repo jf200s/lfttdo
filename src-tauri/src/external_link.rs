@@ -99,13 +99,19 @@ mod tests {
         let path = rundll32_path();
         assert!(path.is_absolute(), "必须用绝对路径：{}", path.display());
         assert!(
-            path.to_string_lossy().to_lowercase().ends_with("system32\\rundll32.exe"),
+            path.to_string_lossy()
+                .to_lowercase()
+                .ends_with("system32\\rundll32.exe"),
             "必须落在 System32：{}",
             path.display()
         );
 
         let cmd = launcher("https://example.com/a?b=1&c=2");
-        assert!(cmd.get_program().to_string_lossy().ends_with("rundll32.exe"));
+        assert!(
+            cmd.get_program()
+                .to_string_lossy()
+                .ends_with("rundll32.exe")
+        );
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())

@@ -2,7 +2,7 @@
 use crate::agent::types::{Risk, ToolOutput};
 use crate::tools::registry::{Tool, ToolCtx, ToolError, ToolMeta};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 pub const NAME: &str = "write_file";
