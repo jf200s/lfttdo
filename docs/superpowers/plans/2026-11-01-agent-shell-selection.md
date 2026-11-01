@@ -212,3 +212,14 @@
 - 类型改动波及面已穷举（B1）：全仓库 `(): SettingsView` 全键字面量夹具恰四份——`App.test.tsx:66`、`AppSettings.test.tsx:82`、`AppImages.test.tsx:52`（线 3 Task 3.1 补键）、`SettingsPanel.test.tsx:28`（线 3 Task 3.2 补键）；`SettingsPanel.tsx:411` 的保存载荷是 `{...form, roots, accent}` 的 spread 形状，新键自动携带，不破。
 - No placeholders: 每个任务给出确切接口、测试清单与验收命令；模板级的代码本体由实现线按桩与 spec 写出（桩内已带可运行的类型层参考实现）。
 - Baseline honesty: 749 passed / 0 failed / 1 ignored（`cargo test --lib`，2026-11-01 实测）；`npm test` / `npm run build` / `npm run lint:css` 基线失败，只要求不新增失败；架构师环境无 `node_modules`，npm 系检查（含 vitest）在计划期一条都没跑过。
+
+---
+
+## Addendum（2026-11-01，feat/shell-detect-presets：候选 + 检测）
+
+合并后的一处设计修订（spec §5.2 的带日期修订为准）：**8 个内置预设从「写死恒在」改为「运行时检测」。** §5.2 的表冻结为候选表（id/label/program/args 与展示顺序不变），落点：
+
+- `tools/shell.rs`：新增 `detected_presets()`（生产检测单一真相）与 `is_preset_candidate_id()`（纯词法候选判定）；`ShellCatalog` 增 `presets` 字段，构造点（`new`/`from_parts`，测试注入口 `from_parts_with_probe`）对每条候选用 `ensure_executable` + 候选专属搜索目录判定，通过的才进预设集；检测只过滤、不回写解析路径，执行期 `ensure_executable` 兜底不变。Windows 候选目录表 `cfg(windows)` 才编译（真机项）。
+- `settings.rs`：normalize 的 `default_shell` 判定改为「候选 id 静态集合 ∪ 自定义 id」，R284（不碰文件系统）不破；Global Constraints 第 4 条的「shell 条目词法整理」语义不变。
+- `ipc.rs`：`shell_presets()` 返回检测子集（自然变少，可能为空）；Task 2.3 里「presets 返回 8 条」的测试钉法相应改为「spec §5.2 顺序的子序列 + 与候选表逐字段一致」。`shell_profile_validate` 与自定义覆盖预设的优先级不变。
+- 前端零改动：SettingsPanel 纯动态渲染预设列表与默认 shell 下拉（无写死数量），既有 UI 测试的 8 条 mock 测的是渲染不是后端。

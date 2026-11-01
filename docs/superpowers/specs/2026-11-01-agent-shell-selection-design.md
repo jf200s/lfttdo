@@ -121,6 +121,13 @@ pub struct ShellProfile {
 
 默认预设 id 常量：`DEFAULT_PRESET_ID = "bash"`（settings normalize 的回落目标、装配期空 catalog 的缺省）。
 
+> **修订（2026-11-01，feat/shell-detect-presets）：预设从「8 条恒在」改为「候选 + 检测」。**
+> 上面这张表保持冻结（id/label/program/args 与展示顺序一概不变），新增的语义是：它降格为**候选表**——构造 `ShellCatalog` 时对每条候选用 `ensure_executable(program, 候选专属搜索目录)` 判定可得性，**检测通过的才进入预设集**（`ShellCatalog.presets`，见 §5.3 的字段修订；检测只做过滤，不把解析出的绝对路径写回 profile，执行期 `ensure_executable` 照旧兜底）。
+>
+> 候选专属搜索目录：Unix 候选（bash/sh/zsh/fish）= `PATH`；Windows 候选在 `PATH` 之外叠各自目录——`pwsh` = `%ProgramFiles%\PowerShell\{7,6}`、`powershell` = `%SystemRoot%\System32\WindowsPowerShell\v1.0`、`cmd` = `%SystemRoot%\System32`、`git-bash` = Git for Windows 常见安装位置（`%ProgramFiles%\Git\bin` 等；其 program 本是绝对路径，`ensure_executable` 直判该路径）。**Windows 真机项**：目录表行为本环境（Linux）无法实测，以 `#[cfg(windows)]` 测试与真机验收记账。
+>
+> 连带裁定：settings `normalize()` 对 `default_shell` 的合法性判定改为「候选 id 静态集合 ∪ 自定义 id」的**纯词法**判定——绝不触发文件系统探测（R284 同规）；没检测到的候选 id 在这台机器上仍算合法（换机器的 settings 文件不失效），运行期 `resolve`/`ensure_executable` 给出明确报错。一台机器可能一条候选都没有：预设列表为空、UI 渲染空列表不炸、resolve 的报错在空集时说明原因与出路（自定义 profile）；其余 shell 一律由用户以自定义路径添加（§3.1 机制不变）。本文其余小节里「8 条 / 8 个」的表述按当时（恒在表）的语境读，不回改；`shell_presets` 返回检测子集（自然变少，可能为空），发布面测试钉「spec §5.2 顺序的子序列 + 逐字段一致」。
+
 ### 5.3 `ShellCatalog`
 
 ```rust
