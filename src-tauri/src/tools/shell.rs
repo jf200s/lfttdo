@@ -1,10 +1,9 @@
 // `run_command`：把一条命令文本交给选定的 shell 后端执行。
 //
-// 2026-11-01：本文件是**接口契约桩**（设计见
-// `docs/superpowers/specs/2026-11-01-agent-shell-selection-design.md`）。类型、预设表、
-// 解析/校验/命令构造与入参形状判定都已就位并被下面的类型级单测钉住；**spawn/超时/
-// 输出捕获/进程树回收**这一段由 feat/agent-shell-core 线交付 —— 桩的 `execute` 走完
-// 全部前置检查后返回一条明确的「尚未实现」错误，绝不 panic、绝不空转。
+// 2026-11-01：类型、预设表、解析/校验/命令构造由接口契约桩交付并被下面的类型级
+// 单测钉住；**spawn/超时/取消/输出捕获/进程树回收**已由 feat/agent-shell-core 交付
+// （执行语义见 spec §7）。设计全文：
+// `docs/superpowers/specs/2026-11-01-agent-shell-selection-design.md`。
 //
 // 与接线线/UI 线的契约（改任何 `pub` 签名都是破坏契约，需三线同步）：
 // * 工具名 `run_command`，`ToolMeta.risk = Risk::Exec`（风险唯一真相源，registry::risk_of 出）。
@@ -20,13 +19,18 @@
 // 回收（T34 设施；mcp/bridge.rs 本就反向引用 tools::registry::ToolError，这个方向的
 // 依赖是既有事实）。
 use crate::agent::types::{Risk, ToolOutput};
+use crate::mcp::process::{create_kill_job, KillOnCloseJob};
 use crate::tools::registry::{Tool, ToolCtx, ToolError, ToolMeta};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, LazyLock, RwLock};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 /// 工具注册名。闸门对 `Risk::Exec` 的作用域令牌取 `input.command`（gate.rs rule_key），
 /// 入参名与这份既有口径对齐，不改门。
@@ -386,6 +390,175 @@ pub fn build_command(profile: &ShellProfile, command: &str, cwd: &Path) -> Comma
     cmd
 }
 
+/// 单根管道的排空：读到 EOF（或读出错）为止，返回攒到的字节。
+///
+/// 两根管道必须**并发**抽干：任一根塞满都会卡住子进程，而「读完一根再读另一根」
+/// 会让先满的那根永远等不到人——所以读与读之间靠 join! 的并发轮询交错。
+async fn drain_pipe(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let Some(mut pipe) = pipe else {
+        return kept; // 没拿到管道（理论不该发生，spawn 已声明 piped）——按空输出处理
+    };
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => kept.extend_from_slice(&buf[..n]),
+            Err(_) => break, // 这根管道读挂了就到此为止，不影响另一根
+        }
+    }
+    kept
+}
+
+/// 退出状态 → 尾部那一行（`None` = 退出 0，不挂行）。非零退出**不是**工具错误
+/// （spec §2：命令失败是模型该看到并处理的结果）；被信号终止时如实点名信号，
+/// 不冒充「退出码 1」。我们自己的超时/取消不走这里（那两条直接 Err），
+/// 能落进这一行的信号都来自命令本身或外部。
+fn exit_note(status: &ExitStatus) -> Option<String> {
+    if let Some(code) = status.code() {
+        return (code != 0).then(|| format!("[退出码 {code}]"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal().map(|s| format!("[被信号 {s} 终止]"))
+    }
+    #[cfg(windows)]
+    {
+        Some("[退出码未知]".to_string())
+    }
+}
+
+/// 输出编排（spec §7.6，纯函数可测）：stdout 在前；stderr 非空则跟 `[stderr]` 段；
+/// 退出码非零追加一行；stdout/stderr 全空且退出 0 → `[命令成功，没有输出]`。
+/// 段与段之间只补一个缺着的换行，不修剪命令自己的输出。
+fn compose_output(stdout: &[u8], stderr: &[u8], exit_line: Option<String>) -> String {
+    let stdout_text = String::from_utf8_lossy(stdout);
+    let stderr_text = String::from_utf8_lossy(stderr);
+    let mut body = stdout_text.into_owned();
+    if !stderr_text.is_empty() {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str("[stderr]\n");
+        body.push_str(&stderr_text);
+    }
+    if let Some(line) = exit_line.as_deref() {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(line);
+    }
+    if body.is_empty() && exit_line.is_none() {
+        body.push_str("[命令成功，没有输出]");
+    }
+    body
+}
+
+/// select 的三种收场（spec §7.4/§7.7）：命令跑完（带全部抓到的输出与退出状态）、
+/// 超时、取消。三种出口结束时 `KillOnCloseJob` 都会随本函数返回 Drop——整棵树回收。
+enum WaitOutcome {
+    Done {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        status: std::io::Result<ExitStatus>,
+    },
+    TimedOut,
+    Cancelled,
+}
+
+/// spawn 之后的一切：job 上膛、管道抽干、超时/取消、输出编排。
+///
+/// 可测缝（R305 注入口径）：`job_factory` 是参数——生产 `execute` 传
+/// `create_kill_job`，测试注入假工厂，于是「拿不到 job 就不 spawn」（R323）、
+/// 「取消先于工厂先于 spawn」这些**次序**都能在不真的起进程的情况下钉住。
+/// trait 对象要 `+ Send + Sync`：本函数的 future 必须是 Send（`Tool` 的
+/// `#[async_trait]` 默认 Send 约束），而 `&dyn Fn` 本身不是 Send。
+///
+/// 无论正常退出、超时还是取消，本函数返回时 `KillOnCloseJob` 一律 Drop：
+/// job 上挂着整棵进程树（Unix 杀进程组 / Windows 杀 job），agent 跑的命令
+/// **不留后台进程**——想在一轮里留一个常驻服务不是本工具的用途（spec §7.7
+/// 的已知限制）。
+async fn run_with_job_factory(
+    job_factory: &(dyn Fn() -> Result<KillOnCloseJob, String> + Send + Sync),
+    profile: &ShellProfile,
+    command: &str,
+    cwd: &Path,
+    timeout_ms: u64,
+    cancel: &CancellationToken,
+) -> Result<ToolOutput, ToolError> {
+    // spawn 前的取消检查：进程还没起来，此时取消零成本（等待中的取消由下面 select 接管）。
+    if cancel.is_cancelled() {
+        return Err(ToolError::Cancelled);
+    }
+    // R323 同口径：拿不到进程回收单位就不 spawn，绝不静默退化成「裸跑」——
+    // 一棵没人管的命令树比一次失败难收拾得多。
+    let job = job_factory().map_err(ToolError::Failed)?;
+
+    let mut cmd = build_command(profile, command, cwd);
+    // stdin 接 Null：命令读 stdin 时立刻见 EOF，而不是挂到超时（这里没有可给的输入）。
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ToolError::Failed(format!("无法启动「{}」：{e}", profile.program)))?;
+    // 上膛：把子进程记进回收单位（Unix 记 pgid、Windows 进 job）——这是唯一能拿
+    // pid 的时刻。失败就亲手杀掉，不留一个没有兜底的孩子（R323 同一失败策略）。
+    // pid 为 None 只可能是「spawn 后立刻被收尸」，此时已无事可回收（bridge.rs 同判读）。
+    if let Some(pid) = child.id() {
+        if let Err(e) = job.assign(pid) {
+            let _ = child.kill().await;
+            return Err(ToolError::Failed(e));
+        }
+    }
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    // 读输出 + wait 一起进 select（biased：取消臂最先轮询，spec §7.1）。kill 不放在
+    // select 臂内而是出块后再做：wait future 对 child 的可变借用要到块尾才结束，
+    // 出块再杀的语义不变——取消/超时先杀、返回时 job Drop 兜整棵树。
+    let outcome = {
+        let wait_child = child.wait();
+        let wait_out = drain_pipe(stdout_pipe);
+        let wait_err = drain_pipe(stderr_pipe);
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => WaitOutcome::Cancelled,
+            _ = tokio::time::sleep(Duration::from_millis(timeout_ms)) => WaitOutcome::TimedOut,
+            done = async move { tokio::join!(wait_out, wait_err, wait_child) } => {
+                let (stdout, stderr, status) = done;
+                WaitOutcome::Done { stdout, stderr, status }
+            }
+        }
+    };
+
+    match outcome {
+        WaitOutcome::Cancelled => {
+            // 先亲手杀直接子进程；返回时 job Drop 把整组（含孙进程）一并 SIGKILL。
+            let _ = child.kill().await;
+            Err(ToolError::Cancelled)
+        }
+        WaitOutcome::TimedOut => {
+            let _ = child.kill().await;
+            Err(ToolError::Failed(format!(
+                "命令在 {timeout_ms} ms 超时被终止（连同它启动的子进程一起回收）"
+            )))
+        }
+        WaitOutcome::Done {
+            stdout,
+            stderr,
+            status,
+        } => {
+            let status =
+                status.map_err(|e| ToolError::Failed(format!("等待命令退出失败：{e}")))?;
+            let exit_line = exit_note(&status);
+            Ok(ToolOutput::text(compose_output(&stdout, &stderr, exit_line)))
+        }
+    }
+}
+
 /// `run_command` 工具本体。catalog 经装配层注入（见 [`ShellCatalog`] 的注释）；
 /// 风险 `Risk::Exec`：每次调用弹窗，会话级放行的粒度是整条命令文本（门既有行为）。
 pub struct ShellTool {
@@ -480,21 +653,19 @@ impl Tool for ShellTool {
         }
 
         // 执行前的强制校验（需求硬约束的第二个消费点；第一个是 IPC 校验命令）。
-        let resolved_program = ensure_executable(&profile.program, &path_search_dirs())
-            .map_err(ToolError::Failed)?;
-        drop(resolved_program); // 桩不 spawn；核心线在这里接 build_command 之后的路径。
+        ensure_executable(&profile.program, &path_search_dirs()).map_err(ToolError::Failed)?;
 
-        let cmd = build_command(&profile, &command, &cwd);
-        let _ = cmd;
-        let _ = timeout_ms; // 形状校验即桩期用途；超时/取消/输出语义由核心线消费。
-
-        // —— 桩边界：不是 panic、不是 loop，是明确的「尚未实现」。 ——
-        Err(ToolError::Failed(
-            "run_command 的执行路径尚未实现（2026-11-01 接口契约桩）：入参解析、profile 解析、\
-             程序存在性校验与命令构造已就位并通过测试；spawn、超时、输出捕获与进程树回收由 \
-             feat/agent-shell-core 交付（spec：docs/superpowers/specs/2026-11-01-agent-shell-selection-design.md）。"
-                .to_string(),
-        ))
+        // spawn 之后的一切（job、超时、取消、输出捕获、编排）走可测缝：
+        // 生产用 `create_kill_job`，测试注入假工厂。
+        run_with_job_factory(
+            &create_kill_job,
+            &profile,
+            &command,
+            &cwd,
+            timeout_ms,
+            &ctx.cancel,
+        )
+        .await
     }
 }
 
@@ -797,10 +968,11 @@ mod tests {
         assert_eq!(required_command(&json!({"command": " ls "})).unwrap(), " ls ");
     }
 
-    // ———————— 桩边界：未实现路径明确报错，绝不 panic / loop ————————
+    // ———————— 入参/前置检查的失败面（形状错误发生在任何 spawn 之前） ————————
 
     /// 用「当前测试可执行文件」当 program：它在两个平台上都存在且可执行
-    /// （Unix 有 x 位；Windows 是 .exe），免掉平台夹具。
+    /// （Unix 有 x 位；Windows 是 .exe），免掉平台夹具。下面的测试都只走到
+    /// spawn 之前的检查就报错返回，这个 program 永远不会被真的启动。
     fn executable_self_profile(id: &str) -> ShellProfile {
         let exe = std::env::current_exe().expect("测试可执行文件路径");
         ShellProfile {
@@ -812,30 +984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stub_execute_reports_the_unimplemented_boundary_clearly() {
-        let tool = ShellTool::new(catalog_with(
-            vec![executable_self_profile("self")],
-            "self",
-        ));
-        let ctx = test_ctx(Some(std::env::current_dir().unwrap()));
-        let e = tool
-            .execute(json!({"command": "echo hi"}), &ctx)
-            .await
-            .unwrap_err();
-        match e {
-            ToolError::Failed(msg) => {
-                assert!(msg.contains("尚未实现"), "错误要明说是桩：{msg}");
-                assert!(
-                    msg.contains("feat/agent-shell-core"),
-                    "错误要指路实现线：{msg}"
-                );
-            }
-            other => panic!("桩边界必须是 Failed，实得 {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn stub_execute_rejects_bad_shapes_before_the_boundary() {
+    async fn execute_rejects_bad_shapes_before_spawning() {
         let tool = ShellTool::new(catalog_with(
             vec![executable_self_profile("self")],
             "self",
@@ -854,17 +1003,10 @@ mod tests {
                 "{input} 必须 BadInput，实得 {e:?}"
             );
         }
-        // 坏形状错误**不是**那条「尚未实现」——两者不许混淆。
-        let e = tool
-            .execute(json!({"command": "x", "shell_id": "nope"}), &ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(!e.contains("尚未实现"), "BadInput 不该带桩文案：{e}");
     }
 
     #[tokio::test]
-    async fn stub_execute_rejects_a_missing_cwd_as_bad_input() {
+    async fn execute_rejects_a_missing_cwd_as_bad_input() {
         let tool = ShellTool::new(catalog_with(
             vec![executable_self_profile("self")],
             "self",
@@ -881,7 +1023,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stub_execute_honours_cancel_before_anything() {
+    async fn execute_honours_cancel_before_anything() {
         let tool = ShellTool::new(catalog_with(Vec::new(), ""));
         let ctx = test_ctx(None);
         ctx.cancel.cancel();
@@ -889,6 +1031,268 @@ mod tests {
         assert!(
             matches!(e, Err(ToolError::Cancelled)),
             "取消必须最先查，实得 {e:?}"
+        );
+    }
+
+    // ———————— 执行路径（spec §7/§9；unix 真进程 /bin/sh，Windows 真机项按 spec §10 记账） ————————
+
+    /// 执行路径测试的夹具：unix 上必有的 `/bin/sh` 走自定义 profile（预设的 bash
+    /// 裸名要按 PATH 解析，测试不该依赖本机装了什么——R305 同口径）。
+    #[cfg(unix)]
+    fn sh_profile() -> ShellProfile {
+        ShellProfile {
+            id: "sh-test".into(),
+            label: "测试 sh".into(),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into()],
+        }
+    }
+
+    #[cfg(unix)]
+    fn sh_tool() -> ShellTool {
+        ShellTool::new(catalog_with(vec![sh_profile()], "sh-test"))
+    }
+
+    #[cfg(unix)]
+    fn sh_ctx() -> (tempfile::TempDir, ToolCtx) {
+        let dir = tempfile::tempdir().expect("建临时目录失败");
+        let ctx = test_ctx(Some(dir.path().to_path_buf()));
+        (dir, ctx)
+    }
+
+    #[cfg(unix)]
+    fn text_of(out: ToolOutput) -> String {
+        match out {
+            ToolOutput::Text { text } => text,
+            other => panic!("run_command 恒返回文本，实得 {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn ps_args_listing() -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-eo", "args="])
+            .output()
+            .expect("ps 必须可用");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_runs_a_command_and_returns_its_output() {
+        let (_dir, ctx) = sh_ctx();
+        let tool = sh_tool();
+        let text = text_of(
+            tool.execute(json!({"command": "echo hi"}), &ctx)
+                .await
+                .expect("echo 必须成功"),
+        );
+        assert!(text.contains("hi"), "输出要含命令产出：{text:?}");
+        assert!(!text.contains("[退出码"), "退出 0 不挂退出码行：{text:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_zero_exit_is_ok_with_an_exit_code_line() {
+        let (_dir, ctx) = sh_ctx();
+        let tool = sh_tool();
+        let text = text_of(
+            tool.execute(json!({"command": "exit 3"}), &ctx)
+                .await
+                .expect("非零退出不是工具错误（spec §2）"),
+        );
+        assert!(text.contains("[退出码 3]"), "尾部要挂退出码行：{text:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdout_comes_first_then_the_stderr_section() {
+        let (_dir, ctx) = sh_ctx();
+        let tool = sh_tool();
+        let text = text_of(
+            tool.execute(json!({"command": "echo out-line; echo err-line >&2"}), &ctx)
+                .await
+                .expect("必须成功"),
+        );
+        let out_at = text.find("out-line").expect("stdout 要在：{text:?}");
+        let section_at = text.find("[stderr]").expect("stderr 非空要有 [stderr] 段：{text:?}");
+        let err_at = text.find("err-line").expect("stderr 内容要在：{text:?}");
+        assert!(
+            out_at < section_at && section_at < err_at,
+            "spec §7.6 的编排顺序——stdout、[stderr] 段、stderr 内容：{text:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn empty_output_with_exit_zero_says_so() {
+        let (_dir, ctx) = sh_ctx();
+        let tool = sh_tool();
+        let text = text_of(
+            tool.execute(json!({"command": "true"}), &ctx)
+                .await
+                .expect("必须成功"),
+        );
+        assert_eq!(text, "[命令成功，没有输出]");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_tree_and_names_the_milliseconds() {
+        let (_dir, ctx) = sh_ctx();
+        let tool = sh_tool();
+        // 标记放进命令文本：它会出现在 `/bin/sh -c …` 的 argv 里，ps 抓得到；
+        // `#` 之后是 sh 的注释，不影响命令语义。
+        const MARKER: &str = "shell-core-timeout-7f3a-marker";
+        let e = tool
+            .execute(
+                json!({"command": format!("sleep 5 #{MARKER}"), "timeout_ms": 50}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        match &e {
+            ToolError::Failed(msg) => assert!(
+                msg.contains("超时") && msg.contains("50"),
+                "超时错误要含超时毫秒值：{msg}"
+            ),
+            other => panic!("超时必须是 Failed，实得 {other:?}"),
+        }
+        // 进程树被回收：带标记的 sh（连同它启动的 sleep）不许残留。轮询到消失或
+        // 超期为止，不把「还没来得及收尸」误判成「泄漏」。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let listing = ps_args_listing();
+            if !listing.lines().any(|l| l.contains(MARKER)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "超时后仍见残留进程树：{listing}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_before_spawn_wins_and_never_touches_the_factory() {
+        // 直接打可测缝：注入「一被调用就记账」的假工厂。取消先于工厂 ⇒ 更先于
+        // spawn——错误次序就是「没有进程被启动」的佐证。
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let factory_flag = Arc::clone(&called);
+        let factory = move || -> Result<KillOnCloseJob, String> {
+            factory_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err("工厂不该被调到".to_string())
+        };
+        let e = run_with_job_factory(&factory, &sh_profile(), "echo hi", dir.path(), 1_000, &token)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, ToolError::Cancelled),
+            "spawn 前取消必须 Cancelled，实得 {e:?}"
+        );
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "取消时连 job 工厂都不该被调（进程根本没起）"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_during_the_wait_kills_the_command_and_reports_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+        let ok_factory = || -> Result<KillOnCloseJob, String> {
+            Ok(create_kill_job().expect("unix 支建 job 恒成功"))
+        };
+        let e = run_with_job_factory(&ok_factory, &sh_profile(), "sleep 5", dir.path(), 30_000, &token)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, ToolError::Cancelled),
+            "等待中的取消必须 Cancelled，实得 {e:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_job_factory_blocks_the_spawn_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-never-be-created");
+        let factory = || -> Result<KillOnCloseJob, String> {
+            Err("无法建立进程回收作业对象（测试注入的失败）".to_string())
+        };
+        let e = run_with_job_factory(
+            &factory,
+            &sh_profile(),
+            &format!("touch {}", marker.display()),
+            dir.path(),
+            1_000,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        match &e {
+            ToolError::Failed(msg) => assert!(
+                msg.contains("进程回收"),
+                "错误要透传工厂的失败原因：{msg}"
+            ),
+            other => panic!("工厂失败必须是 Failed，实得 {other:?}"),
+        }
+        assert!(
+            !marker.exists(),
+            "R323：拿不到 job 不许 spawn——marker 文件不该出现"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_program_fails_closed_naming_the_program() {
+        let (_dir, ctx) = sh_ctx();
+        let tool = ShellTool::new(catalog_with(
+            vec![ShellProfile {
+                id: "ghost".into(),
+                label: String::new(),
+                program: "/definitely/not/here/sh".into(),
+                args: vec!["-c".into()],
+            }],
+            "ghost",
+        ));
+        let e = tool
+            .execute(json!({"command": "echo hi"}), &ctx)
+            .await
+            .unwrap_err();
+        match &e {
+            ToolError::Failed(msg) => assert!(
+                msg.contains("/definitely/not/here/sh"),
+                "Failed 要点名 program：{msg}"
+            ),
+            other => panic!("程序缺失必须是 Failed，实得 {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_default_cwd_is_bad_input_not_a_silent_process_cwd() {
+        let tool = sh_tool();
+        // 没给 cwd 且 write_root 为 None → BadInput（回落进程 cwd 是不可复现行为，不做）。
+        let ctx = test_ctx(None);
+        let e = tool
+            .execute(json!({"command": "echo hi"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, ToolError::BadInput(m) if m.contains("cwd")),
+            "缺省 cwd 落空必须 BadInput 并点名 cwd，实得 {e:?}"
         );
     }
 }
