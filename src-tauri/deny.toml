@@ -1,0 +1,45 @@
+# cargo-deny 配置：依赖的漏洞告警、许可证白名单、来源校验。
+# CI 侧由 .github/workflows/ci.yml 的 cargo-deny job（EmbarkStudios/cargo-deny-action）执行。
+
+[advisories]
+version = 2
+# 被撤回（yanked）的版本不允许留在锁文件里
+yanked = "deny"
+ignore = [
+  # 以下四条均为「unmaintained 且公告写明 No safe upgrade is available」，全部是平台栈的
+  # 传递依赖，升级它们等于升级 tauri/gtk/zbus 生态本身，属独立工程；落地后逐条删除。
+  #
+  # zbus 5 家族三件套（公告 z-galaxy/zbus#2043：并入 zbus 6.0）：经 rfd(xdg-portal) 与
+  # zbus-secret-service-keyring-store 进来，即 Linux 移植线的文件对话框与凭据存储。
+  "RUSTSEC-2026-0370", # zvariant
+  "RUSTSEC-2026-0371", # zbus_names
+  "RUSTSEC-2026-0372", # zvariant_derive
+  # proc-macro-error：维护者失联四年，经 gtk(tauri Linux 侧) 进来，生态级知名积案
+  "RUSTSEC-2024-0370",
+]
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+  "BSL-1.0",
+]
+
+[bans]
+# 依赖树里同名多版本只警告不拦（Tauri 生态常见），有需要再收紧
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
