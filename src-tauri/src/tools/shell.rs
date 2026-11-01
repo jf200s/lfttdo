@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -43,6 +44,13 @@ pub const MAX_TIMEOUT_MS: u64 = 600_000;
 /// stdout + stderr 合计的字节上限。与 `read_file::MAX_BYTES` 同一量级——「一页上下文」
 /// 的既有口径。超限后**继续读取并丢弃**（管道不塞死、命令能跑完），交出的文本截断。
 pub const MAX_OUTPUT_BYTES: usize = 512 * 1024;
+/// 尾部装饰（截断标记、`[退出码 N]`、非 UTF-8 注明）要占的字节预算：交出的**整段**
+/// 文本承诺 ≤ `MAX_OUTPUT_BYTES`，内容就得留出装饰的空间（read_file 的 CONTENT_BUDGET
+/// 同一口径——512 字节对这几行提示绰绰有余）。
+const MARKER_RESERVE: usize = 512;
+/// 抓取阶段的合计字节预算 = `MAX_OUTPUT_BYTES - MARKER_RESERVE`。stdout 与 stderr
+/// 两根管道共享这一份，原子扣减保证「合计」恰好成立。
+const OUTPUT_BUDGET: usize = MAX_OUTPUT_BYTES - MARKER_RESERVE;
 
 /// 默认预设 id：settings normalize 的回落目标、装配期空 catalog 的缺省。
 /// spec §5.2 的表里它排第一（需求示例即 `bash -lc`）。
@@ -390,11 +398,18 @@ pub fn build_command(profile: &ShellProfile, command: &str, cwd: &Path) -> Comma
     cmd
 }
 
-/// 单根管道的排空：读到 EOF（或读出错）为止，返回攒到的字节。
+/// 单根管道的「有界排空」：预算内的字节攒下来；预算用尽后**继续读但只丢弃并计数**
+/// （spec §7.5）——管道被持续排空，子进程不会因为没人收输出而塞死，跑得完。
 ///
 /// 两根管道必须**并发**抽干：任一根塞满都会卡住子进程，而「读完一根再读另一根」
 /// 会让先满的那根永远等不到人——所以读与读之间靠 join! 的并发轮询交错。
-async fn drain_pipe(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> {
+/// `budget` 与 `dropped` 是共享原子：两根管道合计受 `OUTPUT_BUDGET` 约束，
+/// 原子扣减保证不多留一个字节。
+async fn drain_pipe(
+    pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+    budget: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+) -> Vec<u8> {
     let mut kept = Vec::new();
     let Some(mut pipe) = pipe else {
         return kept; // 没拿到管道（理论不该发生，spawn 已声明 piped）——按空输出处理
@@ -403,7 +418,34 @@ async fn drain_pipe(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> Vec<u8> 
     loop {
         match pipe.read(&mut buf).await {
             Ok(0) => break,
-            Ok(n) => kept.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                // 预算认领（CAS 重试）：两根管道并发认领同一份预算，
+                // 原子交换保证「合计」恰好成立、不多留一个字节。
+                let take = loop {
+                    let current = budget.load(Ordering::Relaxed);
+                    let take = n.min(current);
+                    if take == 0 {
+                        break 0;
+                    }
+                    if budget
+                        .compare_exchange_weak(
+                            current,
+                            current - take,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        break take;
+                    }
+                };
+                if take > 0 {
+                    kept.extend_from_slice(&buf[..take]);
+                }
+                if n > take {
+                    dropped.fetch_add(n - take, Ordering::Relaxed);
+                }
+            }
             Err(_) => break, // 这根管道读挂了就到此为止，不影响另一根
         }
     }
@@ -430,9 +472,15 @@ fn exit_note(status: &ExitStatus) -> Option<String> {
 }
 
 /// 输出编排（spec §7.6，纯函数可测）：stdout 在前；stderr 非空则跟 `[stderr]` 段；
-/// 退出码非零追加一行；stdout/stderr 全空且退出 0 → `[命令成功，没有输出]`。
-/// 段与段之间只补一个缺着的换行，不修剪命令自己的输出。
-fn compose_output(stdout: &[u8], stderr: &[u8], exit_line: Option<String>) -> String {
+/// 退出码非零追加一行；stdout/stderr 全空且退出 0 → `[命令成功，没有输出]`；
+/// 管道阶段丢弃过字节就在尾部挂截断标记（含实测丢弃字节数，风格同 read_file 的
+/// 页尾标记）。段与段之间只补一个缺着的换行，不修剪命令自己的输出。
+fn compose_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    dropped_bytes: usize,
+    exit_line: Option<String>,
+) -> String {
     let stdout_text = String::from_utf8_lossy(stdout);
     let stderr_text = String::from_utf8_lossy(stderr);
     let mut body = stdout_text.into_owned();
@@ -451,6 +499,17 @@ fn compose_output(stdout: &[u8], stderr: &[u8], exit_line: Option<String>) -> St
     }
     if body.is_empty() && exit_line.is_none() {
         body.push_str("[命令成功，没有输出]");
+    }
+    if dropped_bytes > 0 {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        // 「已交出」量的是这段文本自身的字节数；丢弃量的是管道里实测的原始字节。
+        body.push_str(&format!(
+            "[输出超过 512 KiB（{MAX_OUTPUT_BYTES} 字节）上限：已交出前 {} 字节，其余 \
+             {dropped_bytes} 字节已读取并丢弃（读而不停，命令照常跑完）]",
+            body.len()
+        ));
     }
     body
 }
@@ -515,14 +574,18 @@ async fn run_with_job_factory(
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
+    // 合计预算（spec §7.5）：两根管道共享 OUTPUT_BUDGET；超限继续读但丢弃并计数，
+    // 交出文本截断挂标记——管道不塞死，命令跑得完。
+    let budget = Arc::new(AtomicUsize::new(OUTPUT_BUDGET));
+    let dropped = Arc::new(AtomicUsize::new(0));
 
     // 读输出 + wait 一起进 select（biased：取消臂最先轮询，spec §7.1）。kill 不放在
     // select 臂内而是出块后再做：wait future 对 child 的可变借用要到块尾才结束，
     // 出块再杀的语义不变——取消/超时先杀、返回时 job Drop 兜整棵树。
     let outcome = {
         let wait_child = child.wait();
-        let wait_out = drain_pipe(stdout_pipe);
-        let wait_err = drain_pipe(stderr_pipe);
+        let wait_out = drain_pipe(stdout_pipe, Arc::clone(&budget), Arc::clone(&dropped));
+        let wait_err = drain_pipe(stderr_pipe, Arc::clone(&budget), Arc::clone(&dropped));
         tokio::select! {
             biased;
             _ = cancel.cancelled() => WaitOutcome::Cancelled,
@@ -554,7 +617,13 @@ async fn run_with_job_factory(
             let status =
                 status.map_err(|e| ToolError::Failed(format!("等待命令退出失败：{e}")))?;
             let exit_line = exit_note(&status);
-            Ok(ToolOutput::text(compose_output(&stdout, &stderr, exit_line)))
+            let dropped_bytes = dropped.load(Ordering::Relaxed);
+            Ok(ToolOutput::text(compose_output(
+                &stdout,
+                &stderr,
+                dropped_bytes,
+                exit_line,
+            )))
         }
     }
 }
@@ -1293,6 +1362,44 @@ mod tests {
         assert!(
             matches!(&e, ToolError::BadInput(m) if m.contains("cwd")),
             "缺省 cwd 落空必须 BadInput 并点名 cwd，实得 {e:?}"
+        );
+    }
+
+    // ———————— 输出上限与截断标记（spec §7.5） ————————
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_over_the_cap_is_truncated_with_an_honest_marker_and_the_command_finishes() {
+        let (_dir, ctx) = sh_ctx();
+        let tool = sh_tool();
+        // 600_000 个 'a'（> 512 KiB）：/dev/zero 管进 tr，输出体积精确可控。
+        let text = text_of(
+            tool.execute(
+                json!({"command": "head -c 600000 /dev/zero | tr '\\000' a"}),
+                &ctx,
+            )
+            .await
+            .expect("超限不是工具错误：命令要能跑完并 Ok 返回"),
+        );
+        assert!(
+            text.len() <= MAX_OUTPUT_BYTES,
+            "交出文本 ≤ {MAX_OUTPUT_BYTES} 字节：实得 {}",
+            text.len()
+        );
+        assert!(text.starts_with("aaaa"), "交出的应是产出的前缀");
+        let tail: String = text.chars().rev().take(200).collect::<String>().chars().rev().collect();
+        assert!(
+            text.contains("512 KiB"),
+            "标记要写明上限（512 KiB）。文本尾部：…{tail}"
+        );
+        let expected_dropped = 600_000 - (MAX_OUTPUT_BYTES - MARKER_RESERVE);
+        assert!(
+            text.contains(&expected_dropped.to_string()),
+            "标记要含实测丢弃字节数 {expected_dropped}。文本尾部：…{tail}"
+        );
+        assert!(
+            !text.contains("[退出码"),
+            "命令要正常跑完（退出 0，不因 reader 停读而卡死）。文本尾部：…{tail}"
         );
     }
 }
