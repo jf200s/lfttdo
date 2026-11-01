@@ -29,7 +29,8 @@ use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::shell::{
-    ShellCatalog, ShellProfile, ShellTool, ensure_executable, path_search_dirs, validate_custom,
+    ShellCatalog, ShellProfile, ShellTool, detected_presets, ensure_executable, path_search_dirs,
+    validate_custom,
 };
 use crate::tools::use_skill::UseSkillTool;
 use crate::tools::write_file::WriteFileTool;
@@ -2543,34 +2544,15 @@ pub async fn settings_set_api_key(
 
 // ───────────────────── Agent Shell：预设表与 profile 校验（spec §5.5） ─────────────────────
 
-/// 预设表的只读副本（spec §5.5 `shellPresets()`）。真相住在 `tools/shell.rs` 的常量表里
-/// （spec §2：单一真相，前端经 IPC 拿只读副本、不抄第二份）。契约桩没有 pub 的枚举口
-/// （`presets()` 是私有的，改它超出本线所有权），本命令经 pub 的
-/// `ShellCatalog::resolve(Some(id))` 逐个 id 取出预设 —— 空自定义表时这就是纯预设查询。
-/// id 清单抄自 spec §5.2 的**冻结**表；两端都钉着测试（shell.rs 的
-/// `presets_table_has_exactly_the_eight_spec_ids` 钉表本身，下面的
-/// `shell_presets_match_the_spec_table_entry_for_entry` 钉发布面）—— 表若变，两边必有一边红。
+/// 检测到的预设表（spec §5.5 `shellPresets()`；2026-11-01 修订：候选 + 检测）。
+/// 真相住在 `tools/shell.rs`：候选表 + 检测（`detected_presets()`，spec §2 单一真相，
+/// 前端经 IPC 拿只读副本、不抄第二份）。返回的是「本机检测到的那部分候选」——可能
+/// 少于 8 条，也可能为空（一台机器可能一条候选都没有；此时 UI 渲染空列表，其余
+/// shell 由用户以自定义路径添加，机制不变）。展示顺序仍是 spec §5.2 的冻结顺序
+/// （检测只过滤、不重排）。
 #[tauri::command]
 pub fn shell_presets() -> Vec<ShellProfile> {
-    let catalog = ShellCatalog::new();
-    let preset_ids = [
-        "bash",
-        "sh",
-        "zsh",
-        "fish",
-        "git-bash",
-        "pwsh",
-        "powershell",
-        "cmd",
-    ];
-    preset_ids
-        .iter()
-        .map(|id| {
-            catalog
-                .resolve(Some(id))
-                .expect("spec §5.2 的预设 id 必须全部可解析（两端测试钉着）")
-        })
-        .collect()
+    detected_presets()
 }
 
 /// 校验的**可测核心**（`#[tauri::command]` 在单测里调不动，同本模块测试头 R103 段的
@@ -2835,7 +2817,8 @@ pub fn build_production_registry(
 }
 
 /// 这一轮的 shell catalog（spec §2「生效时机」的纯函数面）：从本轮现取的 `Settings`
-/// 拼出「自定义表 + 默认 id」。`send_message` 在 `store.load()` 之后调它并刷进
+/// 拼出「自定义表 + 默认 id」，预设侧在本构造点检测（2026-11-01 修订：候选 + 检测，
+/// 每轮重测一次）。`send_message` 在 `store.load()` 之后调它并刷进
 /// `AppState.shells` —— 与 roots / temperature 同一条「本轮现取、下一条消息生效」线，
 /// 这里没有任何缓存可以过期。`default_shell` 的 trim 与空回落由 `from_parts`/`resolve`
 /// 的既有语义承担（settings 侧 `normalize()` 已先行回落过一次）。
@@ -4047,6 +4030,9 @@ mod tests {
     /// 纯函数：settings 的 shells / default_shell 原样进 catalog；default 空白时
     /// `from_parts` 只做 trim（catalog 里就是空串），真正的回落发生在 `resolve(None)`
     /// —— 落到 `DEFAULT_PRESET_ID`（桩的既有语义；这条钉的是接线面别把它弄丢）。
+    /// 2026-11-01 修订后 catalog 的预设侧来自本机检测：回落那半句改用全在 probe 构造
+    /// （不依赖本机装了什么，R305）；自定义那半句仍走真构造 —— customs 先于 presets，
+    /// 检测与否不影响命中。
     #[test]
     fn shell_catalog_of_passes_settings_through_and_resolves_a_blank_default_to_the_preset() {
         let settings = Settings {
@@ -4078,8 +4064,18 @@ mod tests {
             blank.default_id, "",
             "空白 default 进 catalog 只是空串（from_parts 只 trim）"
         );
+        // 回落语义钉在检测过的 catalog 上（全在 probe ⇒ 8 条候选全数在预设侧）。
+        let blank_with_all_presets =
+            crate::tools::shell::ShellCatalog::from_parts_with_probe(Vec::new(), "", &|_, _| {
+                Ok(PathBuf::new())
+            });
         assert_eq!(
-            blank.resolve(None).unwrap().id,
+            blank_with_all_presets.presets.len(),
+            8,
+            "全在 probe 下候选表全数进预设侧"
+        );
+        assert_eq!(
+            blank_with_all_presets.resolve(None).unwrap().id,
             crate::tools::shell::DEFAULT_PRESET_ID,
             "空 default 在 resolve 时回落默认预设"
         );
@@ -4087,15 +4083,23 @@ mod tests {
 
     // ---- Agent Shell：两条 IPC 命令（spec §5.5） ----
 
-    /// `shell_presets` 返回 spec §5.2 的 8 条，逐项一致（顺序即展示顺序），且每条
-    /// Serialize 成 id/label/program/args **恰好**四键 —— `ShellProfile` 本身就是线格式，
-    /// 不新增 view 结构体（spec §5.5；TS 镜像 `ShellProfile` 靠这条钉着）。
+    /// `shell_presets` 返回的是「候选表经本机检测的子集」（2026-11-01 修订：候选 +
+    /// 检测 —— 本机装了什么决定返回几条，例如这台 Linux 开发机是 bash/sh，其余候选
+    /// 缺席；也可能为空）。钉法相应改为：返回集必须是 spec §5.2 冻结顺序的**子序列**，
+    /// 且每一条与候选表**逐字段一致**（原「逐项一致」意图的检测版 —— 发布面没抄错由
+    /// 这里钉；候选表本身由 shell.rs 的 `candidate_table_has_exactly_the_eight_spec_ids`
+    /// 钉着）。每条 Serialize 成 id/label/program/args **恰好**四键 —— `ShellProfile`
+    /// 本身就是线格式，不新增 view 结构体（spec §5.5；TS 镜像 `ShellProfile` 靠这条钉着）。
     #[test]
-    fn shell_presets_match_the_spec_table_entry_for_entry() {
-        let presets = shell_presets();
-        let ids: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
+    fn shell_presets_return_a_spec_ordered_subset_matching_the_candidate_table() {
+        // 全在 probe 造出完整候选面，当「spec §5.2 冻结表」的参照。
+        let all_candidates =
+            ShellCatalog::from_parts_with_probe(Vec::new(), "", &|_, _| Ok(PathBuf::new())).presets;
         assert_eq!(
-            ids,
+            all_candidates
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
             [
                 "bash",
                 "sh",
@@ -4106,7 +4110,17 @@ mod tests {
                 "powershell",
                 "cmd"
             ],
-            "spec §5.2 的 8 条逐项一致，顺序即展示顺序"
+            "参照面 = spec §5.2 的 8 条（顺序即展示顺序）"
+        );
+        let presets = shell_presets();
+        let expected: Vec<_> = all_candidates
+            .iter()
+            .filter(|c| presets.iter().any(|p| p.id == c.id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            presets, expected,
+            "发布面必须是候选表按冻结顺序过滤出的子集，且逐字段一致"
         );
         for p in &presets {
             let v = serde_json::to_value(p).unwrap();
@@ -4125,18 +4139,6 @@ mod tests {
                 p.id
             );
         }
-        // 内容抽样钉「发布面没抄错」（全表内容由 shell.rs 自己的测试钉着）：
-        // bash 是需求示例原样；git-bash 用 Git for Windows 标准安装位置；cmd 三段模板。
-        let bash = &presets[0];
-        assert_eq!(
-            (bash.label.as_str(), bash.program.as_str()),
-            ("Bash", "bash")
-        );
-        assert_eq!(bash.args, vec!["-lc"]);
-        let git_bash = presets.iter().find(|p| p.id == "git-bash").unwrap();
-        assert_eq!(git_bash.program, r"C:\Program Files\Git\bin\bash.exe");
-        let cmd = presets.iter().find(|p| p.id == "cmd").unwrap();
-        assert_eq!(cmd.args, vec!["/d", "/s", "/c"]);
     }
 
     /// 校验的命中支：裸名在注入的假 search_dirs 里命中 → `Ok`。validate_custom 先归一化

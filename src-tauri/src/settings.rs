@@ -34,7 +34,7 @@ use crate::agent::context::ContextConfig;
 use crate::model::openai_compat::{ModelConfig, normalize_base_url};
 // settings → tools 的单向引用（spec §4 裁定合法）：只取 `ShellProfile` 类型与
 // `DEFAULT_PRESET_ID` 常量；shell.rs 不认识 `Settings`，反向不存在。
-use crate::tools::shell::{DEFAULT_PRESET_ID, ShellCatalog, ShellProfile};
+use crate::tools::shell::{DEFAULT_PRESET_ID, ShellProfile, is_preset_candidate_id};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -731,17 +731,18 @@ impl Settings {
             }
         }
         self.shells = shells;
-        // `default_shell`：trim 后为空、或既不是预设 id 也不是任何自定义 id → 回落
-        // `DEFAULT_PRESET_ID`（同 accent「认不出来回落预设」，不报错）。「是不是可解析」
-        // 的判定走 `ShellCatalog::resolve`（先查自定义表、再查预设表，语义与执行期同一条）：
-        // 预设表没有 pub 枚举口，空 catalog 的 `resolve(Some(..))` 就是「是不是预设」的
-        // 纯查询 —— 全程不碰文件系统，程序在不在是 `ensure_executable` 的事（spec §2）。
+        // `default_shell`：trim 后为空、或既不是候选 id 也不是任何自定义 id → 回落
+        // `DEFAULT_PRESET_ID`（同 accent「认不出来回落预设」，不报错）。判定是**纯词法**
+        // 的「候选 id 静态集合 ∪ 自定义 id」（R284：normalize 全程不碰文件系统——
+        // 2026-11-01 修订后预设侧来自运行时检测，normalize 绝不跟着探测）：
+        // 没检测到的候选 id 在这台机器上仍算合法（换机器的 settings 文件不失效），
+        // 运行期 `resolve`/`ensure_executable` 给出明确报错；「检测到哪些」由 catalog
+        // 构造点（`ShellCatalog::from_parts`）负责，与这里的合法性判定是两回事。
         let default_shell = self.default_shell.trim().to_string();
-        let resolvable = !default_shell.is_empty()
-            && ShellCatalog::from_parts(self.shells.clone(), "")
-                .resolve(Some(&default_shell))
-                .is_ok();
-        self.default_shell = if resolvable {
+        let known = !default_shell.is_empty()
+            && (is_preset_candidate_id(&default_shell)
+                || self.shells.iter().any(|p| p.id == default_shell));
+        self.default_shell = if known {
             default_shell
         } else {
             DEFAULT_PRESET_ID.into()
@@ -2739,9 +2740,10 @@ mod tests {
         assert_eq!(s.shells[0].label, "首条");
     }
 
-    /// spec §6 判据 2：`default_shell` trim 后为空、或既不是预设 id 也不是任何自定义 id
-    /// → 回落 `DEFAULT_PRESET_ID`（同 accent「认不出来回落预设」，不报错）；
-    /// 指向预设或某个自定义 id → 原样（trim 后）。
+    /// spec §6 判据 2（2026-11-01 修订：判据从 resolve 改为「候选 id 静态集合 ∪ 自定义
+    /// id」的纯词法判定，R284 —— normalize 不碰文件系统）：`default_shell` trim 后为空、
+    /// 或既不是候选 id 也不是任何自定义 id → 回落 `DEFAULT_PRESET_ID`（同 accent
+    /// 「认不出来回落预设」，不报错）；指向候选或某个自定义 id → 原样（trim 后）。
     #[test]
     fn normalize_falls_back_to_the_default_preset_for_an_unresolvable_default_shell() {
         let custom = ShellProfile {
@@ -2776,7 +2778,7 @@ mod tests {
             ..Default::default()
         };
         s.normalize();
-        assert_eq!(s.default_shell, "pwsh", "预设 id 原样保留（trim 后）");
+        assert_eq!(s.default_shell, "pwsh", "候选 id 原样保留（trim 后）");
         let mut s = Settings {
             default_shell: " mine ".into(),
             shells: vec![custom],
@@ -2784,6 +2786,18 @@ mod tests {
         };
         s.normalize();
         assert_eq!(s.default_shell, "mine", "自定义 id 同样算数");
+        // 修订后的关键账面：候选 id **不因本机没检测到而失效**（换机器的 settings 不
+        // 崩）。cmd 在 Linux 上永远检测不到，normalize 仍原样保留 —— 这条同时证明
+        // normalize 没有偷跑文件系统探测（R284）。
+        #[cfg(unix)]
+        {
+            let mut s = Settings {
+                default_shell: " cmd ".into(),
+                ..Default::default()
+            };
+            s.normalize();
+            assert_eq!(s.default_shell, "cmd", "候选 id 即使本机检测不到也合法");
+        }
     }
 
     /// 线格式（spec §5.6）：`shells` 是 `ShellProfile` 的 snake_case 四键数组、

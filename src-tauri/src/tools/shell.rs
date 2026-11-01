@@ -5,12 +5,20 @@
 // （执行语义见 spec §7）。设计全文：
 // `docs/superpowers/specs/2026-11-01-agent-shell-selection-design.md`。
 //
+// 2026-11-01 修订（feat/shell-detect-presets，spec §5.2 的带日期修订）：预设从
+// 「8 条恒在」改为「**候选 + 检测**」—— 下面的静态表降格为候选表（id/label/program/
+// args 与展示顺序不变），构造 catalog 时对每条候选用 `ensure_executable` 判可得性，
+// 检测通过的才进预设集；一台机器可能一条都没有，此时预设列表为空，其余 shell 一律
+// 由用户以自定义路径添加（机制不变）。
+//
 // 与接线线/UI 线的契约（改任何 `pub` 签名都是破坏契约，需三线同步）：
 // * 工具名 `run_command`，`ToolMeta.risk = Risk::Exec`（风险唯一真相源，registry::risk_of 出）。
 // * 入参 schema 写死在 spec §5.1：`{ command, shell_id?, cwd?, timeout_ms? }`。
 // * `ShellProfile` 同时是 settings.json 与 IPC 的线格式（snake_case 四键，serde 派生）。
-// * `ShellCatalog::from_parts` 是接线线从 `Settings` 构造 catalog 的唯一入口；
-//   `DEFAULT_PRESET_ID` 是 settings normalize 的回落目标。
+// * `ShellCatalog::from_parts` 仍是接线线从 `Settings` 构造 catalog 的唯一入口（构造点
+//   跑候选检测；测试注入口是 `from_parts_with_probe`）；`DEFAULT_PRESET_ID` 是 settings
+//   normalize 的回落目标（合法性按「候选 id 静态集合 ∪ 自定义 id」判，见
+//   `is_preset_candidate_id` —— normalize 全程不碰文件系统，R284 同规）。
 // * `ensure_executable` 是「程序存在且可执行」的唯一实现：IPC 校验命令与执行前强制
 //   都调它；保存（normalize）**不**调它 —— settings 归一化不碰文件系统（R284 同规）。
 //
@@ -53,7 +61,8 @@ const MARKER_RESERVE: usize = 512;
 const OUTPUT_BUDGET: usize = MAX_OUTPUT_BYTES - MARKER_RESERVE;
 
 /// 默认预设 id：settings normalize 的回落目标、装配期空 catalog 的缺省。
-/// spec §5.2 的表里它排第一（需求示例即 `bash -lc`）。
+/// spec §5.2 的表里它排第一（需求示例即 `bash -lc`）。它是**候选** id——本机没检测到
+/// bash 时，resolve 的缺省路径照旧 fail-closed 报错（不悄悄换一个后端）。
 pub const DEFAULT_PRESET_ID: &str = "bash";
 
 /// 一个 shell 后端的描述。**预设与自定义共用这一个类型**：命令文本永远作为 argv 的
@@ -63,8 +72,9 @@ pub const DEFAULT_PRESET_ID: &str = "bash";
 /// serde 形状是 settings.json / IPC 的线格式（snake_case 四键），字段名即线上键名。
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ShellProfile {
-    /// 稳定键。预设 = 8 个固定 id；自定义 = 用户命名。自定义与预设同名时**覆盖预设**
-    /// （resolve 先查 customs）：用户明确加同名 profile 就是要换掉那个后端。
+    /// 稳定键。预设 = 候选表（spec §5.2）的 8 个 id 经本机检测的子集；自定义 = 用户命名。
+    /// 自定义与预设同名时**覆盖预设**（resolve 先查 customs）：用户明确加同名 profile
+    /// 就是要换掉那个后端。
     pub id: String,
     /// UI 显示名。预设给专有名；自定义允许空串（UI 回显 id）。
     pub label: String,
@@ -75,7 +85,9 @@ pub struct ShellProfile {
     pub args: Vec<String>,
 }
 
-/// 内置预设表（spec §5.2 写死）。`program` 为裸名的按 PATH 解析；`git-bash` 用 Git for
+/// 内置**候选**表（spec §5.2 冻结的 8 条；2026-11-01 修订：候选 + 检测 —— 表的 id/
+/// label/program/args 与展示顺序一概不变，检测通过的子集才是预设集，见
+/// [`detected_presets`]）。`program` 为裸名的按 PATH 解析；`git-bash` 用 Git for
 /// Windows 的标准安装位置——装在别处的用户请建自定义 profile 指过去，预设不猜第二条路径。
 fn presets() -> &'static [ShellProfile] {
     static PRESETS: LazyLock<Vec<ShellProfile>> = LazyLock::new(|| {
@@ -138,6 +150,86 @@ fn presets() -> &'static [ShellProfile] {
         ]
     });
     &PRESETS
+}
+
+/// 候选 id 的**纯词法**判定（settings normalize 对 `default_shell` 的合法性判定用）：
+/// 归属「候选 id 静态集合 ∪ 自定义 id」里前一半的判定。R284 同规——normalize 全程
+/// 不碰文件系统，这里只查表、绝不触发探测：没检测到的候选 id 在这台机器上仍算合法
+/// （换机器的 settings 文件不失效），运行期 `resolve`/`ensure_executable` 给出明确报错。
+pub fn is_preset_candidate_id(id: &str) -> bool {
+    presets().iter().any(|p| p.id == id)
+}
+
+/// 生产检测入口（IPC `shell_presets` 与 catalog 构造共用，单一真相）：候选表逐条过
+/// `ensure_executable`（候选专属搜索目录），通过的按 spec §5.2 的展示顺序组成预设集。
+/// 检测**只做过滤**：通过的候选原样保留（program 仍是表里的裸名/标准路径，不把解析出
+/// 的绝对路径写回 profile），执行期 `ensure_executable` 照旧兜底。
+pub fn detected_presets() -> Vec<ShellProfile> {
+    detect_presets_with(&|program, dirs| ensure_executable(program, dirs))
+}
+
+/// 检测的可注入内核（同 `run_with_job_factory` 的注入口径，R305）：probe 形状即
+/// `ensure_executable` 的签名，测试注入假 probe 钉「全在 / 全不在 / 部分在」三态，
+/// 单测不依赖本机装了什么。
+fn detect_presets_with(
+    probe: &dyn Fn(&str, &[PathBuf]) -> Result<PathBuf, String>,
+) -> Vec<ShellProfile> {
+    presets()
+        .iter()
+        .filter(|p| probe(&p.program, &candidate_search_dirs(p)).is_ok())
+        .cloned()
+        .collect()
+}
+
+/// 候选的专属搜索目录（检测用）：基础是 `path_search_dirs()`（与执行期同一份 PATH），
+/// Windows 候选再叠各自的常见安装位置（[`windows_candidate_dirs`]，cfg(windows) 才
+/// 编译进探测）。检测目录 ⊇ 执行目录（PATH），所以「检测到但执行期才报错」只可能在
+/// 「程序只在专属目录、不在 PATH」的极端情形出现——fail-closed，错误点名 program。
+/// `git-bash` 的 program 本就是绝对路径，`ensure_executable` 对它直判该路径，这里的
+/// 目录只是同一张表的一部分，不参与它的判定。
+fn candidate_search_dirs(preset: &ShellProfile) -> Vec<PathBuf> {
+    let dirs = path_search_dirs();
+    #[cfg(windows)]
+    {
+        let mut dirs = dirs;
+        dirs.extend(windows_candidate_dirs(&preset.id));
+        dirs
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = preset;
+        dirs
+    }
+}
+
+/// Windows 候选的专属目录表（表即文档，spec §5.2 修订 2026-11-01）：`pwsh` 的 MSI 装
+/// 在 `%ProgramFiles%\PowerShell\<主版本>`；Windows PowerShell 与 cmd.exe 是系统组件，
+/// 各在自己唯一的系统目录；git-bash 叠 Git for Windows 的常见安装根。环境变量缺失时
+/// 跳过对应目录——检测不到就少一条预设（fail-closed），不影响其余候选。
+/// **Windows 真机项**：本目录表在 Linux 开发环境无法实测，只有 cfg(windows) 测试与
+/// 真机验收覆盖。
+#[cfg(windows)]
+fn windows_candidate_dirs(id: &str) -> Vec<PathBuf> {
+    fn under(var: &str, sub: &str) -> Option<PathBuf> {
+        std::env::var_os(var).map(|root| PathBuf::from(root).join(sub))
+    }
+    match id {
+        "pwsh" => vec![
+            under("ProgramFiles", r"PowerShell\7"),
+            under("ProgramFiles", r"PowerShell\6"),
+        ],
+        "powershell" => vec![under("SystemRoot", r"System32\WindowsPowerShell\v1.0")],
+        "cmd" => vec![under("SystemRoot", r"System32")],
+        "git-bash" => vec![
+            under("ProgramFiles", r"Git\bin"),
+            under("ProgramFiles", r"Git\usr\bin"),
+            under("ProgramFiles(x86)", r"Git\bin"),
+        ],
+        _ => Vec::new(),
+    }
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// 自定义 profile 的校验与归一化（**词法**层，不做存在性检查——那一步是
@@ -260,7 +352,7 @@ fn check_candidate(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 这一轮可用的 shell 全集：预设（只读常量）+ 自定义（来自 Settings）+ 默认 id。
+/// 这一轮可用的 shell 全集：自定义（来自 Settings）+ 检测到的预设 + 默认 id。
 ///
 /// 注册表是进程级单例而 `ToolCtx` 是每轮现构的——往 `ToolCtx` 加字段会炸穿十余个
 /// 测试文件里的字面量构造（它们不属于任何一条开发线），所以 catalog 以共享句柄
@@ -270,27 +362,49 @@ fn check_candidate(path: &Path) -> Result<(), String> {
 pub struct ShellCatalog {
     /// 自定义表（来自 `Settings.shells`）。解析顺序在预设**之前**（同名覆盖预设）。
     pub customs: Vec<ShellProfile>,
+    /// 检测到的预设集：候选表（spec §5.2 的 8 条）经可用性检测后的**子集**，保持展示
+    /// 顺序（检测只过滤、不重排）。在构造点检测（[`ShellCatalog::new`] / `from_parts`，
+    /// 测试注入口 `from_parts_with_probe`），resolve 不碰文件系统。`Default` 给的是空表
+    /// ——那是「一条候选都没检测到」的诚实形状，生产的构造一律走 `new`/`from_parts`。
+    pub presets: Vec<ShellProfile>,
     /// 来自 `Settings.default_shell`；空串回落 `DEFAULT_PRESET_ID`。
     pub default_id: String,
 }
 
 impl ShellCatalog {
-    /// 装配期占位：空自定义 + 默认预设。第一条消息前 `send_message` 会现刷。
+    /// 装配期占位：空自定义 + 检测到的预设 + 空 default id。第一条消息前 `send_message`
+    /// 会现刷。与 `Default`（纯空表）不同：本构造跑检测（装配点的一次性成本）。
     pub fn new() -> Self {
-        Self::default()
+        Self::from_parts(Vec::new(), "")
     }
 
-    /// 接线线从 `Settings` 构造的唯一入口（不依赖 settings.rs 的类型）。
+    /// 接线线从 `Settings` 构造的唯一入口（不依赖 settings.rs 的类型）。预设集在本
+    /// 构造点检测——每轮 `send_message` 刷新时重测一次，与 roots/temperature 同一条
+    /// 「本轮现取」线；测试要脱钩本机装了什么，改走 [`ShellCatalog::from_parts_with_probe`]。
     pub fn from_parts(customs: Vec<ShellProfile>, default_id: &str) -> Self {
+        Self::from_parts_with_probe(customs, default_id, &|program, dirs| {
+            ensure_executable(program, dirs)
+        })
+    }
+
+    /// 构造的可注入口（R305 同款）：probe 即 `ensure_executable` 的签名，测试注入假
+    /// probe 钉「全在 / 全不在 / 部分在」三态，不依赖本机装了什么。
+    pub fn from_parts_with_probe(
+        customs: Vec<ShellProfile>,
+        default_id: &str,
+        probe: &dyn Fn(&str, &[PathBuf]) -> Result<PathBuf, String>,
+    ) -> Self {
         Self {
             customs,
+            presets: detect_presets_with(probe),
             default_id: default_id.trim().to_string(),
         }
     }
 
-    /// 解析要用的 profile。显式 `shell_id` → customs → presets；缺省 → `default_id`
-    /// （空则 `DEFAULT_PRESET_ID`）。查不到 ⇒ `Err`，错误里列出全部可用 id（fail-closed，
-    /// 不悄悄换一个后端——模型以为在用 A 实际跑在 B 上，比失败更糟）。
+    /// 解析要用的 profile。显式 `shell_id` → customs → presets（**检测到的**子集）；
+    /// 缺省 → `default_id`（空则 `DEFAULT_PRESET_ID`）。查不到 ⇒ `Err`，错误里列出全部
+    /// 可用 id（fail-closed，不悄悄换一个后端——模型以为在用 A 实际跑在 B 上，比失败
+    /// 更糟）。点了没检测到的候选 id 同样报错并点名可用面。
     pub fn resolve(&self, id: Option<&str>) -> Result<ShellProfile, String> {
         let wanted = match id {
             Some(explicit) => explicit.trim(),
@@ -306,7 +420,7 @@ impl ShellCatalog {
         if let Some(custom) = self.customs.iter().find(|p| p.id == wanted) {
             return Ok(custom.clone());
         }
-        if let Some(preset) = presets().iter().find(|p| p.id == wanted) {
+        if let Some(preset) = self.presets.iter().find(|p| p.id == wanted) {
             return Ok(preset.clone());
         }
         Err(self.unknown_shell_error(wanted))
@@ -322,11 +436,17 @@ impl ShellCatalog {
                 .collect::<Vec<_>>()
                 .join("、")
         };
-        let preset_ids = presets()
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect::<Vec<_>>()
-            .join("、");
+        // 空预设集要说明**为什么**空：本机一条候选都没检测到（不是表丢了），出路是
+        // 自定义 profile——报错给得出下一步，才算「清晰」。
+        let preset_ids = if self.presets.is_empty() {
+            "无（本机未检测到任何内置候选 shell，可在设置里以自定义路径添加）".to_string()
+        } else {
+            self.presets
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
+        };
         format!("未知的 shell profile：{wanted}。可用——预设：{preset_ids}；自定义：{custom_ids}")
     }
 }
@@ -690,9 +810,10 @@ impl Tool for ShellTool {
         ToolMeta {
             name: NAME.to_string(),
             description: "在选定的 shell 后端里执行一条命令并返回它的 stdout 与 stderr；命令文本\
-                          由该 shell 解释。参数：command 必填；shell_id 可选（预设 bash/sh/zsh/\
-                          fish/git-bash/pwsh/powershell/cmd，或设置里的自定义 id；缺省用用户的默认\
-                          shell）；cwd 可选（绝对路径且必须已存在，缺省是本会话的输出目录）；\
+                          由该 shell 解释。参数：command 必填；shell_id 可选（内置预设 id 是\
+                          bash/sh/zsh/fish/git-bash/pwsh/powershell/cmd 中**本机检测到**的子集，\
+                          或设置里的自定义 id；缺省用用户的默认 shell）；cwd 可选（绝对路径且\
+                          必须已存在，缺省是本会话的输出目录）；\
                           timeout_ms 可选（毫秒，默认 30000，上限 600000，超时命令连同它启动的\
                           子进程会被终止）。输出合计上限 524288 字节，超出部分截断并注明；命令\
                           退出码非零时输出尾部带「[退出码 N]」（这不是工具错误）；输出含非 UTF-8 \
@@ -806,22 +927,30 @@ mod tests {
         Arc::new(RwLock::new(ShellCatalog::from_parts(customs, default_id)))
     }
 
-    // ———————— 预设表（spec §5.2 的钉子） ————————
+    // ———————— 候选表（spec §5.2 的钉子；2026-11-01 修订：候选 + 检测） ————————
 
+    /// 原名 `presets_table_has_exactly_the_eight_spec_ids`：表本身仍是 spec §5.2 那 8 条，
+    /// 语义从「恒在的预设」改为「候选」——钉的内容不变。
     #[test]
-    fn presets_table_has_exactly_the_eight_spec_ids() {
+    fn candidate_table_has_exactly_the_eight_spec_ids() {
         let ids: Vec<&str> = presets().iter().map(|p| p.id.as_str()).collect();
         assert_eq!(
             ids,
             vec![
                 "bash", "sh", "zsh", "fish", "git-bash", "pwsh", "powershell", "cmd"
             ],
-            "预设表与 spec §5.2 逐项对齐（顺序即展示顺序）"
+            "候选表与 spec §5.2 逐项对齐（顺序即展示顺序）"
         );
+        // 候选 id 判定与表同源（settings normalize 的 R284 依据）：表内皆真、表外皆假。
+        for id in &ids {
+            assert!(is_preset_candidate_id(id), "{id} 必须是候选 id");
+        }
+        assert!(!is_preset_candidate_id("nope"));
+        assert!(!is_preset_candidate_id(""));
     }
 
     #[test]
-    fn preset_entries_are_well_formed() {
+    fn candidate_entries_are_well_formed() {
         for p in presets() {
             assert!(!p.program.is_empty(), "{} 的 program 为空", p.id);
             assert!(!p.label.is_empty(), "{} 的 label 为空", p.id);
@@ -835,6 +964,153 @@ mod tests {
             }
         }
         assert_eq!(presets()[0].id, DEFAULT_PRESET_ID);
+    }
+
+    // ———————— 候选 + 检测（spec §5.2 修订；假 probe 钉三态，不依赖本机） ————————
+
+    /// 测试注入的假 probe：全在 / 全不在 / 按程序名点名的部分在。
+    fn probe_all_present(_: &str, _: &[PathBuf]) -> Result<PathBuf, String> {
+        Ok(PathBuf::new())
+    }
+
+    fn probe_none_present(program: &str, _: &[PathBuf]) -> Result<PathBuf, String> {
+        Err(format!("测试注入：{program} 不存在"))
+    }
+
+    #[test]
+    fn detection_with_an_all_present_probe_lists_the_whole_candidate_table_in_order() {
+        let c = ShellCatalog::from_parts_with_probe(Vec::new(), "", &probe_all_present);
+        let ids: Vec<&str> = c.presets.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "bash", "sh", "zsh", "fish", "git-bash", "pwsh", "powershell", "cmd"
+            ],
+            "全部在 ⇒ 8 条按 spec §5.2 展示顺序全出"
+        );
+        assert_eq!(
+            c.resolve(Some("pwsh")).unwrap().program,
+            "pwsh",
+            "检测到的候选可解析"
+        );
+    }
+
+    #[test]
+    fn detection_with_an_all_missing_probe_yields_an_empty_preset_set_and_a_clear_error() {
+        let c = ShellCatalog::from_parts_with_probe(Vec::new(), "", &probe_none_present);
+        assert!(c.presets.is_empty(), "全部不在 ⇒ 预设集为空");
+        let e = c.resolve(Some("bash")).unwrap_err();
+        assert!(
+            e.contains("bash") && e.contains("未检测到"),
+            "空预设集的报错要说明原因并点名请求的 id：{e}"
+        );
+        // 自定义不受检测影响；错误里仍列得出自定义 id（可用面只有自定义时同样清晰）。
+        let with_custom = ShellCatalog::from_parts_with_probe(
+            vec![custom("mine", "/opt/mine")],
+            "mine",
+            &probe_none_present,
+        );
+        assert_eq!(
+            with_custom.resolve(None).unwrap().id,
+            "mine",
+            "default 指向自定义时照常解析"
+        );
+        let e = with_custom.resolve(Some("nope")).unwrap_err();
+        assert!(
+            e.contains("mine") && e.contains("未检测到"),
+            "空预设集 + 有自定义的错误要两边都交代：{e}"
+        );
+    }
+
+    #[test]
+    fn detection_with_a_partial_probe_lists_only_the_hits_in_spec_order() {
+        let probe = |program: &str, _: &[PathBuf]| -> Result<PathBuf, String> {
+            if program == "zsh" || program == "cmd" {
+                Ok(PathBuf::new())
+            } else {
+                Err(format!("测试注入：{program} 不存在"))
+            }
+        };
+        let c = ShellCatalog::from_parts_with_probe(Vec::new(), "", &probe);
+        let ids: Vec<&str> = c.presets.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["zsh", "cmd"],
+            "部分在 ⇒ 只出命中的子集，保持 spec 顺序"
+        );
+        assert!(c.resolve(Some("zsh")).is_ok());
+        assert!(
+            c.resolve(Some("bash")).is_err(),
+            "没检测到的候选不可解析（fail-closed，不悄悄换后端）"
+        );
+    }
+
+    /// probe 收到的必须是「每条候选各一次、program 与候选专属目录成对」——unix 候选的
+    /// 目录就是 `path_search_dirs()`（PATH）这份账面。
+    #[cfg(unix)]
+    #[test]
+    fn detection_feeds_each_candidate_its_program_and_the_path_dirs() {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let probe = |program: &str, dirs: &[PathBuf]| -> Result<PathBuf, String> {
+            seen.lock()
+                .unwrap()
+                .push((program.to_string(), dirs.to_vec()));
+            Err("只记账，不命中".into())
+        };
+        detect_presets_with(&probe);
+        let seen = seen.into_inner().unwrap();
+        let expected = path_search_dirs();
+        assert_eq!(seen.len(), 8, "每条候选各探一次");
+        for (i, (program, dirs)) in seen.iter().enumerate() {
+            assert_eq!(
+                program.as_str(),
+                presets()[i].program,
+                "probe 按候选表顺序收到各条的 program"
+            );
+            assert_eq!(
+                dirs, &expected,
+                "unix 候选的搜索目录 = PATH（与执行期同一份）"
+            );
+        }
+    }
+
+    /// **Windows 真机项**（本环境无法实测，spec §10 记账口径）：Windows 候选在 PATH 之外
+    /// 叠各自的专属目录——表即文档（pwsh → %ProgramFiles%\PowerShell\{7,6}、powershell →
+    /// %SystemRoot%\System32\WindowsPowerShell\v1.0、cmd → %SystemRoot%\System32、
+    /// git-bash → %ProgramFiles%\Git\bin 等）。
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidates_get_their_documented_specific_dirs() {
+        let profile = |id: &str| ShellProfile {
+            id: id.into(),
+            label: String::new(),
+            program: "x".into(),
+            args: vec!["-c".into()],
+        };
+        let contains =
+            |id: &str, sub: &str| candidate_search_dirs(&profile(id)).contains(&PathBuf::from(sub));
+        let sysroot = std::env::var("SystemRoot").expect("Windows 恒有 SystemRoot");
+        let program_files = std::env::var("ProgramFiles").expect("Windows 恒有 ProgramFiles");
+        assert!(
+            contains("cmd", &format!(r"{sysroot}\System32")),
+            "cmd 的专属目录是 %SystemRoot%\\System32"
+        );
+        assert!(
+            contains(
+                "powershell",
+                &format!(r"{sysroot}\System32\WindowsPowerShell\v1.0")
+            ),
+            "powershell 的专属目录是系统 WindowsPowerShell 目录"
+        );
+        assert!(
+            contains("pwsh", &format!(r"{program_files}\PowerShell\7"))
+                && contains("pwsh", &format!(r"{program_files}\PowerShell\6")),
+            "pwsh 叠 MSI 的常见主版本目录"
+        );
+        assert!(
+            contains("git-bash", &format!(r"{program_files}\Git\bin")),
+            "git-bash 叠 Git for Windows 的常见安装根"
+        );
     }
 
     // ———————— 工具声明（风险真相源 + schema 钉死） ————————
@@ -885,6 +1161,7 @@ mod tests {
 
     #[test]
     fn resolve_prefers_customs_over_presets_on_name_collision() {
+        // customs 先于 presets，检测与否不影响命中 —— 沿用真构造即可。
         let c = ShellCatalog::from_parts(vec![custom("bash", "/opt/my/bash")], "");
         let got = c.resolve(Some("bash")).expect("同名自定义必须可解析");
         assert_eq!(got.program, "/opt/my/bash", "自定义覆盖同名预设（有意语义）");
@@ -892,10 +1169,15 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_to_default_id_then_default_preset() {
-        let c = ShellCatalog::from_parts(vec![custom("mine", "/opt/mine")], "mine");
+        // 2026-11-01 修订后预设侧来自检测：回落断言改用全在 probe，不依赖本机装了什么。
+        let c = ShellCatalog::from_parts_with_probe(
+            vec![custom("mine", "/opt/mine")],
+            "mine",
+            &probe_all_present,
+        );
         assert_eq!(c.resolve(None).unwrap().program, "/opt/mine");
 
-        let empty_default = ShellCatalog::from_parts(Vec::new(), "");
+        let empty_default = ShellCatalog::from_parts_with_probe(Vec::new(), "", &probe_all_present);
         assert_eq!(
             empty_default.resolve(None).unwrap().id,
             DEFAULT_PRESET_ID,
@@ -905,10 +1187,18 @@ mod tests {
 
     #[test]
     fn resolve_names_the_available_ids_when_unknown() {
-        let c = ShellCatalog::from_parts(vec![custom("mine", "/opt/mine")], "");
+        // 全在 probe：错误里列出的预设侧是确定的全集，断言不随本机漂。
+        let c = ShellCatalog::from_parts_with_probe(
+            vec![custom("mine", "/opt/mine")],
+            "",
+            &probe_all_present,
+        );
         let e = c.resolve(Some("nope")).unwrap_err();
         assert!(e.contains("nope"), "错误要点名请求的那个 id：{e}");
-        assert!(e.contains("bash") && e.contains("mine"), "错误要列出预设与自定义：{e}");
+        assert!(
+            e.contains("bash") && e.contains("mine"),
+            "错误要列出预设与自定义：{e}"
+        );
     }
 
     // ———————— validate_custom：归一化与拒绝 ————————
