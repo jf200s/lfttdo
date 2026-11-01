@@ -13,5 +13,6 @@
 .superpowers/
 .env
 release/
+.worktrees/
 
 src-tauri/.cargo/
