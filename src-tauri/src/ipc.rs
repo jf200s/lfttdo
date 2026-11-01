@@ -28,7 +28,9 @@ use crate::tools::fetch::FetchTool;
 use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
-use crate::tools::shell::{ShellCatalog, ShellTool};
+use crate::tools::shell::{
+    ShellCatalog, ShellProfile, ShellTool, ensure_executable, path_search_dirs, validate_custom,
+};
 use crate::tools::use_skill::UseSkillTool;
 use crate::tools::write_file::WriteFileTool;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
@@ -2539,6 +2541,52 @@ pub async fn settings_set_api_key(
     blocking(move || store.set_api_key(&api_key).map_err(|e| e.to_string())).await
 }
 
+// ───────────────────── Agent Shell：预设表与 profile 校验（spec §5.5） ─────────────────────
+
+/// 预设表的只读副本（spec §5.5 `shellPresets()`）。真相住在 `tools/shell.rs` 的常量表里
+/// （spec §2：单一真相，前端经 IPC 拿只读副本、不抄第二份）。契约桩没有 pub 的枚举口
+/// （`presets()` 是私有的，改它超出本线所有权），本命令经 pub 的
+/// `ShellCatalog::resolve(Some(id))` 逐个 id 取出预设 —— 空自定义表时这就是纯预设查询。
+/// id 清单抄自 spec §5.2 的**冻结**表；两端都钉着测试（shell.rs 的
+/// `presets_table_has_exactly_the_eight_spec_ids` 钉表本身，下面的
+/// `shell_presets_match_the_spec_table_entry_for_entry` 钉发布面）—— 表若变，两边必有一边红。
+#[tauri::command]
+pub fn shell_presets() -> Vec<ShellProfile> {
+    let catalog = ShellCatalog::new();
+    ["bash", "sh", "zsh", "fish", "git-bash", "pwsh", "powershell", "cmd"]
+        .iter()
+        .map(|id| {
+            catalog
+                .resolve(Some(id))
+                .expect("spec §5.2 的预设 id 必须全部可解析（两端测试钉着）")
+        })
+        .collect()
+}
+
+/// 校验的**可测核心**（`#[tauri::command]` 在单测里调不动，同本模块测试头 R103 段的
+/// 既有口径，所以抽一层能直接测的纯函数）。顺序是 spec §5.4 的两步分工：
+/// 1. `validate_custom` —— 词法（trim、空 id / 空 program / 空-含空白 args 项拒绝），
+///    **不做存在性检查**；
+/// 2. `ensure_executable` —— 存在 + 可执行判定；裸名按 `search_dirs` 逐目录解析，
+///    生产传 `path_search_dirs()`（PATH，Windows 叠 PATHEXT），测试注入假表 ——
+///    同 mcp R305 的「解析器可注入」口径。
+/// 错误是给人读的中文串，`Err` 原样上屏（spec §5.5）。
+fn validate_shell_profile_with_dirs(
+    profile: ShellProfile,
+    search_dirs: &[PathBuf],
+) -> Result<(), String> {
+    let normalized = validate_custom(profile)?;
+    ensure_executable(&normalized.program, search_dirs)?;
+    Ok(())
+}
+
+/// UI「校验」按钮（spec §5.5 `shellProfileValidate`）：成功 `Ok(())`，失败
+/// `Err(中文原因)`。**保存时不校验**（spec §2 决策清单）—— 这条命令只服务显式的校验动作。
+#[tauri::command]
+pub fn shell_profile_validate(profile: ShellProfile) -> Result<(), String> {
+    validate_shell_profile_with_dirs(profile, &path_search_dirs())
+}
+
 /// R110：`settings_api_key_masked` 这条命令**不实现** —— `settings_get` 已经带掩码，
 /// 再开一个只读掩码的命令没有消费者（R89：加接口先给消费者）。
 ///
@@ -3108,6 +3156,8 @@ pub fn run() {
             settings_get,
             settings_set,
             settings_set_api_key,
+            shell_presets,
+            shell_profile_validate,
             normalize_image,
             runtime_summary,
             mcp_servers,
@@ -4019,6 +4069,135 @@ mod tests {
             blank.resolve(None).unwrap().id,
             crate::tools::shell::DEFAULT_PRESET_ID,
             "空 default 在 resolve 时回落默认预设"
+        );
+    }
+
+    // ---- Agent Shell：两条 IPC 命令（spec §5.5） ----
+
+    /// `shell_presets` 返回 spec §5.2 的 8 条，逐项一致（顺序即展示顺序），且每条
+    /// Serialize 成 id/label/program/args **恰好**四键 —— `ShellProfile` 本身就是线格式，
+    /// 不新增 view 结构体（spec §5.5；TS 镜像 `ShellProfile` 靠这条钉着）。
+    #[test]
+    fn shell_presets_match_the_spec_table_entry_for_entry() {
+        let presets = shell_presets();
+        let ids: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["bash", "sh", "zsh", "fish", "git-bash", "pwsh", "powershell", "cmd"],
+            "spec §5.2 的 8 条逐项一致，顺序即展示顺序"
+        );
+        for p in &presets {
+            let v = serde_json::to_value(p).unwrap();
+            let obj = v.as_object().expect("每条预设必须能 Serialize 成对象");
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["args", "id", "label", "program"],
+                "{} 的线格式是恰好四键，多一个少一个都算错",
+                p.id
+            );
+            assert!(
+                !obj["program"].as_str().unwrap().is_empty(),
+                "{} 的 program 不该是空串",
+                p.id
+            );
+        }
+        // 内容抽样钉「发布面没抄错」（全表内容由 shell.rs 自己的测试钉着）：
+        // bash 是需求示例原样；git-bash 用 Git for Windows 标准安装位置；cmd 三段模板。
+        let bash = &presets[0];
+        assert_eq!(
+            (bash.label.as_str(), bash.program.as_str()),
+            ("Bash", "bash")
+        );
+        assert_eq!(bash.args, vec!["-lc"]);
+        let git_bash = presets.iter().find(|p| p.id == "git-bash").unwrap();
+        assert_eq!(git_bash.program, r"C:\Program Files\Git\bin\bash.exe");
+        let cmd = presets.iter().find(|p| p.id == "cmd").unwrap();
+        assert_eq!(cmd.args, vec!["/d", "/s", "/c"]);
+    }
+
+    /// 校验的命中支：裸名在注入的假 search_dirs 里命中 → `Ok`。validate_custom 先归一化
+    /// （trim 过的 id/args 才进判定），程序存在性用的是注入表 —— 单测不依赖本机 PATH
+    /// （同 mcp R305 的注入口径）。
+    #[cfg(unix)]
+    #[test]
+    fn shell_profile_validate_hits_a_bare_name_in_the_injected_search_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hit = dir.path().join("mysh");
+        std::fs::write(&hit, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&hit, std::fs::Permissions::from_mode(0o755)).unwrap();
+        validate_shell_profile_with_dirs(
+            ShellProfile {
+                id: " mine ".into(),
+                label: " 显示名 ".into(),
+                program: "mysh".into(),
+                args: vec![" -c ".into()],
+            },
+            &[dir.path().to_path_buf()],
+        )
+        .expect("裸名在注入目录里命中必须 Ok");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Windows 支：当前测试可执行文件是**真的**存在且带 .exe 的普通文件
+    /// （桩的启发式判据），绝对路径直判必须过（plan：Windows 分支用 current_exe 兜底真值）。
+    #[cfg(windows)]
+    #[test]
+    fn shell_profile_validate_on_windows_hits_the_test_executable_itself() {
+        let exe = std::env::current_exe().unwrap();
+        validate_shell_profile_with_dirs(
+            ShellProfile {
+                id: "self".into(),
+                label: String::new(),
+                program: exe.display().to_string(),
+                args: Vec::new(),
+            },
+            &[],
+        )
+        .expect("测试可执行文件（.exe）必须判为可执行");
+    }
+
+    /// 未命中支：裸名不在假 PATH 里 → `Err` 且**点名 program 与查找范围**
+    /// （错误原样上屏，用户要能对着它改 profile）。
+    #[test]
+    fn shell_profile_validate_misses_name_the_program() {
+        let empty = tempfile::tempdir().unwrap();
+        let e = validate_shell_profile_with_dirs(
+            ShellProfile {
+                id: "mine".into(),
+                label: String::new(),
+                program: "no-such-shell".into(),
+                args: vec!["-c".into()],
+            },
+            &[empty.path().to_path_buf()],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("no-such-shell") && e.contains("搜索目录"),
+            "错误要点名 program 与查找范围：{e}"
+        );
+        std::fs::remove_dir_all(empty).ok();
+    }
+
+    /// 形状错误支：`validate_custom` 先拒（空 id），存在性检查**根本不发生** ——
+    /// program 指到不存在的地方也不影响错误内容（两步分开，spec §5.4）。
+    #[test]
+    fn shell_profile_validate_reports_shape_errors_without_any_existence_check() {
+        let e = validate_shell_profile_with_dirs(
+            ShellProfile {
+                id: "  ".into(),
+                label: String::new(),
+                program: "/definitely/not/here".into(),
+                args: vec!["-c".into()],
+            },
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("id"),
+            "形状错误要来自 validate_custom 而不是存在性判定：{e}"
         );
     }
 
@@ -7539,6 +7718,30 @@ mod tests {
             assert!(
                 registered.contains(&name),
                 "{name} 写了但没登记，对应面板只会拿到 not found：{registered:?}"
+            );
+        }
+    }
+
+    /// Agent Shell 的两条命令与上面同一个坑（`generate_handler!` 是宏）：漏登记不编译
+    /// 报错，只会在运行时让前端拿到 not found。机制照抄
+    /// `the_normalization_command_is_registered_in_the_handler_list`。
+    #[test]
+    fn the_shell_commands_are_registered_in_the_handler_list() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ipc.rs"));
+        let list = src
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split("]").next())
+            .expect("找不到 generate_handler 的登记表");
+        let registered: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        for cmd in ["shell_presets", "shell_profile_validate"] {
+            assert!(
+                registered.contains(&cmd),
+                "命令 {cmd} 写了但没登记，前端调用只会拿到 not found:{registered:?}"
             );
         }
     }
