@@ -471,25 +471,57 @@ fn exit_note(status: &ExitStatus) -> Option<String> {
     }
 }
 
+/// 字节 → 文本的唯一入口。与 read_file 的「拒绝非 UTF-8」**刻意不同**（spec §8.5）：
+/// read_file 的对象是用户根目录里的文件，拒读是安全取向；这里的对象是「命令跑出来的
+/// 东西」——中文 Windows 上 GBK 输出若按拒绝处理，`dir` 这类命令永远读不到结果，
+/// 这把工具就残废了。所以失败就 lossy 转换，并返回「发生过替换转换」的标记，
+/// 由输出尾部的注明补偿 U+FFFD 被模型当成内容的风险。返回 (文本, 是否有替换转换)。
+fn to_text(bytes: &[u8]) -> (String, bool) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_string(), false),
+        Err(_) => (String::from_utf8_lossy(bytes).into_owned(), true),
+    }
+}
+
+/// 往左找最近的字符边界（std 的 `floor_char_boundary` 还没稳，先自己写）。
+fn floor_char_boundary(s: &str, mut index: usize) -> usize {
+    while index > 0 && !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 /// 输出编排（spec §7.6，纯函数可测）：stdout 在前；stderr 非空则跟 `[stderr]` 段；
 /// 退出码非零追加一行；stdout/stderr 全空且退出 0 → `[命令成功，没有输出]`；
 /// 管道阶段丢弃过字节就在尾部挂截断标记（含实测丢弃字节数，风格同 read_file 的
-/// 页尾标记）。段与段之间只补一个缺着的换行，不修剪命令自己的输出。
+/// 页尾标记）；出现过替换转换再挂一行注明。段与段之间只补一个缺着的换行，
+/// 不修剪命令自己的输出。
 fn compose_output(
     stdout: &[u8],
     stderr: &[u8],
     dropped_bytes: usize,
     exit_line: Option<String>,
 ) -> String {
-    let stdout_text = String::from_utf8_lossy(stdout);
-    let stderr_text = String::from_utf8_lossy(stderr);
-    let mut body = stdout_text.into_owned();
+    let (stdout_text, stdout_lossy) = to_text(stdout);
+    let (stderr_text, stderr_lossy) = to_text(stderr);
+    let non_utf8 = stdout_lossy || stderr_lossy;
+
+    let mut body = stdout_text;
     if !stderr_text.is_empty() {
         if !body.is_empty() && !body.ends_with('\n') {
             body.push('\n');
         }
         body.push_str("[stderr]\n");
         body.push_str(&stderr_text);
+    }
+    // 内容预算的兜底：预算是按原始字节扣的，lossy 替换会让文本膨胀（1 字节无效字节
+    // → 3 字节 U+FFFD），这里按字符截回预算内。走到这一步必然 non_utf8（合法 UTF-8
+    // 是保长的），膨胀的事实由下面的注明一并交代。
+    let mut trimmed = false;
+    if body.len() > OUTPUT_BUDGET {
+        let cut = floor_char_boundary(&body, OUTPUT_BUDGET);
+        body.truncate(cut);
+        trimmed = true;
     }
     if let Some(line) = exit_line.as_deref() {
         if !body.is_empty() && !body.ends_with('\n') {
@@ -510,6 +542,18 @@ fn compose_output(
              {dropped_bytes} 字节已读取并丢弃（读而不停，命令照常跑完）]",
             body.len()
         ));
+    }
+    if non_utf8 {
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        let mut note =
+            "[输出含非 UTF-8 字节，已按替换字符（U+FFFD）转换".to_string();
+        if trimmed {
+            note.push_str("；替换使文本膨胀，已再按字符截到上限内");
+        }
+        note.push(']');
+        body.push_str(&note);
     }
     body
 }
@@ -1401,5 +1445,22 @@ mod tests {
             !text.contains("[退出码"),
             "命令要正常跑完（退出 0，不因 reader 停读而卡死）。文本尾部：…{tail}"
         );
+    }
+
+    // ———————— 非 UTF-8 输出的 lossy 处理（spec §8.5） ————————
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_output_is_lossily_converted_with_an_explicit_notice() {
+        let (_dir, ctx) = sh_ctx();
+        let tool = sh_tool();
+        // \377\376 是两个非法 UTF-8 字节（printf 八进制转义，POSIX sh 原生支持）。
+        let text = text_of(
+            tool.execute(json!({"command": "printf '\\377\\376'"}), &ctx)
+                .await
+                .expect("非 UTF-8 输出不是错误（spec §8.5，与 read_file 的拒绝刻意不同）"),
+        );
+        assert!(text.contains('\u{FFFD}'), "无效字节按替换字符转换：{text:?}");
+        assert!(text.contains("非 UTF-8"), "尾部要注明转换：{text:?}");
     }
 }
