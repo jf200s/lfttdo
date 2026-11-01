@@ -2553,7 +2553,17 @@ pub async fn settings_set_api_key(
 #[tauri::command]
 pub fn shell_presets() -> Vec<ShellProfile> {
     let catalog = ShellCatalog::new();
-    ["bash", "sh", "zsh", "fish", "git-bash", "pwsh", "powershell", "cmd"]
+    let preset_ids = [
+        "bash",
+        "sh",
+        "zsh",
+        "fish",
+        "git-bash",
+        "pwsh",
+        "powershell",
+        "cmd",
+    ];
+    preset_ids
         .iter()
         .map(|id| {
             catalog
@@ -4051,7 +4061,10 @@ mod tests {
         };
         let catalog = shell_catalog_of(&settings);
         assert_eq!(catalog.customs, settings.shells, "自定义表原样进 catalog");
-        assert_eq!(catalog.default_id, "mine", "default_shell trim 后进 catalog");
+        assert_eq!(
+            catalog.default_id, "mine",
+            "default_shell trim 后进 catalog"
+        );
         assert_eq!(
             catalog.resolve(None).unwrap().program,
             "/opt/mine",
@@ -4083,7 +4096,16 @@ mod tests {
         let ids: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["bash", "sh", "zsh", "fish", "git-bash", "pwsh", "powershell", "cmd"],
+            [
+                "bash",
+                "sh",
+                "zsh",
+                "fish",
+                "git-bash",
+                "pwsh",
+                "powershell",
+                "cmd"
+            ],
             "spec §5.2 的 8 条逐项一致，顺序即展示顺序"
         );
         for p in &presets {

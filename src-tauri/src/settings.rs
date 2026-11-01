@@ -34,7 +34,7 @@ use crate::agent::context::ContextConfig;
 use crate::model::openai_compat::{ModelConfig, normalize_base_url};
 // settings → tools 的单向引用（spec §4 裁定合法）：只取 `ShellProfile` 类型与
 // `DEFAULT_PRESET_ID` 常量；shell.rs 不认识 `Settings`，反向不存在。
-use crate::tools::shell::{ShellCatalog, ShellProfile, DEFAULT_PRESET_ID};
+use crate::tools::shell::{DEFAULT_PRESET_ID, ShellCatalog, ShellProfile};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -2802,9 +2802,9 @@ mod tests {
             ..Default::default()
         };
         let v = serde_json::to_value(&s).unwrap();
-        let entry = v["shells"][0].as_object().unwrap_or_else(|| {
-            panic!("shells 必须是 JSON 数组，实得 {:?}", v["shells"])
-        });
+        let entry = v["shells"][0]
+            .as_object()
+            .unwrap_or_else(|| panic!("shells 必须是 JSON 数组，实得 {:?}", v["shells"]));
         let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
