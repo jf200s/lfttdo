@@ -347,7 +347,7 @@ const DEGRADED_IMAGE_NOTE: &str = "[图片已移除以节省上下文]";
 /// 不碰 `ContentBlock::ToolResult` 里的 `ToolOutput::Image`：Plan A 的 registry 为空，
 /// 工具结果进历史今天不可达，为它扩实现会让「图片降级」和「工具结果图片」两套规则混在
 /// 一起（R150）。工具结果图片的降级随 Plan B 的工具注册一起做。
-pub fn degrade_old_images(msgs: &mut Vec<Message>, keep_recent: usize) {
+pub fn degrade_old_images(msgs: &mut [Message], keep_recent: usize) {
     let mut image_positions: Vec<(usize, usize)> = Vec::new();
     for (mi, m) in msgs.iter().enumerate() {
         for (bi, b) in m.blocks.iter().enumerate() {

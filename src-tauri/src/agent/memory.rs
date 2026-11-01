@@ -512,6 +512,9 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for TextModel {
+        // ModelError::Transport 内联携带 OpenAIError（≥136 字节），替身签名躲不开 Result<_, ModelError>；
+        // Box 化属于错误类型布局重构，超出本次机械清理范围。
+        #[allow(clippy::result_large_err)]
         fn stream<'a>(
             &'a self,
             req: ChatRequest,
@@ -917,8 +920,7 @@ mod tests {
         });
         let err = extract_memories(&*model, &src_messages(), &never_cancelled())
             .await
-            .err()
-            .expect("429 必须是 Err");
+            .expect_err("429 必须是 Err");
         assert!(err.contains("429"), "报错要能判断该重试还是该改设置:{err}");
     }
 

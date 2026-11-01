@@ -430,7 +430,7 @@ impl Db {
     /// - `Role::System`:摘要备注不是对话内容(抽它等于让模型总结自己的总结);
     /// - 工具结果行:工具输出是数据不是陈述,把网页正文/文件内容喂给抽取会烧掉大量
     ///   token 并抽出与用户无关的东西。
-    /// 只取文本:带图的行在抽取调用里没有意义(vision 模型也不该为记忆付费)。
+    ///   只取文本:带图的行在抽取调用里没有意义(vision 模型也不该为记忆付费)。
     pub fn messages_for_extraction(
         &self,
         session_id: &str,
@@ -539,7 +539,7 @@ impl Db {
     /// 2. `confidence` 抬到 1.0 —— 用户亲手确认过的事,不该再被算法的置信度打折;
     /// 3. 清除 `due_at`/`notified_at` 之外的时间戳不动:`valid_from` 保留原始记忆的
     ///    年龄(用户改的是内容,不是「这件事什么时候发生的」)。
-    /// 待办被编辑时 `due_at` **保留** —— 用户改进措辞不该把提醒弄丢。
+    ///    待办被编辑时 `due_at` **保留** —— 用户改进措辞不该把提醒弄丢。
     pub fn update_memory_body_by_user(&self, id: i64, body: &str) -> Result<(), rusqlite::Error> {
         let c = self.lock();
         reject_empty_body(body)?;
@@ -884,11 +884,11 @@ pub fn to_vec(v: &[f32]) -> Vec<u8> {
 /// 返回 None 而不是截断或补零:检索侧把 None 当「无向量」降级(裁定 4),
 /// 决不把损坏的字节当语义 —— 那是「看起来完整的行」这一类错误(R71 同族)。
 pub fn from_vec(b: &[u8]) -> Option<Vec<f32>> {
-    if b.len() % 4 != 0 {
+    if !b.len().is_multiple_of(4) {
         return None;
     }
     Some(
-        b.chunks_exact(4)
+        b.as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     )

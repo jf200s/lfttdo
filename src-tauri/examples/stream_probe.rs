@@ -120,11 +120,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
-            if let Some(t) = &ch.delta.content {
-                if !t.is_empty() {
+            if let Some(t) = &ch.delta.content
+                && !t.is_empty() {
                     println!("TEXT {t:?}");
                 }
-            }
         }
     }
     // 审查修复（附带项）：不再 `first.unwrap_or_default()` —— 零块流会打印成

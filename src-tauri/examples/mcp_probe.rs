@@ -4,7 +4,7 @@
 //! 回答 spec 第 11 节风险 #2 的三件事：
 //! 1) rmcp 当前版本（3.5.1）的 client + stdio 传输到底怎么构造
 //!    —— client 侧走 `rmcp::transport::TokioChildProcess`（它内部消费一个
-//!       `tokio::process::Command`），server 侧才是 `rmcp::transport::stdio()`。
+//!    `tokio::process::Command`），server 侧才是 `rmcp::transport::stdio()`。
 //! 2) Windows 上 `npx`（实为 `npx.cmd`）能否被 spawn。
 //!    这里刻意用 `tokio::process::Command` 而不是 `std::process::Command`，因为
 //!    rmcp 的 TokioChildProcess 收的就是 tokio 那种 Command，测出来的不对称才直接可复用。

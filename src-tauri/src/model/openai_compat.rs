@@ -15,6 +15,9 @@
 //!   （已连通，是 key/配额/模型名的问题，去查设置）
 //!   vs `无法连接模型端点 https://…: http error: dns error`（没连通，去查网络/代理）。
 //!   分错的代价是把「你的 key 不对」送去查网络。
+// ModelError::Transport 内联携带 OpenAIError（≥136 字节），本文件 6 个返回 Result<_, ModelError>
+// 的函数全部命中；Box 化属于错误类型布局重构，超出本次机械清理范围。
+#![allow(clippy::result_large_err)]
 use super::provider::{ChatRequest, ModelDelta, ModelError, ModelProvider, ToolDef};
 use crate::agent::types::{ContentBlock, ImageMime, Message, Role, ToolOutput};
 use async_openai::{
@@ -71,10 +74,10 @@ fn strip_len(s: &str, suffix: &str) -> Option<usize> {
 /// 3. 循环（每步都严格变短，必然终止）：
 ///    a. 去全部尾斜杠；
 ///    b. 尾部是「端点段 + 版本段」的颠倒粘贴（`…/chat/completions/v1`、`…/completions/v1`）
-///       → 只摘尾部 `/v1`，剩下的端点段交给 d 处理；
+///    → 只摘尾部 `/v1`，剩下的端点段交给 d 处理；
 ///    c. 尾部恰为 `/v1/v1`（复制粘贴常见，可多层，循环收敛）→ 摘掉一个 `/v1`；
 ///    d. 尾部是端点段 → 摘掉它。**`/chat/completions` 必须先于 `/completions` 判定**，
-///       否则 `…/v1/chat/completions` 会被削成 `…/v1/chat` 再加 `/v1`（R27 的主形态）。
+///    否则 `…/v1/chat/completions` 会被削成 `…/v1/chat` 再加 `/v1`（R27 的主形态）。
 /// 4. 尾段不是 `/v1` 就补一个。
 ///
 /// R27 的动机：用户粘贴的是各家控制台显示的那一行。dashscope 控制台给的就是
@@ -688,11 +691,10 @@ fn chunk_to_deltas(c: &async_openai::types::chat::CreateChatCompletionStreamResp
         });
     }
     for ch in &c.choices {
-        if let Some(t) = &ch.delta.content {
-            if !t.is_empty() {
+        if let Some(t) = &ch.delta.content
+            && !t.is_empty() {
                 v.push(ModelDelta::Text(t.clone()));
             }
-        }
         if let Some(tcs) = &ch.delta.tool_calls {
             for f in tcs {
                 // R21：0.42.2 的 `index` 是非可选 `u32`，且没有 `#[serde(default)]`

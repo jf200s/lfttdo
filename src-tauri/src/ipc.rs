@@ -657,6 +657,8 @@ async fn plan_memory_writes_from_candidates(
     Ok(writes)
 }
 
+// 9 个参数是压缩轮次的真实签名，收拢成参数对象属于签名重构，超出本次机械清理范围。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn compact_before_turn(
     db: &Arc<Db>,
     session_id: &str,
@@ -700,7 +702,7 @@ pub(crate) async fn compact_before_turn(
         match locks.try_acquire(session_id) {
             Some(_guard) => {
                 plan_memory_writes(
-                    &db,
+                    db,
                     session_id,
                     model,
                     &plan.source,
@@ -1206,11 +1208,10 @@ pub(crate) fn memory_notes_for_turn(
     // ① 待办提醒:先取、先标记。`due_notes` 只读,标记在这里做 ——
     // 标记失败不影响注入(见上面的取向说明)。
     let (due, due_ids) = due_notes(db, window_hours)?;
-    if !due_ids.is_empty() {
-        if let Err(reason) = db.mark_notified(&due_ids, Db::now_ms()) {
+    if !due_ids.is_empty()
+        && let Err(reason) = db.mark_notified(&due_ids, Db::now_ms()) {
             tracing::warn!("待办提醒标记失败,本轮仍然注入(宁可重复一次,不可丢失):{reason}");
         }
-    }
     notes.extend(due);
 
     // ② 画像:常驻,不受超限影响。
@@ -1260,11 +1261,10 @@ pub(crate) fn memory_notes_for_turn(
     }
 
     // ④ 概览:最后一条,也是最先被 cap 砍掉的一条(它最「元」、最不紧急)。
-    if let Some(overview) = overview_note(db)? {
-        if used + crate::agent::context::note_tokens(&overview) <= cap {
+    if let Some(overview) = overview_note(db)?
+        && used + crate::agent::context::note_tokens(&overview) <= cap {
             notes.push(overview);
         }
-    }
 
     Ok(notes)
 }
@@ -2562,7 +2562,7 @@ pub fn shell_presets() -> Vec<ShellProfile> {
 /// 2. `ensure_executable` —— 存在 + 可执行判定；裸名按 `search_dirs` 逐目录解析，
 ///    生产传 `path_search_dirs()`（PATH，Windows 叠 PATHEXT），测试注入假表 ——
 ///    同 mcp R305 的「解析器可注入」口径。
-/// 错误是给人读的中文串，`Err` 原样上屏（spec §5.5）。
+///    错误是给人读的中文串，`Err` 原样上屏（spec §5.5）。
 fn validate_shell_profile_with_dirs(
     profile: ShellProfile,
     search_dirs: &[PathBuf],
@@ -2845,6 +2845,9 @@ fn resolve_data_dir(handle: &AppHandle) -> Option<PathBuf> {
 ///
 /// 返回**成功处理**的会话数(失败/跳过都不计)。模型惰性构造:一个待抽会话都没有、
 /// 或者全被 running 跳过时,不构造客户端、不读 keyring。
+// model_factory / built 的 `dyn Fn(&Settings) -> Option<(模型, 嵌入)>` 是刻意的注入形状，
+// 收拢为 type alias 属于签名重构，超出本次机械清理范围。
+#[allow(clippy::type_complexity)]
 pub(crate) async fn idle_extract_tick(
     db: &Arc<Db>,
     settings: &Settings,
@@ -2919,6 +2922,9 @@ pub(crate) async fn idle_extract_tick(
 /// 它每 60 秒最多一次、只在真的有待抽会话时发生(惰性构造),一次本地凭据读取
 /// 的阻塞量级远小于它要发起的网络调用。为它套一层 `spawn_blocking` 只是把同一段
 /// 阻塞挪到另一个线程,不会让 tick 更快。
+// 返回的 `(模型, 嵌入)` 元组与 idle_extract_tick 的注入形状同一套，收拢为 type alias 属于
+// 签名重构，超出本次机械清理范围。
+#[allow(clippy::type_complexity)]
 fn build_idle_model(
     settings: &Settings,
     store: &SettingsStore,
@@ -4437,6 +4443,9 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for FakeModel {
+        // ModelError::Transport 内联携带 OpenAIError（≥136 字节），替身签名躲不开
+        // Result<_, ModelError>；Box 化属于错误类型布局重构，超出本次机械清理范围。
+        #[allow(clippy::result_large_err)]
         fn stream<'a>(
             &'a self,
             req: ChatRequest,
@@ -4585,6 +4594,8 @@ mod tests {
     /// T5 起多带一份记忆开关：压缩段对记忆的全部行为都由它定，夹具不许替调用方暗定。
     /// T6 起多带一份嵌入客户端:`None` = off/构造失败,写路径整段跳过;
     /// 假实现由 T6 的写路径测试注入。
+    // 8 个参数是 Step 1–4 共用夹具的真实签名，收拢成参数对象属于签名重构，超出本次机械清理范围。
+    #[allow(clippy::too_many_arguments)]
     async fn compact_once(
         f: &Fixture,
         model: &Arc<FakeModel>,
@@ -4672,7 +4683,7 @@ mod tests {
             "先说忘了多少,再说记住了多少:{tags:?}"
         );
         assert!(
-            tags[saved_at..].iter().any(|t| *t == "text_delta"),
+            tags[saved_at..].contains(&"text_delta"),
             "记住的通知必须排在本轮回答之前:{tags:?}"
         );
         match &rec.frames()[saved_at] {
@@ -8834,6 +8845,8 @@ mod tests {
         let running = Arc::new(Mutex::new(None));
         let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = factories.clone();
+        // 与 idle_extract_tick 注入形状同一套，收拢为 type alias 属于签名重构，超出机械清理范围。
+        #[allow(clippy::type_complexity)]
         let factory = move |_s: &Settings| -> Option<(
             Arc<dyn ModelProvider>,
             Option<Arc<dyn EmbedProvider>>,
@@ -8868,6 +8881,8 @@ mod tests {
         let running = Arc::new(Mutex::new(None));
         let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = factories.clone();
+        // 与 idle_extract_tick 注入形状同一套，收拢为 type alias 属于签名重构，超出机械清理范围。
+        #[allow(clippy::type_complexity)]
         let factory = move |_s: &Settings| -> Option<(
             Arc<dyn ModelProvider>,
             Option<Arc<dyn EmbedProvider>>,
@@ -8902,6 +8917,8 @@ mod tests {
         let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = factories.clone();
         let fake = model.clone();
+        // 与 idle_extract_tick 注入形状同一套，收拢为 type alias 属于签名重构，超出机械清理范围。
+        #[allow(clippy::type_complexity)]
         let factory = move |_s: &Settings| -> Option<(
             Arc<dyn ModelProvider>,
             Option<Arc<dyn EmbedProvider>>,
@@ -9065,6 +9082,8 @@ mod tests {
         let locks = ExtractLocks::default();
         let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = factories.clone();
+        // 与 idle_extract_tick 注入形状同一套，收拢为 type alias 属于签名重构，超出机械清理范围。
+        #[allow(clippy::type_complexity)]
         let factory = move |_s: &Settings| -> Option<(
             Arc<dyn ModelProvider>,
             Option<Arc<dyn EmbedProvider>>,
@@ -9103,6 +9122,8 @@ mod tests {
             &[],
         );
         let fake = model.clone();
+        // 与 idle_extract_tick 注入形状同一套，收拢为 type alias 属于签名重构，超出机械清理范围。
+        #[allow(clippy::type_complexity)]
         let factory = move |_s: &Settings| -> Option<(
             Arc<dyn ModelProvider>,
             Option<Arc<dyn EmbedProvider>>,
@@ -9147,6 +9168,8 @@ mod tests {
             &[],
         );
         let fake = model.clone();
+        // 与 idle_extract_tick 注入形状同一套，收拢为 type alias 属于签名重构，超出机械清理范围。
+        #[allow(clippy::type_complexity)]
         let factory = move |_s: &Settings| -> Option<(
             Arc<dyn ModelProvider>,
             Option<Arc<dyn EmbedProvider>>,

@@ -212,7 +212,7 @@ fn within_decode_budget(total_bytes: u64) -> bool {
 
 /// `STANDARD`（带 padding、不换行）编码后的字节数，不用真的编一遍就知道会不会超线。
 fn base64_len(raw: usize) -> usize {
-    (raw + 2) / 3 * 4
+    raw.div_ceil(3) * 4
 }
 
 #[cfg(test)]
@@ -402,7 +402,7 @@ mod tests {
         let mut gif_buf = Vec::new();
         {
             let mut enc = image::codecs::gif::GifEncoder::new(&mut gif_buf);
-            enc.encode_frames(vec![image::Frame::new(red), image::Frame::new(blue)].into_iter())
+            enc.encode_frames(vec![image::Frame::new(red), image::Frame::new(blue)])
                 .unwrap();
         }
         let blk = normalize_image(&gif_buf).unwrap();
@@ -648,6 +648,9 @@ mod tests {
     /// [`the_decode_budget_matches_the_reserve_it_replaces`] 钉住。这条留着是因为：谁把 `map_err`
     /// 改成 panic、或把这条路径整个重构掉，这里会响。
     #[test]
+    // 夹具前提二的条件虽是编译期常量，但它是夹具护栏：MAX_DECODE_ALLOC_BYTES 或夹具尺寸
+    // 一旦改动必须当场红；clippy 的 const 块化会改变失败模式，删除则失去护栏，故保留原样。
+    #[allow(clippy::assertions_on_constants)]
     fn rejects_a_small_png_that_claims_huge_dimensions() {
         let bytes = bomb_png(40_000, 40_000);
         // 夹具前提一：这是个小文件，40MB 那道入流闸管不到它 —— 拦住它的只能是分配预算

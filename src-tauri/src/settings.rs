@@ -2469,7 +2469,7 @@ mod tests {
         } else {
             PathBuf::from("/")
         };
-        let out = dedupe_roots(&[drive_root.clone()]);
+        let out = dedupe_roots(std::slice::from_ref(&drive_root));
         assert_eq!(
             out.len(),
             1,

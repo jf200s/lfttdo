@@ -171,6 +171,8 @@ pub fn detected_presets() -> Vec<ShellProfile> {
 /// 检测的可注入内核（同 `run_with_job_factory` 的注入口径，R305）：probe 形状即
 /// `ensure_executable` 的签名，测试注入假 probe 钉「全在 / 全不在 / 部分在」三态，
 /// 单测不依赖本机装了什么。
+// probe 的 `&dyn Fn` 签名是刻意的注入口（R305），收拢为 type alias 属于签名重构，超出机械清理范围。
+#[allow(clippy::type_complexity)]
 fn detect_presets_with(
     probe: &dyn Fn(&str, &[PathBuf]) -> Result<PathBuf, String>,
 ) -> Vec<ShellProfile> {
@@ -389,6 +391,8 @@ impl ShellCatalog {
 
     /// 构造的可注入口（R305 同款）：probe 即 `ensure_executable` 的签名，测试注入假
     /// probe 钉「全在 / 全不在 / 部分在」三态，不依赖本机装了什么。
+    // probe 的 `&dyn Fn` 签名是刻意的注入口（R305），收拢为 type alias 属于签名重构，超出机械清理范围。
+    #[allow(clippy::type_complexity)]
     pub fn from_parts_with_probe(
         customs: Vec<ShellProfile>,
         default_id: &str,
@@ -729,12 +733,11 @@ async fn run_with_job_factory(
     // 上膛：把子进程记进回收单位（Unix 记 pgid、Windows 进 job）——这是唯一能拿
     // pid 的时刻。失败就亲手杀掉，不留一个没有兜底的孩子（R323 同一失败策略）。
     // pid 为 None 只可能是「spawn 后立刻被收尸」，此时已无事可回收（bridge.rs 同判读）。
-    if let Some(pid) = child.id() {
-        if let Err(e) = job.assign(pid) {
+    if let Some(pid) = child.id()
+        && let Err(e) = job.assign(pid) {
             let _ = child.kill().await;
             return Err(ToolError::Failed(e));
         }
-    }
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
