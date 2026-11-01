@@ -28,6 +28,11 @@ const h = vi.hoisted(() => {
       output_dir: "C:\\out\\session",
     })),
     setSessionWorkspace: vi.fn(),
+    // Shell 子区（SettingsPanel 的生产默认回调直连这两个命令）：本文件虽不开设置面板，
+    // mock 工厂缺了这两支，任何「面板 + 本 mock」的组合一挂载就会抛
+    // 「No "shellPresets" export is defined on the mock」。补上以防相邻文件牵连。
+    shellPresets: vi.fn(async () => []),
+    shellProfileValidate: vi.fn(async () => {}),
     // App 订阅的是 `subscribeAgent`（不是 `listen`）：mock 工厂里缺这一支，渲染期就会抛
     // 「No "subscribeAgent" export is defined on the mock」，十三条一起红 —— 红的是接线不是行为。
     subscribeAgent: (cb: (sessionId: string, e: never) => void) => {

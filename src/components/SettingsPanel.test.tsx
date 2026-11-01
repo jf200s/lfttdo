@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SettingsPanel } from "./SettingsPanel";
-import type { MemoryView, SettingsView } from "../types";
+import type { MemoryView, SettingsView, ShellProfile } from "../types";
 
 const downloadPersonaText = vi.hoisted(() => vi.fn());
 vi.mock("../persona", async (importOriginal) => {
@@ -120,6 +120,11 @@ const setup = async (over: Partial<SettingsView> = {}, props: Partial<PanelProps
   const onUpdateMemory = vi.fn<PanelProps["onUpdateMemory"]>(async () => {});
   const onAddMemory = vi.fn<PanelProps["onAddMemory"]>(async () => 1);
   const onPickFolder = vi.fn<PanelProps["onPickFolder"]>(async () => null);
+  // Shell 子区（spec §3.1）的两个回调。与记忆区同一口径：面板一挂载就要拉预设表，
+  // 默认给空表（= 生产上 Rust 恒返回 8 条，但既有用例不关心它，空表让它们零改动）；
+  // 校验默认成功，只有关心失败路径的用例才覆写。
+  const onLoadShellPresets = vi.fn<NonNullable<PanelProps["onLoadShellPresets"]>>(async () => []);
+  const onValidateShellProfile = vi.fn<NonNullable<PanelProps["onValidateShellProfile"]>>(async () => {});
   render(
     <SettingsPanel
       initial={view(over)}
@@ -134,6 +139,8 @@ const setup = async (over: Partial<SettingsView> = {}, props: Partial<PanelProps
       onUpdateMemory={onUpdateMemory}
       onAddMemory={onAddMemory}
       onPickFolder={onPickFolder}
+      onLoadShellPresets={onLoadShellPresets}
+      onValidateShellProfile={onValidateShellProfile}
       {...props}
     />,
   );
@@ -155,6 +162,8 @@ const setup = async (over: Partial<SettingsView> = {}, props: Partial<PanelProps
     onUpdateMemory,
     onAddMemory,
     onPickFolder,
+    onLoadShellPresets,
+    onValidateShellProfile,
   };
 };
 
@@ -839,7 +848,9 @@ describe("SettingsPanel", () => {
     fireEvent.change(screen.getByLabelText(/记忆正文/), {
       target: { value: "用户喜欢深色主题" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+    fireEvent.click(
+      within(screen.getByTestId("memory-add")).getByRole("button", { name: "添加" }),
+    );
     await waitFor(() =>
       expect(onAddMemory).toHaveBeenCalledWith(
         "preference",
@@ -884,7 +895,9 @@ describe("SettingsPanel", () => {
     fireEvent.change(screen.getByLabelText(/提醒时间/), {
       target: { value: "2026-11-01T09:00" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+    fireEvent.click(
+      within(screen.getByTestId("memory-add")).getByRole("button", { name: "添加" }),
+    );
     await waitFor(() =>
       expect(onAddMemory).toHaveBeenCalledWith(
         "prospective",
@@ -906,7 +919,9 @@ describe("SettingsPanel", () => {
     await screen.findByTestId("memory-empty");
     fireEvent.change(screen.getByLabelText(/记忆类型/), { target: { value: "prospective" } });
     fireEvent.change(screen.getByLabelText(/记忆正文/), { target: { value: "改天再说的事" } });
-    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+    fireEvent.click(
+      within(screen.getByTestId("memory-add")).getByRole("button", { name: "添加" }),
+    );
     await waitFor(() =>
       expect(onAddMemory).toHaveBeenCalledWith("prospective", "改天再说的事", null),
     );
@@ -925,7 +940,9 @@ describe("SettingsPanel", () => {
     });
     fireEvent.change(screen.getByLabelText(/记忆类型/), { target: { value: "fact" } });
     fireEvent.change(screen.getByLabelText(/记忆正文/), { target: { value: "用户养了一只猫" } });
-    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+    fireEvent.click(
+      within(screen.getByTestId("memory-add")).getByRole("button", { name: "添加" }),
+    );
     await waitFor(() =>
       expect(onAddMemory).toHaveBeenCalledWith("fact", "用户养了一只猫", null),
     );
@@ -935,11 +952,234 @@ describe("SettingsPanel", () => {
     const onLoadMemories = vi.fn<PanelProps["onLoadMemories"]>(async () => []);
     await setup({}, { onLoadMemories });
     await screen.findByTestId("memory-empty");
-    const add = screen.getByRole("button", { name: "添加" });
+    // Shell 子区也有一个「添加」按钮：这里钉的是记忆新增区那个，按容器收窄。
+    const add = within(screen.getByTestId("memory-add")).getByRole("button", {
+      name: "添加",
+    });
     expect(add).toBeDisabled();
     fireEvent.change(screen.getByLabelText(/记忆正文/), { target: { value: "   " } });
     expect(add).toBeDisabled();
     fireEvent.change(screen.getByLabelText(/记忆正文/), { target: { value: "记一件事" } });
     expect(add).toBeEnabled();
+  });
+
+  // ==== Shell 切片（spec §3.1）：预设只读 / 默认 shell 下拉 / 自定义 profile 增删改校 ====
+  // 预设表的真相在 Rust（tools/shell.rs），onLoadShellPresets 返回什么就渲染什么；
+  // 自定义表的真值在 form.shells（保存随整表走 settings_set），表单草稿只是面板局部 state。
+  // 这一组的「添加/删除」按钮与长期记忆子区同名，所以每条用例都先 within(Shell 那组
+  // fieldset) 收窄查找范围，避免跨组误中（getByRole 一旦命中两个元素就直接抛错）。
+
+  /** spec §5.2 预设表的一条。默认给看得见差别的值，用例只覆写它关心的键（同 view() 的用法）。 */
+  const preset = (id: string, p: Partial<ShellProfile> = {}): ShellProfile => ({
+    id,
+    label: `预设 ${id}`,
+    program: `/usr/bin/${id}`,
+    args: ["-c"],
+    ...p,
+  });
+
+  /** spec §5.2 的 8 条预设（真实表），给只读渲染用例当线上真值。 */
+  const eightPresets = (): ShellProfile[] => [
+    preset("bash", { label: "Bash", program: "bash", args: ["-lc"] }),
+    preset("sh", { label: "sh", args: [] }),
+    preset("zsh", { label: "Zsh" }),
+    preset("fish", { label: "Fish" }),
+    preset("git-bash", {
+      label: "Git Bash",
+      program: "C:\\Program Files\\Git\\bin\\bash.exe",
+      args: ["-lc"],
+    }),
+    preset("pwsh", {
+      label: "PowerShell (pwsh)",
+      program: "pwsh",
+      args: ["-NoLogo", "-NoProfile", "-Command"],
+    }),
+    preset("powershell", { label: "Windows PowerShell" }),
+    preset("cmd", { label: "CMD", args: ["/d", "/s", "/c"] }),
+  ];
+
+  const shellGroup = (): HTMLElement => screen.getByRole("group", { name: "Shell" });
+
+  it("renders the presets returned by onLoadShellPresets as read-only rows", async () => {
+    // 挂载即拉一次：App 侧用稳定的注入身份，面板不重拉（同 onLoadProfile 的口径）。
+    const onLoadShellPresets = vi.fn<NonNullable<PanelProps["onLoadShellPresets"]>>(async () => eightPresets());
+    await setup({}, { onLoadShellPresets });
+    const rows = await screen.findAllByTestId("shell-preset");
+    expect(rows).toHaveLength(8);
+    expect(onLoadShellPresets).toHaveBeenCalledTimes(1);
+    // 行文案按 spec §3.1 的形状：{label}（{id}）· {program} {args.join(" ")}。
+    expect(rows[0]).toHaveTextContent("Bash（bash）· bash -lc");
+    expect(rows[4]).toHaveTextContent("Git Bash（git-bash）· C:\\Program Files\\Git\\bin\\bash.exe -lc");
+    expect(rows[5]).toHaveTextContent("PowerShell (pwsh)（pwsh）· pwsh -NoLogo -NoProfile -Command");
+    // 只读：预设行里不许有任何输入控件绑定它们的 program/args。
+    for (const row of rows) {
+      expect(within(row).queryByRole("textbox")).toBeNull();
+      expect(within(row).queryByRole("combobox")).toBeNull();
+      expect(within(row).queryByRole("button")).toBeNull();
+    }
+    // 区块尾提示与「文件访问」同款：保存后下一条消息生效。
+    expect(within(shellGroup()).getByText("保存后下一条消息生效。")).toBeInTheDocument();
+  });
+
+  it("offers preset and custom ids in the default shell select and saves the change", async () => {
+    const p = await setup(
+      { shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }] },
+      { onLoadShellPresets: vi.fn(async () => [preset("bash"), preset("pwsh")]) },
+    );
+    const select = within(shellGroup()).getByLabelText(/默认 shell/) as HTMLSelectElement;
+    // 选项 = 预设 id ∪ 自定义 id：下拉里能看到自定义的那条，预设两条也都在。
+    expect([...select.options].map((o) => o.value)).toEqual(["bash", "pwsh", "mine"]);
+    expect(select.value).toBe("bash");
+    fireEvent.change(select, { target: { value: "mine" } });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].default_shell).toBe("mine");
+  });
+
+  it("adds the draft profile to the payload and refuses to add without a program", async () => {
+    const p = await setup(
+      { shells: [] },
+      { onLoadShellPresets: vi.fn(async () => [preset("bash")]) },
+    );
+    const add = within(shellGroup()).getByRole("button", { name: "添加" });
+    // 前端只做按钮使能（真校验只有 Rust 一处）：程序路径为空时禁用，id/label 齐了也不行。
+    expect(add).toBeDisabled();
+    fireEvent.change(within(shellGroup()).getByLabelText(/标识（id）/), {
+      target: { value: "mine" },
+    });
+    fireEvent.change(within(shellGroup()).getByLabelText(/显示名/), {
+      target: { value: "我的 shell" },
+    });
+    expect(add).toBeDisabled();
+    fireEvent.change(within(shellGroup()).getByLabelText(/程序路径/), {
+      target: { value: "/opt/mine" },
+    });
+    expect(add).toBeEnabled();
+    // args 每行一个参数：空行丢掉、行两端空白 trim（结构整理，不是内容校验）。
+    fireEvent.change(within(shellGroup()).getByLabelText(/参数（每行一个）/), {
+      target: { value: "-c\n\n  --login  \n" },
+    });
+    fireEvent.click(add);
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].shells).toEqual([
+      { id: "mine", label: "我的 shell", program: "/opt/mine", args: ["-c", "--login"] },
+    ]);
+  });
+
+  it("routes a failed shell validation into the error channel and keeps the draft", async () => {
+    const onValidateShellProfile = vi.fn<NonNullable<PanelProps["onValidateShellProfile"]>>(async () => {
+      throw new Error("程序不存在：/opt/nope");
+    });
+    await setup({}, { onValidateShellProfile });
+    fireEvent.change(within(shellGroup()).getByLabelText(/标识（id）/), {
+      target: { value: "mine" },
+    });
+    fireEvent.change(within(shellGroup()).getByLabelText(/程序路径/), {
+      target: { value: "/opt/nope" },
+    });
+    fireEvent.change(within(shellGroup()).getByLabelText(/参数（每行一个）/), {
+      target: { value: "-c\n" },
+    });
+    fireEvent.click(within(shellGroup()).getByRole("button", { name: "校验" }));
+    // 失败原因原文进既有 error 通道（role=alert），前端不解释文案（R195 口径）。
+    expect(await screen.findByRole("alert")).toHaveTextContent("程序不存在：/opt/nope");
+    // 草稿不丢：改完路径再点一次校验就行，用户不许重打一遍。
+    expect((within(shellGroup()).getByLabelText(/程序路径/) as HTMLInputElement).value).toBe(
+      "/opt/nope",
+    );
+    const idBox = within(shellGroup()).getByLabelText(/标识（id）/);
+    expect((idBox as HTMLInputElement).value).toBe("mine");
+    const argsBox = within(shellGroup()).getByLabelText(/参数（每行一个）/);
+    expect((argsBox as HTMLTextAreaElement).value).toBe("-c\n");
+    // 递给后端的是切好行的线上形状，不是 textarea 原文。
+    expect(onValidateShellProfile).toHaveBeenCalledWith({
+      id: "mine",
+      label: "",
+      program: "/opt/nope",
+      args: ["-c"],
+    });
+  });
+
+  it("shows the executable notice when validation succeeds", async () => {
+    const onValidateShellProfile = vi.fn<NonNullable<PanelProps["onValidateShellProfile"]>>(async () => {});
+    await setup({}, { onValidateShellProfile });
+    expect(screen.queryByTestId("shell-check-ok")).toBeNull();
+    fireEvent.change(within(shellGroup()).getByLabelText(/程序路径/), {
+      target: { value: "/bin/sh" },
+    });
+    fireEvent.click(within(shellGroup()).getByRole("button", { name: "校验" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("shell-check-ok")).toHaveTextContent("程序存在且可执行。"),
+    );
+  });
+
+  it("removes a custom profile from the payload on delete", async () => {
+    const p = await setup(
+      {
+        shells: [
+          { id: "a", label: "", program: "/opt/a", args: [] },
+          { id: "b", label: "", program: "/opt/b", args: [] },
+        ],
+      },
+      { onLoadShellPresets: vi.fn(async () => []) },
+    );
+    const rows = screen.getAllByTestId("shell-profile-item");
+    expect(rows).toHaveLength(2);
+    fireEvent.click(within(rows[0]).getByRole("button", { name: "删除" }));
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].shells).toEqual([
+      { id: "b", label: "", program: "/opt/b", args: [] },
+    ]);
+  });
+
+  it("replaces the selected profile in place when the edit is saved", async () => {
+    const p = await setup(
+      {
+        shells: [
+          { id: "a", label: "甲", program: "/opt/a", args: ["-c"] },
+          { id: "b", label: "", program: "/opt/b", args: [] },
+        ],
+      },
+      { onLoadShellPresets: vi.fn(async () => []) },
+    );
+    const rows = screen.getAllByTestId("shell-profile-item");
+    // 选中回填：表单拿到的是这一行的完整值（args 逐行回显），不是列表上的展示串。
+    fireEvent.click(within(rows[0]).getByRole("button", { name: "修改" }));
+    const program = within(shellGroup()).getByLabelText(/程序路径/) as HTMLInputElement;
+    expect(program.value).toBe("/opt/a");
+    fireEvent.change(program, { target: { value: "/opt/a2" } });
+    fireEvent.click(within(shellGroup()).getByRole("button", { name: "保存修改" }));
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    // 位置不变：第 0 条被替换、第 1 条原样 —— 修改不是「删了再添到末尾」。
+    expect(p.onSave.mock.calls[0][0].shells).toEqual([
+      { id: "a", label: "甲", program: "/opt/a2", args: ["-c"] },
+      { id: "b", label: "", program: "/opt/b", args: [] },
+    ]);
+  });
+
+  it("warns when a custom profile would shadow a preset by id", async () => {
+    await setup({}, { onLoadShellPresets: vi.fn(async () => [preset("bash")]) });
+    expect(screen.queryByText(/同名自定义 profile/)).toBeNull();
+    fireEvent.change(within(shellGroup()).getByLabelText(/标识（id）/), {
+      target: { value: "bash" },
+    });
+    expect(
+      screen.getByText("同名自定义 profile 会在执行时覆盖同名预设。"),
+    ).toBeInTheDocument();
+    fireEvent.change(within(shellGroup()).getByLabelText(/标识（id）/), {
+      target: { value: "mine" },
+    });
+    expect(screen.queryByText(/同名自定义 profile/)).toBeNull();
+  });
+
+  it("routes a failed preset load into the existing error channel", async () => {
+    const onLoadShellPresets = vi.fn<NonNullable<PanelProps["onLoadShellPresets"]>>(async () => {
+      throw new Error("shell_presets 失败：IPC 断了");
+    });
+    await setup({}, { onLoadShellPresets });
+    expect(await screen.findByRole("alert")).toHaveTextContent("shell_presets 失败：IPC 断了");
   });
 });

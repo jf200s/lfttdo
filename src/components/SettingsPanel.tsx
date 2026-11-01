@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
+import { shellPresets, shellProfileValidate } from "../ipc/commands";
 import {
   MAX_PERSONA_CHARS,
   downloadPersonaText,
   normalizePersonaText,
 } from "../persona";
 import { THEME_NAMES, type Mode } from "../theme/theme";
-import type { MemoryView, Settings, SettingsView } from "../types";
+import type { MemoryView, Settings, SettingsView, ShellProfile } from "../types";
 
 interface SettingsPanelProps {
   initial: SettingsView;
@@ -40,6 +41,18 @@ interface SettingsPanelProps {
   onUpdateMemory: (id: number, body: string) => Promise<void>;
   onAddMemory: (kind: string, body: string, dueAt: number | null) => Promise<number>;
   onPickFolder: () => Promise<string | null>;
+  /**
+   * Shell 子区（spec §3.1）的两个回调。**生产不传**：默认直连 `commands.ts` 的两个命令
+   * （同 `McpPanel` 的 `loadConfigStatus = mcpConfigStatus` 模式，`App.tsx` 零改动）；
+   * 测试注入假实现省一次 IPC。
+   *
+   * 两个都**不 catch**：失败原文由面板进自己的 error 通道（同 `onSave`/`onLoadMemories`
+   * 的口径）。`onLoadShellPresets` 返回的预设表是**只读副本**（真相在 Rust 的
+   * `tools/shell.rs`），面板只展示；`onValidateShellProfile` 是唯一的真校验入口
+   * （`validate_custom` + `ensure_executable`），保存时**不**调用它（R284 同规）。
+   */
+  onLoadShellPresets?: () => Promise<ShellProfile[]>;
+  onValidateShellProfile?: (profile: ShellProfile) => Promise<void>;
   /**
    * P1：轻提示点击「已记住 N 条」时由 App 置真：面板打开后把长期记忆那一组滚进视野。
    * 为什么不在 App 里 `scrollIntoView`：那一刻面板还没挂载（`setSettingsView` 是异步的），
@@ -90,6 +103,39 @@ const NUMERIC_FIELDS: { key: keyof Settings; label: string }[] = [
  *  形态进上下文，设置页不许变成第二个阅读器。 */
 const brief = (body: string): string =>
   body.length > 60 ? body.slice(0, 60) + "…" : body;
+
+/**
+ * Shell 子区（spec §3.1）的自定义 profile 表单草稿。`args` 在框里是**每行一个参数**的
+ * textarea 原文（受控输入要能原样回显用户刚敲的东西），切行只发生在提交那一刻 ——
+ * 与 `rootsDraft` 同一条「草稿存原文、载荷走解析」的取舍。
+ */
+interface ShellDraft {
+  id: string;
+  label: string;
+  program: string;
+  argsText: string;
+}
+
+const SHELL_DRAFT_EMPTY: ShellDraft = { id: "", label: "", program: "", argsText: "" };
+
+/**
+ * args 的 textarea 草稿 → 线上 `args: string[]`：每行一个参数，trim 后丢空行。
+ * 只丢**空**行（那是结构，不是内容）—— 含空白的参数项是内容，留给 Rust 的
+ * `validate_custom` 拒收，前端不做第二套判据（真校验只有 Rust 一处）。
+ */
+const splitShellArgs = (argsText: string): string[] =>
+  argsText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+
+/**
+ * 列表行的展示串：`{label}（{id}）· {program} {args.join(" ")}`（spec §3.1）。
+ * 自定义 profile 的 label 可空（spec §5.2），空则回显 id —— 预设与自定义共用这一个
+ * 形状，两份列表读起来是同一种行。
+ */
+const shellLine = (s: ShellProfile): string =>
+  `${s.label === "" ? s.id : s.label}（${s.id}）· ${s.program} ${s.args.join(" ")}`;
 
 /**
  * T12：毫秒 → **本地** `YYYY-MM-DD`，手工拼而不是 `toLocaleDateString`。
@@ -170,6 +216,8 @@ export function SettingsPanel({
   onUpdateMemory,
   onAddMemory,
   onPickFolder,
+  onLoadShellPresets = shellPresets,
+  onValidateShellProfile = shellProfileValidate,
   scrollToMemories = false,
 }: SettingsPanelProps) {
   // 从 `initial` 拷一份本地草稿：面板活着的时候用户改的是这一份，
@@ -213,6 +261,19 @@ export function SettingsPanel({
   // 所以不需要 `null` 那一态（列表的 `null` 是为了「拉取中」与「确认为空」分开，
   // 而画像的空态渲染结果相同：什么都不显示）。
   const [profile, setProfile] = useState("");
+  /**
+   * Shell 子区（spec §3.1）。预设表是只读副本（真相在 Rust 的 `tools/shell.rs`），挂载时
+   * 经注入回调拉一次；自定义表的**真值**在 `form.shells`（保存随整表走 `settings_set`，
+   * 改完下一条消息生效），增删改都直接落 `setField("shells", …)`，不持有第二份。
+   * 表单草稿（`shellDraft`）与「正在修改第几条」（`shellEditIndex`）是面板局部 state：
+   * 它们只服务输入过程，保存成功后草稿清空，失败时保留（用户不许重打一遍）。
+   * `shellCheckOk` 只记「最近一次校验通过」：草稿一变或编辑目标一变就作废，
+   * 拿旧结论盖新草稿等于撒谎。
+   */
+  const [presets, setPresets] = useState<ShellProfile[]>([]);
+  const [shellDraft, setShellDraft] = useState<ShellDraft>(SHELL_DRAFT_EMPTY);
+  const [shellEditIndex, setShellEditIndex] = useState<number | null>(null);
+  const [shellCheckOk, setShellCheckOk] = useState(false);
   // 强调色控件的三态（任务 #64，计划 :942）：`null` = 跟随预设（复选框勾着、取色器不渲染），
   // `""` = 回到自选但**这一轮还没有值**（只有载入的 accent 本身是空串时才停在这里），
   // 其余才是用户真选过的 `#rrggbb`。
@@ -305,6 +366,22 @@ export function SettingsPanel({
     };
   }, [onLoadProfile]);
 
+  // Shell 预设表：与画像同一条挂载期口径 —— 拉一次、失败进既有 error 通道、alive 守卫。
+  // 预设表是纯只读副本，拉不到只是这一组空着 + 错误上屏，不影响面板其余部分。
+  useEffect(() => {
+    let alive = true;
+    onLoadShellPresets()
+      .then((list) => {
+        if (alive) setPresets(list);
+      })
+      .catch((e: unknown) => {
+        if (alive) setError(String(e));
+      });
+    return () => {
+      alive = false;
+    };
+  }, [onLoadShellPresets]);
+
   const removeMemory = async (id: number) => {
     try {
       await onDeleteMemory(id);
@@ -376,6 +453,81 @@ export function SettingsPanel({
     setAddBody("");
     setAddDue("");
     await reloadMemories();
+  };
+
+  // ==== Shell 子区（spec §3.1）的动作 ====
+  // 草稿进 `form.shells` 的两个入口：添加（追加到末尾）与保存修改（原位替换）。
+  // program 为空时按钮禁用是前端唯一的轻校验 —— 空不空由 Rust `validate_custom` 拒收，
+  // 前端只负责不给一个「看起来能点」的按钮（同 `addMemory` 的口径）。
+
+  /** 草稿 → 线上形状：id/label/program 原样（Rust normalize 会做词法 trim），args 切行。 */
+  const draftProfile = (): ShellProfile => ({
+    id: shellDraft.id,
+    label: shellDraft.label,
+    program: shellDraft.program,
+    args: splitShellArgs(shellDraft.argsText),
+  });
+
+  const resetShellDraft = () => {
+    setShellDraft(SHELL_DRAFT_EMPTY);
+    setShellEditIndex(null);
+    setShellCheckOk(false);
+  };
+
+  const addShellProfile = () => {
+    if (shellDraft.program.trim() === "") return;
+    setField("shells", [...form.shells, draftProfile()]);
+    resetShellDraft();
+  };
+
+  /** 选中回填：表单拿到这一行的**完整值**（args 逐行回显），不是列表上的展示串。 */
+  const beginShellEdit = (index: number) => {
+    const s = form.shells[index];
+    setShellEditIndex(index);
+    setShellCheckOk(false);
+    setShellDraft({
+      id: s.id,
+      label: s.label,
+      program: s.program,
+      argsText: s.args.join("\n"),
+    });
+  };
+
+  const saveShellProfile = () => {
+    if (shellEditIndex === null || shellDraft.program.trim() === "") return;
+    setField(
+      "shells",
+      form.shells.map((s, i) => (i === shellEditIndex ? draftProfile() : s)),
+    );
+    resetShellDraft();
+  };
+
+  const removeShellProfile = (index: number) => {
+    setField(
+      "shells",
+      form.shells.filter((_, i) => i !== index),
+    );
+    if (shellEditIndex === null) return;
+    // 删除会让下标漂移：删的正是编辑目标 → 收掉编辑；删在它前面 → 目标前移一位。
+    // 不校正的话「保存修改」会写进错位的那一行。
+    if (shellEditIndex === index) resetShellDraft();
+    else if (shellEditIndex > index) setShellEditIndex(shellEditIndex - 1);
+  };
+
+  /**
+   * 校验草稿：唯一一次真校验在 Rust（`validate_custom` + `ensure_executable`）。
+   * 失败原因原文进既有 error 通道、草稿不动；成功就地亮一句「程序存在且可执行。」。
+   * 调用前先把上一轮的成功标记按掉 —— 校验的是**当前**草稿，旧结论不许盖上来。
+   */
+  const validateShellProfile = async () => {
+    setShellCheckOk(false);
+    try {
+      await onValidateShellProfile(draftProfile());
+    } catch (e) {
+      setError(String(e));
+      return;
+    }
+    setShellCheckOk(true);
   };
 
   // 数值行的一份实现、两个入口（模型组与长期记忆组共用同一渲染形状，R117 的口径）。
@@ -610,6 +762,130 @@ export function SettingsPanel({
             一行一个绝对路径，只作为读取范围；写入/编辑只允许发生在当前工作文件夹或默认
             输出目录。留空 = 不允许读取任何目录。保存后下一条消息生效。
           </p>
+        </fieldset>
+
+        {/*
+          Shell 子区（spec §3.1）：预设只读、默认 shell 下拉、自定义 profile 的增删改校。
+          预设表的真相在 Rust（tools/shell.rs），这里只是 `shell_presets` 的只读副本；
+          自定义表的真值在 `form.shells`，保存随整表走 `settings_set`。
+          前端只做按钮使能：program 为空禁用添加/保存修改，形状与存在性的真校验只有
+          Rust 一处（「校验」按钮）。
+        */}
+        <fieldset className="panel-group">
+          <legend>Shell</legend>
+          {/* 预设（只读）：一行一条，没有任何可编辑控件绑定它们。 */}
+          {presets.map((p) => (
+            <p className="panel-row panel-readonly" data-testid="shell-preset" key={p.id}>
+              <span>{shellLine(p)}</span>
+            </p>
+          ))}
+          {/* 默认 shell：选项 = 预设 id ∪ 自定义 id。同名自定义会覆盖预设（执行期语义），
+              两个来源都列出来才不会出现「存了却选不到」的空档；Set 去重防同 id 出现两次。 */}
+          <label className="panel-row">
+            <span>默认 shell</span>
+            <select
+              value={form.default_shell}
+              onChange={(e) => setField("default_shell", e.target.value)}
+            >
+              {[...new Set([...presets.map((p) => p.id), ...form.shells.map((s) => s.id)])].map(
+                (id) => (
+                  <option key={id} value={id}>
+                    {id}
+                  </option>
+                ),
+              )}
+            </select>
+          </label>
+          {/* 自定义 profile 列表：与长期记忆列表同一条行结构（span + panel-actions）。
+              label 可空，空则行上回显 id（spec §5.2）。 */}
+          {form.shells.map((s, i) => (
+            <div className="panel-row" data-testid="shell-profile-item" key={`${s.id}-${i}`}>
+              <span>{shellLine(s)}</span>
+              <div className="panel-actions">
+                <button type="button" onClick={() => beginShellEdit(i)}>
+                  修改
+                </button>
+                <button type="button" onClick={() => removeShellProfile(i)}>
+                  删除
+                </button>
+              </div>
+            </div>
+          ))}
+          {/* 表单草稿：三个 panel-row 输入 + 每行一个参数的 textarea（复用 roots 那行的
+              单列宽版式，参数是给 shell 的，等宽字体才读得清）。 */}
+          <label className="panel-row">
+            <span>标识（id）</span>
+            <input
+              type="text"
+              value={shellDraft.id}
+              onChange={(e) => setShellDraft({ ...shellDraft, id: e.target.value })}
+            />
+          </label>
+          <label className="panel-row">
+            <span>显示名（可空）</span>
+            <input
+              type="text"
+              value={shellDraft.label}
+              onChange={(e) => setShellDraft({ ...shellDraft, label: e.target.value })}
+            />
+          </label>
+          <label className="panel-row">
+            <span>程序路径（program）</span>
+            <input
+              type="text"
+              value={shellDraft.program}
+              onChange={(e) => setShellDraft({ ...shellDraft, program: e.target.value })}
+            />
+          </label>
+          <label className="panel-row panel-roots">
+            <span>参数（每行一个）</span>
+            <textarea
+              rows={3}
+              spellCheck={false}
+              value={shellDraft.argsText}
+              onChange={(e) => setShellDraft({ ...shellDraft, argsText: e.target.value })}
+            />
+          </label>
+          {/* id 与预设同名：合法（执行时覆盖预设），但必须明说 —— 这句话不是报错，
+              是让用户知道同名意味着什么（spec §6.3）。 */}
+          {presets.some((p) => p.id === shellDraft.id.trim()) ? (
+            <p className="panel-hint">同名自定义 profile 会在执行时覆盖同名预设。</p>
+          ) : null}
+          <div className="panel-actions">
+            {shellEditIndex === null ? (
+              <button
+                type="button"
+                disabled={shellDraft.program.trim() === ""}
+                onClick={addShellProfile}
+              >
+                添加
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  disabled={shellDraft.program.trim() === ""}
+                  onClick={saveShellProfile}
+                >
+                  保存修改
+                </button>
+                <button type="button" onClick={resetShellDraft}>
+                  取消
+                </button>
+              </>
+            )}
+            {/* 校验不做使能门槛：program 为空也放行，让 Rust 的形状校验来说明哪里不对
+                （真校验只有 Rust 一处；前端拦下了用户就看不到后端原因）。 */}
+            <button type="button" onClick={() => void validateShellProfile()}>
+              校验
+            </button>
+          </div>
+          {shellCheckOk ? (
+            <p className="panel-hint" data-testid="shell-check-ok">
+              程序存在且可执行。
+            </p>
+          ) : null}
+          <p className="panel-hint">保存后下一条消息生效。</p>
         </fieldset>
 
         <fieldset className="panel-group">

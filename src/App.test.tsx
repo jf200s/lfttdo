@@ -40,6 +40,11 @@ const h = vi.hoisted(() => {
     memoryProfile: vi.fn(),
     updateMemoryBody: vi.fn(),
     addMemory: vi.fn(),
+    // Shell 子区（SettingsPanel 的生产默认回调直连这两个命令）：mock 工厂里缺这两支的话，
+    // 面板一挂载就会在默认参数求值时抛「No "shellPresets" export is defined on the mock」，
+    // 把真正的失败淹掉。预设给空表 —— 本文件的用例不关心 Shell 区。
+    shellPresets: vi.fn(async () => []),
+    shellProfileValidate: vi.fn(async () => {}),
     subscribeAgent: (cb: (sessionId: string, e: AgentEvent) => void) => {
       listeners.push(cb);
       return () => {
@@ -148,6 +153,8 @@ beforeEach(() => {
   h.memoryProfile.mockReset().mockResolvedValue("");
   h.updateMemoryBody.mockReset().mockResolvedValue(undefined);
   h.addMemory.mockReset().mockResolvedValue(1);
+  h.shellPresets.mockReset().mockResolvedValue([]);
+  h.shellProfileValidate.mockReset().mockResolvedValue(undefined);
   h.listeners.length = 0;
 });
 

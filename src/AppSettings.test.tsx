@@ -50,6 +50,11 @@ const h = vi.hoisted(() => {
     // 所以判据是「面板里点的那一下，最终打到了哪个命令、带的是哪个正文」。
     updateMemoryBody: vi.fn(),
     addMemory: vi.fn(),
+    // Shell 子区（SettingsPanel 的生产默认回调直连这两个命令）：mock 工厂里缺这两支的话，
+    // 面板一挂载就会在默认参数求值时抛「No "shellPresets" export is defined on the mock」，
+    // 把真正的失败淹掉。预设给空表 —— 本文件的用例不关心 Shell 区。
+    shellPresets: vi.fn(async () => []),
+    shellProfileValidate: vi.fn(async () => {}),
     subscribeAgent: (cb: (sessionId: string, e: AgentEvent) => void) => {
       listeners.push(cb);
       return () => {
@@ -177,6 +182,8 @@ beforeEach(() => {
   h.memoryProfile.mockReset().mockResolvedValue("");
   h.updateMemoryBody.mockReset().mockResolvedValue(undefined);
   h.addMemory.mockReset().mockResolvedValue(1);
+  h.shellPresets.mockReset().mockResolvedValue([]);
+  h.shellProfileValidate.mockReset().mockResolvedValue(undefined);
   h.listeners.length = 0;
 });
 
@@ -267,7 +274,12 @@ describe("App 设置接线", () => {
     fireEvent.change(within(dialog).getByLabelText(/记忆正文/), {
       target: { value: "下周三交季度报告" },
     });
-    fireEvent.click(within(dialog).getByRole("button", { name: "添加" }));
+    // Shell 子区也有一个「添加」按钮：这里点的是记忆新增区那个，按容器收窄。
+    fireEvent.click(
+      within(within(dialog).getByTestId("memory-add")).getByRole("button", {
+        name: "添加",
+      }),
+    );
     await waitFor(() =>
       expect(h.addMemory).toHaveBeenCalledWith(
         "prospective",
