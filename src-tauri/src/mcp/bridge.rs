@@ -102,6 +102,15 @@ impl SpawnPlan {
             // 不需要 `CommandExt`：tokio 的 `Command` 自带固有方法 `creation_flags`。
             cmd.creation_flags(self.creation_flags);
         }
+        #[cfg(not(windows))]
+        {
+            // Unix 支（T34）：进程组**必须在 spawn 时建立**（spawn 后补 setpgid 撞 exec 竞态），
+            // 而这里是 unix 上唯一的 spawn 出口，所以建组动作长在这里。`process_group(0)` =
+            // 子进程自成一个进程组（pgid = pid）；setpgid 失败 ⇒ spawn 报错 ⇒ connect_stdio
+            // 判这条不连（R323：不静默降级）。`KillOnCloseJob::assign` 只负责把 pgid 记给
+            // Drop 杀组 —— 见 mcp/process.rs 的 Unix 支说明。
+            cmd.process_group(0);
+        }
         cmd
     }
 }
@@ -1638,7 +1647,7 @@ mod tests {
     }
 
     /// 失败的重连不许把「还活着的旧连接」谎报成 Disconnected，也不许换掉它的 job。
-    #[cfg(windows)]
+    /// 曾因 `create_kill_job` 在非 Windows 返回 `Err` 而 windows-only；Unix 支补齐后两边都能跑。
     #[tokio::test]
     async fn a_failed_reconnect_keeps_the_old_connection_and_its_status() {
         let bridge = McpBridge::new();
@@ -1672,7 +1681,7 @@ mod tests {
 
     /// 回归：重连一台 server 只许换掉它自己的 job。曾经一个桥共用一个 job，
     /// 重连时覆盖 `self.job` ⇒ 旧句柄关闭 ⇒ 其余所有 server 的进程树被连带杀掉。
-    #[cfg(windows)]
+    /// 曾因 `create_kill_job` 在非 Windows 返回 `Err` 而 windows-only；Unix 支补齐后两边都能跑。
     #[tokio::test]
     async fn reconnecting_one_server_keeps_the_jobs_of_the_others() {
         let bridge = McpBridge::new();

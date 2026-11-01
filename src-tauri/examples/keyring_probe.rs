@@ -25,9 +25,14 @@
 //! **本探针永不打印条目的值**，只在拒绝时打印长度：库里那条可能就是用户的真 key，
 //! 而 stdout 会进终端滚动缓冲、也可能进 CI 日志。
 
+// 只被下面的 Windows 分支用到；非 Windows 的 stub main 不碰 store。
+// （在本仓库解锁 Linux 分支之前，这行 import 在 Linux 上解析不过 —— 探针当时
+// 只有 `cargo check`（不含 examples）能装作无事发生。）
+#[cfg(windows)]
 use lfttdo_lib::settings::{KeyringSecretStore, SecretStore};
 
 /// 一眼可辨的假 key：真 key 不会长这样，`cleanup` 靠它判断这条是不是本探针写的。
+#[cfg(windows)]
 const CANARY: &str = "sk-QWEN-DO-SELFTEST-CANARY-DELETE-ME";
 
 #[cfg(not(windows))]

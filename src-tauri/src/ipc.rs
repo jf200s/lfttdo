@@ -2060,7 +2060,13 @@ pub fn skills_open_folder(state: State<'_, AppState>) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err("打开技能文件夹目前仅支持 Windows".to_string())
+        // 与 Windows 分支同一纪律：参数走数组、不经 shell。`xdg-open` 是 freedesktop 的
+        // 标准入口（PATH 解析不含当前目录，没有 CreateProcess 那条搜索序问题）。
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("打开技能文件夹失败：{e}"))?;
+        Ok(())
     }
 }
 

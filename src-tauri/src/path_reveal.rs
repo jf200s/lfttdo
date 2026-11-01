@@ -1,4 +1,4 @@
-//! Validate paths and reveal them in Explorer without invoking a shell.
+//! Validate paths and reveal them in the system file manager without invoking a shell.
 use std::path::{Path, PathBuf};
 
 pub fn validate_target(
@@ -41,8 +41,11 @@ pub fn reveal(target: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-pub fn reveal(_target: &Path) -> Result<(), String> {
-    Err("打开文件位置目前仅支持 Windows".to_string())
+pub fn reveal(target: &Path) -> Result<(), String> {
+    reveal_command(target)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开文件位置失败：{e}"))
 }
 
 #[cfg(windows)]
@@ -56,6 +59,19 @@ fn explorer_command(target: &Path) -> std::process::Command {
         cmd.arg(&shown);
     } else {
         cmd.arg(format!("/select,{shown}"));
+    }
+    cmd
+}
+
+/// freedesktop 没有 Explorer `/select,` 的标准等价物（org.freedesktop.FileManager1 要
+/// 走 D-Bus 且只有部分文件管理器实现）：文件退而求其次开它所在的**目录**，目录直接开。
+#[cfg(not(windows))]
+fn reveal_command(target: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("xdg-open");
+    if target.is_dir() {
+        cmd.arg(target);
+    } else {
+        cmd.arg(target.parent().unwrap_or(target));
     }
     cmd
 }
@@ -182,6 +198,39 @@ mod tests {
             PathBuf::from(crate::tools::fs_write::display_path(
                 &root.canonicalize().unwrap()
             ))
+        );
+    }
+
+    /// 「在文件管理器中显示」的形状：目录开自身、文件开所在目录。不真正 spawn
+    /// （那会弹出文件管理器），只检查构造出来的命令 —— 与上面 explorer 那条同一条验收。
+    #[cfg(not(windows))]
+    #[test]
+    fn xdg_open_reveals_directories_and_the_parents_of_files() {
+        let (_guard, root) = temp_root();
+        let file = root.join("a b.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        let file_cmd = reveal_command(&file.canonicalize().unwrap());
+        assert_eq!(file_cmd.get_program(), "xdg-open");
+        let args: Vec<String> = file_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![root.canonicalize().unwrap().to_string_lossy().to_string()],
+            "文件开所在目录：{args:?}"
+        );
+
+        let dir_cmd = reveal_command(&root.canonicalize().unwrap());
+        let dir_args: Vec<String> = dir_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            dir_args,
+            vec![root.canonicalize().unwrap().to_string_lossy().to_string()],
+            "目录直接打开：{dir_args:?}"
         );
     }
 }

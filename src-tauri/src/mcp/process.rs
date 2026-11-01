@@ -1,4 +1,4 @@
-// T34：JobObject 的进程树回收。
+// T34：JobObject（Windows）/ 进程组（Unix）的进程树回收。
 //
 // 为什么需要它（切片 0 的实测，`docs/findings/plan-a-risk-verification.md:559-620`）：
 // 我们 spawn 的是 `npx.cmd`，Windows 会为它另起一个 `cmd.exe` 宿主，真正的 node server 是**孙进程**；
@@ -98,14 +98,74 @@ impl KillOnCloseJob {
     }
 }
 
-/// 非 Windows：没有 job 这一套 ⇒ 返回 `Err`（R323 的失败策略：不静默降级）。
-/// 本项目发布目标只有 Windows，这一支是为了让 `cargo check` 在别的平台上不骗人。
+// ─── Unix：进程组等价物 ───
+//
+// 语义与 JobObject 等价，但建立时机不同：Windows 是「先建 job，spawn 后 assign」；
+// Unix 的进程组**必须在 spawn 时建立**（`process_group(0)`，在 bridge.rs 的
+// `SpawnPlan::into_command` —— 真 spawn 的唯一出口 —— 里做），spawn 之后再补 `setpgid`
+// 会撞上 exec 竞态（父进程无法保证子进程还没 exec）。所以职责切分是：
+//   * spawn 侧：`process_group(0)` 让子进程自成一个进程组（pgid = pid）。setpgid 失败
+//     会让 spawn 本身报错 ⇒ `connect_stdio` 把这条标成 Disconnected —— 与 R323 同一
+//     失败策略：**不静默降级**。spawn 成功 ⇒ 组必然存在，没有「没建成组却 spawn 成功」
+//     的中间态。
+//   * assign 侧：把 pgid 记下来「上膛」。不验证组存在（验证会与 pre_exec 的 setpgid
+//     竞态），也不需要：存在性由 spawn 侧的结构保证。
+//   * Drop 侧：`kill(-pgid, SIGKILL)` 带走整组 —— 组内之后 fork/spawn 出来的孙进程
+//     同属该组，一并带走，与 `KILL_ON_JOB_CLOSE` 等价。
+//
+// 与 JobObject 的两处已知差异（同为 best-effort 语义下的可接受残留）：
+//   * job 持内核句柄，pgid 只是个数字：若直接子进程先被收尸、pid 被复用、且复用者恰好
+//     又是组领袖，kill 会打偏。收尸发生在 transport 释放之后、本结构 Drop 之前
+//     （`Connection` 里相邻的两个字段），窗口极小。
+//   * daemon 化（setsid 脱组）的孙进程两边都会逃逸 —— Windows 上同一句话成立。
+
+/// 「上膛」标记：0 = 未 assign（Drop 时不动干戈）。真实 pgid = 直接子进程 pid，恒 > 0。
 #[cfg(not(windows))]
-pub struct KillOnCloseJob;
+pub struct KillOnCloseJob {
+    pgid: std::sync::atomic::AtomicI32,
+}
+
+// AtomicI32 自带 Send/Sync，无需像 Windows 的裸 HANDLE 那样 unsafe 声明。
+#[cfg(not(windows))]
+impl std::fmt::Debug for KillOnCloseJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KillOnCloseJob")
+            .field("pgid", &self.pgid)
+            .finish()
+    }
+}
 
 #[cfg(not(windows))]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let pgid = self.pgid.load(Ordering::Acquire);
+        if pgid > 0 {
+            // 尽力而为：组已全灭（ESRCH）或权限不足（EPERM）时没有别的收场方式，Drop 里不 panic。
+            let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Unix 支的「建 job」无事可做（组在 spawn 时由 `into_command` 建立）⇒ 恒 `Ok`。
+/// 真正可能失败的环节是 spawn 本身（setpgid 失败 ⇒ spawn 报错 ⇒ 这条不连，R323）。
+#[cfg(not(windows))]
 pub fn create_kill_job() -> Result<KillOnCloseJob, String> {
-    Err("当前平台不支持进程回收作业对象".to_string())
+    Ok(KillOnCloseJob {
+        pgid: std::sync::atomic::AtomicI32::new(0),
+    })
+}
+
+#[cfg(not(windows))]
+impl KillOnCloseJob {
+    /// spawn 成功后记录 pgid（= 子进程 pid，`process_group(0)` 的定义）。
+    /// 恒成功：pid 超过 `i32::MAX` 这种形态现实里不存在，`try_from` 只是类型上绕不开。
+    pub fn assign(&self, pid: u32) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        let pgid = i32::try_from(pid).map_err(|e| format!("pid {pid} 越界：{e}"))?;
+        self.pgid.store(pgid, Ordering::Release);
+        Ok(())
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -168,5 +228,82 @@ mod tests {
             .output();
         let _ = child.wait();
         panic!("drop(job) 之后 {pid} 仍在世：JobObject 没有带走整棵树");
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod unix_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command as StdCommand;
+    use std::time::{Duration, Instant};
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    /// 组里还有活口吗。`kill(-pgid, 0)` 只探测不投递；返回 -1 且 errno = ESRCH 才算全灭，
+    /// 其余（含拿不到 errno 的形态）一律当「还在」：宁可让测试红，也不把「没法确认」当成「已回收」。
+    fn group_alive(pgid: i32) -> bool {
+        let rc = unsafe { libc::kill(-pgid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn create_kill_job_works_and_is_send_and_sync() {
+        assert_send_sync::<KillOnCloseJob>();
+        let job = create_kill_job().expect("unix 支建 job 恒成功");
+        drop(job);
+    }
+
+    /// 与 Windows 侧 `dropping_the_job_takes_the_whole_tree_with_it` 同一条验收：
+    /// drop 之后整棵树（含孙进程）必须被内核带走。
+    #[test]
+    fn dropping_the_job_takes_the_whole_group_with_it() {
+        let job = create_kill_job().expect("建 job");
+        // 与 bridge.rs `into_command` 同一动作：spawn 时自成一组（这是 unix 支的全部前提）。
+        // `sh -c 'sleep 120 & wait'`：sh 守着 wait，后台的 sleep 是「后代进程」的最小替身。
+        let mut cmd = StdCommand::new("sh");
+        cmd.args(["-c", "sleep 120 & wait"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn sh");
+        let pid = child.id();
+        job.assign(pid).expect("unix 支 assign 恒成功");
+        let pgid = pid as i32;
+        assert!(
+            group_alive(pgid),
+            "刚 spawn 的进程组必须在场，否则这条测试什么都没测到"
+        );
+
+        drop(job);
+        // 先收尸 sh：SIGKILL 之后它是我们名下的**僵尸**，而僵尸仍占着组员名额 —— 不收尸，
+        // `kill(-pgid, 0)` 会永远探到「组还在」（Windows 没有僵尸，`tasklist` 那条探针没有这层）。
+        // sh 3 秒内没死 = SIGKILL 根本没投进组，同样按失败处理，绝不挂住测试。
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(3) {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            // 清扫：SIGKILL 没到组里，用测试自己的 kill 收场再如实上报。
+            let _ = StdCommand::new("kill").args(["-9", &format!("-{pgid}")]).output();
+            let _ = child.wait();
+            panic!("drop(job) 之后 sh 未死：SIGKILL 没有投到组 -{pgid} 里");
+        }
+        // sh 已收尸出组，组里只剩孙进程（被 init 收尸前短暂占名额）。SIGKILL 是内核行为，
+        // 几毫秒内生效；给 3 秒的余量。
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(3) {
+            if !group_alive(pgid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 请神容易送神难：这里失败说明组回收没带走孙进程，要如实上报（R324）。
+        // 测试自己的清扫：别把 sleep 120 留在机器上。
+        let _ = StdCommand::new("kill").args(["-9", &format!("-{pgid}")]).output();
+        panic!("drop(job) 之后组 -{pgid} 仍有活口：进程组回收没有带走整棵树");
     }
 }
