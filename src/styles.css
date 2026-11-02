@@ -689,6 +689,26 @@ button.path-chip:disabled {
   color: var(--text-primary);
 }
 
+/* 语音错误：与 `.image-error` 同一语义（原文整条上屏、异常才描 `--danger`），
+   但它是**独立的一行**，所以单独一支类而不是复用图片那一条的语义。 */
+.voice-error {
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  background-color: var(--bg-raised);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+/* 录音态：只换描边与字色（取 `--danger`，不新造颜色），按钮本身仍是基座那一套。
+   选择器带上 `button` 是为了与 `button:hover:not(:disabled)` 同特异度 ——
+   排在它后面而特异度更低的话，`no-descending-specificity` 会红。 */
+button.voice[data-recording="true"] {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
 /* 这个控件在基座那一节里是按「控件」待遇画的（边框、底色、阴影）。整条规则现在把这些
    一层层撤掉，落到最后一行只剩那枚 UA 按钮 —— 因为 UA 按钮自己就是可见控件，外面那层壳
    是多余的一圈。宽度预算仍在：不写 `width: fit-content`，它作为 `.image-strip`（flex 列）

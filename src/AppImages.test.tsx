@@ -86,6 +86,8 @@ const view = (): SettingsView => ({
   // 生产默认值（无自定义 profile、默认 bash）。仅补键，本文件的用例一行未动（R216②）。
   shells: [],
   default_shell: "bash",
+  // 语音输入：生产默认值（本文件不涉及语音，键只为镜像完整）。
+  voice_language: "zh-CN",
   api_key_masked: "…abcd",
   corrupt_backup: null,
 });

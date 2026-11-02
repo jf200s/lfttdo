@@ -142,6 +142,15 @@ export const addMemory = (kind: string, body: string, dueAt: number | null) =>
   invoke<number>("memory_add", { kind, body, dueAt });
 
 /**
+ * 语音输入三条命令（Windows 自带离线识别）：开始录音 / 停止并取回最终文本 / 取消丢弃。
+ * 识别语言来自 `Settings.voice_language`，不在参数里传第二遍（Rust 侧读设置）。
+ * 全都不 catch：失败原文由 `Composer` 原样上屏（与 `saveKey` 同一口径）。
+ */
+export const voiceStart = (): Promise<void> => invoke("voice_start");
+export const voiceStop = (): Promise<string> => invoke<string>("voice_stop");
+export const voiceCancel = (): Promise<void> => invoke("voice_cancel");
+
+/**
  * 把一张图的原始字节交给 Rust 归一化，回来的就是可以直接进 `send_message` 的那一支
  * `ContentBlock`（`image`，已按上限缩放/转码）。
  *

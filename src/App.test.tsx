@@ -104,6 +104,9 @@ const view = (over: Partial<SettingsView> = {}): SettingsView => ({
   // 无自定义 profile、默认 shell 为 bash（Rust `DEFAULT_PRESET_ID`）。
   shells: [],
   default_shell: "bash",
+  // 语音输入（Windows 自带离线识别）：生产默认值；本文件不断言保存载荷，键只承担
+  // 「镜像多一键、夹具少一键就编译不过」。
+  voice_language: "zh-CN",
   api_key_masked: "…abcd",
   corrupt_backup: null,
   ...over,

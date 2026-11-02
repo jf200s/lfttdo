@@ -112,6 +112,8 @@ describe("ipc commands", () => {
       // Shell 两键（Shell 切片）：Settings 的必填键随类型镜像加进来，取生产默认值。
       shells: [],
       default_shell: "bash",
+      // 语音输入语言（Windows 自带离线识别）：生产默认值。
+      voice_language: "zh-CN",
     });
     expect(invoke).toHaveBeenNthCalledWith(1, "settings_get");
     expect(invoke).toHaveBeenNthCalledWith(2, "settings_set", {
@@ -141,6 +143,7 @@ describe("ipc commands", () => {
         memory_embedding_model: "text-embedding-v3",
         shells: [],
         default_shell: "bash",
+        voice_language: "zh-CN",
       },
     });
   });
@@ -227,6 +230,24 @@ describe("ipc commands", () => {
   it("interrupts without arguments", async () => {
     await api.interrupt();
     expect(invoke).toHaveBeenCalledWith("interrupt");
+  });
+
+  // 语音三条命令：命令名与「无参数」一起钉住。命令名写错时 Tauri 直接找不到处理器，
+  // 界面只会看见一次无声的失败；`voice_stop` 的返回值是字符串文案，必须原样交回调用方。
+  it("wires voice start/stop/cancel with no arguments and returns the transcript", async () => {
+    invoke
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce("你好世界")
+      .mockResolvedValueOnce(undefined);
+    await api.voiceStart();
+    const text = await api.voiceStop();
+    await api.voiceCancel();
+    expect(text).toBe("你好世界");
+    expect(invoke.mock.calls).toEqual([
+      ["voice_start"],
+      ["voice_stop"],
+      ["voice_cancel"],
+    ]);
   });
 
   // R147：`normalize_image` **只吃 raw body**（`ipc.rs:564` 对 json body 直接 Err）。

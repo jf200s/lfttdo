@@ -22,6 +22,7 @@ pub mod skills;
 pub mod store;
 pub mod text;
 pub mod tools;
+pub mod voice;
 pub mod web_guard;
 pub mod window_state;
 pub mod workspace;

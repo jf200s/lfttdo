@@ -119,6 +119,9 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   // label 留空顺带钉住「自定义 profile 的显示名可空」这条线上语义（types.ts / spec §5.2）。
   shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }],
   default_shell: "pwsh",
+  // 语音输入给**非默认**值（Rust 默认 `zh-CN`）：与上面 roots 的非默认取向同一条 ——
+  // 下面整表载荷断言要能区分「App 原样转交」与「App 重拼了一份默认表」。
+  voice_language: "en-US",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -336,6 +339,8 @@ describe("App 设置接线", () => {
         // Shell 两键原样转交：App 不重拼默认表（夹具给的是非默认值，重拼了这里当场红）。
         shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }],
         default_shell: "pwsh",
+        // 语音语言同理（夹具给 en-US，Rust 默认 zh-CN）。
+        voice_language: "en-US",
       }),
     );
     // 保存成功才改界面：这三项是 `applyTheme` 唯一的三个可见后果。

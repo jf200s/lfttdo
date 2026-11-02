@@ -295,6 +295,9 @@ pub struct AppState {
     /// 留在某一轮的 `ToolCtx` 里）；`send_message` 每轮开头现刷（spec §2「生效时机」：
     /// 改设置下一条消息生效，无缓存可过期）。锁走 `crate::lock` 的中毒容忍入口。
     pub shells: Arc<RwLock<ShellCatalog>>,
+    /// Phase 1：正在进行的那次语音输入。槽位空 = 没在录音；take 出来之后命令层
+    /// 用 `blocking()` 等它收尾。与 `cancel`/`running` 同一种「一次性槽位」。
+    pub voice: Arc<Mutex<Option<crate::voice::VoiceSession>>>,
 }
 
 /// 单轮并发闸门。guard 一析构就释放槽位，所以 `?` 的每条早退路径（读设置失败、
@@ -2557,6 +2560,53 @@ pub async fn settings_set_api_key(
     blocking(move || store.set_api_key(&api_key).map_err(|e| e.to_string())).await
 }
 
+// ───────────────────── 语音输入：Phase 1（SAPI 5） ─────────────────────
+
+/// 开始一次录音。已有会话时返回「正在录音」——前端据此恢复按钮状态。
+/// 命令层只做薄装配：读语言设置、调 `voice::start`、把会话放进槽位。
+#[tauri::command]
+pub async fn voice_start(state: State<'_, AppState>) -> Result<(), String> {
+    if guard(&state.voice).is_some() {
+        return Err("正在录音，请先停止或取消当前录音。".into());
+    }
+
+    let store = state.settings.clone();
+    let settings = blocking(move || store.load().map_err(|e| e.to_string())).await?;
+    let language = settings.voice_language;
+    let session = blocking(move || crate::voice::start(&language)).await?;
+
+    // 启动是异步的（专用线程 + 10 秒初始化窗口），两次 start 可能同时走到这里。
+    // 第二次进来时把刚建好的会话丢掉 —— 它的 Drop 会发送 Cancel，不会泄漏麦克风。
+    let mut slot = guard(&state.voice);
+    if slot.is_some() {
+        drop(slot);
+        return Err("正在录音，请先停止或取消当前录音。".into());
+    }
+    *slot = Some(session);
+    Ok(())
+}
+
+/// 停止录音并返回最终文本（trim 后）。允许空串：用户没说话不是错误。
+#[tauri::command]
+pub async fn voice_stop(state: State<'_, AppState>) -> Result<String, String> {
+    let session = guard(&state.voice).take();
+    let Some(session) = session else {
+        return Err("当前没有正在进行的录音。".into());
+    };
+    // `stop` 最多等 5 秒 SPEI_END_SR_STREAM 并 join 专用线程，不能占住 tokio worker。
+    blocking(move || session.stop()).await
+}
+
+/// 取消录音并丢弃已识别的文本。没有会话时幂等成功（前端 Esc 可能多按）。
+#[tauri::command]
+pub async fn voice_cancel(state: State<'_, AppState>) -> Result<(), String> {
+    let session = guard(&state.voice).take();
+    let Some(session) = session else {
+        return Ok(());
+    };
+    blocking(move || session.cancel()).await
+}
+
 // ───────────────────── Agent Shell：预设表与 profile 校验（spec §5.5） ─────────────────────
 
 /// 检测到的预设表（spec §5.5 `shellPresets()`；2026-11-01 修订：候选 + 检测）。
@@ -3087,6 +3137,7 @@ pub fn run() {
                 data_dir: dir.clone(),
                 extracting: ExtractLocks::default(),
                 shells,
+                voice: Arc::new(Mutex::new(None)),
             });
             // 后台自举：句柄从刚装好的 State 里取（保持装配行仍是唯一一条
             // `registry: build_production_registry()` —— 那条守卫测试盯着它）。
@@ -3194,6 +3245,9 @@ pub fn run() {
             skills_list,
             skills_open_folder,
             skills_set_enabled,
+            voice_start,
+            voice_stop,
+            voice_cancel,
         ])
         // R108 / T18 m2 —— `capabilities/default.json` 的 `"windows": ["main"]` 按
         // **label** 指名窗口。主窗口现在在 `setup` 里由 `WebviewWindowBuilder` 创建
@@ -7852,6 +7906,29 @@ mod tests {
             .filter(|name| !name.is_empty())
             .collect();
         for cmd in ["shell_presets", "shell_profile_validate"] {
+            assert!(
+                registered.contains(&cmd),
+                "命令 {cmd} 写了但没登记，前端调用只会拿到 not found:{registered:?}"
+            );
+        }
+    }
+
+    /// Phase 1 语音命令与上面同一个坑（`generate_handler!` 是宏）：漏登记不编译报错，
+    /// 只会在运行时让前端拿到 not found。机制照抄 shell 那条守卫。
+    #[test]
+    fn the_voice_commands_are_registered_in_the_handler_list() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ipc.rs"));
+        let list = src
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split("]").next())
+            .expect("找不到 generate_handler 的登记表");
+        let registered: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        for cmd in ["voice_start", "voice_stop", "voice_cancel"] {
             assert!(
                 registered.contains(&cmd),
                 "命令 {cmd} 写了但没登记，前端调用只会拿到 not found:{registered:?}"

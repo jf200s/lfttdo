@@ -130,10 +130,16 @@ windows-native-keyring-store = "1.1.0"
 # 不新增任何 crate，代价是编译这两个模块。手写 `extern "system"` 也能做，但
 # `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 的嵌套布局写错时是**静默失败**（SetInformationJobObject
 # 收一个 void* + 长度），核对成本高于直接用它。
+# Phase 1 语音输入：`Win32_Media_Speech`（SAPI 5 / ISpRecognizer）、`Win32_System_Com`
+# （MTA COM 与 CoTaskMemFree）、`Win32_Globalization`（LocaleNameToLCID）三个 feature。
+# 不新增 crate：`windows` 本来就是这里的直接依赖。
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
-    "Win32_System_Threading",
+    "Win32_Globalization",
+    "Win32_Media_Speech",
+    "Win32_System_Com",
     "Win32_System_JobObjects",
+    "Win32_System_Threading",
 ] }
 
 [target."cfg(not(windows))".dependencies]

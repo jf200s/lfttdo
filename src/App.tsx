@@ -524,6 +524,16 @@ export default function App() {
   );
 
   /**
+   * 语音输入三条回调（合同：`voice_start` / `voice_stop` / `voice_cancel`）。
+   * 与 `normalize` 同一条写法：包一层闭包把 `api` 的属性取值推迟到真的按了麦克风，
+   * 否则 `App.test.tsx` 那类 mock 工厂（没有 `voice*` 这三支）会在渲染期就取到 undefined
+   * —— 这一层因此不新造状态，只递命令；失败原文交给 `Composer` 自己的 voice-error 通道。
+   */
+  const voiceStart = useCallback(() => api.voiceStart(), []);
+  const voiceStop = useCallback(() => api.voiceStop(), []);
+  const voiceCancel = useCallback(() => api.voiceCancel(), []);
+
+  /**
    * T45：面板是 `settings_set` / `settings_set_api_key` 的第一个消费者。
    * 打开时**重新读一次**而不是复用启动那一份 —— `settings_get` 每次都读磁盘
    * （`ipc.rs:370` → `settings.rs:432`），用户在外面改了 `settings.json`，
@@ -741,6 +751,9 @@ export default function App() {
           onSend={send}
           onStop={stop}
           onNormalize={normalize}
+          onVoiceStart={voiceStart}
+          onVoiceStop={voiceStop}
+          onVoiceCancel={voiceCancel}
           seed={composerSeed}
         />
         <div className="statusbar" data-testid="usage">
