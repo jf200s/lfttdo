@@ -2502,7 +2502,7 @@ mod tests {
         #[cfg(windows)]
         {
             let unc = PathBuf::from(r"\\nas\books");
-            let once = dedupe_roots(&[unc.clone()]);
+            let once = dedupe_roots(std::slice::from_ref(&unc));
             assert_eq!(
                 once.len(),
                 1,
