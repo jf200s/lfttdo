@@ -215,8 +215,10 @@ describe("App", () => {
     await settled();
     fireEvent.click(screen.getByRole("button", { name: "技能" }));
     const panel = await screen.findByRole("region", { name: "技能" });
-    expect(within(panel).getByText("翻译润色")).toBeInTheDocument();
-    expect(within(panel).getByText("中英互译")).toBeInTheDocument();
+    // 面板先挂载、技能列表是异步加载的：必须等技能项出现，不能同步 getByText
+    // （CI runner 比本机慢，曾在「正在读取技能目录…」时就断言）。
+    expect(await within(panel).findByText("翻译润色", {}, { timeout: 4_000 })).toBeInTheDocument();
+    expect(await within(panel).findByText("中英互译", {}, { timeout: 4_000 })).toBeInTheDocument();
   });
 
   it("prefills the composer when choosing a skill from the panel", async () => {
@@ -235,7 +237,10 @@ describe("App", () => {
     await settled();
     fireEvent.click(screen.getByRole("button", { name: "技能" }));
     const panel = await screen.findByRole("region", { name: "技能" });
-    fireEvent.click(within(panel).getByRole("button", { name: "用这个技能" }));
+    // 同上：技能卡片异步出现，等按钮再点，避免 CI 上点击落在「读取中」的空面板上。
+    fireEvent.click(
+      await within(panel).findByRole("button", { name: "用这个技能" }, { timeout: 4_000 }),
+    );
     expect(screen.getByRole("textbox", { name: "输入消息" })).toHaveValue(
       "使用「翻译润色」技能：",
     );

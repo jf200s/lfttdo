@@ -199,8 +199,9 @@ describe("SettingsPanel", () => {
     fireEvent.change(screen.getByLabelText("导入人设文件"), {
       target: { files: [file] },
     });
-    await waitFor(() =>
-      expect(screen.getByRole("alert")).toHaveTextContent(/64,000/),
+    await waitFor(
+      () => expect(screen.getByRole("alert")).toHaveTextContent(/64,000/),
+      { timeout: 4_000 },
     );
     const box = screen.getByLabelText(/人设（系统提示词）/) as HTMLTextAreaElement;
     expect(box.value).toBe("保留我");

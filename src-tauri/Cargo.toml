@@ -60,7 +60,7 @@ url = "2"
 ipnet = "2"
 tokio-util = "0.7.20"
 uuid = { version = "1.28.0", features = ["v4"] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 tracing = "0.1.44"
 # R107：GUI 进程没有控制台，日志必须落到 app data 目录里的文件，否则 settings.rs 那两条
 # `warn!`（R87）和 spec:543「全文搜索日志文件」都凭空消失。
