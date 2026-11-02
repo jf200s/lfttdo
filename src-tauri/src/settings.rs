@@ -6,10 +6,11 @@
 // key「不写 settings 表、不进导出、不写日志」，三条里最容易失守的是第一条，而靠纪律
 // （「记得别写」）守的规矩一定会被下一次加字段破掉；字段不存在才是结构性防线：
 // serde 写不出一个不存在的字段，`{:?}` 打不出它，导出也就无从带上它。
-// `serialized_field_names_are_exactly_the_twenty_six_settings_fields` 那条测试钉的正是这件事，
+// `serialized_field_names_are_exactly_the_twenty_seven_settings_fields` 那条测试钉的正是这件事，
 // 它同时也是 R89 的防线：加字段必须先给出它的消费者，否则 Plan A 里多一个没人读的键。
 // （T26 落 `roots` 时它的名字从 `twelve` 变成 `thirteen`，shell 选择功能落
-// `default_shell`/`shells` 时变到 `twenty_six` —— 名字里的数字就是这条防线的读数。）
+// `default_shell`/`shells` 时变到 `twenty_six`，Phase 1 语音输入落 `voice_language`
+// 时变到 `twenty_seven` —— 名字里的数字就是这条防线的读数。）
 //
 // 「不写日志」那一条还有第二道闸，而且不在结构体上：`SettingsError` 的 `Debug` 是**手写**的
 // （R94，见 `impl fmt::Debug`）。`keyring_core::Error` 自己 derive 了 `Debug`，而它的
@@ -182,7 +183,7 @@ pub enum SettingsError {
 /// 打成十进制转储 —— spec :473 说的「不写日志」在这种形态下守不住，而且 spec :543 计划的
 /// 「全文搜索 key 字符串」根本查不到十进制转储。Display 侧本来就安全（那两个变体的 Display
 /// 只说 "Password data is not valid UTF-8"），所以这里每一支都借 Display 落地。
-/// `serialized_field_names_are_exactly_the_twenty_six_settings_fields` 同族的
+/// `serialized_field_names_are_exactly_the_twenty_seven_settings_fields` 同族的
 /// `credential_debug_never_prints_the_secret_bytes` 钉住它。
 impl std::fmt::Debug for SettingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -409,6 +410,11 @@ pub struct Settings {
     /// （不是预设 id 也不是任何自定义 id）回落 `DEFAULT_PRESET_ID`
     /// （同 accent「认不出来回落预设」的取向，不报错）。
     pub default_shell: String,
+    /// Phase 1 语音输入语言。白名单 `"system" | "zh-CN" | "en-US"`，默认 `"zh-CN"`；
+    /// 其余/空回落 `"zh-CN"`（`normalize_voice_language` 是唯一判定处）。
+    /// `"system"` = 不调用 `ISpRecognizer::SetRecognizer`，交给系统默认识别器。
+    /// 这里没有模型名 / base_url / API key —— 语音走 Windows 内置离线引擎。
+    pub voice_language: String,
 }
 
 impl Default for Settings {
@@ -460,6 +466,7 @@ impl Default for Settings {
             // Agent Shell：默认没有自定义 profile，默认 shell 是预设 bash（spec §5.2/§6）。
             shells: Vec::new(),
             default_shell: DEFAULT_PRESET_ID.into(),
+            voice_language: "zh-CN".into(),
         }
     }
 }
@@ -507,6 +514,19 @@ pub fn normalize_accent(s: &str) -> String {
         return String::new();
     }
     format!("#{}", expanded.to_lowercase())
+}
+
+/// Phase 1 语音输入语言的**唯一**白名单（同 `normalize_memory_embedding_source` 的
+/// 「一个字段一处校验」纪律）。只放行 `"system"` / `"zh-CN"` / `"en-US"`；空串与
+/// 一切不认识的值回落默认 `"zh-CN"` —— 设置文件是用户可手改的，一个拼错的语言名
+/// 不该让语音输入整体罢工。幂等（读写两侧各过一次）。
+pub fn normalize_voice_language(s: &str) -> String {
+    match s.trim() {
+        "system" => "system".into(),
+        "en-US" => "en-US".into(),
+        // "zh-CN" 与一切不认识的值同路：`_` 臂就是回落纪律本身。
+        _ => "zh-CN".into(),
+    }
 }
 
 /// T6:嵌入来源的**唯一**白名单(同 `normalize_accent` 的「一个字段一处校验」纪律)。
@@ -748,6 +768,8 @@ impl Settings {
         } else {
             DEFAULT_PRESET_ID.into()
         };
+        // Phase 1：语音输入语言走白名单回落（认不出来 = 默认 zh-CN，不报错）。
+        self.voice_language = normalize_voice_language(&self.voice_language);
     }
 
     /// 归一后的副本。派生方法用它，省掉「调用者忘了先 normalize」这条静默错误路径。
@@ -1156,6 +1178,32 @@ mod tests {
         // 变成 0 —— 而 0 恰好是「关闭」这个合法档,于是「默认开着」静默变成「默认关了」,
         // 没有任何报错。所以它必须在这里被钉住。
         assert_eq!(s.memory_idle_extract_minutes, 5);
+    }
+
+    /// Phase 1：语音输入语言的默认值与白名单回落。默认必须是 `zh-CN`（协议契约），
+    /// `system`/`en-US` 原样保留，其余/空/大小写不对一律回落 `zh-CN`。
+    #[test]
+    fn voice_language_defaults_to_zh_cn_and_normalizes_to_the_whitelist() {
+        assert_eq!(Settings::default().voice_language, "zh-CN");
+        for (input, want) in [
+            ("system", "system"),
+            (" zh-CN ", "zh-CN"),
+            ("en-US", "en-US"),
+            ("en-us", "zh-CN"),
+            ("ja-JP", "zh-CN"),
+            ("", "zh-CN"),
+        ] {
+            let normalized = Settings {
+                voice_language: input.into(),
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(
+                normalized.voice_language, want,
+                "voice_language={input:?} 应归一为 {want:?}"
+            );
+        }
+        assert_eq!(normalize_voice_language("  en-US\n"), "en-US");
     }
 
     /// T15(P0):空闲抽取间隔的钳位。与半衰期/待办窗口那两条的关键差别:**0 是合法值**,
@@ -2562,7 +2610,7 @@ mod tests {
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_twenty_six_settings_fields() {
+    fn serialized_field_names_are_exactly_the_twenty_seven_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -2599,6 +2647,7 @@ mod tests {
                 "system_prompt",
                 "temperature",
                 "theme",
+                "voice_language",
                 "window_messages"
             ]
         );

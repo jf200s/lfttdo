@@ -641,6 +641,28 @@ export function SettingsPanel({
           {MODEL_NUMERIC_FIELDS.map(numericRow)}
         </fieldset>
 
+        {/* 语音输入：用 Windows 自带离线识别（SAPI），没有模型名 / base_url / API key。
+            下拉的三支就是 Rust `normalize` 的白名单；未知值已在 Rust 侧回落成 `zh-CN`，
+            所以这里的受控值永远能选中一项，不需要再补第四支。 */}
+        <fieldset className="panel-group">
+          <legend>语音输入</legend>
+          <label className="panel-row">
+            <span>识别语言</span>
+            <select
+              value={form.voice_language}
+              onChange={(e) => setField("voice_language", e.target.value)}
+            >
+              <option value="zh-CN">中文（简体）</option>
+              <option value="en-US">English (US)</option>
+              <option value="system">跟随系统</option>
+            </select>
+          </label>
+          <p className="panel-hint">
+            使用 Windows 自带离线识别，不下载模型；中文需要系统语音包。识别质量与标点弱于
+            Whisper。
+          </p>
+        </fieldset>
+
         <fieldset className="panel-group">
           <legend>API key</legend>
           <p className="panel-row panel-readonly">

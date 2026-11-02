@@ -1,10 +1,27 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   ImageStrip,
   MAX_IMAGES_PER_MESSAGE,
   type PendingImage,
 } from "./ImageStrip";
 import type { ContentBlock, SendBlock } from "../types";
+
+/** 语音三态：空闲 / 录音中 / 已停止、等识别结果。 */
+type VoiceState = "idle" | "recording" | "stopping";
+
+/**
+ * 录音上限 120 秒（合同）。到点自动走「停止」那一条路 —— 不自动取消：
+ * 用户已经说出口的话不该被静默丢掉，能不能识别出来由 `voice_stop` 的返回值决定。
+ */
+const VOICE_MAX_SECONDS = 120;
+
+/** 计时器文案 `m:ss`（停止按钮上要让人看到已经录了多久）。 */
+const clockText = (seconds: number): string =>
+  `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+
+/** 失败原文的取法（与 `addFiles` 的 catch 同一口径）：前端不解释、不裁剪。 */
+const errorText = (err: unknown): string =>
+  err instanceof Error ? err.message : String(err);
 
 /**
  * 从粘贴事件里挑出图片文件（R145：实现只许读 `items[i].type` 与 `getAsFile()`，
@@ -41,6 +58,9 @@ export function Composer({
   onStop,
   onNormalize,
   seed,
+  onVoiceStart,
+  onVoiceStop,
+  onVoiceCancel,
 }: {
   streaming: boolean;
   onSend: (blocks: SendBlock[]) => Promise<void>;
@@ -49,12 +69,36 @@ export function Composer({
   onNormalize: (bytes: ArrayBuffer) => Promise<ContentBlock>;
   /** 技能面板“用这个技能”的预填；每次点击换一个新对象（id 递增），同一句话也能再填一次。 */
   seed?: { id: number; text: string } | null;
+  /**
+   * 语音输入三条命令（可选）：只有传了 `onVoiceStart` 才渲染麦克风按钮 ——
+   * 现有直接渲染 `Composer` 的测试（与将来别的宿主）因此一行都不用改。
+   * `onVoiceStop` resolve 出的字符串由 `Composer` trim 后插入当前选区并自动发送。
+   */
+  onVoiceStart?: () => Promise<void>;
+  onVoiceStop?: () => Promise<string>;
+  onVoiceCancel?: () => Promise<void>;
 }) {
   const [text, setText] = useState("");
   const [stopRequested, setStopRequested] = useState(false);
   /** 本地发送锁：从按下发送到 turn_start（或失败返回）之间，拦住第二次 Enter。 */
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
+  /** `text` 的同步影子：语音结果回来时要读**最新**草稿（识别期间用户可能还在打字）。 */
+  const textRef = useRef(text);
+  textRef.current = text;
+  /** 语音三态 + 已录秒数。`voiceRef` 是同步影子，挡「按钮点击与 120 秒计时同时到点」。 */
+  const [voice, setVoice] = useState<VoiceState>("idle");
+  const voiceRef = useRef<VoiceState>("idle");
+  const [voiceSeconds, setVoiceSeconds] = useState(0);
+  /** 语音错误单独一条（不混进图片的 `errors`）：两者来源不同，清空时机也不同。 */
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  /** `voice_start` 在途：不让连点两次真的开两路录音（界面上仍是「语音」）。 */
+  const startingRef = useRef(false);
+  /** 插完文本之后要落到的光标位；`useLayoutEffect` 在 DOM 更新后消费一次。 */
+  const pendingCaretRef = useRef<{ start: number; end: number } | null>(null);
+  /** 计时器/键盘监听只在 effect 里装一次，函数本体走 ref 取最新那一份。 */
+  const finishVoiceRef = useRef<() => Promise<void>>(async () => {});
+  const cancelVoiceRef = useRef<() => Promise<void>>(async () => {});
   /** 这一次已经交给 `onSend` 的草稿快照：turn_start 时按它清空，失败时保留。 */
   const sentRef = useRef<{ text: string; images: PendingImage[] } | null>(null);
   /** 已归一化、等着和这句话一起发出去的图。 */
@@ -80,6 +124,57 @@ export function Composer({
       el.setSelectionRange(seed.text.length, seed.text.length);
     }
   }, [seed]);
+
+  // 录音计时：只在 recording 期间走表；进 stopping / idle 就拆掉，不会把秒数带进下一段。
+  useEffect(() => {
+    if (voice !== "recording") return;
+    const id = setInterval(() => setVoiceSeconds((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, [voice]);
+
+  // 120 秒自动停止。判定放在 effect 里而不是计时回调里：`setVoiceSeconds` 的函数式更新
+  // 内不许产生副作用（React 可能重放它），到点这件事必须由「秒数已落进 state」触发一次。
+  useEffect(() => {
+    if (voice !== "recording" || voiceSeconds < VOICE_MAX_SECONDS) return;
+    void finishVoiceRef.current();
+  }, [voice, voiceSeconds]);
+
+  // 录音中按 Esc = 取消（丢弃，不插入、不发送）。监听挂在 document 上：
+  // 点过麦克风之后焦点在按钮上，只挂 textarea 的话这一下根本收不到。
+  useEffect(() => {
+    if (voice !== "recording") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      void cancelVoiceRef.current();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [voice]);
+
+  // 语音取消回调的同步影子：卸载清理只跑一次，不能因为宿主换了回调身份就取消录音。
+  const onVoiceCancelRef = useRef(onVoiceCancel);
+  onVoiceCancelRef.current = onVoiceCancel;
+  // 组件卸载时如果还在录音，交给后端取消：否则会话会一直握着麦克风到应用退出。
+  useEffect(() => {
+    return () => {
+      if (voiceRef.current !== "recording") return;
+      const cancel = onVoiceCancelRef.current;
+      if (cancel) void cancel().catch(() => {});
+    };
+  }, []);
+
+  // 语音文本插进 `text` 之后，DOM 已更新（layout 阶段）才 focus + setSelectionRange：
+  // 在 `setText` 同一步里设选区会被随后的 value 写入冲掉。
+  useLayoutEffect(() => {
+    const caret = pendingCaretRef.current;
+    if (caret === null) return;
+    pendingCaretRef.current = null;
+    const el = inputRef.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(caret.start, caret.end);
+  }, [text]);
 
   const pushPending = (img: PendingImage) => {
     pendingRef.current = [...pendingRef.current, img];
@@ -233,11 +328,26 @@ export function Composer({
     };
   }, []);
 
-  const submit = async () => {
-    const t = text.trim();
+  /**
+   * 唯一发送路径。`overrideText` 只给语音那一条用：识别文本刚 `setText` 过，
+   * 这个渲染闭包里的 `text` 还是旧值，读 state 会把语音结果丢掉。
+   * 其余所有调用点（Enter、发送按钮）不传，行为与以前一字不差。
+   */
+  const submit = async (overrideText?: string) => {
+    const draft = overrideText ?? text;
+    const t = draft.trim();
     // R216④：「有图无字」必须放行 —— 只贴一张图不打字是日常主用法，
     // 只判 `t === ""` 的可见症状是「贴图点发送没反应」。
-    if ((t === "" && pending.length === 0) || streaming || sendingRef.current) return;
+    // 录音/收尾期间也挡住发送：语音结果回来会自己走这一条路径，手动先发一次
+    // 会让同一段话被发两遍（识别完成后还会再触发一次自动发送）。
+    if (
+      (t === "" && pending.length === 0) ||
+      streaming ||
+      sendingRef.current ||
+      voiceRef.current !== "idle"
+    ) {
+      return;
+    }
     sendingRef.current = true;
     setSending(true);
     // Step 2 第 7 条：顺序固定图在前、文本在最后；文本为空时**不产出**空的 text 块
@@ -245,7 +355,6 @@ export function Composer({
     // 取 `pendingRef`（同步影子）而不是 `pending`：这份快照同时是 `dropSent` 的删除依据，
     // 两者必须是同一个列表，否则「按身份移除」会移除成另一批。
     const sent = pendingRef.current;
-    const draft = text;
     const blocks: SendBlock[] = sent.map((p) => p.block);
     if (t !== "") blocks.push({ type: "text", text: t });
     sentRef.current = { text: draft, images: sent };
@@ -284,6 +393,97 @@ export function Composer({
     setErrors([]);
     setIgnored(0);
   };
+
+  // ==== 语音输入（Windows 自带离线识别）====
+
+  const setVoiceState = (v: VoiceState) => {
+    voiceRef.current = v;
+    setVoice(v);
+  };
+
+  /** idle → recording。命令失败时原文上屏、留在 idle；`startingRef` 挡连点。 */
+  const beginVoice = async () => {
+    if (startingRef.current || voiceRef.current !== "idle") return;
+    if (streaming || sendingRef.current || !onVoiceStart) return;
+    startingRef.current = true;
+    setVoiceError(null);
+    try {
+      await onVoiceStart();
+      setVoiceSeconds(0);
+      setVoiceState("recording");
+    } catch (err) {
+      setVoiceError(errorText(err));
+      setVoiceState("idle");
+    } finally {
+      startingRef.current = false;
+    }
+  };
+
+  /** recording → stopping → 插入 + 自动发送（或空结果只报错）。 */
+  const finishVoice = async () => {
+    if (voiceRef.current !== "recording") return;
+    setVoiceState("stopping");
+    setVoiceError(null);
+    if (!onVoiceStop) {
+      setVoiceState("idle");
+      return;
+    }
+    let raw: string;
+    try {
+      raw = await onVoiceStop();
+    } catch (err) {
+      // 合同：错误原文上屏、回 idle、不发送、草稿一个字不动。
+      setVoiceError(errorText(err));
+      setVoiceState("idle");
+      return;
+    }
+    const transcript = raw.trim();
+    if (transcript === "") {
+      setVoiceError("没有识别到文字");
+      setVoiceState("idle");
+      return;
+    }
+    // 选区在 `await` **之后**读：识别要几秒，用户可能已经改了草稿或挪了光标。
+    // `textRef` 是同步影子，保证拿到的是最新草稿（state 在这个闭包里还是旧的）。
+    const cur = textRef.current;
+    const el = inputRef.current;
+    const from = el === null ? cur.length : el.selectionStart;
+    const to = el === null ? cur.length : el.selectionEnd;
+    const before = cur.slice(0, from);
+    const after = cur.slice(to);
+    const inserted = before + transcript + after;
+    // 光标落到插入文本之后；`useLayoutEffect` 在 DOM 更新后消费这一次。
+    const caret = before.length + transcript.length;
+    pendingCaretRef.current = { start: caret, end: caret };
+    setText(inserted);
+    setVoiceState("idle");
+    // 走既有发送路径（不是另写一份发送）⇒ `sendingRef` 防重、图在前文本在后、
+    // 失败保留草稿/图片、成功清理，全部与手动发送一字不差。
+    await submit(inserted);
+  };
+
+  /** recording → idle，丢弃识别结果。取消失败只上屏，不改发送或草稿。 */
+  const cancelVoice = async () => {
+    if (voiceRef.current !== "recording") return;
+    setVoiceState("idle");
+    setVoiceSeconds(0);
+    if (!onVoiceCancel) return;
+    try {
+      await onVoiceCancel();
+    } catch (err) {
+      setVoiceError(errorText(err));
+    }
+  };
+
+  finishVoiceRef.current = finishVoice;
+  cancelVoiceRef.current = cancelVoice;
+
+  const voiceLabel =
+    voice === "recording"
+      ? `停止 ${clockText(voiceSeconds)}`
+      : voice === "stopping"
+        ? "识别中…"
+        : "语音";
 
   return (
     <form
@@ -324,6 +524,12 @@ export function Composer({
           onRemove={removePending}
           onPick={(files) => void addFiles(files)}
         />
+        {/* 语音错误单独一行：与图片错误来源不同、生命周期也不同，不混进 `errors`。 */}
+        {voiceError !== null ? (
+          <p className="voice-error" role="alert" data-testid="voice-error">
+            {voiceError}
+          </p>
+        ) : null}
         <div className="composer-row">
           <textarea
             ref={inputRef}
@@ -343,6 +549,23 @@ export function Composer({
               void submit();
             }}
           />
+          {/* 只有宿主传了 `onVoiceStart` 才出现：现有直用 `Composer` 的测试因此零改动。
+              `type="button"` 是必须的 —— 放在 form 里，默认的 submit 会顺手把草稿发出去。 */}
+          {onVoiceStart ? (
+            <button
+              type="button"
+              className="voice"
+              data-testid="voice-button"
+              data-recording={voice === "recording" ? "true" : undefined}
+              disabled={voice === "stopping" || streaming || sending}
+              onClick={() => {
+                if (voice === "recording") void finishVoice();
+                else void beginVoice();
+              }}
+            >
+              {voiceLabel}
+            </button>
+          ) : null}
           {streaming ? (
             <button
               type="button"
@@ -356,7 +579,11 @@ export function Composer({
               {stopRequested ? "停止中…" : "停止"}
             </button>
           ) : (
-            <button type="submit" className="send" disabled={sending}>
+            <button
+              type="submit"
+              className="send"
+              disabled={sending || voice !== "idle"}
+            >
               {sending ? "发送中…" : "发送"}
             </button>
           )}

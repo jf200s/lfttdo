@@ -283,6 +283,13 @@ export interface Settings {
    * `"bash"`（`DEFAULT_PRESET_ID`）；前端不回落第二遍，下拉的选项 = 预设 id ∪ 自定义 id。
    */
   default_shell: string;
+  /**
+   * 语音输入的识别语言（Windows 自带离线识别，SAPI）。Rust 默认 `"zh-CN"`，
+   * normalize 后只有 `"system" | "zh-CN" | "en-US"` 三支，未知/空值回落 `"zh-CN"`。
+   * 白名单与回落只在 Rust 一处（同 `font_size` 的 R123 规矩），前端只把下拉的选择原样送出。
+   * 语音**没有**模型名 / base_url / API key —— 用的是系统语音包，不是远端服务。
+   */
+  voice_language: string;
 }
 
 /**

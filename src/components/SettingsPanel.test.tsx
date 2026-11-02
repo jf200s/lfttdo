@@ -67,6 +67,8 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   // 「带成别的值」由 Shell 切片的用例用非默认值另钉。
   shells: [],
   default_shell: "bash",
+  // 语音输入：默认 `zh-CN`（面板**渲染**它，漏带会在下拉里先露馅）。
+  voice_language: "zh-CN",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -259,7 +261,22 @@ describe("SettingsPanel", () => {
       memory_embedding_model: "text-embedding-v3",
       shells: [],
       default_shell: "bash",
+      voice_language: "zh-CN",
     });
+  });
+
+  // 语音输入：下拉的 value 是 Rust normalize 白名单里的三支，改完随整表保存。
+  it("edits the voice language and saves the chosen value", async () => {
+    const p = await setup({ voice_language: "zh-CN" });
+    const select = screen.getByLabelText(/识别语言/) as HTMLSelectElement;
+    expect(select.value).toBe("zh-CN");
+    expect(within(select).getAllByRole("option").map((o) => o.getAttribute("value"))).toEqual(
+      ["zh-CN", "en-US", "system"],
+    );
+    fireEvent.change(select, { target: { value: "en-US" } });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
+    expect(p.onSave.mock.calls[0][0].voice_language).toBe("en-US");
   });
 
   it("renders the configured roots as one path per line", async () => {

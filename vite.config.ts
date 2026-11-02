@@ -43,6 +43,9 @@ export default defineConfig(() => ({
       "**/.git/**",
       "**/dist/**",
       "**/release/**",
+      // `.worktrees/` 是 git worktree 的隔离工作区（gitignored）：里面是同一批源码的副本，
+      // 从主仓跑 `npm test` 时不该重复扫描，否则用例数翻倍、并发下还会互相干扰。
+      "**/.worktrees/**",
       "**/src-tauri/**",
     ],
   },
