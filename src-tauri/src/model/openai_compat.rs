@@ -15,6 +15,9 @@
 //!   （已连通，是 key/配额/模型名的问题，去查设置）
 //!   vs `无法连接模型端点 https://…: http error: dns error`（没连通，去查网络/代理）。
 //!   分错的代价是把「你的 key 不对」送去查网络。
+// ModelError::Transport 内联携带 OpenAIError（≥136 字节），本文件 6 个返回 Result<_, ModelError>
+// 的函数全部命中；Box 化属于错误类型布局重构，超出本次机械清理范围。
+#![allow(clippy::result_large_err)]
 use super::provider::{ChatRequest, ModelDelta, ModelError, ModelProvider, ToolDef};
 use crate::agent::types::{ContentBlock, ImageMime, Message, Role, ToolOutput};
 use async_openai::{
@@ -29,8 +32,7 @@ use async_openai::{
         ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
         ChatCompletionRequestUserMessageContentPart, ChatCompletionStreamOptions,
         ChatCompletionTool, ChatCompletionTools, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, FunctionCall,
-        FunctionObject,
+        CreateChatCompletionRequestArgs, FunctionCall, FunctionObject,
     },
 };
 use futures::StreamExt;
@@ -71,10 +73,10 @@ fn strip_len(s: &str, suffix: &str) -> Option<usize> {
 /// 3. 循环（每步都严格变短，必然终止）：
 ///    a. 去全部尾斜杠；
 ///    b. 尾部是「端点段 + 版本段」的颠倒粘贴（`…/chat/completions/v1`、`…/completions/v1`）
-///       → 只摘尾部 `/v1`，剩下的端点段交给 d 处理；
+///    → 只摘尾部 `/v1`，剩下的端点段交给 d 处理；
 ///    c. 尾部恰为 `/v1/v1`（复制粘贴常见，可多层，循环收敛）→ 摘掉一个 `/v1`；
 ///    d. 尾部是端点段 → 摘掉它。**`/chat/completions` 必须先于 `/completions` 判定**，
-///       否则 `…/v1/chat/completions` 会被削成 `…/v1/chat` 再加 `/v1`（R27 的主形态）。
+///    否则 `…/v1/chat/completions` 会被削成 `…/v1/chat` 再加 `/v1`（R27 的主形态）。
 /// 4. 尾段不是 `/v1` 就补一个。
 ///
 /// R27 的动机：用户粘贴的是各家控制台显示的那一行。dashscope 控制台给的就是
@@ -641,7 +643,12 @@ fn raw_chunk_to_deltas(chunk: &RawChunk, in_reasoning: &mut bool) -> Vec<ModelDe
         });
     }
     for ch in &chunk.choices {
-        if let Some(r) = ch.delta.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(r) = ch
+            .delta
+            .reasoning_content
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
             if !*in_reasoning {
                 *in_reasoning = true;
                 v.push(ModelDelta::Text("<think>".into()));
@@ -679,7 +686,9 @@ fn raw_chunk_to_deltas(chunk: &RawChunk, in_reasoning: &mut bool) -> Vec<ModelDe
 /// 一个 SSE chunk → 0..n 个 `ModelDelta`。顺序：usage 先于文本与工具（usage 只在
 /// 最后一个分片出现，且那一轮 `choices` 通常是空数组）。
 #[cfg(test)]
-fn chunk_to_deltas(c: &async_openai::types::chat::CreateChatCompletionStreamResponse) -> Vec<ModelDelta> {
+fn chunk_to_deltas(
+    c: &async_openai::types::chat::CreateChatCompletionStreamResponse,
+) -> Vec<ModelDelta> {
     let mut v = Vec::new();
     if let Some(u) = &c.usage {
         v.push(ModelDelta::Usage {
@@ -688,10 +697,10 @@ fn chunk_to_deltas(c: &async_openai::types::chat::CreateChatCompletionStreamResp
         });
     }
     for ch in &c.choices {
-        if let Some(t) = &ch.delta.content {
-            if !t.is_empty() {
-                v.push(ModelDelta::Text(t.clone()));
-            }
+        if let Some(t) = &ch.delta.content
+            && !t.is_empty()
+        {
+            v.push(ModelDelta::Text(t.clone()));
         }
         if let Some(tcs) = &ch.delta.tool_calls {
             for f in tcs {
@@ -1438,29 +1447,47 @@ mod tests {
     fn reasoning_is_wrapped_once_and_closed_before_the_answer() {
         let texts = |ds: Vec<ModelDelta>| -> Vec<String> {
             ds.into_iter()
-                .filter_map(|d| if let ModelDelta::Text(t) = d { Some(t) } else { None })
+                .filter_map(|d| {
+                    if let ModelDelta::Text(t) = d {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                })
                 .collect()
         };
         let raw = |j: &str| serde_json::from_str::<RawChunk>(j).unwrap();
         let mut in_r = false;
         assert_eq!(
-            texts(raw_chunk_to_deltas(&raw(r#"{"choices":[{"delta":{"reasoning_content":"想"}}]}"#), &mut in_r)),
+            texts(raw_chunk_to_deltas(
+                &raw(r#"{"choices":[{"delta":{"reasoning_content":"想"}}]}"#),
+                &mut in_r
+            )),
             vec!["<think>", "想"]
         );
         assert!(in_r);
         assert_eq!(
-            texts(raw_chunk_to_deltas(&raw(r#"{"choices":[{"delta":{"reasoning_content":"考"}}]}"#), &mut in_r)),
+            texts(raw_chunk_to_deltas(
+                &raw(r#"{"choices":[{"delta":{"reasoning_content":"考"}}]}"#),
+                &mut in_r
+            )),
             vec!["考"],
             "同一段思考只开一次 <think>"
         );
         assert_eq!(
-            texts(raw_chunk_to_deltas(&raw(r#"{"choices":[{"delta":{"content":"答案"}}]}"#), &mut in_r)),
+            texts(raw_chunk_to_deltas(
+                &raw(r#"{"choices":[{"delta":{"content":"答案"}}]}"#),
+                &mut in_r
+            )),
             vec!["</think>", "答案"],
             "正文到来前必须闭合思考"
         );
         assert!(!in_r);
         assert_eq!(
-            texts(raw_chunk_to_deltas(&raw(r#"{"choices":[{"delta":{"content":"纯文本"}}]}"#), &mut in_r)),
+            texts(raw_chunk_to_deltas(
+                &raw(r#"{"choices":[{"delta":{"content":"纯文本"}}]}"#),
+                &mut in_r
+            )),
             vec!["纯文本"],
             "没有思考的分片不许凭空加标签"
         );
@@ -1548,8 +1575,10 @@ mod tests {
         let raw = r#"{"id":"1","object":"chat.completion.chunk","created":1,"model":"m",
                       "choices":[{"index":0,"delta":{"tool_calls":[
                         {"id":"call_1","type":"function","function":{"name":"fs.read"}}]}}]}"#;
-        let err = serde_json::from_str::<async_openai::types::chat::CreateChatCompletionStreamResponse>(raw)
-            .expect_err("缺 index 的分片在 0.42.2 上必须解不出来");
+        let err = serde_json::from_str::<
+            async_openai::types::chat::CreateChatCompletionStreamResponse,
+        >(raw)
+        .expect_err("缺 index 的分片在 0.42.2 上必须解不出来");
         assert!(
             err.to_string().contains("index"),
             "报错应指向缺失的 index，实际：{err}"

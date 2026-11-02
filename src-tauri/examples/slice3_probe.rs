@@ -195,7 +195,10 @@ async fn turn_mode(args: &[String], prompt: &str) -> Result<(), Box<dyn std::err
             output_dir: None,
             db: db.clone(),
             // 空表 catalog：探针不跑 shell，装配签名（Agent Shell 接线）要求这只共享锁。
-            registry: build_production_registry(db.clone(), Arc::new(RwLock::new(ShellCatalog::new()))),
+            registry: build_production_registry(
+                db.clone(),
+                Arc::new(RwLock::new(ShellCatalog::new())),
+            ),
             gate: Arc::new(PermissionGate::new()),
             model,
             sink: sink.clone(),

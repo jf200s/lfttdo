@@ -116,7 +116,9 @@ impl RuleTable {
     /// MCP 注册名的真名解析：alias 表里没有 ⇒ `None`（未注册名与没喂过 alias 的直通名
     /// 都走这条，调用方自行退回 scope 兜底）。
     fn real_server_of(&self, registered: &str) -> Option<String> {
-        crate::lock::read(&self.server_alias).get(registered).cloned()
+        crate::lock::read(&self.server_alias)
+            .get(registered)
+            .cloned()
     }
 
     /// 读回当前档位（T35 的界面要显示它）。

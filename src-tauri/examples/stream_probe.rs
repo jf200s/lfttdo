@@ -120,10 +120,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
-            if let Some(t) = &ch.delta.content {
-                if !t.is_empty() {
-                    println!("TEXT {t:?}");
-                }
+            if let Some(t) = &ch.delta.content
+                && !t.is_empty()
+            {
+                println!("TEXT {t:?}");
             }
         }
     }

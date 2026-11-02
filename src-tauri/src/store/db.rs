@@ -900,7 +900,6 @@ mod tests {
         assert_eq!(db.user_version().unwrap(), 2);
     }
 
-
     #[test]
     fn session_workspace_round_trips_and_clears() {
         let (_d, db) = tmpdb();

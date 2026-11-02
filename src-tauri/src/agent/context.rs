@@ -158,11 +158,7 @@ impl ContextBuilder {
         }
         let prompt = prompt.as_str();
         let mut head: Vec<Message> = vec![Message::system_note(prompt)];
-        head.extend(
-            self.memory_notes
-                .iter()
-                .map(|n| Message::system_note(n)),
-        );
+        head.extend(self.memory_notes.iter().map(|n| Message::system_note(n)));
         head.extend(
             history
                 .iter()
@@ -347,7 +343,7 @@ const DEGRADED_IMAGE_NOTE: &str = "[图片已移除以节省上下文]";
 /// 不碰 `ContentBlock::ToolResult` 里的 `ToolOutput::Image`：Plan A 的 registry 为空，
 /// 工具结果进历史今天不可达，为它扩实现会让「图片降级」和「工具结果图片」两套规则混在
 /// 一起（R150）。工具结果图片的降级随 Plan B 的工具注册一起做。
-pub fn degrade_old_images(msgs: &mut Vec<Message>, keep_recent: usize) {
+pub fn degrade_old_images(msgs: &mut [Message], keep_recent: usize) {
     let mut image_positions: Vec<(usize, usize)> = Vec::new();
     for (mi, m) in msgs.iter().enumerate() {
         for (bi, b) in m.blocks.iter().enumerate() {
@@ -1209,7 +1205,10 @@ mod memory_injection {
         // 顺序是硬性的:系统提示词 → 记忆(画像+召回,本轮现算) → 历史摘要备注 → tail。
         // 记忆是「当前相关性」,摘要备注是「过去发生了什么」,越靠近提示词的越新鲜。
         let mut b = ContextBuilder::new(ContextConfig::default());
-        b.set_memory_notes(vec!["[用户画像]用户是 Rust 开发者".into(), "[长期记忆]用户住在上海".into()]);
+        b.set_memory_notes(vec![
+            "[用户画像]用户是 Rust 开发者".into(),
+            "[长期记忆]用户住在上海".into(),
+        ]);
         let hist = vec![
             Message::system_note("早期对话摘要:聊了天气"),
             u("第一"),
@@ -1238,7 +1237,9 @@ mod memory_injection {
             window_messages: 40,
             ..Default::default()
         };
-        let hist: Vec<Message> = (0..12).map(|i| u(&("句子".repeat(150) + &format!(" {i}")))).collect();
+        let hist: Vec<Message> = (0..12)
+            .map(|i| u(&("句子".repeat(150) + &format!(" {i}"))))
+            .collect();
 
         let mut with = ContextBuilder::new(cfg.clone());
         with.set_memory_notes(vec!["画像很长".repeat(40)]);
@@ -1254,7 +1255,10 @@ mod memory_injection {
         let bare = ContextBuilder::new(cfg).build(&hist);
         let with_est = estimate_tokens(&with.build(&hist).messages);
         let bare_est = estimate_tokens(&bare.messages);
-        assert!(with_est > bare_est, "记忆备注必须真的进预算:{with_est} vs {bare_est}");
+        assert!(
+            with_est > bare_est,
+            "记忆备注必须真的进预算:{with_est} vs {bare_est}"
+        );
     }
 
     #[test]

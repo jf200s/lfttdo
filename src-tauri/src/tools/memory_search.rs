@@ -178,7 +178,10 @@ mod tests {
             .expect("只读工具不该失败");
         let text = text_of(&out);
         assert!(text.contains("用户住在北京"), "命中的正文要在结果里:{text}");
-        assert!(!text.contains("用户养了一只猫"), "零重叠的不许混进来:{text}");
+        assert!(
+            !text.contains("用户养了一只猫"),
+            "零重叠的不许混进来:{text}"
+        );
         assert!(text.contains("fact"), "kind 要标出来:{text}");
         assert!(
             text.contains("确认 1 次"),
@@ -207,7 +210,8 @@ mod tests {
     async fn k_is_clamped_and_defaulted() {
         let (_d, db) = tmpdb();
         for i in 0..8 {
-            db.add_memory(&fact(&format!("用户住在北京第{i}号"))).unwrap();
+            db.add_memory(&fact(&format!("用户住在北京第{i}号")))
+                .unwrap();
         }
         let out = MemorySearchTool::new(db.clone())
             .execute(json!({"query": "住在北京", "k": 1}), &ctx())

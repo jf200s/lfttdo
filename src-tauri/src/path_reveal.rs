@@ -166,10 +166,12 @@ mod tests {
         let file = root.join("a b.txt");
         std::fs::write(&file, "x").unwrap();
         let file_cmd = explorer_command(&file.canonicalize().unwrap());
-        assert!(file_cmd
-            .get_program()
-            .to_string_lossy()
-            .ends_with("explorer"));
+        assert!(
+            file_cmd
+                .get_program()
+                .to_string_lossy()
+                .ends_with("explorer")
+        );
         let args: Vec<String> = file_cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())

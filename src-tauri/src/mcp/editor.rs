@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::mcp::config::{McpConfig, MCP_FILE, Skipped, parse_text};
+use crate::mcp::config::{MCP_FILE, McpConfig, Skipped, parse_text};
 
 /// 文件不存在时编辑器预填的最小模板。保存它会创建一份空配置。
 pub const EMPTY_CONFIG_TEXT: &str = "{\n  \"mcpServers\": {}\n}\n";
@@ -230,7 +230,8 @@ mod tests {
         let old_text = r#"{"mcpServers":{"old":{"command":"npx"}}}"#;
         std::fs::write(&path, old_text).unwrap();
 
-        let new_text = "{\n  \"mcpServers\": {\n    \"new\": {\n      \"command\": \"node\"\n    }\n  }\n}\n";
+        let new_text =
+            "{\n  \"mcpServers\": {\n    \"new\": {\n      \"command\": \"node\"\n    }\n  }\n}\n";
         save(dir.path(), new_text).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), new_text);
@@ -284,9 +285,18 @@ mod tests {
     fn every_entry_level_failure_blocks_the_write_and_names_the_entry() {
         let cases = [
             (r#"{ "mcpServers": { "": {"command":"x"} } }"#, "名字为空"),
-            (r#"{ "mcpServers": { "bad": {"args":"-y"} } }"#, "字段类型不对"),
-            (r#"{ "mcpServers": { "bad": {"command":""} } }"#, "command 为空"),
-            (r#"{ "mcpServers": { "bad": {} } }"#, "没有 command 也没有 url"),
+            (
+                r#"{ "mcpServers": { "bad": {"args":"-y"} } }"#,
+                "字段类型不对",
+            ),
+            (
+                r#"{ "mcpServers": { "bad": {"command":""} } }"#,
+                "command 为空",
+            ),
+            (
+                r#"{ "mcpServers": { "bad": {} } }"#,
+                "没有 command 也没有 url",
+            ),
             (
                 r#"{ "mcpServers": { "d": {"command":"a"}, "d": {"command":"b"} } }"#,
                 "同名重复",

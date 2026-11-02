@@ -149,21 +149,19 @@ impl RedirectWalker {
             }
 
             let following = (300..=399).contains(&res.status);
-            if following {
-                if let Some(loc) = res.location.as_deref().map(str::trim) {
-                    // 归一 + 复验：畸形/跨方案/内网/凭据段伪装全部在这里断掉，
-                    // **不会**走到下一跳的 `resolve` 或 `transport`。
-                    let next = self.validate_joined(&current, loc)?;
-                    if hops + 1 > self.max_hops {
-                        // 回显的是「实际停下的那一跳」（已过复验的地址），不是我们
-                        // 拒绝去的那个 Location——把一个没校验过的字符串回显给用户，
-                        // 本身就是在造新的注入面。
-                        return Err(GuardError::TooManyHops(current.as_str().to_string()));
-                    }
-                    hops += 1;
-                    current = next;
-                    continue;
+            if following && let Some(loc) = res.location.as_deref().map(str::trim) {
+                // 归一 + 复验：畸形/跨方案/内网/凭据段伪装全部在这里断掉，
+                // **不会**走到下一跳的 `resolve` 或 `transport`。
+                let next = self.validate_joined(&current, loc)?;
+                if hops + 1 > self.max_hops {
+                    // 回显的是「实际停下的那一跳」（已过复验的地址），不是我们
+                    // 拒绝去的那个 Location——把一个没校验过的字符串回显给用户，
+                    // 本身就是在造新的注入面。
+                    return Err(GuardError::TooManyHops(current.as_str().to_string()));
                 }
+                hops += 1;
+                current = next;
+                continue;
             }
 
             // 最终响应（非 3xx，或 3xx 但没给 Location ⇒ 无处可去）。
@@ -398,10 +396,10 @@ impl FetchTransport for ReqwestTransport {
         // 体积闸门：先看声明长度（能省一趟字节），再逐块累加。
         // 注意这里**不许**用 declared 长度去 `Vec::with_capacity`——那是让远端
         // 决定本机分配多少内存。
-        if let Some(declared) = res.content_length() {
-            if declared > max_bytes as u64 {
-                return Err(GuardError::TooLargeBody { limit: max_bytes });
-            }
+        if let Some(declared) = res.content_length()
+            && declared > max_bytes as u64
+        {
+            return Err(GuardError::TooLargeBody { limit: max_bytes });
         }
         let mut body: Vec<u8> = Vec::new();
         while let Some(chunk) = res.chunk().await.map_err(|e| transport_err(url, e))? {
