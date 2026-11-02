@@ -14,7 +14,6 @@ import { useEffect, useRef } from "react";
  */
 export function useTextBuffer(onFlush: (chunk: string) => void) {
   const buf = useRef("");
-  const marker = useRef<string | null>(null);
   const queued = useRef(false);
   const cb = useRef(onFlush);
   cb.current = onFlush;
@@ -50,9 +49,5 @@ export function useTextBuffer(onFlush: (chunk: string) => void) {
       queued.current = false;
       if (t) cb.current(t);
     },
-    marker(m: string) {
-      marker.current = m;
-    },
-    pendingMarker: () => marker.current,
   };
 }

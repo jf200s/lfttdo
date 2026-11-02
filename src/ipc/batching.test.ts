@@ -27,9 +27,8 @@ describe("useTextBuffer", () => {
     const { result } = renderHook(() => useTextBuffer(onFlush));
 
     act(() => { result.current.push("x"); });
-    act(() => { result.current.flushNow(); result.current.marker("tool"); });
+    act(() => { result.current.flushNow(); });
     expect(onFlush).toHaveBeenNthCalledWith(1, "x");
-    expect(result.current.pendingMarker()).toBe("tool");
     vi.unstubAllGlobals();
   });
 
