@@ -105,7 +105,7 @@ Rust 侧需 MSVC 工具链：默认工具链不是 MSVC 的机器，用 `rustup 
 可设 `AWS_LC_SYS_PREBUILT_NASM=1` 改用预编译汇编，或把仓库放到纯 ASCII 路径。
 
 当前读数：Rust 797 passed / 1 ignored + 集成 3 passed；前端 294 passed；clippy 无新增
-（Windows 侧另有一处 `cloned_ref_to_slice_refs`，等 Windows lint 门收口时一并修）。
+（Windows 目标也已是 `-D warnings` 门禁）。
 
 ## 目录结构
 
