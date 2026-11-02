@@ -136,10 +136,10 @@ export function Composer({
    * 剩下的不碰归一化、只报一个「已忽略 N 张」的数 —— 不静默丢，也不假装收了。
    * 张数额度用 `pendingRef`（同步影子）而不是 `pending`：归一化是异步的，只看 state
    * 的话连投两批会把额度算重（第 4 张还没回来时 state 里还是 0）。
+   * 光有影子还不够：影子只在 `pushPending` 落图那一刻更新，交叠批次在 await 之前读到
+   * 的还是旧快照 —— 所以这一层必须整体串行（见 `addFiles` 的排队链）。
    */
-  const addFiles = async (files: File[]) => {
-    // Step 2 第 9 条：`streaming` 期间三个入口都关掉，避免半途改图。
-    if (streaming) return;
+  const addFilesImpl = async (files: File[]) => {
     const room = MAX_IMAGES_PER_MESSAGE - pendingRef.current.length;
     if (room <= 0) {
       setIgnored((n) => n + files.length);
@@ -170,6 +170,25 @@ export function Composer({
         setErrors((prev) => [...prev, `${file.name}：${msg}`]);
       }
     }
+  };
+
+  /**
+   * 排队链：各入口都是 fire-and-forget（`void addFiles(…)`），归一化又是异步的，
+   * 两批粘贴/拖拽交叠时后一批会在前一批任何一张落定之前读 `pendingRef` —— 各算各的
+   * `room`，4 张的额度被算两遍，上限被绕过。让后一批排在 `addFilesQueue` 尾部，
+   * 前一批**落定**（该推的都推进了 `pendingRef`）之后才轮到自己算额度，影子才作数。
+   * 链上存的是吞掉 rejection 的 promise：单批内部的失败已逐文件上屏（`errors`），
+   * 不许把后面排队的批一起饿死。
+   */
+  const addFilesQueue = useRef<Promise<void>>(Promise.resolve());
+  const addFiles = (files: File[]) => {
+    // Step 2 第 9 条：`streaming` 期间三个入口都关掉，避免半途改图。闸在**入口这一刻**
+    // （和旧代码一致：fire-and-forget 的 addFiles 本来也是提交即判）；排在队里、轮到时
+    // streaming 才变真的批，与旧代码「await 挂着时回合开始」的同批一样放行。
+    if (streaming) return;
+    const run = addFilesQueue.current.then(() => addFilesImpl(files));
+    addFilesQueue.current = run.catch(() => {});
+    return run;
   };
 
   const stop = () => {
