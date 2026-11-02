@@ -224,21 +224,29 @@ impl SecretStore for UnsupportedSecretStore {
     }
 }
 
-/// 生产实现：持注入的 Windows 凭据管理器 store，用 `build()` 取条目（R80/R81）。
-/// `build()` 本身**不写任何东西**，crate 源码 store.rs:108 明写「setting a password
-/// does that」，所以下面 `entry()` 可以被只读测试安全调用。
-#[cfg(windows)]
+/// 生产实现：持注入的平台凭据 store（Windows 凭据管理器 / Linux Secret Service），
+/// 用 `build()` 取条目（R80/R81）。`build()` 本身**不写任何东西**，crate 源码 store.rs:108
+/// 明写「setting a password does that」，所以下面 `entry()` 可以被只读测试安全调用。
+#[cfg(any(windows, target_os = "linux"))]
 pub struct KeyringSecretStore {
     store: Arc<keyring_core::CredentialStore>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl KeyringSecretStore {
-    /// 用真实 Windows store 构造。`windows_native_keyring_store::Store::new()` 的
-    /// `Err` 分支按 crate 源码不可达（`new_internal` 不校验平台可用性），**未实测**。
+    /// 用真实平台 store 构造。两个 store 同族同 API，错误类型都是 `keyring_core::Error`。
+    /// Windows 侧 `Store::new()` 的 `Err` 分支按 crate 源码不可达（`new_internal` 不校验
+    /// 平台可用性），**未实测**；Linux 侧连不上 D-Bus（无会话总线 / 无 gnome-keyring，
+    /// 无头或极简桌面）是**真实可达**的失败，由 `default_secret_store` 接住（R81：不回落
+    /// 内存存储）。
     pub fn new() -> Result<Self, SettingsError> {
+        #[cfg(windows)]
         let store: Arc<keyring_core::CredentialStore> = windows_native_keyring_store::Store::new()
             .map_err(|e| SettingsError::Credential(Box::new(e)))?;
+        #[cfg(target_os = "linux")]
+        let store: Arc<keyring_core::CredentialStore> =
+            zbus_secret_service_keyring_store::Store::new()
+                .map_err(|e| SettingsError::Credential(Box::new(e)))?;
         Ok(Self { store })
     }
 
@@ -250,7 +258,7 @@ impl KeyringSecretStore {
     }
 }
 
-#[cfg(all(windows, test))]
+#[cfg(all(any(windows, target_os = "linux"), test))]
 impl KeyringSecretStore {
     /// 注入接缝用的构造器（测试把 `keyring_core::mock::Store` 递进来）。
     /// 只随测试构建，且刻意不 `pub`：T13 请用 `KeyringSecretStore::new()`，别把 mock 接进生产。
@@ -259,12 +267,12 @@ impl KeyringSecretStore {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn credential_error(e: keyring_core::Error) -> SettingsError {
     SettingsError::Credential(Box::new(e))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl SecretStore for KeyringSecretStore {
     fn set(&self, key: &str) -> Result<(), SettingsError> {
         self.entry()?.set_password(key).map_err(credential_error)
@@ -796,7 +804,7 @@ const _: fn() = || {
 };
 
 impl SettingsStore {
-    /// 生产构造：Windows 上接真实的凭据管理器，其余平台接 `UnsupportedSecretStore`。
+    /// 生产构造：Windows / Linux 接真实凭据存储，其余平台接 `UnsupportedSecretStore`。
     /// 这里不返回 `Result` 是因为文件侧对任何平台都可用；凭据侧的「不能用」由每次调用
     /// 自己报（R81），而不是让构造期就把设置页整个堵死。
     pub fn new(dir: &Path) -> Self {
@@ -988,7 +996,19 @@ fn default_secret_store() -> Arc<dyn SecretStore> {
             }
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        match KeyringSecretStore::new() {
+            Ok(store) => Arc::new(store),
+            Err(e) => {
+                // 与 Windows 分支同一策略（R81）：初始化失败只报「用不了」，绝不回落内存 store。
+                // 与 Windows 不同的真实点：Linux 上这支**可达**（无会话总线 / 无 gnome-keyring）。
+                tracing::warn!("Secret Service 初始化失败，凭据操作将一律报错: {e}");
+                Arc::new(UnsupportedSecretStore)
+            }
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         Arc::new(UnsupportedSecretStore)
     }
@@ -1000,9 +1020,9 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     use keyring_core::api::CredentialStoreApi;
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     use keyring_core::{CredentialStore, mock};
 
     /// 目录里的文件名（排序后）。R84/R85 三条测试都靠它盯「该留的留、不该留的别留」。
@@ -1057,7 +1077,7 @@ mod tests {
 
     /// R81 ①：生产实现（`KeyringSecretStore`，走 `store.build(..)` 那条注入路径）
     /// 底下换成 keyring-core 自带的 mock store —— 全程不落真实凭据管理器。
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn mock_backed(dir: &Path) -> (SettingsStore, Arc<mock::Store>) {
         let m = mock::Store::new().unwrap();
         let injected: Arc<CredentialStore> = m.clone();
@@ -2744,7 +2764,7 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn mock_backed_round_trip_sets_gets_and_deletes_the_key() {
         let d = tempfile::tempdir().unwrap();
@@ -2770,7 +2790,7 @@ mod tests {
         store.clear_api_key().unwrap();
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn an_empty_key_is_stored_as_a_clear_instead_of_a_blank_credential() {
         let d = tempfile::tempdir().unwrap();
@@ -2784,7 +2804,7 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn a_platform_length_limit_surfaces_with_its_own_number() {
         let d = tempfile::tempdir().unwrap();
@@ -2833,7 +2853,7 @@ mod tests {
 
     // ---- review M-1：`{:?}` 不许把秘密字节打出来 ----
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn credential_debug_never_prints_the_secret_bytes() {
         // 前提先自证：`keyring_core::Error` 自己 derive 的 Debug 确实把 Vec<u8> 逐字节打印。
@@ -2890,7 +2910,7 @@ mod tests {
 
     // ---- review R95：粘贴进来的 key 要 trim ----
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn a_pasted_key_is_trimmed_and_a_whitespace_only_one_clears() {
         // 从浏览器/邮件里复制 key 常带尾部 `\r\n`。原样入库换来的是 API 侧一个 401，
@@ -2911,7 +2931,7 @@ mod tests {
         assert_eq!(store.api_key().unwrap(), None, "空白必须等价于「清除」");
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn a_blank_stored_entry_reads_as_unconfigured_not_masked() {
         // `mask_key("")` 返回的是「未配置」这三个字。若库里躺着一条空白条目（本模块写不进去，
@@ -2935,7 +2955,7 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn an_entry_written_by_another_program_reads_back_trimmed() {
         // N-5 的另一半。`set_api_key` 写进去的必然干净，但库里那条可能是**别的程序**、或
@@ -2975,7 +2995,7 @@ mod tests {
 
     // ---- spec 6.6 / :473：key 永远不落盘 ----
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn the_key_never_appears_anywhere_in_the_settings_directory() {
         let d = tempfile::tempdir().unwrap();

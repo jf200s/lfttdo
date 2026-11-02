@@ -1,4 +1,5 @@
-//! 打开外部链接的唯一出口。只允许 http(s)，Windows 上交给系统默认浏览器。
+//! 打开外部链接的唯一出口。只允许 http(s)，交给系统默认浏览器
+//! （Windows：绝对路径 rundll32；Unix：`xdg-open`）。
 //!
 //! 不用 shell：`rundll32 url.dll,FileProtocolHandler` 收的是 argv 里的一个 URL，
 //! 不经过 `cmd /C`，所以 URL 里的 `&`/`|` 不会被解释成命令分隔符。
@@ -30,7 +31,10 @@ pub fn open_external(url: &str) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err("当前平台不支持打开外部链接".to_string())
+        launcher(parsed.as_str())
+            .spawn()
+            .map_err(|e| format!("无法打开浏览器：{e}"))?;
+        Ok(())
     }
 }
 
@@ -53,6 +57,16 @@ fn rundll32_path() -> std::path::PathBuf {
     std::path::PathBuf::from(root)
         .join("System32")
         .join("rundll32.exe")
+}
+
+/// `xdg-open` 是 freedesktop 的标准入口，走 PATH 解析（/usr/bin 不含当前目录，没有
+/// CreateProcess 那条「便携目录先于 System32」的搜索序问题，无需绝对路径化）。
+/// argv 里只有一个 URL 元素，不经 shell，`&`/`|` 不会被解释 —— 与 rundll32 同一纪律。
+#[cfg(not(windows))]
+fn launcher(url: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(url);
+    cmd
 }
 
 #[cfg(test)]
@@ -102,6 +116,24 @@ mod tests {
                 "url.dll,FileProtocolHandler".to_string(),
                 "https://example.com/a?b=1&c=2".to_string()
             ],
+            "URL 必须是单独一个 argv，不许拼进 shell 串"
+        );
+    }
+
+    /// 打开命令的形状：xdg-open + 一个 URL argv。不真正 spawn（那会弹出浏览器），
+    /// 只检查构造出来的命令 —— 与上面 rundll32 那条同一条验收。
+    #[cfg(not(windows))]
+    #[test]
+    fn the_launcher_is_xdg_open_with_one_url_argument() {
+        let cmd = launcher("https://example.com/a?b=1&c=2");
+        assert_eq!(cmd.get_program(), "xdg-open");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["https://example.com/a?b=1&c=2".to_string()],
             "URL 必须是单独一个 argv，不许拼进 shell 串"
         );
     }
