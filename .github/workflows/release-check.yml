@@ -1,0 +1,65 @@
+name: Release check
+
+# 只做“低频但昂贵”的 Windows 成品校验：
+# - 不进 pull_request 门禁（一次 NSIS 打包约 15~25 分钟）；
+# - 手动触发，或每周一 03:00 UTC 跑一次；
+# - 同时量安装包体积（仓库验收线 <15MiB）并上传产物供人工验收。
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-nsis:
+    name: Windows NSIS build + size gate
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build NSIS installer
+        run: npx tauri build
+
+      # 仓库既有验收线：安装包 <15MiB（见 src-tauri/Cargo.toml 的注释）。
+      # 这里不仅“量一下”，超线直接让 job 失败；体积数字同时写进日志。
+      - name: Check installer size
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($null -eq $installer) {
+            throw "NSIS installer not found under src-tauri/target/release/bundle/nsis/"
+          }
+          $bytes = $installer.Length
+          $limit = 15 * 1024 * 1024
+          Write-Host "NSIS installer: $($installer.FullName)"
+          Write-Host "Size: $bytes bytes ($([math]::Round($bytes / 1MB, 2)) MiB)"
+          Write-Host "Limit: $limit bytes (15 MiB)"
+          if ($bytes -gt $limit) {
+            throw "Installer exceeds the 15 MiB acceptance line: $bytes bytes"
+          }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsis-installer
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

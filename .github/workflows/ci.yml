@@ -34,3 +34,22 @@ jobs:
           workspaces: src-tauri
       - name: Run tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # 现有 CI 没有 Windows 侧 clippy：Windows-only 代码（SAPI、JobObject）和
+  # examples（含 speech_probe）都不会被 Linux clippy 看到。`--all-targets` 会把
+  # examples 也编进来，防止示例在 Windows 上烂掉。
+  #
+  # 临时：main 上的 #12（clippy 清理）尚未合并，当前有 27 个既有 lint。
+  # 先用 --cap-lints warn 输出告警但不阻断；#12 合并后把这一步改成
+  # `-- -D warnings`，它就会变成硬门。
+  clippy-windows:
+    name: Rust (clippy Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Lint (warnings only until #12 lands)
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- --cap-lints warn
