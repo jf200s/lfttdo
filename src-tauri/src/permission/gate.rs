@@ -49,6 +49,12 @@ pub struct RuleTable {
     /// server 名 ⇒ 信任档位（T33）。按 server 作用域而不是工具名：一台 server 的工具是它自己
     /// 声明的，逐个授权等于让用户去追一个随时会变的清单。
     server_trust: RwLock<HashMap<String, Verdict>>,
+    /// 注册名 ⇒ 真实 server 名（T33 的 alias 表）。**只在内存里**：每次 MCP 工具注册
+    /// （启动自举 / 重连，`ipc::mcp_register_tools`）重建，不落盘 —— 落盘的档位按真名存
+    /// （`mcp_trust.json`），注册名是本进程的产物，重启后由注册期重新喂回来。
+    /// 没有这张表，T30 兜底命名的注册名（server 段截到 8 个 char）还原不出真名，
+    /// `verdict_for` 按 scope 查信任表永远落空 —— Block/Auto 对长名 server 静默失效。
+    server_alias: RwLock<HashMap<String, String>>,
 }
 
 impl RuleTable {
@@ -72,18 +78,45 @@ impl RuleTable {
         crate::lock::write(&self.auto_keys).clear();
     }
 
-    /// 只作废**某一台 MCP server** 的会话授权（key 形如 `mcp__srv__tool|srv`）。
-    /// 改一台 server 的信任档不该把内置工具（`read_file|read`）的授权也一起清掉。
-    /// 长 server 名的令牌可能被截断到 8 字符（T30 的命名兜底），那时这里匹配不到；
-    /// 安全上仍由 `check` 的「Block 先判」兜底。
+    /// 只作废**某一台 MCP server** 的会话授权。会话键是 `{注册名}|{scope}`，所以经 alias
+    /// 反查这台 server 的**全部注册名**、按「注册名|」**前缀**清。旧的「按 `|真名` 后缀
+    /// retain」对 T30 兜底命名的键永远匹配不到 —— 兜底键的 scope 是截断的 server 段，
+    /// 不含真名，改成 Block 就压不住本会话已有的放行。收尾的 `|` 保证 `mcp__a__x` 的
+    /// 前缀不会误伤 `mcp__a__x2` 的键；内置工具键（`read_file|read`）不以任何 `mcp__…|`
+    /// 开头，天然不受影响。alias 表里没有这台 server ⇒ 它的工具没注册过 ⇒ 也不可能有
+    /// 它的会话键，无事可清不是漏清。
     pub fn clear_session_rules_for_server(&self, server: &str) {
-        let suffix = format!("|{server}");
-        crate::lock::write(&self.auto_keys).retain(|key| !key.ends_with(&suffix));
+        let registered: Vec<String> = {
+            let alias = crate::lock::read(&self.server_alias);
+            alias
+                .iter()
+                .filter(|(_, real)| real.as_str() == server)
+                .map(|(registered, _)| registered.clone())
+                .collect()
+        };
+        let mut keys = crate::lock::write(&self.auto_keys);
+        for name in &registered {
+            let prefix = format!("{name}|");
+            keys.retain(|key| !key.starts_with(&prefix));
+        }
     }
 
     /// 设定一台 server 的信任档位（T35 的 `mcp_set_trust` 是唯一写入者）。
     pub fn set_server_trust(&self, server: &str, verdict: Verdict) {
         crate::lock::write(&self.server_trust).insert(server.to_string(), verdict);
+    }
+
+    /// 注册期登记「注册名 → 真实 server 名」。唯一写入者是 `ipc::mcp_register_tools`
+    /// （启动自举 / 每次重连都重新喂一遍）；重注册同名覆盖，摘掉的工具留下的旧条目
+    /// 无害 —— 工具不在注册表里就调不到。
+    pub fn set_server_alias(&self, registered: &str, server: &str) {
+        crate::lock::write(&self.server_alias).insert(registered.to_string(), server.to_string());
+    }
+
+    /// MCP 注册名的真名解析：alias 表里没有 ⇒ `None`（未注册名与没喂过 alias 的直通名
+    /// 都走这条，调用方自行退回 scope 兜底）。
+    fn real_server_of(&self, registered: &str) -> Option<String> {
+        crate::lock::read(&self.server_alias).get(registered).cloned()
     }
 
     /// 读回当前档位（T35 的界面要显示它）。
@@ -101,10 +134,16 @@ impl RuleTable {
 
     /// 只回答「有没有 override」（R45：默认策略不许搬进来，否则同一条策略住两处）：
     /// 先精确 `{name}|{scope}`（今天还没有生产者，留着是因为它是最窄的一档），再按 server 作用域。
+    /// MCP 注册名先经 alias 还原成**真实 server 名**再查（T30 兜底命名的 scope 是截断段，
+    /// 按它查永远落空）；还原到了就**只**按真名查 —— 再退回 scope 兜底会撞名：短 server
+    /// 的真名可以恰好等于长 server 的截断段，两台 server 就互串了信任档。
     pub fn verdict_for(&self, name: &str, scope: &str) -> Option<Verdict> {
         let trust = crate::lock::read(&self.server_trust);
         if let Some(v) = trust.get(&format!("{name}|{scope}")) {
             return Some(*v);
+        }
+        if let Some(server) = self.real_server_of(name) {
+            return trust.get(&server).copied();
         }
         trust.get(scope).copied()
     }
@@ -238,7 +277,13 @@ impl PermissionGate {
         match self.rules.verdict_for(&call.name, &scope) {
             Some(Verdict::Auto) => return Decision::allow(Scope::Once),
             Some(Verdict::Block) => {
-                return Decision::deny(format!("server `{scope}` 被设为 Block，调用被拒绝"));
+                // 理由点名 server：注册名经 alias 还原成真名 —— T30 兜底名的 scope 是
+                // 截断段，用户在界面上设的是真名，拒绝理由里也该说真名。
+                let server = self
+                    .rules
+                    .real_server_of(&call.name)
+                    .unwrap_or_else(|| scope.clone());
+                return Decision::deny(format!("server `{server}` 被设为 Block，调用被拒绝"));
             }
             Some(Verdict::Ask) => {}
             None => {}
@@ -965,9 +1010,12 @@ mod tests {
     }
 
     /// 改一台 MCP server 的信任档只收回它自己的授权，内置工具的授权保留。
+    /// alias 照生产流程喂（`ipc::mcp_register_tools` 注册期必喂）——没有 alias 条目
+    /// 就没有注册名可反查，这里喂的是直通名。
     #[test]
     fn clearing_one_servers_rules_keeps_builtin_allows() {
         let rules = RuleTable::default();
+        rules.set_server_alias("mcp__search__web_search", "search");
         rules.remember_session("read_file|read");
         rules.remember_session("mcp__search__web_search|search");
         rules.clear_session_rules_for_server("search");
@@ -979,5 +1027,156 @@ mod tests {
             rules.lookup("read_file|read").is_some(),
             "无关的内置工具授权不许被一起清掉"
         );
+    }
+
+    // ───────────────────────── T30 兜底命名 × T33 信任档（本修复的回归钉） ─────────────────────────
+    //
+    // naming.rs 测试用的同一台长名 server：注册名走 T30 兜底形状，server 段截到
+    // 前 8 个 char（`a-very-l`），从注册名还原不出真名 —— 信任表按真名存，查档、
+    // 清会话授权都必须经 alias 表（注册名 → 真名）这条路。
+
+    const LONG_SERVER: &str = "a-very-long-community-server-name-that-goes-on";
+    const LONG_TOOL: &str = "get_the_current_weather_forecast_for_a_location";
+
+    fn registered_long() -> String {
+        crate::mcp::naming::namespaced(LONG_SERVER, LONG_TOOL)
+    }
+
+    /// Block 必须压过本会话已有的放行 —— 哪怕 server 走的是兜底命名。本缺陷的主症状：
+    /// 旧实现按截断 scope 查信任表查不到 Block，清放行又按 `|真名` 后缀截不到兜底键。
+    #[tokio::test]
+    async fn a_blocked_fallback_named_server_overrides_an_existing_session_allow() {
+        let sink = Arc::new(VecSink::default());
+        let rules = Arc::new(RuleTable::default());
+        let registered = registered_long();
+        rules.set_server_alias(&registered, LONG_SERVER);
+        let gate = PermissionGate::new()
+            .with_sink(sink.clone())
+            .with_rules(rules.clone());
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: registered,
+            risk: Risk::Read,
+            input: json!({}),
+        };
+        // 先买一次「本会话都允许」：键走 rule_key 的真实形状（scope 是截断的 server 段）。
+        let key = gate.rule_key(&c);
+        rules.remember_session(&key);
+        assert!(rules.lookup(&key).is_some(), "前提：会话放行已在表里");
+        // 用户随后把整台 server（按真名）设为 Block。
+        rules.set_server_trust(LONG_SERVER, Verdict::Block);
+
+        let d = tokio::time::timeout(
+            Duration::from_secs(2),
+            gate.check(&c, &CancellationToken::new()),
+        )
+        .await
+        .expect("Block 必须当场拒绝，不该走到等人应答那一步");
+        assert!(!d.allowed(), "Block 必须压过会话级放行：{d:?}");
+        assert!(
+            matches!(&d, Decision::Deny { reason } if reason.contains(LONG_SERVER)),
+            "拒绝理由要点名**真名**，截断段对用户没有意义：{d:?}"
+        );
+        assert!(sink.events().is_empty(), "Block 不弹窗，直接拒");
+    }
+
+    /// 兜底命名的 server 登记为 Auto：注册名经 alias 还原成真名命中信任表，静默放行。
+    /// 本缺陷的另一个症状：Auto 退化成每次弹窗（信任表按真名存、查档按截断段查）。
+    #[tokio::test]
+    async fn a_trusted_fallback_named_server_is_silent() {
+        let sink = Arc::new(VecSink::default());
+        let rules = Arc::new(RuleTable::default());
+        let registered = registered_long();
+        rules.set_server_alias(&registered, LONG_SERVER);
+        rules.set_server_trust(LONG_SERVER, Verdict::Auto);
+        let gate = PermissionGate::new()
+            .with_sink(sink.clone())
+            .with_rules(rules);
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: registered,
+            risk: Risk::Read,
+            input: json!({}),
+        };
+        // 包 timeout：没命中 Auto 就会去等人，测试挂死比假绿好。
+        let d = tokio::time::timeout(
+            Duration::from_secs(2),
+            gate.check(&c, &CancellationToken::new()),
+        )
+        .await
+        .expect("登记 Auto 的兜底名 server 必须当场静默放行，不该去等人");
+        assert!(d.allowed(), "Auto 经 alias 解析后必须生效：{d:?}");
+        assert!(sink.events().is_empty(), "Auto 不产生弹窗事件");
+    }
+
+    /// 兜底命名的 server：clear 会话授权必须按「注册名|」前缀清（旧实现的 `|真名` 后缀
+    /// 截不到兜底键），清完之后恢复弹窗。
+    #[tokio::test]
+    async fn clearing_a_fallback_named_servers_allow_restores_asking() {
+        let sink = Arc::new(VecSink::default());
+        let rules = Arc::new(RuleTable::default());
+        let registered = registered_long();
+        rules.set_server_alias(&registered, LONG_SERVER);
+        let gate = PermissionGate::new()
+            .with_sink(sink.clone())
+            .with_rules(rules.clone());
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: registered,
+            risk: Risk::Read,
+            input: json!({}),
+        };
+        let key = gate.rule_key(&c);
+        rules.remember_session(&key);
+        assert!(rules.lookup(&key).is_some());
+
+        rules.clear_session_rules_for_server(LONG_SERVER);
+        assert!(
+            rules.lookup(&key).is_none(),
+            "兜底键的 scope 是截断段、不含真名：按 |真名 后缀清不掉它"
+        );
+
+        // 行为上恢复弹窗：下一次调用重新等人应答（没有信任档，走默认 Ask）。
+        let (h, id) = pending_request(&gate, &c, &CancellationToken::new(), &sink, 1).await;
+        gate.resolve(&id, Decision::deny("测试收尾"));
+        let _ = tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("resolve 之后 check 仍不返回");
+    }
+
+    /// 红线：短 server 的信任档**不许**漏给截断段恰好相同的长 server。
+    /// `truncate` 是一台真实存在的（直通名）server 且被设为 Block；长 server 的兜底
+    /// scope 恰好也是 `truncate` —— 若 alias 还原之后还退回 scope 兜底，长 server 就
+    /// 白背了短 server 的 Block。alias 命中后必须只按真名查，查不到就落回默认 Ask。
+    #[tokio::test]
+    async fn a_short_servers_trust_never_leaks_to_a_fallback_named_server() {
+        let sink = Arc::new(VecSink::default());
+        let rules = Arc::new(RuleTable::default());
+        rules.set_server_trust("truncate", Verdict::Block);
+        // 名字里带 `.` ⇒ 必走 T30 兜底（非法字符），server 段截到 `truncate`。
+        let long = "truncate.example.com";
+        let registered = crate::mcp::naming::namespaced(long, "tool_name");
+        assert_eq!(
+            scope_of(&registered, &json!({})),
+            "truncate",
+            "前提：长 server 的兜底 scope 确实撞上短 server 的真名"
+        );
+        rules.set_server_alias(&registered, long);
+        let gate = PermissionGate::new()
+            .with_sink(sink.clone())
+            .with_rules(rules);
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: registered,
+            risk: Risk::Read,
+            input: json!({}),
+        };
+        // 不是 Block（没有互串）——落回默认 Ask：等人应答。
+        // 若哪天有人把 alias 命中后的 scope 兜底加回来，这里等不到弹窗、直接变红。
+        let (h, id) = pending_request(&gate, &c, &CancellationToken::new(), &sink, 1).await;
+        gate.resolve(&id, Decision::deny("测试收尾"));
+        let _ = tokio::time::timeout(Duration::from_secs(2), h)
+            .await
+            .expect("resolve 之后 check 仍不返回");
     }
 }

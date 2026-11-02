@@ -471,6 +471,13 @@ impl McpTool {
             bridge,
         }
     }
+
+    /// 模型端看到的注册名（T30 命名层的输出）。gate 的 alias 表拿它当键
+    /// （`ipc::mcp_register_tools` 注册期喂入「注册名 → 真名」），别处仍不许
+    /// 拿名字反推 (server, tool) —— 兜底形状是有损的。
+    pub fn registered_name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[async_trait::async_trait]
