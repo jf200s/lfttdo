@@ -28,13 +28,17 @@ use crate::tools::fetch::FetchTool;
 use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::shell::{
+    ShellCatalog, ShellProfile, ShellTool, detected_presets, ensure_executable, path_search_dirs,
+    validate_custom,
+};
 use crate::tools::use_skill::UseSkillTool;
 use crate::tools::write_file::WriteFileTool;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tauri::ipc::InvokeBody;
 use tauri::{
@@ -286,6 +290,11 @@ pub struct AppState {
     /// 按会话的抽取互斥(spec §12.5 缺口 1)。空闲 worker 与切换回补都经它,
     /// 避免同一会话被两条路径同时抽取、堆出重复记忆。
     pub extracting: ExtractLocks,
+    /// Agent Shell（spec §2/§5.5）：这一轮可用的 shell 全集（预设 + 自定义 + 默认 id）。
+    /// `ShellTool` 与 `AppState` 持**同一个** `Arc`（注册表是进程级单例，catalog 不能
+    /// 留在某一轮的 `ToolCtx` 里）；`send_message` 每轮开头现刷（spec §2「生效时机」：
+    /// 改设置下一条消息生效，无缓存可过期）。锁走 `crate::lock` 的中毒容忍入口。
+    pub shells: Arc<RwLock<ShellCatalog>>,
 }
 
 /// 单轮并发闸门。guard 一析构就释放槽位，所以 `?` 的每条早退路径（读设置失败、
@@ -1599,6 +1608,13 @@ pub async fn send_message(
 
     let store = state.settings.clone();
     let settings = blocking(move || store.load().map_err(|e| e.to_string())).await?;
+    // Agent Shell（spec §2「生效时机」）：每轮开头用**本轮现取**的设置刷 shell catalog，
+    // 与下面的 roots / temperature 同一条线 —— 用户改完设置发下一条消息就生效，
+    // 没有任何缓存可以过期（轮内不变：正在流式的那一轮不换后端）。
+    // 锁走 `crate::lock` 的中毒容忍入口；`ShellTool` 持同一个 Arc，本轮 run_turn 里的
+    // 每次执行看到的都是这份。这一行没法单测（`#[tauri::command]` 在单测里调不动），
+    // 「值真的可解析」由 `shell_catalog_of` 的纯函数测试与 settings 侧 normalize 钉着。
+    *crate::lock::write(&state.shells) = shell_catalog_of(&settings);
     // R90：`normalize_base_url("")` 返回空串，settings.rs 不替用户编一个默认端点，
     // 所以这道守卫必须住在装配层 —— 空 base_url 到这里就停。
     if settings.base_url.trim().is_empty() {
@@ -2545,6 +2561,43 @@ pub async fn settings_set_api_key(
     blocking(move || store.set_api_key(&api_key).map_err(|e| e.to_string())).await
 }
 
+// ───────────────────── Agent Shell：预设表与 profile 校验（spec §5.5） ─────────────────────
+
+/// 检测到的预设表（spec §5.5 `shellPresets()`；2026-11-01 修订：候选 + 检测）。
+/// 真相住在 `tools/shell.rs`：候选表 + 检测（`detected_presets()`，spec §2 单一真相，
+/// 前端经 IPC 拿只读副本、不抄第二份）。返回的是「本机检测到的那部分候选」——可能
+/// 少于 8 条，也可能为空（一台机器可能一条候选都没有；此时 UI 渲染空列表，其余
+/// shell 由用户以自定义路径添加，机制不变）。展示顺序仍是 spec §5.2 的冻结顺序
+/// （检测只过滤、不重排）。
+#[tauri::command]
+pub fn shell_presets() -> Vec<ShellProfile> {
+    detected_presets()
+}
+
+/// 校验的**可测核心**（`#[tauri::command]` 在单测里调不动，同本模块测试头 R103 段的
+/// 既有口径，所以抽一层能直接测的纯函数）。顺序是 spec §5.4 的两步分工：
+/// 1. `validate_custom` —— 词法（trim、空 id / 空 program / 空-含空白 args 项拒绝），
+///    **不做存在性检查**；
+/// 2. `ensure_executable` —— 存在 + 可执行判定；裸名按 `search_dirs` 逐目录解析，
+///    生产传 `path_search_dirs()`（PATH，Windows 叠 PATHEXT），测试注入假表 ——
+///    同 mcp R305 的「解析器可注入」口径。
+/// 错误是给人读的中文串，`Err` 原样上屏（spec §5.5）。
+fn validate_shell_profile_with_dirs(
+    profile: ShellProfile,
+    search_dirs: &[PathBuf],
+) -> Result<(), String> {
+    let normalized = validate_custom(profile)?;
+    ensure_executable(&normalized.program, search_dirs)?;
+    Ok(())
+}
+
+/// UI「校验」按钮（spec §5.5 `shellProfileValidate`）：成功 `Ok(())`，失败
+/// `Err(中文原因)`。**保存时不校验**（spec §2 决策清单）—— 这条命令只服务显式的校验动作。
+#[tauri::command]
+pub fn shell_profile_validate(profile: ShellProfile) -> Result<(), String> {
+    validate_shell_profile_with_dirs(profile, &path_search_dirs())
+}
+
 /// R110：`settings_api_key_masked` 这条命令**不实现** —— `settings_get` 已经带掩码，
 /// 再开一个只读掩码的命令没有消费者（R89：加接口先给消费者）。
 ///
@@ -2764,8 +2817,13 @@ fn persist_window_geometry(window: &tauri::Window) {
 ///
 /// 名字序由 `ToolRegistry` 里的 `BTreeMap` 决定（字典序），**不是**这里的注册顺序；
 ///
-///
-pub fn build_production_registry(db: Arc<Db>) -> Arc<ToolRegistry> {
+/// Agent Shell（spec §2/§5.5）：`run_command` 在这里注册。catalog 经 `shells` 注入 ——
+/// 调用方把**同一个** `Arc` 装进 `AppState`，`send_message` 每轮开头现刷它的内容；
+/// 工具不自取设置（「装配层注入、工具不自取」的既有取向）。
+pub fn build_production_registry(
+    db: Arc<Db>,
+    shells: Arc<RwLock<ShellCatalog>>,
+) -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     registry.register(Arc::new(FetchTool::new()));
     registry.register(Arc::new(ReadFileTool));
@@ -2773,7 +2831,18 @@ pub fn build_production_registry(db: Arc<Db>) -> Arc<ToolRegistry> {
     registry.register(Arc::new(MemorySearchTool::new(db)));
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
+    registry.register(Arc::new(ShellTool::new(shells)));
     registry
+}
+
+/// 这一轮的 shell catalog（spec §2「生效时机」的纯函数面）：从本轮现取的 `Settings`
+/// 拼出「自定义表 + 默认 id」，预设侧在本构造点检测（2026-11-01 修订：候选 + 检测，
+/// 每轮重测一次）。`send_message` 在 `store.load()` 之后调它并刷进
+/// `AppState.shells` —— 与 roots / temperature 同一条「本轮现取、下一条消息生效」线，
+/// 这里没有任何缓存可以过期。`default_shell` 的 trim 与空回落由 `from_parts`/`resolve`
+/// 的既有语义承担（settings 侧 `normalize()` 已先行回落过一次）。
+fn shell_catalog_of(settings: &Settings) -> ShellCatalog {
+    ShellCatalog::from_parts(settings.shells.clone(), settings.default_shell.trim())
 }
 
 /// 数据目录的唯一解析点：`%APPDATA%\<identifier>`。
@@ -2991,10 +3060,15 @@ pub fn run() {
             // 注册表要 clone 一份 db,而 `db` 字段本身会被 move 进 AppState ——
             // 先单独克隆一次避开 E0382(字面量里既 move 又借用不合法)。
             let db_for_registry = db.clone();
+            // Agent Shell（spec §5.5）：shell catalog 的共享句柄在装配期建一次，
+            // `ShellTool`（经 build_production_registry）与 `AppState.shells` 持同一个 Arc；
+            // 装配期占位为空 catalog，第一条消息前 `send_message` 会现刷。
+            let shells = Arc::new(RwLock::new(ShellCatalog::new()));
+            let shells_for_registry = shells.clone();
             app.manage(AppState {
                 db,
                 settings,
-                registry: build_production_registry(db_for_registry),
+                registry: build_production_registry(db_for_registry, shells_for_registry),
                 gate,
                 cancel: Arc::new(Mutex::new(None)),
                 running: Arc::new(Mutex::new(None)),
@@ -3007,6 +3081,7 @@ pub fn run() {
                 skills_dir,
                 data_dir: dir.clone(),
                 extracting: ExtractLocks::default(),
+                shells,
             });
             // 后台自举：句柄从刚装好的 State 里取（保持装配行仍是唯一一条
             // `registry: build_production_registry()` —— 那条守卫测试盯着它）。
@@ -3100,6 +3175,8 @@ pub fn run() {
             settings_get,
             settings_set,
             settings_set_api_key,
+            shell_presets,
+            shell_profile_validate,
             normalize_image,
             runtime_summary,
             mcp_servers,
@@ -3919,12 +3996,12 @@ mod tests {
     /// `echo` / `guarded` 这类替身只该活在 `#[cfg(test)]` 里 —— 它们的名字一旦进生产，
     /// 请求体里就多出一条用户看不懂、实现也不是给用户的工具。
     #[test]
-    fn production_registry_ships_the_six_builtin_tools() {
+    fn production_registry_ships_the_seven_builtin_tools() {
         let (_dir, db) = (
             tempfile::tempdir().unwrap(),
             Arc::new(Db::open(&tempfile::tempdir().unwrap().path().join("r.db")).unwrap()),
         );
-        let r = build_production_registry(db);
+        let r = build_production_registry(db, Arc::new(RwLock::new(ShellCatalog::new())));
         let names: Vec<String> = r.defs().into_iter().map(|d| d.name).collect();
         // 这个字面顺序由 `ToolRegistry` 的 `BTreeMap`（字典序）决定，**不是**注册顺序。
         // 刻意不加 `.sort()`、也不换成集合比较：T33 的 MCP 工具重挂之后仍然靠「名字序不变」
@@ -3936,6 +4013,7 @@ mod tests {
                 "fetch_url",
                 "memory_search",
                 "read_file",
+                "run_command",
                 "use_skill",
                 "write_file",
             ],
@@ -3960,10 +4038,216 @@ mod tests {
                 "{name} 必须走 Write 档，权限门才会弹窗；降成 Read 等于绕开用户"
             );
         }
+        // Agent Shell（spec §2/§8）：`run_command` 是第一把内置 Exec 工具，风险唯一真相源
+        // 是 `ShellTool::meta()`（经 `risk_of` 出）。它降档就等于绕开权限门的每次弹窗。
+        assert_eq!(
+            r.risk_of("run_command"),
+            Risk::Exec,
+            "run_command 必须走 Exec 档：每次调用弹窗，会话级放行的粒度是整条命令文本"
+        );
         assert_eq!(
             r.risk_of("delete_everything"),
             Risk::Exec,
             "未知工具按最严一档（R158）"
+        );
+    }
+
+    /// Agent Shell（spec §2/§5.5）：`send_message` 每轮开头用它把本轮设置变成 catalog。
+    /// 纯函数：settings 的 shells / default_shell 原样进 catalog；default 空白时
+    /// `from_parts` 只做 trim（catalog 里就是空串），真正的回落发生在 `resolve(None)`
+    /// —— 落到 `DEFAULT_PRESET_ID`（桩的既有语义；这条钉的是接线面别把它弄丢）。
+    /// 2026-11-01 修订后 catalog 的预设侧来自本机检测：回落那半句改用全在 probe 构造
+    /// （不依赖本机装了什么，R305）；自定义那半句仍走真构造 —— customs 先于 presets，
+    /// 检测与否不影响命中。
+    #[test]
+    fn shell_catalog_of_passes_settings_through_and_resolves_a_blank_default_to_the_preset() {
+        let settings = Settings {
+            shells: vec![crate::tools::shell::ShellProfile {
+                id: "mine".into(),
+                label: String::new(),
+                program: "/opt/mine".into(),
+                args: vec!["-c".into()],
+            }],
+            default_shell: "  mine  ".into(),
+            ..Default::default()
+        };
+        let catalog = shell_catalog_of(&settings);
+        assert_eq!(catalog.customs, settings.shells, "自定义表原样进 catalog");
+        assert_eq!(
+            catalog.default_id, "mine",
+            "default_shell trim 后进 catalog"
+        );
+        assert_eq!(
+            catalog.resolve(None).unwrap().program,
+            "/opt/mine",
+            "默认 shell 指向自定义 profile 时按它解析"
+        );
+        let blank = shell_catalog_of(&Settings {
+            default_shell: "   ".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            blank.default_id, "",
+            "空白 default 进 catalog 只是空串（from_parts 只 trim）"
+        );
+        // 回落语义钉在检测过的 catalog 上（全在 probe ⇒ 8 条候选全数在预设侧）。
+        let blank_with_all_presets =
+            crate::tools::shell::ShellCatalog::from_parts_with_probe(Vec::new(), "", &|_, _| {
+                Ok(PathBuf::new())
+            });
+        assert_eq!(
+            blank_with_all_presets.presets.len(),
+            8,
+            "全在 probe 下候选表全数进预设侧"
+        );
+        assert_eq!(
+            blank_with_all_presets.resolve(None).unwrap().id,
+            crate::tools::shell::DEFAULT_PRESET_ID,
+            "空 default 在 resolve 时回落默认预设"
+        );
+    }
+
+    // ---- Agent Shell：两条 IPC 命令（spec §5.5） ----
+
+    /// `shell_presets` 返回的是「候选表经本机检测的子集」（2026-11-01 修订：候选 +
+    /// 检测 —— 本机装了什么决定返回几条，例如这台 Linux 开发机是 bash/sh，其余候选
+    /// 缺席；也可能为空）。钉法相应改为：返回集必须是 spec §5.2 冻结顺序的**子序列**，
+    /// 且每一条与候选表**逐字段一致**（原「逐项一致」意图的检测版 —— 发布面没抄错由
+    /// 这里钉；候选表本身由 shell.rs 的 `candidate_table_has_exactly_the_eight_spec_ids`
+    /// 钉着）。每条 Serialize 成 id/label/program/args **恰好**四键 —— `ShellProfile`
+    /// 本身就是线格式，不新增 view 结构体（spec §5.5；TS 镜像 `ShellProfile` 靠这条钉着）。
+    #[test]
+    fn shell_presets_return_a_spec_ordered_subset_matching_the_candidate_table() {
+        // 全在 probe 造出完整候选面，当「spec §5.2 冻结表」的参照。
+        let all_candidates =
+            ShellCatalog::from_parts_with_probe(Vec::new(), "", &|_, _| Ok(PathBuf::new())).presets;
+        assert_eq!(
+            all_candidates
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "bash",
+                "sh",
+                "zsh",
+                "fish",
+                "git-bash",
+                "pwsh",
+                "powershell",
+                "cmd"
+            ],
+            "参照面 = spec §5.2 的 8 条（顺序即展示顺序）"
+        );
+        let presets = shell_presets();
+        let expected: Vec<_> = all_candidates
+            .iter()
+            .filter(|c| presets.iter().any(|p| p.id == c.id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            presets, expected,
+            "发布面必须是候选表按冻结顺序过滤出的子集，且逐字段一致"
+        );
+        for p in &presets {
+            let v = serde_json::to_value(p).unwrap();
+            let obj = v.as_object().expect("每条预设必须能 Serialize 成对象");
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["args", "id", "label", "program"],
+                "{} 的线格式是恰好四键，多一个少一个都算错",
+                p.id
+            );
+            assert!(
+                !obj["program"].as_str().unwrap().is_empty(),
+                "{} 的 program 不该是空串",
+                p.id
+            );
+        }
+    }
+
+    /// 校验的命中支：裸名在注入的假 search_dirs 里命中 → `Ok`。validate_custom 先归一化
+    /// （trim 过的 id/args 才进判定），程序存在性用的是注入表 —— 单测不依赖本机 PATH
+    /// （同 mcp R305 的注入口径）。
+    #[cfg(unix)]
+    #[test]
+    fn shell_profile_validate_hits_a_bare_name_in_the_injected_search_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hit = dir.path().join("mysh");
+        std::fs::write(&hit, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&hit, std::fs::Permissions::from_mode(0o755)).unwrap();
+        validate_shell_profile_with_dirs(
+            ShellProfile {
+                id: " mine ".into(),
+                label: " 显示名 ".into(),
+                program: "mysh".into(),
+                args: vec![" -c ".into()],
+            },
+            &[dir.path().to_path_buf()],
+        )
+        .expect("裸名在注入目录里命中必须 Ok");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Windows 支：当前测试可执行文件是**真的**存在且带 .exe 的普通文件
+    /// （桩的启发式判据），绝对路径直判必须过（plan：Windows 分支用 current_exe 兜底真值）。
+    #[cfg(windows)]
+    #[test]
+    fn shell_profile_validate_on_windows_hits_the_test_executable_itself() {
+        let exe = std::env::current_exe().unwrap();
+        validate_shell_profile_with_dirs(
+            ShellProfile {
+                id: "self".into(),
+                label: String::new(),
+                program: exe.display().to_string(),
+                args: Vec::new(),
+            },
+            &[],
+        )
+        .expect("测试可执行文件（.exe）必须判为可执行");
+    }
+
+    /// 未命中支：裸名不在假 PATH 里 → `Err` 且**点名 program 与查找范围**
+    /// （错误原样上屏，用户要能对着它改 profile）。
+    #[test]
+    fn shell_profile_validate_misses_name_the_program() {
+        let empty = tempfile::tempdir().unwrap();
+        let e = validate_shell_profile_with_dirs(
+            ShellProfile {
+                id: "mine".into(),
+                label: String::new(),
+                program: "no-such-shell".into(),
+                args: vec!["-c".into()],
+            },
+            &[empty.path().to_path_buf()],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("no-such-shell") && e.contains("搜索目录"),
+            "错误要点名 program 与查找范围：{e}"
+        );
+        std::fs::remove_dir_all(empty).ok();
+    }
+
+    /// 形状错误支：`validate_custom` 先拒（空 id），存在性检查**根本不发生** ——
+    /// program 指到不存在的地方也不影响错误内容（两步分开，spec §5.4）。
+    #[test]
+    fn shell_profile_validate_reports_shape_errors_without_any_existence_check() {
+        let e = validate_shell_profile_with_dirs(
+            ShellProfile {
+                id: "  ".into(),
+                label: String::new(),
+                program: "/definitely/not/here".into(),
+                args: vec!["-c".into()],
+            },
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("id"),
+            "形状错误要来自 validate_custom 而不是存在性判定：{e}"
         );
     }
 
@@ -5690,7 +5974,10 @@ mod tests {
             due_at: None,
         })
         .unwrap();
-        let registry = build_production_registry(f.db.clone());
+        let registry = build_production_registry(
+            f.db.clone(),
+            Arc::new(RwLock::new(ShellCatalog::new())),
+        );
         let out = registry
             .get("memory_search")
             .expect("生产工具表里必须有 memory_search")
@@ -7485,6 +7772,30 @@ mod tests {
         }
     }
 
+    /// Agent Shell 的两条命令与上面同一个坑（`generate_handler!` 是宏）：漏登记不编译
+    /// 报错，只会在运行时让前端拿到 not found。机制照抄
+    /// `the_normalization_command_is_registered_in_the_handler_list`。
+    #[test]
+    fn the_shell_commands_are_registered_in_the_handler_list() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ipc.rs"));
+        let list = src
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split("]").next())
+            .expect("找不到 generate_handler 的登记表");
+        let registered: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        for cmd in ["shell_presets", "shell_profile_validate"] {
+            assert!(
+                registered.contains(&cmd),
+                "命令 {cmd} 写了但没登记，前端调用只会拿到 not found:{registered:?}"
+            );
+        }
+    }
+
     // ---- resolve_api_key：本机模型免 key 的唯一闸门 ----
     //
     // 这三条断言是一组「放宽不许越界」的锁：第一条是新行为，后两条是既有行为，
@@ -7602,6 +7913,31 @@ mod tests {
             "那唯一一处空构造必须是 `build_production_registry` 的第一行，不是别处的第二条装配路径；\
              实得 {:?}",
             empty_constructions[0]
+        );
+        // Agent Shell（spec §5.5）：装配段还必须把 `shells` 字段接进 `AppState` ——
+        // `ShellTool` 经 `build_production_registry` 拿到的是同一个共享句柄，漏接这一半
+        // 就等于工具表里有一把永远解析不到自定义 profile 的 run_command（每轮现刷的
+        // 另一半由 `send_message` 那行做，单测调不动，见该行注释）。按同一取法逐行取：
+        // 字段初始化若写成简写 `shells,`（无冒号）也认得 —— 按**前缀**匹配「shells」，
+        // 不硬钉 `shells:` 的写法（F6-N4 同一教训：不依赖具体拼写形状）。
+        let shells_wired: Vec<&str> = manage
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("shells"))
+            .map(|line| line.split("//").next().unwrap_or("").trim())
+            .map(|line| line.trim_end_matches(',').trim())
+            .collect();
+        assert_eq!(
+            shells_wired.len(),
+            1,
+            "装配段里 `shells` 那一行必须**恰好一条**（0 条=没接线，2 条=两条接线路径）；\
+             实得 {shells_wired:?}"
+        );
+        assert_eq!(
+            shells_wired[0], "shells",
+            "`AppState.shells` 必须接到共享句柄上（字段初始化 `shells`/`shells: shells` 均可）；\
+             实得 {:?}",
+            shells_wired[0]
         );
     }
 

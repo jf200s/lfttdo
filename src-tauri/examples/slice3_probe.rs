@@ -36,10 +36,11 @@ use lfttdo_lib::permission::gate::PermissionGate;
 use lfttdo_lib::settings::{SettingsStore, effective_roots};
 use lfttdo_lib::store::db::Db;
 use lfttdo_lib::tools::registry::{ToolCtx, ToolRegistry};
+use lfttdo_lib::tools::shell::ShellCatalog;
 
 use serde_json::{json, value::Value};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
@@ -193,7 +194,8 @@ async fn turn_mode(args: &[String], prompt: &str) -> Result<(), Box<dyn std::err
         TurnDeps {
             output_dir: None,
             db: db.clone(),
-            registry: build_production_registry(db.clone()),
+            // 空表 catalog：探针不跑 shell，装配签名（Agent Shell 接线）要求这只共享锁。
+            registry: build_production_registry(db.clone(), Arc::new(RwLock::new(ShellCatalog::new()))),
             gate: Arc::new(PermissionGate::new()),
             model,
             sink: sink.clone(),
@@ -243,7 +245,7 @@ async fn turn_mode(args: &[String], prompt: &str) -> Result<(), Box<dyn std::err
 /// 但查不到任何东西 —— 探针不碰用户的真实记忆库。
 fn probe_registry() -> Arc<ToolRegistry> {
     let db = Arc::new(Db::open(std::path::Path::new(":memory:")).expect("内存库"));
-    build_production_registry(db)
+    build_production_registry(db, Arc::new(RwLock::new(ShellCatalog::new())))
 }
 
 async fn direct_mode(

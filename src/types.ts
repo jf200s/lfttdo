@@ -157,6 +157,23 @@ export interface SessionOutputView {
 }
 
 /**
+ * 一条 shell profile（spec §5.2 的线格式，与 Rust `tools/shell.rs::ShellProfile` 逐键同形）。
+ * **预设表的真相在 Rust 的 `tools/shell.rs`**（8 条内置预设是编译期常量）：前端经
+ * `shell_presets` 拿到的只是只读副本，不在这里抄第二份；`id`/`label`/`program`/`args`
+ * 四键的语义与归一化（trim 等）也都只有 Rust 一处。
+ */
+export interface ShellProfile {
+  /** 稳定键：预设 = `"bash"` 等 8 个；自定义 = 用户命名。同名自定义在执行时覆盖同名预设。 */
+  id: string;
+  /** UI 显示名；预设由 Rust 给出，自定义可空（空则界面回显 id）。 */
+  label: string;
+  /** 可执行文件：绝对/相对路径，或按 PATH 解析的名字。存在性只有 Rust 校验。 */
+  program: string;
+  /** 固定参数模板；命令文本在执行时作为 argv 的最后一个元素追加（Rust 侧保证）。 */
+  args: string[];
+}
+
+/**
  * `Settings`（settings.rs:261-284）：22 个键（其中 6 个是长期记忆切片的 `memory_*` 键），
  * `serde` 无 `rename_all` ⇒ 全 snake_case；
  * `mode` 是 `rename_all = "lowercase"` 的 `"light"|"dark"`（settings.rs:250-253），
@@ -252,6 +269,20 @@ export interface Settings {
    * 同样是 carry-through 键，面板无控件。
    */
   memory_embedding_model: string;
+  /**
+   * 自定义 shell profile 表（spec §6）。空 = 只有预设可用。**必填**：Rust serde 恒序列化
+   * 这个字段，线上没有「可选」形态。Rust normalize 只做词法整理 + 按 id 去重（保留首条），
+   * 不删坏条目、不碰文件系统 —— 空 id/空 program 的条目原样保留，执行时 fail-closed。
+   * 前端同样不做第二遍归一化；`SettingsPanel` 的增删改直接改这一键，保存随整表走
+   * `settings_set`，改完**下一条消息生效**（每轮 send_message 现刷 catalog）。
+   */
+  shells: ShellProfile[];
+  /**
+   * 默认 shell 的 profile id（spec §6）。**必填**（同上，serde 恒序列化）。
+   * Rust normalize：trim 后为空、或既不是预设 id 也不是 `shells` 里的 id → 回落
+   * `"bash"`（`DEFAULT_PRESET_ID`）；前端不回落第二遍，下拉的选项 = 预设 id ∪ 自定义 id。
+   */
+  default_shell: string;
 }
 
 /**

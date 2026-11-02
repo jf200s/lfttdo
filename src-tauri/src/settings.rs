@@ -6,9 +6,10 @@
 // key「不写 settings 表、不进导出、不写日志」，三条里最容易失守的是第一条，而靠纪律
 // （「记得别写」）守的规矩一定会被下一次加字段破掉；字段不存在才是结构性防线：
 // serde 写不出一个不存在的字段，`{:?}` 打不出它，导出也就无从带上它。
-// `serialized_field_names_are_exactly_the_twenty_three_settings_fields` 那条测试钉的正是这件事，
+// `serialized_field_names_are_exactly_the_twenty_six_settings_fields` 那条测试钉的正是这件事，
 // 它同时也是 R89 的防线：加字段必须先给出它的消费者，否则 Plan A 里多一个没人读的键。
-// （T26 落 `roots` 时它的名字从 `twelve` 变成 `thirteen` —— 名字里的数字就是这条防线的读数。）
+// （T26 落 `roots` 时它的名字从 `twelve` 变成 `thirteen`，shell 选择功能落
+// `default_shell`/`shells` 时变到 `twenty_six` —— 名字里的数字就是这条防线的读数。）
 //
 // 「不写日志」那一条还有第二道闸，而且不在结构体上：`SettingsError` 的 `Debug` 是**手写**的
 // （R94，见 `impl fmt::Debug`）。`keyring_core::Error` 自己 derive 了 `Debug`，而它的
@@ -32,6 +33,9 @@
 
 use crate::agent::context::ContextConfig;
 use crate::model::openai_compat::{ModelConfig, normalize_base_url};
+// settings → tools 的单向引用（spec §4 裁定合法）：只取 `ShellProfile` 类型与
+// `DEFAULT_PRESET_ID` 常量；shell.rs 不认识 `Settings`，反向不存在。
+use crate::tools::shell::{DEFAULT_PRESET_ID, ShellProfile, is_preset_candidate_id};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -178,7 +182,7 @@ pub enum SettingsError {
 /// 打成十进制转储 —— spec :473 说的「不写日志」在这种形态下守不住，而且 spec :543 计划的
 /// 「全文搜索 key 字符串」根本查不到十进制转储。Display 侧本来就安全（那两个变体的 Display
 /// 只说 "Password data is not valid UTF-8"），所以这里每一支都借 Display 落地。
-/// `serialized_field_names_are_exactly_the_twenty_three_settings_fields` 同族的
+/// `serialized_field_names_are_exactly_the_twenty_six_settings_fields` 同族的
 /// `credential_debug_never_prints_the_secret_bytes` 钉住它。
 impl std::fmt::Debug for SettingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -394,6 +398,17 @@ pub struct Settings {
     /// 只有端点知道,这里校验等于替用户编答案;配错的症状是端点 400 → 嵌入失败
     /// 降级纯关键词(裁定 4),真话优先。
     pub memory_embedding_model: String,
+    /// Agent Shell（spec §6）：自定义 shell profile 表。空 = 只有预设可用。
+    /// 线格式就是 `ShellProfile` 本身（snake_case 四键，serde 派生自 `tools/shell.rs`）。
+    /// normalize 只做词法整理（逐条 trim + 按 id 去重），**不碰文件系统也不删条目**
+    /// （R284 同规）：空 id / 空 program / args 含空项的条目原样保留，执行时
+    /// `validate_custom` / `ensure_executable` fail-closed 报错 —— 存在性检查只住在
+    /// 使用点，保存时不做（「U 盘拔了 → 设置再也存不进去」的教训）。
+    pub shells: Vec<ShellProfile>,
+    /// Agent Shell（spec §6）：默认 shell 的 profile id。normalize 认不出来
+    /// （不是预设 id 也不是任何自定义 id）回落 `DEFAULT_PRESET_ID`
+    /// （同 accent「认不出来回落预设」的取向，不报错）。
+    pub default_shell: String,
 }
 
 impl Default for Settings {
@@ -442,6 +457,9 @@ impl Default for Settings {
             // 本来就看得到原文,spec §3.1),模型默认 Qwen 生态的 text-embedding-v3。
             memory_embedding_source: DEFAULT_MEMORY_EMBEDDING_SOURCE.into(),
             memory_embedding_model: DEFAULT_MEMORY_EMBEDDING_MODEL.into(),
+            // Agent Shell：默认没有自定义 profile，默认 shell 是预设 bash（spec §5.2/§6）。
+            shells: Vec::new(),
+            default_shell: DEFAULT_PRESET_ID.into(),
         }
     }
 }
@@ -696,6 +714,40 @@ impl Settings {
         // **不碰文件系统、一条都不丢**；「今天解不开就这一轮不用它」住在使用点
         // `effective_roots`（`ipc.rs::run_turn` 每轮一次）。
         self.roots = dedupe_roots(&self.roots);
+        // Agent Shell（spec §6）：`shells` 只做词法整理 —— 逐条 trim，坏形状的条目
+        // （空 id / 空 program / args 含空项）**原样保留**，不静默删用户数据（R284 同规）；
+        // 执行时 `validate_custom` / `ensure_executable` 会 fail-closed 报错，轮不到这里裁。
+        // 只额外做按 id 去重（保留首条，`dedupe_roots` 同纪律）；trim 先于去重，
+        // 「 mine 」与「mine」是同一个 id 的两种写法。
+        let mut shells: Vec<ShellProfile> = Vec::with_capacity(self.shells.len());
+        for p in std::mem::take(&mut self.shells) {
+            let entry = ShellProfile {
+                id: p.id.trim().to_string(),
+                label: p.label.trim().to_string(),
+                program: p.program.trim().to_string(),
+                args: p.args.iter().map(|a| a.trim().to_string()).collect(),
+            };
+            if !shells.iter().any(|q| q.id == entry.id) {
+                shells.push(entry);
+            }
+        }
+        self.shells = shells;
+        // `default_shell`：trim 后为空、或既不是候选 id 也不是任何自定义 id → 回落
+        // `DEFAULT_PRESET_ID`（同 accent「认不出来回落预设」，不报错）。判定是**纯词法**
+        // 的「候选 id 静态集合 ∪ 自定义 id」（R284：normalize 全程不碰文件系统——
+        // 2026-11-01 修订后预设侧来自运行时检测，normalize 绝不跟着探测）：
+        // 没检测到的候选 id 在这台机器上仍算合法（换机器的 settings 文件不失效），
+        // 运行期 `resolve`/`ensure_executable` 给出明确报错；「检测到哪些」由 catalog
+        // 构造点（`ShellCatalog::from_parts`）负责，与这里的合法性判定是两回事。
+        let default_shell = self.default_shell.trim().to_string();
+        let known = !default_shell.is_empty()
+            && (is_preset_candidate_id(&default_shell)
+                || self.shells.iter().any(|p| p.id == default_shell));
+        self.default_shell = if known {
+            default_shell
+        } else {
+            DEFAULT_PRESET_ID.into()
+        };
     }
 
     /// 归一后的副本。派生方法用它，省掉「调用者忘了先 normalize」这条静默错误路径。
@@ -2510,7 +2562,7 @@ mod tests {
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_twenty_four_settings_fields() {
+    fn serialized_field_names_are_exactly_the_twenty_six_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -2526,6 +2578,7 @@ mod tests {
                 "base_url",
                 "budget_tokens",
                 "compact_threshold",
+                "default_shell",
                 "font_size",
                 "keep_turns",
                 "memory_decay_half_life_days",
@@ -2541,6 +2594,7 @@ mod tests {
                 "model",
                 "reserve_output",
                 "roots",
+                "shells",
                 "storage_dir",
                 "system_prompt",
                 "temperature",
@@ -2596,6 +2650,208 @@ mod tests {
         // 空表也是数组，不是 `null`、也不是键整个消失（`#[serde(default)]` 只管读侧）。
         let empty = serde_json::to_value(Settings::default()).unwrap();
         assert_eq!(empty["roots"], serde_json::json!([]));
+    }
+
+    // ---- Agent Shell（spec §6）：shells + default_shell 的归一化 ----
+
+    /// spec §6 判据 1：normalize 对 shells 只做词法整理 —— 坏形状的条目（空 id /
+    /// 空 program / args 含空项）**原样保留**，不静默删用户数据（R284 同规）；
+    /// 执行时 `validate_custom` / `ensure_executable` 会 fail-closed 报错，轮不到这里裁。
+    #[test]
+    fn normalize_keeps_malformed_shell_entries_instead_of_silently_dropping_them() {
+        let mut s = Settings {
+            shells: vec![
+                ShellProfile {
+                    id: "  ".into(),
+                    label: String::new(),
+                    program: "bash".into(),
+                    args: vec!["-c".into()],
+                },
+                ShellProfile {
+                    id: "no-program".into(),
+                    label: "x".into(),
+                    program: "  ".into(),
+                    args: vec![],
+                },
+                ShellProfile {
+                    id: "blank-arg".into(),
+                    label: String::new(),
+                    program: "/opt/x".into(),
+                    args: vec!["-c".into(), "   ".into()],
+                },
+                ShellProfile {
+                    id: " fine ".into(),
+                    label: " 显示名 ".into(),
+                    program: " /opt/fine ".into(),
+                    args: vec![" -c ".into()],
+                },
+            ],
+            ..Default::default()
+        };
+        s.normalize();
+        assert_eq!(
+            s.shells.len(),
+            4,
+            "四条一条都不许删：坏条目是用户数据，执行时才 fail-closed（R284）；实得 {:?}",
+            s.shells
+        );
+        // 词法 trim 照做；trim 后仍空的形状原样保留（不补默认、不删项）。
+        assert_eq!(s.shells[0].id, "");
+        assert_eq!(s.shells[1].program, "");
+        assert_eq!(
+            s.shells[2].args,
+            vec!["-c", ""],
+            "空白参数项 trim 成空项后保留原位"
+        );
+        // 合法条目 trim 到位（词法整理是 normalize 的本职）。
+        assert_eq!(s.shells[3].id, "fine");
+        assert_eq!(s.shells[3].label, "显示名");
+        assert_eq!(s.shells[3].program, "/opt/fine");
+        assert_eq!(s.shells[3].args, vec!["-c"]);
+        // 幂等（normalize 读写两侧各跑一次）：再过一遍还是它自己。
+        let once = s.clone();
+        s.normalize();
+        assert_eq!(s.shells, once.shells, "归一必须是定点");
+    }
+
+    /// spec §6 判据 1 的另一半：同 id 重复 → 保留首条（`dedupe_roots` 同纪律）。
+    /// trim 先于去重：「 mine 」与「mine」是同一个 id 的两种写法。
+    #[test]
+    fn normalize_dedupes_shell_entries_by_id_keeping_the_first() {
+        let mut s = Settings {
+            shells: vec![
+                ShellProfile {
+                    id: "mine".into(),
+                    label: "首条".into(),
+                    program: "/opt/first".into(),
+                    args: vec!["-c".into()],
+                },
+                ShellProfile {
+                    id: " mine ".into(),
+                    label: "次条".into(),
+                    program: "/opt/second".into(),
+                    args: vec!["-c".into()],
+                },
+            ],
+            ..Default::default()
+        };
+        s.normalize();
+        assert_eq!(s.shells.len(), 1, "同 id 只留一条；实得 {:?}", s.shells);
+        assert_eq!(s.shells[0].program, "/opt/first", "保留首次出现的那条");
+        assert_eq!(s.shells[0].label, "首条");
+    }
+
+    /// spec §6 判据 2（2026-11-01 修订：判据从 resolve 改为「候选 id 静态集合 ∪ 自定义
+    /// id」的纯词法判定，R284 —— normalize 不碰文件系统）：`default_shell` trim 后为空、
+    /// 或既不是候选 id 也不是任何自定义 id → 回落 `DEFAULT_PRESET_ID`（同 accent
+    /// 「认不出来回落预设」，不报错）；指向候选或某个自定义 id → 原样（trim 后）。
+    #[test]
+    fn normalize_falls_back_to_the_default_preset_for_an_unresolvable_default_shell() {
+        let custom = ShellProfile {
+            id: "mine".into(),
+            label: String::new(),
+            program: "/opt/mine".into(),
+            args: vec!["-c".into()],
+        };
+        for blank in ["", "   "] {
+            let mut s = Settings {
+                default_shell: blank.into(),
+                ..Default::default()
+            };
+            s.normalize();
+            assert_eq!(
+                s.default_shell, DEFAULT_PRESET_ID,
+                "空 default_shell 回落默认预设，实得 {:?}",
+                s.default_shell
+            );
+        }
+        let mut s = Settings {
+            default_shell: " nope ".into(),
+            ..Default::default()
+        };
+        s.normalize();
+        assert_eq!(
+            s.default_shell, DEFAULT_PRESET_ID,
+            "指不到的 id 回落默认预设"
+        );
+        let mut s = Settings {
+            default_shell: " pwsh ".into(),
+            ..Default::default()
+        };
+        s.normalize();
+        assert_eq!(s.default_shell, "pwsh", "候选 id 原样保留（trim 后）");
+        let mut s = Settings {
+            default_shell: " mine ".into(),
+            shells: vec![custom],
+            ..Default::default()
+        };
+        s.normalize();
+        assert_eq!(s.default_shell, "mine", "自定义 id 同样算数");
+        // 修订后的关键账面：候选 id **不因本机没检测到而失效**（换机器的 settings 不
+        // 崩）。cmd 在 Linux 上永远检测不到，normalize 仍原样保留 —— 这条同时证明
+        // normalize 没有偷跑文件系统探测（R284）。
+        #[cfg(unix)]
+        {
+            let mut s = Settings {
+                default_shell: " cmd ".into(),
+                ..Default::default()
+            };
+            s.normalize();
+            assert_eq!(s.default_shell, "cmd", "候选 id 即使本机检测不到也合法");
+        }
+    }
+
+    /// 线格式（spec §5.6）：`shells` 是 `ShellProfile` 的 snake_case 四键数组、
+    /// `default_shell` 是顶层字符串 —— TS 镜像 `Settings.shells: ShellProfile[]` 靠这条钉着
+    /// （同 `roots_serializes_as_an_array_of_strings_for_the_frontend_mirror` 的风格）。
+    #[test]
+    fn shell_settings_serialize_in_the_snake_case_line_format() {
+        let s = Settings {
+            shells: vec![ShellProfile {
+                id: "mine".into(),
+                label: "Mine".into(),
+                program: "/opt/mine".into(),
+                args: vec!["-c".into()],
+            }],
+            default_shell: "mine".into(),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&s).unwrap();
+        let entry = v["shells"][0]
+            .as_object()
+            .unwrap_or_else(|| panic!("shells 必须是 JSON 数组，实得 {:?}", v["shells"]));
+        let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["args", "id", "label", "program"],
+            "ShellProfile 本身就是线格式：恰好四键，多一个少一个都算错"
+        );
+        assert_eq!(v["default_shell"], serde_json::json!("mine"));
+        // 空表也是数组，键不许整个消失（`#[serde(default)]` 只管读侧）。
+        let empty = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(empty["shells"], serde_json::json!([]));
+        assert_eq!(empty["default_shell"], serde_json::json!(DEFAULT_PRESET_ID));
+    }
+
+    /// R91 的回归测试（spec §13「无迁移」）：旧 `settings.json`（没有这两个键）load 后
+    /// 得到结构体默认值 —— 新程序读旧文件不断，旧程序读新文件则忽略未知字段。
+    #[test]
+    fn a_settings_file_without_the_shell_keys_loads_the_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        std::fs::write(store.path(), r#"{"model":"qwen-turbo"}"#).unwrap();
+        let got = store.load().unwrap();
+        assert_eq!(got.model, "qwen-turbo", "其余设置照原样保住");
+        assert_eq!(got.shells, Vec::new(), "缺 shells 键 ⇒ 空表");
+        assert_eq!(
+            got.default_shell, DEFAULT_PRESET_ID,
+            "缺 default_shell 键 ⇒ 默认预设"
+        );
+        assert!(
+            corrupt_backups(d.path()).is_empty(),
+            "缺字段是可读的，不该按损坏处理（R84 与 R91 的边界）"
+        );
     }
 
     #[test]

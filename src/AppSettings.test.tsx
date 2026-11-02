@@ -50,6 +50,11 @@ const h = vi.hoisted(() => {
     // 所以判据是「面板里点的那一下，最终打到了哪个命令、带的是哪个正文」。
     updateMemoryBody: vi.fn(),
     addMemory: vi.fn(),
+    // Shell 子区（SettingsPanel 的生产默认回调直连这两个命令）：mock 工厂里缺这两支的话，
+    // 面板一挂载就会在默认参数求值时抛「No "shellPresets" export is defined on the mock」，
+    // 把真正的失败淹掉。预设给空表 —— 本文件的用例不关心 Shell 区。
+    shellPresets: vi.fn(async () => []),
+    shellProfileValidate: vi.fn(async () => {}),
     subscribeAgent: (cb: (sessionId: string, e: AgentEvent) => void) => {
       listeners.push(cb);
       return () => {
@@ -108,6 +113,12 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   memory_prospective_window_hours: 24,
   memory_embedding_source: "endpoint",
   memory_embedding_model: "text-embedding-v3",
+  // Shell 两键给**非默认**值（Rust 默认 shells: [] / default_shell: "bash"），与上面 roots
+  // 的非默认取向同一条：下面 `settings_set` 那条 `toHaveBeenCalledWith` 载荷断言，要能
+  // 区分「App 原样转交整张表」与「App 重拼了一份默认表」—— 默认值在这里是看不出来的错值。
+  // label 留空顺带钉住「自定义 profile 的显示名可空」这条线上语义（types.ts / spec §5.2）。
+  shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }],
+  default_shell: "pwsh",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -171,6 +182,8 @@ beforeEach(() => {
   h.memoryProfile.mockReset().mockResolvedValue("");
   h.updateMemoryBody.mockReset().mockResolvedValue(undefined);
   h.addMemory.mockReset().mockResolvedValue(1);
+  h.shellPresets.mockReset().mockResolvedValue([]);
+  h.shellProfileValidate.mockReset().mockResolvedValue(undefined);
   h.listeners.length = 0;
 });
 
@@ -261,7 +274,12 @@ describe("App 设置接线", () => {
     fireEvent.change(within(dialog).getByLabelText(/记忆正文/), {
       target: { value: "下周三交季度报告" },
     });
-    fireEvent.click(within(dialog).getByRole("button", { name: "添加" }));
+    // Shell 子区也有一个「添加」按钮：这里点的是记忆新增区那个，按容器收窄。
+    fireEvent.click(
+      within(within(dialog).getByTestId("memory-add")).getByRole("button", {
+        name: "添加",
+      }),
+    );
     await waitFor(() =>
       expect(h.addMemory).toHaveBeenCalledWith(
         "prospective",
@@ -315,6 +333,9 @@ describe("App 设置接线", () => {
         memory_prospective_window_hours: 24,
         memory_embedding_source: "endpoint",
         memory_embedding_model: "text-embedding-v3",
+        // Shell 两键原样转交：App 不重拼默认表（夹具给的是非默认值，重拼了这里当场红）。
+        shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }],
+        default_shell: "pwsh",
       }),
     );
     // 保存成功才改界面：这三项是 `applyTheme` 唯一的三个可见后果。

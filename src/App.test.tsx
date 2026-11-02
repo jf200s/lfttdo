@@ -41,6 +41,11 @@ const h = vi.hoisted(() => {
     memoryProfile: vi.fn(),
     updateMemoryBody: vi.fn(),
     addMemory: vi.fn(),
+    // Shell 子区（SettingsPanel 的生产默认回调直连这两个命令）：mock 工厂里缺这两支的话，
+    // 面板一挂载就会在默认参数求值时抛「No "shellPresets" export is defined on the mock」，
+    // 把真正的失败淹掉。预设给空表 —— 本文件的用例不关心 Shell 区。
+    shellPresets: vi.fn(async () => []),
+    shellProfileValidate: vi.fn(async () => {}),
     subscribeAgent: (cb: (sessionId: string, e: AgentEvent) => void) => {
       listeners.push(cb);
       return () => {
@@ -94,6 +99,11 @@ const view = (over: Partial<SettingsView> = {}): SettingsView => ({
   memory_prospective_window_hours: 24,
   memory_embedding_source: "endpoint",
   memory_embedding_model: "text-embedding-v3",
+  // Shell 两键（Rust serde 恒序列化，线上没有可选形态）：与上面的 `roots` 同一条注释逻辑 ——
+  // 本文件不断言保存载荷，键只承担「少一键就编译不过」。这里给生产默认值：
+  // 无自定义 profile、默认 shell 为 bash（Rust `DEFAULT_PRESET_ID`）。
+  shells: [],
+  default_shell: "bash",
   api_key_masked: "…abcd",
   corrupt_backup: null,
   ...over,
@@ -144,6 +154,8 @@ beforeEach(() => {
   h.memoryProfile.mockReset().mockResolvedValue("");
   h.updateMemoryBody.mockReset().mockResolvedValue(undefined);
   h.addMemory.mockReset().mockResolvedValue(1);
+  h.shellPresets.mockReset().mockResolvedValue([]);
+  h.shellProfileValidate.mockReset().mockResolvedValue(undefined);
   h.listeners.length = 0;
 });
 
