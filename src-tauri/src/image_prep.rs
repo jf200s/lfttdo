@@ -241,9 +241,9 @@ mod tests {
         let mut rng = rand::rng();
         let img = image::RgbImage::from_fn(w, h, |_, _| {
             image::Rgb([
-                rand::Rng::random(&mut rng),
-                rand::Rng::random(&mut rng),
-                rand::Rng::random(&mut rng),
+                rand::RngExt::random(&mut rng),
+                rand::RngExt::random(&mut rng),
+                rand::RngExt::random(&mut rng),
             ])
         });
         let mut buf = Vec::new();

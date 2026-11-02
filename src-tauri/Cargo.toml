@@ -114,8 +114,8 @@ strip = true
 [dev-dependencies]
 tempfile = "3.27.0"
 # R138：`rand` 不是本 crate 的直接依赖，Cargo.lock 里的 0.9.5 / 0.10.3 **都是传递依赖**，
-# 传递依赖不能 `use rand::`。Step 1 的噪声图夹具用 `rand::rng()`（0.9 API），必须显式加。
-rand = "0.9"
+# 传递依赖不能 `use rand::`。Step 1 的噪声图夹具用 `rand::rng()` + `RngExt::random`（0.10 API），必须显式加。
+rand = "0.10"
 # `rmcp` 不在这儿了：T31 / R312 把它挪进 `[dependencies]`（代价与理由记在那一条的注释里）。
 
 [target."cfg(any(windows, target_os = \"linux\"))".dependencies]
