@@ -9209,7 +9209,15 @@ mod tests {
                     .unwrap();
             }
         }
-        let settings = Settings::default(); // 5 分钟档
+        // 上面的夹具要写 100×100 条消息；慢 runner（Windows CI）上这段准备时间会逼近
+        // 默认 5 分钟的空闲窗口，于是最早创建的会话在 tick 那一刻「看起来已空闲」，
+        // 工厂被调用、断言随机翻车（2026-11-02 在 main 上复现过一次，重跑即绿）。
+        // 本用例验证的是「没有待抽会话时一次便宜查询、零工厂调用」，与阈值取值无关，
+        // 因此把窗口拉到远大于任何可能的准备时长，消除对机器速度的依赖。
+        let settings = Settings {
+            memory_idle_extract_minutes: 24 * 60,
+            ..Settings::default()
+        };
         let running = Arc::new(Mutex::new(None));
         let locks = ExtractLocks::default();
         let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
