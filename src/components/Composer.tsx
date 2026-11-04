@@ -399,7 +399,7 @@ export function Composer({
     setIgnored(0);
   };
 
-  // ==== 语音输入（随包 sherpa-onnx 离线引擎 + SenseVoice 模型，自动多语种）====
+  // ==== 语音输入（ONNX Runtime 离线引擎 + SenseVoice 模型，自动多语种）====
 
   const setVoiceState = (v: VoiceState) => {
     voiceRef.current = v;

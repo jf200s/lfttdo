@@ -716,7 +716,7 @@ export function SettingsPanel({
           {MODEL_NUMERIC_FIELDS.map(numericRow)}
         </fieldset>
 
-        {/* 语音输入：随包 sherpa-onnx 离线引擎 + SenseVoice 模型，自动多语种。
+        {/* 语音输入：ort 离线引擎 + SenseVoice 模型（运行时下载），自动多语种。
             语言下拉随 `voice_language` 一起移除，这里只剩模型管理：状态真值在 Rust
             （挂载查询 + 事件流），前端只渲染收到的帧、把按钮点击原样递成命令。 */}
         <fieldset className="panel-group">

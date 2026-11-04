@@ -11,7 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 给语音线程的命令。只有两条：收尾（识别并保留文本）与取消（丢弃）。
 enum Command {
@@ -108,6 +108,11 @@ pub fn start(model_dir: &Path) -> Result<VoiceSession, String> {
     }
 }
 
+/// 后端录音兜底上限：前端 120s 计时（Composer 的 VOICE_MAX_SECONDS）正常会先停，
+/// 此闸只在前端失联/异常时兜底，防 samples 缓冲无界增长。到点走与 Command::Stop
+/// 相同的识别收尾路径，前端迟到的 voice_stop 仍能 join 拿到结果。
+const MAX_RECORDING_DURATION: Duration = Duration::from_secs(150);
+
 /// 专用线程入口：开流 → 报 ready → 攒音频 → Stop 时识别。
 fn run(
     model_dir: PathBuf,
@@ -130,6 +135,7 @@ fn run(
     super::asr::prewarm(&model_dir);
 
     let mut samples: Vec<f32> = Vec::new();
+    let deadline = Instant::now() + MAX_RECORDING_DURATION;
     loop {
         // 回调只发送，这里攒成一条连续的 mono f32 缓冲。
         while let Ok(chunk) = audio_rx.try_recv() {
@@ -139,24 +145,26 @@ fn run(
             drop(stream);
             return Err(message);
         }
-        match commands.recv_timeout(Duration::from_millis(20)) {
-            Ok(Command::Stop) => {
-                drop(stream); // 停采：Stream 析构即释放设备。
-                while let Ok(chunk) = audio_rx.try_recv() {
-                    samples.extend_from_slice(&chunk);
-                }
-                return recognize(&model_dir, sample_rate, &samples);
-            }
+        let stop = match commands.recv_timeout(Duration::from_millis(20)) {
+            Ok(Command::Stop) => true,
             Ok(Command::Cancel) => {
                 drop(stream);
                 return Ok(String::new());
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            // 兜底上限到点与 Stop 同路（见 MAX_RECORDING_DURATION），不丢已录下的音频。
+            Err(RecvTimeoutError::Timeout) => Instant::now() >= deadline,
             Err(RecvTimeoutError::Disconnected) => {
                 // 句柄被丢弃但 Drop 的 Cancel 没送到：按取消处理，绝不把麦克风留在活动状态。
                 drop(stream);
                 return Ok(String::new());
             }
+        };
+        if stop {
+            drop(stream); // 停采：Stream 析构即释放设备。
+            while let Ok(chunk) = audio_rx.try_recv() {
+                samples.extend_from_slice(&chunk);
+            }
+            return recognize(&model_dir, sample_rate, &samples);
         }
     }
 }

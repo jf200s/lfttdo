@@ -10,9 +10,11 @@
 
 use super::VoiceModelStatus;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
 /// 模型目录名（契约固定）：`data_dir/models/<MODEL_DIR_NAME>/`。
@@ -72,15 +74,47 @@ fn dir_ready(dir: &Path, files: &[FileSpec]) -> bool {
 }
 
 /// 单文件验收：先查尺寸（廉价拒绝），再流式算 sha256 比对。读失败/哈希不符都算不过。
+/// 哈希结果按文件身份（路径 + 尺寸 + mtime）进程内缓存：身份不变命中缓存不重哈
+/// （否则每次开始录音都要全量哈希 239MB）；文件被替换/删除、尺寸或 mtime 变化都使
+/// 键失配而重新校验。缓存里存的是实算哈希，损坏文件的哈希永远不等于验收值，
+/// 绝不会被缓存成 ready。
 fn spec_matches(path: &Path, spec: &FileSpec) -> bool {
-    match std::fs::metadata(path) {
-        Ok(m) if m.len() == spec.bytes => {}
-        _ => return false,
+    let Ok(m) = std::fs::metadata(path) else {
+        return false;
+    };
+    if m.len() != spec.bytes {
+        return false;
     }
-    sha256_of_file(path)
-        .map(|h| h == spec.sha256)
-        .unwrap_or(false)
+    let Ok(mtime) = m.modified() else {
+        // 拿不到 mtime 就无法构造身份键：退化为现算，不进缓存。
+        return sha256_of_file(path)
+            .map(|h| h == spec.sha256)
+            .unwrap_or(false);
+    };
+    let mut guard = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some((len, mt, hash)) = cache.get(path)
+        && *len == m.len()
+        && *mt == mtime
+    {
+        return hash == spec.sha256;
+    }
+    let Ok(hash) = sha256_of_file(path) else {
+        return false;
+    };
+    let ok = hash == spec.sha256;
+    cache.insert(path.to_path_buf(), (m.len(), mtime, hash));
+    ok
 }
+
+/// 校验结果缓存（进程级，与 `asr::CACHE` 同款）：键 = 文件路径，值 = (尺寸, mtime,
+/// 实算 sha256)。身份（尺寸 + mtime）不变 ⇒ 内容没变，直接复用哈希；下载生效走
+/// 原子 rename、手改/损坏都会动 mtime 或尺寸，键失配即重校。锁在哈希期间持有，
+/// 并发查询不会重复付全量哈希。
+/// 缓存条目：(尺寸, mtime, 实算 sha256)。
+type VerifiedEntry = (u64, SystemTime, String);
+
+static VERIFIED: Mutex<Option<HashMap<PathBuf, VerifiedEntry>>> = Mutex::new(None);
 
 /// 流式算一个文件的 sha256（hex 小写）。64KB 缓冲，不整文件读进内存。
 fn sha256_of_file(path: &Path) -> std::io::Result<String> {
@@ -178,6 +212,9 @@ struct Progress {
     /// 已下完文件的字节累计（当前文件内的增量由调用方加在 `done` 上）。
     completed: u64,
     last_emit: Option<Instant>,
+    /// 已发布百分比的高水位：换源重试时当前文件的 written 从 0 重计，done 回落，
+    /// 发布值钳在高水位上，UI 进度条跨重试单调不减。
+    high_water: u32,
 }
 
 impl Progress {
@@ -186,6 +223,7 @@ impl Progress {
             total,
             completed: 0,
             last_emit: None,
+            high_water: 0,
         }
     }
 
@@ -197,7 +235,8 @@ impl Progress {
             return None;
         }
         self.last_emit = Some(now);
-        Some(percent(done, self.total))
+        self.high_water = self.high_water.max(percent(done, self.total));
+        Some(self.high_water)
     }
 }
 
@@ -529,6 +568,60 @@ mod tests {
         );
     }
 
+    /// 缓存键 = 尺寸 + mtime：身份不变命中缓存（改坏内容也不重哈），身份变化必重校，
+    /// 损坏判定绝不会被当成 ready。用独立 tempdir 路径，不与其他测试共享缓存键。
+    #[test]
+    fn hash_cache_hits_on_unchanged_identity_and_rehashes_on_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("model.int8.onnx");
+        let spec = &TINY[1];
+        std::fs::write(&path, b"xxxxxxxx").unwrap();
+        assert!(spec_matches(&path, spec), "首次现算并入缓存");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // 内容改坏、尺寸不变、mtime 拨回原值 ⇒ 身份不变命中缓存，不重新哈希
+        // （若重哈必发现损坏；这里仍返回 true 证明走的是缓存）。
+        std::fs::write(&path, b"xxxxxxxy").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert!(spec_matches(&path, spec), "身份不变应当命中缓存");
+        // mtime 变化 ⇒ 重校，损坏现形，且反复查都不许变成 ready。
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime + Duration::from_secs(1))
+            .unwrap();
+        assert!(!spec_matches(&path, spec), "身份变化应当重哈希并发现损坏");
+        assert!(!spec_matches(&path, spec), "损坏结果不许被缓存成 ready");
+        // 换回正确内容（模拟重下的原子 rename 覆盖）⇒ 身份再变，重校通过。
+        std::fs::write(&path, b"xxxxxxxx").unwrap();
+        assert!(spec_matches(&path, spec), "覆盖后应当重校并通过");
+        // 尺寸变化 ⇒ 直接不过。
+        std::fs::write(&path, b"xxx").unwrap();
+        assert!(!spec_matches(&path, spec));
+        // 删除 ⇒ 不过；缓存里的旧判定不许借尸还魂。
+        std::fs::remove_file(&path).unwrap();
+        assert!(!spec_matches(&path, spec));
+    }
+
+    /// 换源重试时 done 回落（当前文件 written 从 0 重计），发布值钳在高水位。
+    #[test]
+    fn progress_clamps_to_high_water_across_retry() {
+        let mut p = Progress::new(100);
+        let t0 = Instant::now();
+        assert_eq!(p.tick(t0, 80), Some(80));
+        assert_eq!(
+            p.tick(t0 + Duration::from_millis(500), 10),
+            Some(80),
+            "重试回落不许拉低已发布的百分比"
+        );
+        assert_eq!(p.tick(t0 + Duration::from_millis(1000), 90), Some(90));
+    }
+
     #[tokio::test]
     async fn download_writes_part_then_renames_atomically_and_reports_progress() {
         let tmp = tempfile::tempdir().unwrap();
@@ -578,6 +671,84 @@ mod tests {
         assert!(urls[2].contains("hf-mirror.com") && urls[2].ends_with("model.int8.onnx"));
         assert!(urls[3].contains("huggingface.co") && urls[3].ends_with("model.int8.onnx"));
         assert!(tmp.path().join("model.int8.onnx").exists());
+    }
+
+    /// 回归（换源失败路径）：镜像把 model.int8.onnx 下到一半才断流，官方源重下成功。
+    /// 块间刻意停 >500ms 节流窗，保证重试后的首个 tick 真的会发布 —— 不钳高水位时
+    /// 它会从 83% 回落到 58%，进度条倒退。
+    #[tokio::test]
+    async fn retry_after_mid_stream_failure_never_regresses_progress() {
+        struct MidStreamFailTransport;
+        #[async_trait::async_trait]
+        impl ModelTransport for MidStreamFailTransport {
+            async fn stream(
+                &self,
+                url: &str,
+                on_chunk: &mut (dyn for<'a> FnMut(&'a [u8]) -> Result<(), DownloadError> + Send),
+            ) -> Result<Option<u64>, DownloadError> {
+                let file = url.rsplit('/').next().unwrap();
+                let want = TINY.iter().find(|f| f.name == file).unwrap().bytes;
+                if url.contains("hf-mirror.com") && file == "model.int8.onnx" {
+                    on_chunk(b"xxx")?;
+                    tokio::time::sleep(Duration::from_millis(550)).await;
+                    on_chunk(b"xxx")?;
+                    tokio::time::sleep(Duration::from_millis(550)).await;
+                    return Err(DownloadError::Failed(format!("{url}：模拟中途断流")));
+                }
+                let mut sent = 0u64;
+                while sent < want {
+                    let n = ((want - sent).min(3)) as usize;
+                    on_chunk(&vec![b'x'; n])?;
+                    sent += n as u64;
+                }
+                Ok(Some(want))
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let (publish, seen) = collector();
+        download_files(
+            tmp.path(),
+            &TINY,
+            &MidStreamFailTransport,
+            &cancel,
+            &publish,
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.windows(2).all(|w| w[0].percent <= w[1].percent),
+            "换源重试后进度不许倒退：{seen:?}"
+        );
+        assert_eq!(seen.last().unwrap().percent, 100);
+        assert!(tmp.path().join("model.int8.onnx").exists());
+    }
+
+    /// 回归（同尺寸损坏模型经 UI 重下）：盘上已有尺寸恰好对但内容损坏的文件时，
+    /// dir_ready 判非 ready（UI 据此显示「下载模型」按钮），重下原子 rename 覆盖
+    /// 坏文件，终态回 ready。
+    #[tokio::test]
+    async fn redownload_overwrites_corrupt_same_size_files_and_ends_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("tokens.txt"), b"yyyy").unwrap();
+        std::fs::write(tmp.path().join("model.int8.onnx"), b"yyyyyyyy").unwrap();
+        assert!(!dir_ready(tmp.path(), &TINY), "同尺寸损坏必须判非 ready");
+        let cancel = CancellationToken::new();
+        let (publish, seen) = collector();
+        download_with_files(tmp.path(), &TINY, &FakeTransport::new(), &cancel, &publish)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(tmp.path().join("tokens.txt")).unwrap(),
+            b"xxxx"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("model.int8.onnx")).unwrap(),
+            b"xxxxxxxx"
+        );
+        assert!(dir_ready(tmp.path(), &TINY));
+        assert_eq!(seen.lock().unwrap().last().unwrap().state, "ready");
     }
 
     #[tokio::test]

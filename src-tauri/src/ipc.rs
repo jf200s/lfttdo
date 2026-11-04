@@ -2570,7 +2570,7 @@ pub async fn settings_set_api_key(
     blocking(move || store.set_api_key(&api_key).map_err(|e| e.to_string())).await
 }
 
-// ───────────────────── 语音输入：纯 Rust 离线引擎（tract + SenseVoice） ─────────────────────
+// ───────────────────── 语音输入：纯 Rust 离线引擎（ort + SenseVoice） ─────────────────────
 
 /// 模型状态事件通道（契约 `VOICE_MODEL_CHANNEL`）。`app.emit` 只在本文件出现。
 const VOICE_MODEL_CHANNEL: &str = "voice-model";
