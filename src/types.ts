@@ -15,11 +15,11 @@
 //                                         `memory_prospective_window_hours`，见该接口的注释）
 //   src-tauri/src/store/db.rs:239-246     `SessionRow`（无 `rename_all` ⇒ snake_case，R128）
 //
-// 本文件除类型外**只导出一个运行期值**：通道名 `AGENT_CHANNEL`（:115）。
-// Rust 侧它是 `const AGENT_CHANNEL: &str = "agent";`（ipc.rs:146），**私有、没有 `pub`**，
+// 本文件除类型外**只导出两个运行期值**：通道名 `AGENT_CHANNEL` 与 `VOICE_MODEL_CHANNEL`。
+// Rust 侧它们是私有常量（如 `const AGENT_CHANNEL: &str = "agent";`，ipc.rs:146），
 // 跨语言根本取不到 ⇒ 前端只能硬编码这一处，不构成第二套真相。之所以留在镜像里而不是挪去
-// T16 的 IPC 层：它和线格式同属「Rust 说了算的字符串」，放在这里才会在核对表时被一起看到
-// （评审 F7）。除它以外本文件不产生任何运行期代码 —— 长期记忆切片追加的 `MemoryView`
+// T16 的 IPC 层：它们和线格式同属「Rust 说了算的字符串」，放在这里才会在核对表时被一起看到
+// （评审 F7）。除它们以外本文件不产生任何运行期代码 —— 长期记忆切片追加的 `MemoryView`
 // 也只是 interface，同样零运行期产物。
 //
 // Task 17 手测时还要对一次真实帧。若 Rust 加了第 12 支，前端这份镜像的缺口会被**机器**喊出来
@@ -283,13 +283,6 @@ export interface Settings {
    * `"bash"`（`DEFAULT_PRESET_ID`）；前端不回落第二遍，下拉的选项 = 预设 id ∪ 自定义 id。
    */
   default_shell: string;
-  /**
-   * 语音输入的识别语言（Windows 自带离线识别，SAPI）。Rust 默认 `"zh-CN"`，
-   * normalize 后只有 `"system" | "zh-CN" | "en-US"` 三支，未知/空值回落 `"zh-CN"`。
-   * 白名单与回落只在 Rust 一处（同 `font_size` 的 R123 规矩），前端只把下拉的选择原样送出。
-   * 语音**没有**模型名 / base_url / API key —— 用的是系统语音包，不是远端服务。
-   */
-  voice_language: string;
 }
 
 /**
@@ -308,6 +301,26 @@ export interface SettingsView extends Settings {
   api_key_masked: string | null;
   corrupt_backup: string | null;
 }
+
+/**
+ * 语音模型（sherpa-onnx + SenseVoice）的下载/就绪状态，镜像 Rust 侧同名结构体
+ * （serde snake_case，三键恒在）：`state` 四支、`percent` 只在 downloading 时有意义
+ * （其余恒 0）、`message` 是失败原文或空串。状态真值在 Rust：挂载时查一次
+ * `voice_model_status`，此后每次变化/下载节流帧都经 `VOICE_MODEL_CHANNEL` 推过来，
+ * 前端不自己推算百分比、不从命令返回值造状态。
+ */
+export interface VoiceModelStatus {
+  state: "missing" | "downloading" | "ready" | "error";
+  percent: number;
+  message: string;
+}
+
+/**
+ * 语音模型状态的事件通道名，照 `AGENT_CHANNEL` 的同一条惯例（Rust 侧私有常量，
+ * 跨语言取不到，只能在这份镜像里硬编码一处）。载荷就是 `VoiceModelStatus` 本身，
+ * 没有 agent 通道那层信封。
+ */
+export const VOICE_MODEL_CHANNEL = "voice-model";
 
 /**
  * `memories` 表一行的读视图（设计文档 §3；Rust 侧 `MemoryView`，与 `SessionRow` 同一分工：
@@ -424,8 +437,8 @@ export interface AgentPayload {
 
 /**
  * 事件通道名，镜像 ipc.rs:146 `const AGENT_CHANNEL: &str = "agent";`。
- * **本文件唯一的运行期导出**（Rust 侧那个常量是私有的，跨语言取不到，只能硬编码；
- * 理由见文件头）。除了它，本文件全是类型，编译后不产生任何代码。
+ * 与 `VOICE_MODEL_CHANNEL` 同为**本文件仅有的运行期导出**（Rust 侧那些常量是私有的，
+ * 跨语言取不到，只能硬编码；理由见文件头）。除了它们，本文件全是类型，编译后不产生任何代码。
  */
 export const AGENT_CHANNEL = "agent";
 

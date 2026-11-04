@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 // 类型全部来自 `../types` 的镜像：`Settings` / `SettingsView` / `SessionRow` / `SendBlock`
 // 是 T16 按线格式补进那份镜像的（第 3 条裁定），**不在这里手造**——
 // 在调用点就地写形状等于把「Rust 说了算」的事交给人肉记忆，改了 Rust 侧只会在这里静默坏掉。
-import { AGENT_CHANNEL } from "../types";
+import { AGENT_CHANNEL, VOICE_MODEL_CHANNEL } from "../types";
 import type {
   AgentEvent,
   AgentPayload,
@@ -21,6 +21,7 @@ import type {
   SettingsView,
   ShellProfile,
   SkillsView,
+  VoiceModelStatus,
 } from "../types";
 
 /**
@@ -142,13 +143,46 @@ export const addMemory = (kind: string, body: string, dueAt: number | null) =>
   invoke<number>("memory_add", { kind, body, dueAt });
 
 /**
- * 语音输入三条命令（Windows 自带离线识别）：开始录音 / 停止并取回最终文本 / 取消丢弃。
- * 识别语言来自 `Settings.voice_language`，不在参数里传第二遍（Rust 侧读设置）。
+ * 语音输入三条命令（随包 sherpa-onnx 离线引擎 + SenseVoice 模型）：开始录音 /
+ * 停止并取回最终文本 / 取消丢弃。识别语言由模型自动判定（中/英/日/韩/粤），
+ * 不再有语言设置键。模型未下载时 `voice_start` 返回可行动的中文错误。
  * 全都不 catch：失败原文由 `Composer` 原样上屏（与 `saveKey` 同一口径）。
  */
 export const voiceStart = (): Promise<void> => invoke("voice_start");
 export const voiceStop = (): Promise<string> => invoke<string>("voice_stop");
 export const voiceCancel = (): Promise<void> => invoke("voice_cancel");
+
+/**
+ * 语音模型的三条管理命令。`voiceModelDownload` 立即返回（下载在后台跑），
+ * 进度与结果只经 `subscribeVoiceModel` 的事件流到达 —— 前端不从这条命令的
+ * 返回值造状态。已在下载/已就绪时它返回 Err，原文由面板上屏。
+ * 三条都不 catch：失败原文进面板自己的 error 通道（同 `onSave` 的口径）。
+ */
+export const voiceModelStatus = (): Promise<VoiceModelStatus> =>
+  invoke<VoiceModelStatus>("voice_model_status");
+export const voiceModelDownload = (): Promise<void> =>
+  invoke("voice_model_download");
+export const voiceModelCancelDownload = (): Promise<void> =>
+  invoke("voice_model_cancel_download");
+
+/**
+ * 订阅 `voice-model` 通道（照 `subscribeAgent` 的 listen/unlisten 模式，含吞掉
+ * `listen()` 自身的 rejection —— 理由见那一支的注释）。载荷就是 `VoiceModelStatus`
+ * 本身，没有 agent 通道那层信封；状态真值在 Rust，前端只渲染收到的帧。
+ */
+export function subscribeVoiceModel(
+  onEvent: (s: VoiceModelStatus) => void,
+): () => void {
+  const un = listen<VoiceModelStatus>(VOICE_MODEL_CHANNEL, (p) =>
+    onEvent(p.payload),
+  );
+  return () => {
+    void un.then(
+      (f) => f(),
+      () => {},
+    );
+  };
+}
 
 /**
  * 把一张图的原始字节交给 Rust 归一化，回来的就是可以直接进 `send_message` 的那一支

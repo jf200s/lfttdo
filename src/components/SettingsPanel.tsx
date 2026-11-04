@@ -1,12 +1,25 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
-import { shellPresets, shellProfileValidate } from "../ipc/commands";
+import {
+  shellPresets,
+  shellProfileValidate,
+  subscribeVoiceModel,
+  voiceModelCancelDownload,
+  voiceModelDownload,
+  voiceModelStatus,
+} from "../ipc/commands";
 import {
   MAX_PERSONA_CHARS,
   downloadPersonaText,
   normalizePersonaText,
 } from "../persona";
 import { THEME_NAMES, type Mode } from "../theme/theme";
-import type { MemoryView, Settings, SettingsView, ShellProfile } from "../types";
+import type {
+  MemoryView,
+  Settings,
+  SettingsView,
+  ShellProfile,
+  VoiceModelStatus,
+} from "../types";
 
 interface SettingsPanelProps {
   initial: SettingsView;
@@ -53,6 +66,17 @@ interface SettingsPanelProps {
    */
   onLoadShellPresets?: () => Promise<ShellProfile[]>;
   onValidateShellProfile?: (profile: ShellProfile) => Promise<void>;
+  /**
+   * 语音模型子区的四个回调。**生产不传**：默认直连 `commands.ts` 的对应命令
+   * （同 `onLoadShellPresets = shellPresets` 的先例，`App.tsx` 零改动）；测试注入假实现。
+   * 状态真值在 Rust：挂载时 `onLoadVoiceModel` 查一次，此后 `onSubscribeVoiceModel`
+   * 的事件帧覆盖它；下载/取消命令的失败原文进面板既有 error 通道（同 `onSave` 口径），
+   * 成功不造状态 —— 等事件帧。
+   */
+  onLoadVoiceModel?: () => Promise<VoiceModelStatus>;
+  onDownloadVoiceModel?: () => Promise<void>;
+  onCancelVoiceModelDownload?: () => Promise<void>;
+  onSubscribeVoiceModel?: (onEvent: (s: VoiceModelStatus) => void) => () => void;
   /**
    * P1：轻提示点击「已记住 N 条」时由 App 置真：面板打开后把长期记忆那一组滚进视野。
    * 为什么不在 App 里 `scrollIntoView`：那一刻面板还没挂载（`setSettingsView` 是异步的），
@@ -218,6 +242,10 @@ export function SettingsPanel({
   onPickFolder,
   onLoadShellPresets = shellPresets,
   onValidateShellProfile = shellProfileValidate,
+  onLoadVoiceModel = voiceModelStatus,
+  onDownloadVoiceModel = voiceModelDownload,
+  onCancelVoiceModelDownload = voiceModelCancelDownload,
+  onSubscribeVoiceModel = subscribeVoiceModel,
   scrollToMemories = false,
 }: SettingsPanelProps) {
   // 从 `initial` 拷一份本地草稿：面板活着的时候用户改的是这一份，
@@ -274,6 +302,12 @@ export function SettingsPanel({
   const [shellDraft, setShellDraft] = useState<ShellDraft>(SHELL_DRAFT_EMPTY);
   const [shellEditIndex, setShellEditIndex] = useState<number | null>(null);
   const [shellCheckOk, setShellCheckOk] = useState(false);
+  /**
+   * 语音模型状态。`null` = 挂载时那次查询还没回来（这一态不渲染状态行，避免闪一帧
+   * 假的「未下载」）；其余一律是 Rust 给的帧 —— 查询结果或事件流，前端不自己造状态、
+   * 不从下载命令的返回值推算进度（命令立即返回，真值只经事件到达）。
+   */
+  const [voiceModel, setVoiceModel] = useState<VoiceModelStatus | null>(null);
   // 强调色控件的三态（任务 #64，计划 :942）：`null` = 跟随预设（复选框勾着、取色器不渲染），
   // `""` = 回到自选但**这一轮还没有值**（只有载入的 accent 本身是空串时才停在这里），
   // 其余才是用户真选过的 `#rrggbb`。
@@ -381,6 +415,47 @@ export function SettingsPanel({
       alive = false;
     };
   }, [onLoadShellPresets]);
+
+  // 语音模型：先订阅再查询（查询落地前到的事件帧不许丢），卸载时拆订阅。
+  // 查询结果只在还没有任何帧时写入（`cur ?? s`）：用户可能在查询回来之前就点了下载，
+  // 那时事件帧才是更新的真相，迟到的查询结果不许把它盖回「未下载」。
+  // 查询失败进既有 error 通道（同画像/预设表的口径）；订阅回调本身不 catch ——
+  // 它只是 setState，没有可失败的东西。
+  useEffect(() => {
+    let alive = true;
+    const off = onSubscribeVoiceModel((s) => {
+      if (alive) setVoiceModel(s);
+    });
+    onLoadVoiceModel()
+      .then((s) => {
+        if (alive) setVoiceModel((cur) => cur ?? s);
+      })
+      .catch((e: unknown) => {
+        if (alive) setError(String(e));
+      });
+    return () => {
+      alive = false;
+      off();
+    };
+  }, [onLoadVoiceModel, onSubscribeVoiceModel]);
+
+  // 下载/取消：命令立即返回（下载在后台跑），这里只负责把失败原文上屏；
+  // 状态翻转一律等事件帧，不在成功分支里造「下载中」（那是第二份真相）。
+  const downloadVoiceModel = async () => {
+    try {
+      await onDownloadVoiceModel();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const cancelVoiceModelDownload = async () => {
+    try {
+      await onCancelVoiceModelDownload();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   const removeMemory = async (id: number) => {
     try {
@@ -641,25 +716,68 @@ export function SettingsPanel({
           {MODEL_NUMERIC_FIELDS.map(numericRow)}
         </fieldset>
 
-        {/* 语音输入：用 Windows 自带离线识别（SAPI），没有模型名 / base_url / API key。
-            下拉的三支就是 Rust `normalize` 的白名单；未知值已在 Rust 侧回落成 `zh-CN`，
-            所以这里的受控值永远能选中一项，不需要再补第四支。 */}
+        {/* 语音输入：随包 sherpa-onnx 离线引擎 + SenseVoice 模型，自动多语种。
+            语言下拉随 `voice_language` 一起移除，这里只剩模型管理：状态真值在 Rust
+            （挂载查询 + 事件流），前端只渲染收到的帧、把按钮点击原样递成命令。 */}
         <fieldset className="panel-group">
           <legend>语音输入</legend>
-          <label className="panel-row">
-            <span>识别语言</span>
-            <select
-              value={form.voice_language}
-              onChange={(e) => setField("voice_language", e.target.value)}
-            >
-              <option value="zh-CN">中文（简体）</option>
-              <option value="en-US">English (US)</option>
-              <option value="system">跟随系统</option>
-            </select>
-          </label>
+          {voiceModel === null ? null : (
+            <>
+              <p className="panel-row panel-readonly">
+                <span>识别模型</span>
+                <span data-testid="voice-model-state">
+                  {voiceModel.state === "missing"
+                    ? "未下载"
+                    : voiceModel.state === "downloading"
+                      ? `下载中 ${voiceModel.percent}%`
+                      : voiceModel.state === "ready"
+                        ? "已就绪"
+                        : "下载失败"}
+                </span>
+              </p>
+              {voiceModel.state === "downloading" ? (
+                <div
+                  className="voice-model-progress"
+                  role="progressbar"
+                  aria-label="模型下载进度"
+                  aria-valuenow={voiceModel.percent}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                >
+                  <div
+                    className="voice-model-progress-fill"
+                    style={{ width: `${voiceModel.percent}%` }}
+                  />
+                </div>
+              ) : null}
+              {/* 失败原文单独一行（不进共享 error 通道：那条会被别的动作覆盖，
+                  而这条失败要一直留到用户重试或取消）。空 message 不渲染空框。 */}
+              {voiceModel.state === "error" && voiceModel.message !== "" ? (
+                <p className="panel-error" role="alert" data-testid="voice-model-error">
+                  {voiceModel.message}
+                </p>
+              ) : null}
+              {voiceModel.state === "ready" ? null : (
+                <div className="panel-actions">
+                  {voiceModel.state === "downloading" ? (
+                    <button
+                      type="button"
+                      onClick={() => void cancelVoiceModelDownload()}
+                    >
+                      取消下载
+                    </button>
+                  ) : (
+                    <button type="button" onClick={() => void downloadVoiceModel()}>
+                      下载模型
+                    </button>
+                  )}
+                </div>
+              )}
+            </>
+          )}
           <p className="panel-hint">
-            使用 Windows 自带离线识别，不下载模型；中文需要系统语音包。识别质量与标点弱于
-            Whisper。
+            首次使用需下载约 228MB 模型，之后完全离线；自动识别中文/英文/日文/韩文/粤语，
+            不依赖任何 Windows 可选组件。
           </p>
         </fieldset>
 

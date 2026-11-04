@@ -171,6 +171,62 @@ describe("Composer 语音输入", () => {
     fireEvent.submit(screen.getByTestId("composer"));
     expect(p.onSend).not.toHaveBeenCalled();
   });
+
+  it("does not enter recording when voice_start resolves after streaming began", async () => {
+    // 回归（竞态）：voice_start 在途时发送先被 startingRef 挡住；即便宿主在 start
+    // resolve 前已把 streaming 置真（turn_start），beginVoice 也必须复查并丢弃会话
+    // （cancel）、留在 idle，不在生成中录音 —— 否则 120 秒自动停止后识别文本只插
+    // 草稿、自动发送被静默跳过且无提示。原仓库外 repro 断言的是缺陷行为，这里反转。
+    let resolveStart!: () => void;
+    const onVoiceStart = vi.fn<NonNullable<ComposerProps["onVoiceStart"]>>(
+      () =>
+        new Promise<void>((res) => {
+          resolveStart = res;
+        }),
+    );
+    const onVoiceStop = vi.fn<NonNullable<ComposerProps["onVoiceStop"]>>(
+      async () => "你好",
+    );
+    const onVoiceCancel = vi.fn<NonNullable<ComposerProps["onVoiceCancel"]>>(
+      async () => {},
+    );
+    const onSend = vi.fn<ComposerProps["onSend"]>(async () => {});
+    const props = {
+      onSend,
+      onStop: vi.fn(),
+      onNormalize: vi.fn<ComposerProps["onNormalize"]>(async () => imageBlock),
+      onVoiceStart,
+      onVoiceStop,
+      onVoiceCancel,
+    };
+    const { rerender } = render(<Composer streaming={false} {...props} />);
+
+    // 1) 点麦克风：voice_start 挂起（真机上引擎初始化可达数秒）。
+    fireEvent.click(screen.getByTestId("voice-button"));
+    expect(onVoiceStart).toHaveBeenCalledTimes(1);
+
+    // 2) 在途窗口里打字 + 回车：被 startingRef 挡住，发送不发生。
+    fireEvent.change(textarea(), { target: { value: "先发这句" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    await act(async () => {});
+    expect(onSend).not.toHaveBeenCalled();
+
+    // 3) 宿主把 streaming 置真（turn_start 落地）。
+    rerender(<Composer streaming={true} {...props} />);
+
+    // 4) voice_start 现在才 resolve：复查发现生成已开始 ⇒ cancel、留在 idle。
+    await act(async () => {
+      resolveStart();
+    });
+    expect(onVoiceCancel).toHaveBeenCalledTimes(1);
+    expect(onVoiceStop).not.toHaveBeenCalled();
+    const btn = screen.getByTestId("voice-button");
+    expect(btn).not.toHaveAttribute("data-recording", "true");
+    expect(btn).toHaveTextContent("语音");
+    // 草稿原文留在输入区，没有被清空也没有被发送。
+    expect(textarea()).toHaveValue("先发这句");
+    expect(onSend).not.toHaveBeenCalled();
+  });
 });
 
 describe("Composer 语音计时", () => {

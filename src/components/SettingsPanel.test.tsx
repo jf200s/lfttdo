@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SettingsPanel } from "./SettingsPanel";
-import type { MemoryView, SettingsView, ShellProfile } from "../types";
+import type { MemoryView, SettingsView, ShellProfile, VoiceModelStatus } from "../types";
 
 const downloadPersonaText = vi.hoisted(() => vi.fn());
 vi.mock("../persona", async (importOriginal) => {
@@ -67,8 +67,6 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   // 「带成别的值」由 Shell 切片的用例用非默认值另钉。
   shells: [],
   default_shell: "bash",
-  // 语音输入：默认 `zh-CN`（面板**渲染**它，漏带会在下拉里先露馅）。
-  voice_language: "zh-CN",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -101,6 +99,14 @@ const memory = (id: number, p: Partial<MemoryView> = {}): MemoryView => ({
 
 type PanelProps = Parameters<typeof SettingsPanel>[0];
 
+/** 语音模型状态帧。默认「未下载」：用例只覆写它关心的键（同 `view()` / `memory()` 的用法）。 */
+const voiceModel = (p: Partial<VoiceModelStatus> = {}): VoiceModelStatus => ({
+  state: "missing",
+  percent: 0,
+  message: "",
+  ...p,
+});
+
 // 四个 mock 先命名、再各自展开进 JSX，而不是塞进一个字面量再 `{ ...props }`：
 // 那样合并会让每个属性的推断类型变成「`Mock` 与那条签名的**联合**」，`.mock.calls`
 // 当场不存在（tsc rc=2 报的就是这个），而联合是对象展开的必然结果，看不出任何异常。
@@ -127,7 +133,21 @@ const setup = async (over: Partial<SettingsView> = {}, props: Partial<PanelProps
   // 校验默认成功，只有关心失败路径的用例才覆写。
   const onLoadShellPresets = vi.fn<NonNullable<PanelProps["onLoadShellPresets"]>>(async () => []);
   const onValidateShellProfile = vi.fn<NonNullable<PanelProps["onValidateShellProfile"]>>(async () => {});
-  render(
+  // 语音模型子区的四个回调。与 Shell 区同一口径：面板一挂载就要查状态 + 订阅，
+  // 默认给「未下载」+ 空订阅（既有用例不关心模型区，零改动）；想测模型区的用例
+  // 用 `props` 覆盖，事件帧经返回的 `emitVoiceModel` 注入。
+  const onLoadVoiceModel = vi.fn<NonNullable<PanelProps["onLoadVoiceModel"]>>(async () => voiceModel());
+  const onDownloadVoiceModel = vi.fn<NonNullable<PanelProps["onDownloadVoiceModel"]>>(async () => {});
+  const onCancelVoiceModelDownload = vi.fn<NonNullable<PanelProps["onCancelVoiceModelDownload"]>>(async () => {});
+  const voiceModelListeners: ((s: VoiceModelStatus) => void)[] = [];
+  const onSubscribeVoiceModel = vi.fn<NonNullable<PanelProps["onSubscribeVoiceModel"]>>((cb) => {
+    voiceModelListeners.push(cb);
+    return () => {
+      const i = voiceModelListeners.indexOf(cb);
+      if (i >= 0) voiceModelListeners.splice(i, 1);
+    };
+  });
+  const { unmount } = render(
     <SettingsPanel
       initial={view(over)}
       onSave={onSave}
@@ -143,6 +163,10 @@ const setup = async (over: Partial<SettingsView> = {}, props: Partial<PanelProps
       onPickFolder={onPickFolder}
       onLoadShellPresets={onLoadShellPresets}
       onValidateShellProfile={onValidateShellProfile}
+      onLoadVoiceModel={onLoadVoiceModel}
+      onDownloadVoiceModel={onDownloadVoiceModel}
+      onCancelVoiceModelDownload={onCancelVoiceModelDownload}
+      onSubscribeVoiceModel={onSubscribeVoiceModel}
       {...props}
     />,
   );
@@ -166,6 +190,15 @@ const setup = async (over: Partial<SettingsView> = {}, props: Partial<PanelProps
     onPickFolder,
     onLoadShellPresets,
     onValidateShellProfile,
+    onLoadVoiceModel,
+    onDownloadVoiceModel,
+    onCancelVoiceModelDownload,
+    onSubscribeVoiceModel,
+    emitVoiceModel: (s: VoiceModelStatus) => {
+      for (const l of [...voiceModelListeners]) l(s);
+    },
+    voiceModelSubCount: () => voiceModelListeners.length,
+    unmount,
   };
 };
 
@@ -262,22 +295,113 @@ describe("SettingsPanel", () => {
       memory_embedding_model: "text-embedding-v3",
       shells: [],
       default_shell: "bash",
-      voice_language: "zh-CN",
     });
   });
 
-  // 语音输入：下拉的 value 是 Rust normalize 白名单里的三支，改完随整表保存。
-  it("edits the voice language and saves the chosen value", async () => {
-    const p = await setup({ voice_language: "zh-CN" });
-    const select = screen.getByLabelText(/识别语言/) as HTMLSelectElement;
-    expect(select.value).toBe("zh-CN");
-    expect(within(select).getAllByRole("option").map((o) => o.getAttribute("value"))).toEqual(
-      ["zh-CN", "en-US", "system"],
+  // ==== 语音模型子区：状态真值在 Rust（查询 + 事件流），面板只渲染帧、递按钮点击 ====
+  // 语言下拉随 `voice_language` 一起移除（SenseVoice 自动多语种），这里钉的是模型管理：
+  // 未下载 → 下载 → 进度帧 → 就绪/失败，以及取消与两条命令的失败原文。
+
+  it("shows the missing model state and starts the download through the command", async () => {
+    const p = await setup();
+    // 挂载即查一次 + 订阅一次（同画像/预设表的口径）。
+    expect(p.onLoadVoiceModel).toHaveBeenCalledTimes(1);
+    expect(p.onSubscribeVoiceModel).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("voice-model-state")).toHaveTextContent("未下载");
+    expect(screen.getByText(/首次使用需下载约 228MB 模型/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "下载模型" }));
+    await waitFor(() => expect(p.onDownloadVoiceModel).toHaveBeenCalledTimes(1));
+    // 命令立即返回，状态翻转只等事件帧：点完下载不许自己造一个「下载中」。
+    expect(screen.getByTestId("voice-model-state")).toHaveTextContent("未下载");
+  });
+
+  it("renders download progress from status events and offers cancel instead of download", async () => {
+    const p = await setup();
+    act(() => p.emitVoiceModel(voiceModel({ state: "downloading", percent: 42 })));
+    expect(screen.getByTestId("voice-model-state")).toHaveTextContent("下载中 42%");
+    const bar = screen.getByRole("progressbar", { name: "模型下载进度" });
+    expect(bar).toHaveAttribute("aria-valuenow", "42");
+    expect((bar.firstElementChild as HTMLElement).style.width).toBe("42%");
+    expect(screen.queryByRole("button", { name: "下载模型" })).toBeNull();
+    expect(screen.getByRole("button", { name: "取消下载" })).toBeInTheDocument();
+    // 后续节流帧覆盖进度（不是累加、不是取最大）。
+    act(() => p.emitVoiceModel(voiceModel({ state: "downloading", percent: 87 })));
+    expect(screen.getByTestId("voice-model-state")).toHaveTextContent("下载中 87%");
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "87");
+  });
+
+  it("hides every action button and the progress bar when the model becomes ready", async () => {
+    const p = await setup();
+    act(() => p.emitVoiceModel(voiceModel({ state: "downloading", percent: 99 })));
+    act(() => p.emitVoiceModel(voiceModel({ state: "ready" })));
+    expect(screen.getByTestId("voice-model-state")).toHaveTextContent("已就绪");
+    expect(screen.queryByRole("button", { name: "下载模型" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "取消下载" })).toBeNull();
+    expect(screen.queryByRole("progressbar")).toBeNull();
+  });
+
+  it("shows the raw failure message and offers a retry when the download errors", async () => {
+    const p = await setup();
+    act(() =>
+      p.emitVoiceModel(voiceModel({ state: "error", message: "下载失败：连接 hf-mirror.com 超时" })),
     );
-    fireEvent.change(select, { target: { value: "en-US" } });
-    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
-    await waitFor(() => expect(p.onSave).toHaveBeenCalled());
-    expect(p.onSave.mock.calls[0][0].voice_language).toBe("en-US");
+    expect(screen.getByTestId("voice-model-state")).toHaveTextContent("下载失败");
+    // 失败原文整条上屏（R195 口径：前端不解释文案）。
+    expect(screen.getByTestId("voice-model-error")).toHaveTextContent(
+      "下载失败：连接 hf-mirror.com 超时",
+    );
+    // 失败后仍可重试：按钮回到「下载模型」。
+    fireEvent.click(screen.getByRole("button", { name: "下载模型" }));
+    await waitFor(() => expect(p.onDownloadVoiceModel).toHaveBeenCalledTimes(1));
+  });
+
+  it("cancels an in-progress download through the command", async () => {
+    const p = await setup();
+    act(() => p.emitVoiceModel(voiceModel({ state: "downloading", percent: 42 })));
+    fireEvent.click(screen.getByRole("button", { name: "取消下载" }));
+    await waitFor(() => expect(p.onCancelVoiceModelDownload).toHaveBeenCalledTimes(1));
+    // 取消后的状态同样只等事件帧（后端取消是幂等的，回「未下载」）。
+    act(() => p.emitVoiceModel(voiceModel()));
+    expect(screen.getByTestId("voice-model-state")).toHaveTextContent("未下载");
+    expect(screen.getByRole("button", { name: "下载模型" })).toBeInTheDocument();
+  });
+
+  it("routes a failed download command into the existing error channel", async () => {
+    const onDownloadVoiceModel = vi.fn<NonNullable<PanelProps["onDownloadVoiceModel"]>>(async () => {
+      throw new Error("语音模型已在下载中");
+    });
+    await setup({}, { onDownloadVoiceModel });
+    fireEvent.click(screen.getByRole("button", { name: "下载模型" }));
+    expect(await screen.findByTestId("panel-error")).toHaveTextContent("语音模型已在下载中");
+  });
+
+  it("routes a failed cancel command into the existing error channel", async () => {
+    const onCancelVoiceModelDownload = vi.fn<NonNullable<PanelProps["onCancelVoiceModelDownload"]>>(
+      async () => {
+        throw new Error("取消下载失败：IPC 断了");
+      },
+    );
+    const p = await setup({}, { onCancelVoiceModelDownload });
+    act(() => p.emitVoiceModel(voiceModel({ state: "downloading", percent: 42 })));
+    fireEvent.click(screen.getByRole("button", { name: "取消下载" }));
+    expect(await screen.findByTestId("panel-error")).toHaveTextContent("取消下载失败：IPC 断了");
+  });
+
+  it("routes a failed status load into the existing error channel", async () => {
+    const onLoadVoiceModel = vi.fn<NonNullable<PanelProps["onLoadVoiceModel"]>>(async () => {
+      throw new Error("voice_model_status 失败：IPC 断了");
+    });
+    await setup({}, { onLoadVoiceModel });
+    expect(await screen.findByTestId("panel-error")).toHaveTextContent(
+      "voice_model_status 失败：IPC 断了",
+    );
+  });
+
+  it("unsubscribes from voice model status when the panel unmounts", async () => {
+    const p = await setup();
+    expect(p.voiceModelSubCount()).toBe(1);
+    p.unmount();
+    expect(p.voiceModelSubCount()).toBe(0);
   });
 
   it("renders the configured roots as one path per line", async () => {

@@ -13,10 +13,11 @@ import {
   within,
 } from "@testing-library/react";
 import App from "./App";
-import type { AgentEvent, MemoryView, SessionRow, SettingsView } from "./types";
+import type { AgentEvent, MemoryView, SessionRow, SettingsView, VoiceModelStatus } from "./types";
 
 const h = vi.hoisted(() => {
   const listeners: ((sessionId: string, e: AgentEvent) => void)[] = [];
+  const voiceModelListeners: ((s: VoiceModelStatus) => void)[] = [];
   return {
     sendMessage: vi.fn(),
     respond: vi.fn(),
@@ -55,6 +56,20 @@ const h = vi.hoisted(() => {
     // 把真正的失败淹掉。预设给空表 —— 本文件的用例不关心 Shell 区。
     shellPresets: vi.fn(async () => []),
     shellProfileValidate: vi.fn(async () => {}),
+    // 语音模型子区（SettingsPanel 的生产默认回调直连这几支）：与 shellPresets 同一条理由，
+    // 面板一挂载就要查状态 + 订阅，缺了它们每条开面板的用例都会走进 error 通道。
+    // 状态给「未下载」—— 本文件的用例不关心模型区。
+    voiceModelStatus: vi.fn(async () => ({ state: "missing", percent: 0, message: "" })),
+    voiceModelDownload: vi.fn(async () => {}),
+    voiceModelCancelDownload: vi.fn(async () => {}),
+    subscribeVoiceModel: (cb: (s: VoiceModelStatus) => void) => {
+      voiceModelListeners.push(cb);
+      return () => {
+        const i = voiceModelListeners.indexOf(cb);
+        if (i >= 0) voiceModelListeners.splice(i, 1);
+      };
+    },
+    voiceModelListeners,
     subscribeAgent: (cb: (sessionId: string, e: AgentEvent) => void) => {
       listeners.push(cb);
       return () => {
@@ -119,9 +134,6 @@ const view = (p: Partial<SettingsView> = {}): SettingsView => ({
   // label 留空顺带钉住「自定义 profile 的显示名可空」这条线上语义（types.ts / spec §5.2）。
   shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }],
   default_shell: "pwsh",
-  // 语音输入给**非默认**值（Rust 默认 `zh-CN`）：与上面 roots 的非默认取向同一条 ——
-  // 下面整表载荷断言要能区分「App 原样转交」与「App 重拼了一份默认表」。
-  voice_language: "en-US",
   api_key_masked: null,
   corrupt_backup: null,
   ...p,
@@ -187,7 +199,11 @@ beforeEach(() => {
   h.addMemory.mockReset().mockResolvedValue(1);
   h.shellPresets.mockReset().mockResolvedValue([]);
   h.shellProfileValidate.mockReset().mockResolvedValue(undefined);
+  h.voiceModelStatus.mockReset().mockResolvedValue({ state: "missing", percent: 0, message: "" });
+  h.voiceModelDownload.mockReset().mockResolvedValue(undefined);
+  h.voiceModelCancelDownload.mockReset().mockResolvedValue(undefined);
   h.listeners.length = 0;
+  h.voiceModelListeners.length = 0;
 });
 
 const settled = async () => {
@@ -339,8 +355,6 @@ describe("App 设置接线", () => {
         // Shell 两键原样转交：App 不重拼默认表（夹具给的是非默认值，重拼了这里当场红）。
         shells: [{ id: "mine", label: "", program: "/opt/mine", args: ["-c"] }],
         default_shell: "pwsh",
-        // 语音语言同理（夹具给 en-US，Rust 默认 zh-CN）。
-        voice_language: "en-US",
       }),
     );
     // 保存成功才改界面：这三项是 `applyTheme` 唯一的三个可见后果。

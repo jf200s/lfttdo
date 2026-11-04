@@ -83,6 +83,9 @@ export function Composer({
   /** 本地发送锁：从按下发送到 turn_start（或失败返回）之间，拦住第二次 Enter。 */
   const [sending, setSending] = useState(false);
   const sendingRef = useRef(false);
+  /** `streaming` 的同步影子：beginVoice 在 await 之后要读最新生成态（闭包里的 prop 是旧值）。 */
+  const streamingRef = useRef(streaming);
+  streamingRef.current = streaming;
   /** `text` 的同步影子：语音结果回来时要读**最新**草稿（识别期间用户可能还在打字）。 */
   const textRef = useRef(text);
   textRef.current = text;
@@ -339,11 +342,13 @@ export function Composer({
     // R216④：「有图无字」必须放行 —— 只贴一张图不打字是日常主用法，
     // 只判 `t === ""` 的可见症状是「贴图点发送没反应」。
     // 录音/收尾期间也挡住发送：语音结果回来会自己走这一条路径，手动先发一次
-    // 会让同一段话被发两遍（识别完成后还会再触发一次自动发送）。
+    // 会让同一段话被发两遍（识别完成后还会再触发一次自动发送）。voice_start 在途
+    // 窗口（startingRef）同样挡住：否则发送先落地、voice_start resolve 后会在生成中录音。
     if (
       (t === "" && pending.length === 0) ||
       streaming ||
       sendingRef.current ||
+      startingRef.current ||
       voiceRef.current !== "idle"
     ) {
       return;
@@ -394,7 +399,7 @@ export function Composer({
     setIgnored(0);
   };
 
-  // ==== 语音输入（Windows 自带离线识别）====
+  // ==== 语音输入（随包 sherpa-onnx 离线引擎 + SenseVoice 模型，自动多语种）====
 
   const setVoiceState = (v: VoiceState) => {
     voiceRef.current = v;
@@ -409,6 +414,14 @@ export function Composer({
     setVoiceError(null);
     try {
       await onVoiceStart();
+      // 在途窗口可能跨过 turn_start：复查最新 streaming/sendingRef，生成已开始就
+      // 丢弃这次会话（cancel）、留在 idle（草稿原文已上屏），不进 recording ——
+      // 否则生成中录音会在 120 秒自动停止后只插草稿、自动发送被静默跳过且无提示。
+      if (streamingRef.current || sendingRef.current) {
+        if (onVoiceCancel) await onVoiceCancel();
+        setVoiceState("idle");
+        return;
+      }
       setVoiceSeconds(0);
       setVoiceState("recording");
     } catch (err) {

@@ -2,6 +2,7 @@
 // 而那个键名写错时 Rust 侧压根收不到参数（Tauri 按名字取值），界面只会看见一次无声的失败。
 // 所以这一层的每个 invoke 都把「命令名 + 参数对象」原样钉住。
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import type { VoiceModelStatus } from "../types";
 
 const invoke = vi.fn();
 const listen = vi.fn();
@@ -9,7 +10,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...
 vi.mock("@tauri-apps/api/event", () => ({ listen: (...a: unknown[]) => listen(...a) }));
 
 const api = await import("./commands");
-const AGENT_CHANNEL = (await import("../types")).AGENT_CHANNEL;
+const { AGENT_CHANNEL, VOICE_MODEL_CHANNEL } = await import("../types");
 
 beforeEach(() => {
   invoke.mockReset().mockResolvedValue(undefined);
@@ -112,8 +113,6 @@ describe("ipc commands", () => {
       // Shell 两键（Shell 切片）：Settings 的必填键随类型镜像加进来，取生产默认值。
       shells: [],
       default_shell: "bash",
-      // 语音输入语言（Windows 自带离线识别）：生产默认值。
-      voice_language: "zh-CN",
     });
     expect(invoke).toHaveBeenNthCalledWith(1, "settings_get");
     expect(invoke).toHaveBeenNthCalledWith(2, "settings_set", {
@@ -143,7 +142,6 @@ describe("ipc commands", () => {
         memory_embedding_model: "text-embedding-v3",
         shells: [],
         default_shell: "bash",
-        voice_language: "zh-CN",
       },
     });
   });
@@ -250,6 +248,25 @@ describe("ipc commands", () => {
     ]);
   });
 
+  // 语音模型三条管理命令：与上面同一判据（命令名 + 无参数）。`voice_model_status`
+  // 的返回是状态帧，必须原样交回调用方；下载/取消立即返回，进度只经事件流到达。
+  it("wires the voice model commands with no arguments and returns the status frame", async () => {
+    const frame: VoiceModelStatus = { state: "downloading", percent: 42, message: "" };
+    invoke
+      .mockResolvedValueOnce(frame)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined);
+    const status = await api.voiceModelStatus();
+    await api.voiceModelDownload();
+    await api.voiceModelCancelDownload();
+    expect(status).toEqual(frame);
+    expect(invoke.mock.calls).toEqual([
+      ["voice_model_status"],
+      ["voice_model_download"],
+      ["voice_model_cancel_download"],
+    ]);
+  });
+
   // R147：`normalize_image` **只吃 raw body**（`ipc.rs:564` 对 json body 直接 Err）。
   // 写成 `invoke("normalize_image", { bytes })` 会进 `InvokeBody::Json`，症状是「每次贴图都
   // 报错」而原因藏在 IPC 形状里，UI 测试根本看不出是形状错了 —— 所以这一条只能在命令层钉。
@@ -299,6 +316,46 @@ describe("ipc commands", () => {
       off();
       // `unhandledRejection` 在微任务队列清空**之后**的宏任务里才发，所以这里必须真的
       // 让出一个 timer：只 `await Promise.resolve()` 会稳定地看不见它。
+      await new Promise((r) => setTimeout(r, 0));
+      expect(seen).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onRejection);
+    }
+  });
+
+  // ==== 语音模型状态订阅（照 subscribeAgent 的两条判据）====
+
+  // 通道名必须来自镜像常量（同 agent 通道那条的理由）；载荷没有信封，
+  // `p.payload` 就是状态帧本身，必须原样交给回调。
+  it("subscribes to voice model status on the mirrored channel and forwards the frame", () => {
+    const unlisten = vi.fn();
+    listen.mockResolvedValue(unlisten);
+    const seen: VoiceModelStatus[] = [];
+    const off = api.subscribeVoiceModel((s) => seen.push(s));
+
+    const [channel, handler] = listen.mock.calls[0] as unknown as [
+      string,
+      (p: { payload: VoiceModelStatus }) => void,
+    ];
+    expect(channel).toBe(VOICE_MODEL_CHANNEL);
+    const frame: VoiceModelStatus = { state: "downloading", percent: 42, message: "" };
+    handler({ payload: frame });
+    expect(seen).toEqual([frame]);
+
+    off();
+    return Promise.resolve().then(() => expect(unlisten).toHaveBeenCalled());
+  });
+
+  // 与 subscribeAgent 那条同一病灶：清理函数住在 useEffect 的返回位上，没人 await 它，
+  // `listen()` 一旦 reject 就是一次 unhandled rejection。摘掉第二支参数这条就红。
+  it("swallows a rejected voice-model listen instead of leaking an unhandled rejection", async () => {
+    const seen: unknown[] = [];
+    const onRejection = (r: unknown) => seen.push(r);
+    process.on("unhandledRejection", onRejection);
+    try {
+      listen.mockRejectedValue(new Error("窗口已销毁"));
+      const off = api.subscribeVoiceModel(() => {});
+      off();
       await new Promise((r) => setTimeout(r, 0));
       expect(seen).toEqual([]);
     } finally {

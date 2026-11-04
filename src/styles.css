@@ -939,6 +939,23 @@ button.voice[data-recording="true"] {
   overflow-wrap: anywhere;
 }
 
+/* 语音模型下载进度条：槽 + 填充两层。色值只有 `var(--token)`（文件头第 ② 条）：
+   槽取输入框底色、描边取 `--border`，填充取当前生效的 `--accent`（与色块 chip 同一
+   理由 —— 不递第三份颜色真相）。填充宽度是**数据**（百分比），由 TS 写 inline width，
+   这里只画形状；`overflow: hidden` 把圆角内的填充裁齐。 */
+.voice-model-progress {
+  height: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-input);
+  overflow: hidden;
+}
+
+.voice-model-progress-fill {
+  height: 100%;
+  background-color: var(--accent);
+}
+
 .panel-actions {
   display: flex;
   flex-wrap: wrap;

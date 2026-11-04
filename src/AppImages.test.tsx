@@ -33,6 +33,12 @@ const h = vi.hoisted(() => {
     // 「No "shellPresets" export is defined on the mock」。补上以防相邻文件牵连。
     shellPresets: vi.fn(async () => []),
     shellProfileValidate: vi.fn(async () => {}),
+    // 语音模型子区：与上面 shellPresets 同一条防御理由（本文件不开设置面板，
+    // 但「面板 + 本 mock」的组合一挂载就要查状态 + 订阅）。状态给「未下载」。
+    voiceModelStatus: vi.fn(async () => ({ state: "missing", percent: 0, message: "" })),
+    voiceModelDownload: vi.fn(async () => {}),
+    voiceModelCancelDownload: vi.fn(async () => {}),
+    subscribeVoiceModel: () => () => {},
     // App 订阅的是 `subscribeAgent`（不是 `listen`）：mock 工厂里缺这一支，渲染期就会抛
     // 「No "subscribeAgent" export is defined on the mock」，十三条一起红 —— 红的是接线不是行为。
     subscribeAgent: (cb: (sessionId: string, e: never) => void) => {
@@ -86,8 +92,6 @@ const view = (): SettingsView => ({
   // 生产默认值（无自定义 profile、默认 bash）。仅补键，本文件的用例一行未动（R216②）。
   shells: [],
   default_shell: "bash",
-  // 语音输入：生产默认值（本文件不涉及语音，键只为镜像完整）。
-  voice_language: "zh-CN",
   api_key_masked: "…abcd",
   corrupt_backup: null,
 });

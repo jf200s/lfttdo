@@ -100,6 +100,36 @@ encoding_rs = "0.8.42"
 # feature 照旧三条，**不加** `which-command`（R305：路径解析自己写、解析器可注入，
 # 单测才不依赖本机装没装 node —— 与「单测不碰网络」同一条纪律）。
 rmcp = { version = "3.5.1", features = ["client", "transport-io", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+# 语音改版第三轮（2026-11-04）：推理引擎 tract → ort（ONNX Runtime 1.31.0，pyke
+# 预编译**静态**库链入 exe，无随包 DLL），前处理/解码仍是纯 Rust 自研（下面的
+# kaldi-fbank/rubato + asr.rs 里的 LFR/CMVN/CTC）。spike 已对拍 sherpa 2.0.1 基线
+# （三条 wav 文本逐字一致）。放跨平台段：Linux CI 可编译可单测整条识别管线
+# （不碰麦克风/模型）。
+# 体积账：ORT 静态链入，随包 DLL 仍为零；模型 228MB 不进安装包（首次使用下载到
+# data_dir，不变）。exe 增量待 Windows 真机复测；RTF≈0.03 追平 sherpa，加载 ~1s
+# （冷 1.27s/热 0.87s；tract 是 14s），进程级缓存 + 录音时后台预热保留。
+# 注意：pyke CDN 在本网络限速，Linux 静态库已缓存到 ~/.cache/ort.pyke.io/，
+# CI/新机器需预置该缓存，否则首次 build 下载可能超时（Windows 预编译包同理）。
+# 关默认 features：其 tls-native 经 ort-sys 构建期 ureq/native-tls 在 Linux 引入
+# openssl-sys（需 libssl-dev+pkg-config），违背上面「Linux CI 可编译可单测」与
+# reqwest 那条「避开 native-tls 系统 TLS 依赖」的同款纪律。改点 tls-rustls（与
+# reqwest 只开 rustls 同源）；代码只用 Tensor::from_array，ndarray/tracing/copy-dylibs
+# 非必需，一并摘掉。
+ort = { version = "2.0.0-rc.15", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "api-31",
+    "tls-rustls",
+] }
+# 体积账：kaldi 兼容 fbank 特征提取，纯 Rust，依赖仅 realfft/rustfft（与下面
+# rubato 共用同一套 FFT 栈，不重复计费）。sherpa 内置的前处理用它等价复刻。
+kaldi-fbank = "0.1.0"
+# 体积账：任意采样率 → 16k 重采样（FFT 法），纯 Rust；依赖 rustfft/num-complex 等
+# 均为小型纯 Rust crate。cpal 给的是设备原始采样率，必须有这一步。
+rubato = "5.0.1"
+# 体积账：零新增——sha2 0.10 本就是树里的传递依赖，提为直接依赖只为给模型下载/就绪
+# 校验算 sha256（防同尺寸损坏模型蒙混成 ready）。纯 Rust，不重复计费。
+sha2 = "0.10"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
@@ -116,6 +146,9 @@ tempfile = "3.27.0"
 # R138：`rand` 不是本 crate 的直接依赖，Cargo.lock 里的 0.9.5 / 0.10.3 **都是传递依赖**，
 # 传递依赖不能 `use rand::`。Step 1 的噪声图夹具用 `rand::rng()` + `RngExt::random`（0.10 API），必须显式加。
 rand = "0.10"
+# 语音端到端对拍（#[ignore] 测试 + speech_probe example）读测试 wav 用；
+# 产品路径的音频来自 cpal，不需要 wav 解码，故放 dev 段不进安装包。
+hound = "3.5.1"
 # `rmcp` 不在这儿了：T31 / R312 把它挪进 `[dependencies]`（代价与理由记在那一条的注释里）。
 
 [target."cfg(any(windows, target_os = \"linux\"))".dependencies]
@@ -130,17 +163,21 @@ windows-native-keyring-store = "1.1.0"
 # 不新增任何 crate，代价是编译这两个模块。手写 `extern "system"` 也能做，但
 # `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` 的嵌套布局写错时是**静默失败**（SetInformationJobObject
 # 收一个 void* + 长度），核对成本高于直接用它。
-# Phase 1 语音输入：`Win32_Media_Speech`（SAPI 5 / ISpRecognizer）、`Win32_System_Com`
-# （MTA COM 与 CoTaskMemFree）、`Win32_Globalization`（LocaleNameToLCID）三个 feature。
 # 不新增 crate：`windows` 本来就是这里的直接依赖。
+# 语音改版（2026-11-03）：SAPI 专属的 Win32_Media_Speech / Win32_System_Com /
+# Win32_Globalization 三个 feature 随 sapi.rs 一起摘掉（全仓 grep 无其他消费者）。
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
-    "Win32_Globalization",
-    "Win32_Media_Speech",
-    "Win32_System_Com",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+# 语音改版：Windows 内置 SAPI 换成离线引擎 SenseVoice-Small int8（识别管线见
+# 跨平台段的 ort/kaldi-fbank/rubato，ORT 静态链入，无随包 DLL）。
+# 麦克风采集仍只挂 windows 段：Linux CI 不拉 cpal 的 ALSA 后端。
+# cpal 的 WASAPI 后端在 Windows 上零系统组件依赖（SAPI 需要用户装语音语言包，
+# 这正是要消灭的失败形态）。只走 build_input_stream，不引 asio feature
+# （那会拉 ASIO SDK 的本地 C++ 编译）。
+cpal = "0.18.2"
 
 [target."cfg(not(windows))".dependencies]
 # T34 Unix 支：`kill(-pgid, SIGKILL)` 进程组回收（mcp/process.rs）。libc 本就是传递依赖
