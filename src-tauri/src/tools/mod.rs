@@ -3,6 +3,8 @@ pub mod echo;
 pub mod edit_file;
 pub mod fetch;
 pub mod fetch_guard;
+pub mod glob;
+pub mod grep;
 pub(crate) mod fs_write;
 pub mod memory_search;
 pub mod read_file;

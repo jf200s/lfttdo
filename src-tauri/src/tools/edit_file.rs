@@ -22,11 +22,12 @@ impl Tool for EditFileTool {
             description: format!(
                 "在用户配置的根目录（roots）内编辑一个已有的 UTF-8 文本文件：把 old_string \
                  精确替换为 new_string。old_string 必须与文件中一段原文完全一致（含缩进与空行），\
-                 且在文件中只出现一次；0 处或出现多次都会拒绝并说明。先用 read_file 看清原文。\
-                 只接受绝对路径；roots 之外、经符号链接/junction 解析后落到 roots 之外的路径\
-                 一律拒绝。new_string 上限 {MAX_CONTENT_BYTES} 字节且不能含 NUL；目标文件超过\
-                 4 MiB、非 UTF-8（如 GBK）、疑似二进制或换行混用 LF/CRLF 时拒绝，编辑结果超过\
-                 4 MiB 也会拒绝；不静默转码。"
+                 且在文件中只出现一次；0 处或出现多次都会拒绝并说明，除非带 replace_all: true \
+                 （把所有命中一次替换，回执说明替换处数）。结果带 unified diff（-/+ 行，\
+                 前后各 2 行上下文）。先用 read_file 看清原文。只接受绝对路径；roots 之外、\
+                 经符号链接/junction 解析后落到 roots 之外的路径一律拒绝。new_string 上限 \
+                 {MAX_CONTENT_BYTES} 字节且不能含 NUL；目标文件超过 4 MiB、非 UTF-8（如 GBK）、\
+                 疑似二进制或换行混用 LF/CRLF 时拒绝，编辑结果超过 4 MiB 也会拒绝；不静默转码。"
             ),
             input_schema: json!({
                 "type": "object",
@@ -37,11 +38,15 @@ impl Tool for EditFileTool {
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "要替换掉的原文片段，必须与文件内容完全一致且只出现一次"
+                        "description": "要替换掉的原文片段，必须与文件内容完全一致且只出现一次（多命中时须带 replace_all）"
                     },
                     "new_string": {
                         "type": "string",
                         "description": "替换后的新片段；空字符串表示删除这段原文"
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "可选，true = 把 old_string 的所有命中一次替换（默认 false：多命中拒绝）"
                     }
                 },
                 "required": ["path", "old_string", "new_string"]
@@ -114,6 +119,10 @@ impl Tool for EditFileTool {
         let text = crate::tools::fs_write::to_lf(&existing);
         let old_lf = crate::tools::fs_write::to_lf(old);
         let new_lf = crate::tools::fs_write::to_lf(new);
+        let replace_all = input
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let hits = text.matches(&old_lf).count();
         if hits == 0 {
             return Err(ToolError::Failed(format!(
@@ -121,14 +130,20 @@ impl Tool for EditFileTool {
                 crate::tools::fs_write::display_path(&guarded)
             )));
         }
-        if hits > 1 {
+        if hits > 1 && !replace_all {
             return Err(ToolError::Failed(format!(
-                "old_string 在文件中出现了 {hits} 处，必须唯一；请带上更长的上下文再试: {}",
+                "old_string 在文件中出现了 {hits} 处，必须唯一；请带上更长的上下文再试，\
+                 或确认要把所有命中都替换时带 replace_all: true: {}",
                 crate::tools::fs_write::display_path(&guarded)
             )));
         }
 
-        let replaced = text.replacen(&old_lf, &new_lf, 1);
+        let replaced = if replace_all {
+            text.replace(&old_lf, &new_lf)
+        } else {
+            text.replacen(&old_lf, &new_lf, 1)
+        };
+        let diff = unified_diff(&text, &replaced);
         let output = if crlf {
             crate::tools::fs_write::to_crlf(&replaced)
         } else {
@@ -147,11 +162,79 @@ impl Tool for EditFileTool {
         }
         crate::tools::fs_write::atomic_write(&guarded, &output)?;
         Ok(ToolOutput::text(format!(
-            "已编辑 {}（替换 1 处，共 {} 字节）",
+            "已编辑 {}（替换 {} 处，共 {} 字节）\n{}",
             crate::tools::fs_write::display_path(&guarded),
-            output.len()
+            hits,
+            output.len(),
+            if diff.is_empty() {
+                String::new()
+            } else {
+                format!("```diff\n{diff}```")
+            }
         )))
     }
+}
+
+/// 变更差异（有界 unified diff）。改动恒是「一段原文 → 一段新文」，用公共前缀/后缀行
+/// 定位改动区间，前后各带 2 行上下文；对比在 **LF 归一后**的两份文本上进行 ——
+/// 行尾差异（CRLF/LF）不是这次编辑的内容，不该出现在差异里。改动区超过
+/// [`DIFF_LINES_CAP`] 行时截断并注明省略量（edit_file 的改动通常是个位数行，
+/// 上限只为兜住「一次替换整个文件」的极端调用）。
+fn unified_diff(old_text: &str, new_text: &str) -> String {
+    const CTX: usize = 2;
+    const DIFF_LINES_CAP: usize = 40;
+    let old_lines: Vec<&str> = old_text.lines().collect();
+    let new_lines: Vec<&str> = new_text.lines().collect();
+    let mut prefix = 0usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+    let mut suffix = 0usize;
+    while suffix < old_lines.len() - prefix
+        && suffix < new_lines.len() - prefix
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let removed = &old_lines[prefix..old_lines.len() - suffix];
+    let added = &new_lines[prefix..new_lines.len() - suffix];
+    if removed.is_empty() && added.is_empty() {
+        return String::new();
+    }
+    let ctx_start = prefix.saturating_sub(CTX);
+    let ctx_end = (old_lines.len() - suffix + CTX).min(old_lines.len());
+    let mut out = format!("@@ -{} +{} @@\n", prefix + 1, prefix + 1);
+    for line in &old_lines[ctx_start..prefix] {
+        out.push_str(&format!(" {line}\n"));
+    }
+    let mut shown = 0usize;
+    for line in removed {
+        if shown >= DIFF_LINES_CAP {
+            break;
+        }
+        out.push_str(&format!("-{line}\n"));
+        shown += 1;
+    }
+    for line in added {
+        if shown >= DIFF_LINES_CAP {
+            break;
+        }
+        out.push_str(&format!("+{line}\n"));
+        shown += 1;
+    }
+    if removed.len() + added.len() > shown {
+        out.push_str(&format!(
+            "…[差异过长，已省略 {} 行；用 read_file 查看完整结果]\n",
+            removed.len() + added.len() - shown
+        ));
+    }
+    for line in &old_lines[old_lines.len() - suffix..ctx_end] {
+        out.push_str(&format!(" {line}\n"));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -267,6 +350,92 @@ mod tests {
         );
         assert_eq!(read(&root.join("note.txt")), "值\n值\n");
         cleanup(&root);
+    }
+
+    /// G03：显式声明 `replace_all: true` 时多命中一次全部替换，回执报出替换处数。
+    #[tokio::test]
+    async fn replace_all_replaces_every_occurrence_and_reports_the_count() {
+        let root = temp_root();
+        std::fs::write(root.join("note.txt"), "值\n值\n值\n").unwrap();
+        let out = EditFileTool
+            .execute(
+                json!({
+                    "path": p(&root, "note.txt"),
+                    "old_string": "值",
+                    "new_string": "新值",
+                    "replace_all": true
+                }),
+                &test_ctx(vec![root.clone()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read(&root.join("note.txt")), "新值\n新值\n新值\n");
+        let ToolOutput::Text { text } = out else {
+            panic!("edit_file 只产出文本");
+        };
+        assert!(text.contains("替换 3 处"), "{text}");
+        cleanup(&root);
+    }
+
+    /// G03 的另一半：单命中时带 replace_all 也只是普通替换，不放大成多份。
+    #[tokio::test]
+    async fn replace_all_with_a_single_hit_behaves_like_a_plain_replace() {
+        let root = temp_root();
+        std::fs::write(root.join("note.txt"), "a b c\n").unwrap();
+        let out = EditFileTool
+            .execute(
+                json!({
+                    "path": p(&root, "note.txt"),
+                    "old_string": "b",
+                    "new_string": "d",
+                    "replace_all": true
+                }),
+                &test_ctx(vec![root.clone()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read(&root.join("note.txt")), "a d c\n");
+        let ToolOutput::Text { text } = out else {
+            panic!("edit_file 只产出文本");
+        };
+        assert!(text.contains("替换 1 处"), "{text}");
+        cleanup(&root);
+    }
+
+    /// G04：回执带 unified diff —— 被删行带 `-`、新增行带 `+`，上下文行带空格前缀。
+    #[tokio::test]
+    async fn the_receipt_carries_a_unified_diff() {
+        let root = temp_root();
+        std::fs::write(root.join("code.rs"), "line1\nline2\nline3\n").unwrap();
+        let out = EditFileTool
+            .execute(
+                json!({
+                    "path": p(&root, "code.rs"),
+                    "old_string": "line2",
+                    "new_string": "line_two"
+                }),
+                &test_ctx(vec![root.clone()]),
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text { text } = out else {
+            panic!("edit_file 只产出文本");
+        };
+        assert!(text.contains("-line2"), "{text}");
+        assert!(text.contains("+line_two"), "{text}");
+        assert!(text.contains(" line1"), "上下文行要有空格前缀：{text}");
+        assert!(text.contains("@@"), "要有 hunk 头：{text}");
+        cleanup(&root);
+    }
+
+    /// 纯函数面：CRLF 差异不算变更（对比在 LF 归一后）；空差异返回空串。
+    #[test]
+    fn unified_diff_ignores_eol_only_changes_and_returns_empty_when_unchanged() {
+        assert_eq!(unified_diff("a\nb\n", "a\nb\n"), "");
+        assert_eq!(unified_diff("a\r\nb\r\n", "a\nb\n"), "", "行尾差异不是编辑内容");
+        let diff = unified_diff("a\nb\nc\n", "a\nX\nc\n");
+        assert!(diff.contains("-b"), "{diff}");
+        assert!(diff.contains("+X"), "{diff}");
     }
 
     #[tokio::test]

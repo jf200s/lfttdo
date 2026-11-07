@@ -12,6 +12,8 @@ use crate::model::assistant_acc::AssistantAcc;
 use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider, ToolDef};
 use crate::permission::gate::PermissionGate;
 use crate::tools::edit_file;
+use crate::tools::glob;
+use crate::tools::grep;
 use crate::tools::read_file;
 use crate::tools::registry::{ToolCtx, ToolRegistry};
 use crate::tools::use_skill;
@@ -27,9 +29,34 @@ use tokio_util::sync::CancellationToken;
 /// 「被打断」当成「工具坏了」再试一遍。
 const INTERRUPTED_NOTE: &str = "本轮被打断，工具未执行";
 const MODEL_FAILURE_NOTE: &str = "本轮在模型流中断处失败，工具未执行";
+/// 上下文溢出重试（G05）时，给已流出的半截回复补的那条说明。
+const OVERFLOW_RETRY_NOTE: &str = "上一段响应因上下文超限中断，将收缩上下文后重新回答";
+/// 触顶总结轮（G06）追加在 system 尾的指令：只进那一次请求，不落库。
+const MAX_STEPS_DIRECTIVE: &str = "## 收尾\n\
+ 本轮工作步数已到上限，不能再调用任何工具。请基于**已经完成**的工作写一段简短总结：\
+ 做了什么、结果在哪（文件/路径）、还剩什么没做。不要尝试调用工具。";
+/// 触顶后模型仍凭空喊出的工具调用，统一回这条错误结果（不执行）。
+const MAX_TURNS_NOTE: &str = "已到本轮步数上限，这个调用没有执行";
+/// doom-loop 防护（G07）触发时的错误结果文案：打断自我循环，但把出路写清楚。
+const DOOM_LOOP_NOTE: &str = "这已经是连续第 3 次发起完全相同的调用（工具与入参一字未改），本次没有执行。\
+ 上一轮的工具结果里通常已经有你需要的信息；请先读它。确需重试请换一种做法（改入参、换工具），\
+ 或先用文字向用户说明你在等什么。";
 /// 工具**已经开始执行**之后被取消：不能断言它没执行完（副作用可能已经发生），
 /// 只能说这份结果没有被采用。
 const TOOL_CANCELLED_NOTE: &str = "本轮已中断，工具结果未采用";
+
+/// 这条模型错误是不是「上下文超长」。判据只看错误文本：错误**分类**住 provider 层
+/// （`ModelError` 四个变体按「用户该去查什么」划分，不按内容），而溢出是端点自己的
+/// 4xx 文案 —— OpenAI 系 "maximum context length"、Ollama 系 "context window"，
+/// 同一件事各家措辞不同，大小写不敏感地认这几个词；中文关键词兜底本地端点的报错。
+fn is_context_overflow(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("context length")
+        || m.contains("context window")
+        || m.contains("context overflow")
+        || message.contains("上下文长度")
+        || message.contains("上下文超")
+}
 
 /// 循环的护栏。`max_turns` 是防模型自我循环的保险丝（spec 4.6）：日常对话 1 轮收尾，
 /// 带工具的多为 2–5 轮，25 是上限而不是目标；触顶时发 `Done{MaxTurns}` 让 UI 明确提示，
@@ -139,6 +166,12 @@ fn filtered_tool_defs(
     has_skills: bool,
 ) -> Vec<ToolDef> {
     let mut tools = registry.defs();
+    if !glob::usable_with_roots(roots) {
+        tools.retain(|d| d.name != glob::NAME);
+    }
+    if !grep::usable_with_roots(roots) {
+        tools.retain(|d| d.name != grep::NAME);
+    }
     if !read_file::usable_with_roots(roots) {
         tools.retain(|d| d.name != read_file::NAME);
     }
@@ -281,6 +314,14 @@ impl AgentSession {
             skills_disabled: self.skills_disabled.clone(),
         };
 
+        // G05：一次 run() 只自动恢复一次溢出。第二次仍超限 = 预算收缩到下限也装不下，
+        // 走既有失败出口把控制权交回用户（改设置/换端点），而不是无限收缩。
+        let mut overflow_retried = false;
+        // G07：doom-loop 计数器，跨轮存活（「连续」以整次 run() 计）；
+        // 签名 = 工具名 + 入参的 JSON 序列化（serde_json 的 Map 是 BTreeMap，
+        // 键序确定 ⇒ 签名可复现）。出现**任何不同**的调用即复位。
+        let mut doom_sig: Option<String> = None;
+        let mut doom_count: u32 = 0;
         for turn in 1..=self.cfg.max_turns {
             // 上一轮的工具跑完之后又被点了停止：成对状态已经落好，直接收尾。
             if self.cancel.is_cancelled() {
@@ -288,64 +329,26 @@ impl AgentSession {
             }
             self.deps.sink.emit(AgentEvent::TurnStart { turn });
 
-            let mut acc = AssistantAcc::default();
-            // `request()` 要 `&mut self`（记下校准分母），而 `stream` 的接收者是
-            // `&self.deps.model`：分两步取，请求先落地，流再借模型。
+            // `request()` 要 `&mut self`（记下校准分母）：请求先落地，流的消费在
+            // `consume()` 里完成（借 model 的借用随返回值一起结束）。
             let req = self.request();
-            let mut deltas = self.deps.model.stream(req);
-            let mut stream_done = false;
-            let mut interrupted = false;
-            let mut model_error: Option<String> = None;
-
-            // R55：这里用的是 `tokio::select!`。futures 那个 `select!` 的分支要求
-            // `&mut` 位置表达式（`deltas.next()` 不是），而且没有 `biased;`。
-            // 同一个形状（`biased` + `cancel.cancelled()` 臂）在 `PermissionGate::check`
-            // 里已经由 `cancel_stops_a_pending_request_instead_of_hanging` 跑通了。
-            //
-            // 两个分支都只置标志、`break` 之后再动 `self`：分支体里不能调 `&mut self`
-            // 的方法（`self.cancel.cancelled()` 还借用着 `self.cancel`，E0502）。
-            //
-            // `biased` 的代价是一条已知且良性的竞态：**流干净收尾的那一次 poll 里**
-            // 若取消也同时就绪（用户正好在回复结束的同一刻按停止），取消臂先赢，本轮按
-            // `Interrupted` 收尾而不是 `EndTurn`。内容不丢——`commit_partial` 把累加器
-            // 里的整条回复照原样提交，只是 `stop_reason` 记成用户做的那件事。
-            while !stream_done && !interrupted && model_error.is_none() {
-                tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => interrupted = true,
-                    item = deltas.next() => match item {
-                        None => stream_done = true,
-                        Some(Ok(ModelDelta::Usage { input_tokens, output_tokens })) => {
-                            // R60：`AssistantAcc::apply` 会**静默丢掉** Usage 里的 token
-                            // （assistant_acc.rs:37-39），必须在交给它之前自己取走。
-                            // 切片 5：这里同时是 `set_calibration` 的第一个调用方（前置事实 1）。
-                            // 分母用**发出这次请求时**的 est，不是现在的：一轮里可能有多次
-                            // request（工具循环），每次的 usage 只能和它自己那次 build 对齐。
-                            // 两道零闸留在 session 侧：`set_calibration` 只挡非有限值，
-                            // 而 0.0 是**有限**的、会被 clamp 成 0.2 —— 一次「端点报了 0 token」
-                            // 不该把估算压到地板（`a_zero_or_absurd_usage_...` 钉这条）。
-                            if input_tokens > 0 && self.last_est_input > 0 {
-                                self.deps.context.set_calibration(
-                                    input_tokens as f64 / self.last_est_input as f64,
-                                );
-                            }
-                            self.deps.sink.emit(AgentEvent::Usage { input_tokens, output_tokens });
-                        }
-                        Some(Ok(d)) => {
-                            if let Some(text) = acc.apply(d) {
-                                self.deps.sink.emit(AgentEvent::TextDelta { text });
-                            }
-                        }
-                        Some(Err(e)) => model_error = Some(e.to_string()),
-                    }
-                }
-            }
-            // `deltas` 借用着 `self.deps.model`，而下面要 `&mut self`；放掉它，
-            // 顺带把一个没读完的响应体关在这里，而不是拖到整轮结束。
-            drop(deltas);
+            let (acc, interrupted, model_error) = self.consume(req).await;
 
             let assistant = acc.finish();
             if let Some(message) = model_error {
+                // G05：上下文超限先收缩重试一次，而不是整轮失败。半截回复已经流给 UI，
+                // 按 R56 的同一逻辑提交进 history（带归因说明），重试的回答接在它后面。
+                if is_context_overflow(&message) && !overflow_retried {
+                    overflow_retried = true;
+                    self.deps.context.halve_budget();
+                    self.deps.sink.emit(AgentEvent::Error {
+                        at: ErrorWhere::Loop,
+                        message: format!("模型报上下文超限，已收缩上下文并重试：{message}"),
+                        fatal: false,
+                    });
+                    self.commit_partial(assistant, OVERFLOW_RETRY_NOTE);
+                    continue;
+                }
                 // R61：Plan A 里模型错误就结束本轮，所以 fatal 是 true。
                 self.deps.sink.emit(AgentEvent::Error {
                     at: ErrorWhere::Model,
@@ -393,6 +396,33 @@ impl AgentSession {
                 };
                 // 构造函数负责钉住「顶层 risk == call.risk」这个不变量（agent/events.rs:75）。
                 self.deps.sink.emit(AgentEvent::tool_call(view.clone()));
+
+                // G07：doom-loop 防护。完全相同的「工具名 + 入参」连续第 3 次：不再执行，
+                // 回一条可读的错误结果打断自我循环。调用卡照发（UI 仍然看得见这次尝试）；
+                // 不走权限门 —— 门是「该不该执行」的闸，这里已经裁定不执行。
+                {
+                    let sig = format!("{name}\u{0}{input}");
+                    if doom_sig.as_deref() == Some(sig.as_str()) {
+                        doom_count += 1;
+                    } else {
+                        doom_sig = Some(sig);
+                        doom_count = 1;
+                    }
+                    if doom_count >= 3 {
+                        let started = Instant::now();
+                        let (preview, _) = ToolOutput::text(DOOM_LOOP_NOTE).event_view();
+                        self.deps.sink.emit(AgentEvent::ToolResult {
+                            call_id: id.clone(),
+                            is_error: true,
+                            ms: started.elapsed().as_millis() as u64,
+                            preview,
+                            images: vec![],
+                        });
+                        self.history
+                            .push(Message::tool(&id, ToolOutput::text(DOOM_LOOP_NOTE), true));
+                        continue;
+                    }
+                }
 
                 // 本轮已经把正文加载进上下文的技能又被点名：不重读，只回一句提示。
                 // 8B 实测会把同一份正文连读 2–3 遍，每遍都是白烧的输入 token；
@@ -487,7 +517,116 @@ impl AgentSession {
                 self.history.push(followup);
             }
         }
+
+        // ---- G06：步数触顶的强制收尾 ----
+        // 直接终止会让工作停在半截（用户只看到一个 MaxTurns）。OpenCode 的做法是
+        // **收回工具声明**再要一次总结：`summary_request()` 的 tools 为空表，模型在
+        // 物理上开不了新调用。若它仍凭空喊出工具名，逐个回错误结果（不执行）并按
+        // MaxTurns 收尾 —— 调用与结果保持 R57 的配对，下一轮 history 不会破。
+        self.deps.sink.emit(AgentEvent::TurnStart {
+            turn: self.cfg.max_turns + 1,
+        });
+        let req = self.summary_request();
+        let (acc, interrupted, model_error) = self.consume(req).await;
+        let assistant = acc.finish();
+        if interrupted {
+            self.commit_partial(assistant, INTERRUPTED_NOTE);
+            return self.finish(StopReason::Interrupted);
+        }
+        if let Some(message) = model_error {
+            self.deps.sink.emit(AgentEvent::Error {
+                at: ErrorWhere::Model,
+                message,
+                fatal: true,
+            });
+            self.commit_partial(assistant, MODEL_FAILURE_NOTE);
+            return self.finish(StopReason::Error);
+        }
+        if assistant.blocks.is_empty() {
+            // 与主循环同一形状（R58）：空响应不进 history，报非致命 loop 错误收尾。
+            self.deps.sink.emit(AgentEvent::Error {
+                at: ErrorWhere::Loop,
+                message: "模型返回空响应".into(),
+                fatal: false,
+            });
+            return self.finish(StopReason::MaxTurns);
+        }
+        let calls = assistant.tool_calls();
+        self.history.push(assistant);
+        if calls.is_empty() {
+            // 模型交出文本总结：按正常收尾处理（工作没白做，界面上是一段可读的交付）。
+            return self.finish(StopReason::EndTurn);
+        }
+        for (id, _, _) in calls {
+            self.deps.sink.emit(AgentEvent::ToolResult {
+                call_id: id.clone(),
+                is_error: true,
+                ms: 0,
+                preview: MAX_TURNS_NOTE.to_string(),
+                images: vec![],
+            });
+            self.history.push(Message::tool(&id, ToolOutput::text(MAX_TURNS_NOTE), true));
+        }
         self.finish(StopReason::MaxTurns)
+    }
+
+    /// 消费一次模型流（spec 4.6 的「模型说话」半步）：流尽 / 取消 / 出错三出口。
+    /// `req` 由调用方先建好（`request()`/`summary_request()` 都要 `&mut self`），
+    /// 这里只负责把 delta 灌进累加器。三出口返回后借 `self.deps.model` 的借用即告结束。
+    ///
+    /// R55：`tokio::select!` + `biased`（取消臂先轮询）；R60：Usage 里的 token 在进
+    /// `AssistantAcc` 之前取走做校准，分母是**发出这次请求时**的 est。
+    /// `biased` 的代价是一条已知且良性的竞态：流干净收尾的那次 poll 里若取消同时就绪，
+    /// 取消臂先赢 —— 内容不丢（`commit_partial` 照原样提交），只是 `stop_reason`
+    /// 记成用户做的那件事。
+    async fn consume(
+        &mut self,
+        req: ChatRequest,
+    ) -> (AssistantAcc, bool, Option<String>) {
+        let mut acc = AssistantAcc::default();
+        let mut deltas = self.deps.model.stream(req);
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return (acc, true, None),
+                item = deltas.next() => match item {
+                    None => return (acc, false, None),
+                    Some(Ok(ModelDelta::Usage { input_tokens, output_tokens })) => {
+                        // 两道零闸留在 session 侧：`set_calibration` 只挡非有限值，
+                        // 而 0.0 是**有限**的、会被 clamp 成 0.2 —— 一次「端点报了 0 token」
+                        // 不该把估算压到地板（`a_zero_or_absurd_usage_...` 钉这条）。
+                        if input_tokens > 0 && self.last_est_input > 0 {
+                            self.deps.context.set_calibration(
+                                input_tokens as f64 / self.last_est_input as f64,
+                            );
+                        }
+                        self.deps.sink.emit(AgentEvent::Usage { input_tokens, output_tokens });
+                    }
+                    Some(Ok(d)) => {
+                        if let Some(text) = acc.apply(d) {
+                            self.deps.sink.emit(AgentEvent::TextDelta { text });
+                        }
+                    }
+                    Some(Err(e)) => return (acc, false, Some(e.to_string())),
+                }
+            }
+        }
+    }
+
+    /// 触顶总结请求：与 [`Self::request`] 同一条组装路径（预算、校准分母、历史窗口
+    /// 全部照算），只有两处不同 —— 工具声明清空、system 尾换成 [`MAX_STEPS_DIRECTIVE`]。
+    /// 技能索引与自动加载**不带**：没有工具可用，技能正文也是噪声。
+    fn summary_request(&mut self) -> ChatRequest {
+        let built = self
+            .deps
+            .context
+            .build_with_extra(&self.history, MAX_STEPS_DIRECTIVE);
+        self.last_est_input = built.est_input_tokens;
+        ChatRequest {
+            messages: built.messages,
+            tools: Vec::new(),
+            temperature: self.deps.temperature,
+        }
     }
 
     /// 每个出口都只经这里：`Done` 恰好一条，且带的就是返回值本身。
@@ -1211,6 +1350,32 @@ mod tests {
         })
     }
 
+    /// 应答**所有**弹窗（G07 夹具用）：每出现一条新请求就放行（Once），
+    /// 放行 `total` 条后收工。5 秒上限，超时 panic —— 挂死不是通过。
+    fn answer_all(
+        gate: &Arc<PermissionGate>,
+        sink: &Arc<VecSink>,
+        total: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        let gate = gate.clone();
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            let mut answered = 0usize;
+            for _ in 0..500 {
+                let ids = sink.permission_ids();
+                while answered < ids.len().min(total) {
+                    gate.resolve(&ids[answered], Decision::allow(Scope::Once));
+                    answered += 1;
+                }
+                if answered >= total {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("应答不到 {total} 条 PermissionRequest，只应答了 {answered} 条");
+        })
+    }
+
     /// 请求里所有工具结果消息的 `(call_id, is_error, 文本)`。
     fn tool_results_of(msgs: &[Message]) -> Vec<(String, bool, String)> {
         let mut out = Vec::new();
@@ -1810,6 +1975,140 @@ mod tests {
         assert_eq!(rig.reqs().len(), 1);
     }
 
+    /// G05 夹具：**第一次请求**报 `error_message`，之后按序吐 `then` 各轮；
+    /// `then` 耗尽后继续报同一个错（测「重试仍溢出」）。FailingModel 的文案
+    /// 固定是 429，认不出「溢出」，测不了重试分支。
+    struct OverflowModel {
+        error_message: String,
+        then: Mutex<Vec<Vec<ModelDelta>>>,
+        errored: AtomicBool,
+        recorder: Recorder,
+    }
+
+    #[async_trait]
+    impl ModelProvider for OverflowModel {
+        fn stream<'a>(
+            &'a self,
+            req: ChatRequest,
+        ) -> std::pin::Pin<Box<dyn Stream<Item = Result<ModelDelta, ModelError>> + Send + 'a>>
+        {
+            self.recorder.push(req);
+            let already_errored = self.errored.swap(true, Ordering::SeqCst);
+            let mut q = self.then.lock().unwrap();
+            if already_errored && !q.is_empty() {
+                let next = q.remove(0);
+                return Box::pin(futures::stream::iter(next.into_iter().map(Ok)));
+            }
+            Box::pin(futures::stream::iter(std::iter::once(Err(
+                ModelError::Api(self.error_message.clone()),
+            ))))
+        }
+    }
+
+    /// G05 的正向半边：第一次溢出 → 非致命的 Loop 说明 + 收缩上下文 + 重试一次，
+    /// 重试的回答正常收尾。
+    #[tokio::test]
+    async fn an_overflow_error_recovers_by_shrinking_and_retrying_once() {
+        let model = Arc::new(OverflowModel {
+            error_message: "400 This model's maximum context length is exceeded".into(),
+            then: Mutex::new(vec![vec![ModelDelta::Text("修好了".into())]]),
+            errored: AtomicBool::new(false),
+            recorder: Recorder::default(),
+        });
+        let recorder = model.recorder.clone();
+        let mut rig = Rig::assembled(model, ContextConfig::default(), recorder, vec![]);
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        assert!(rig.sink.texts().contains("修好了"), "重试的回答要送达");
+        assert_eq!(
+            rig.sink.errors(),
+            vec![(
+                ErrorWhere::Loop,
+                "模型报上下文超限，已收缩上下文并重试：模型返回错误: 400 This model's maximum context length is exceeded".into(),
+                false
+            )],
+            "只有一条非致命的收缩说明，没有 fatal"
+        );
+        assert_eq!(rig.reqs().len(), 2, "溢出后恰好重试一次");
+    }
+
+    /// G05 的另一半：重试仍然溢出 = 走既有失败出口，不能无限收缩。
+    #[tokio::test]
+    async fn a_second_overflow_still_ends_with_a_fatal_error() {
+        let model = Arc::new(OverflowModel {
+            error_message: "400 maximum context length exceeded".into(),
+            then: Mutex::new(vec![]),
+            errored: AtomicBool::new(false),
+            recorder: Recorder::default(),
+        });
+        let recorder = model.recorder.clone();
+        let mut rig = Rig::assembled(model, ContextConfig::default(), recorder, vec![]);
+        assert_eq!(rig.run("hi").await, StopReason::Error);
+        let errors = rig.sink.errors();
+        assert_eq!(errors.len(), 2, "一次收缩说明 + 一次 fatal：{errors:?}");
+        assert!(!errors[0].2, "第一次是非致命说明");
+        assert!(errors[1].2, "第二次是 fatal");
+        assert_eq!(rig.sink.done(), Some(StopReason::Error));
+        assert_eq!(rig.reqs().len(), 2, "重试恰好一次，之后收尾");
+    }
+
+    /// G07 正向半边：完全相同的「工具名 + 入参」连续第 3 次不再执行，
+    /// 回一条可读的错误结果；前两次照常执行。
+    #[tokio::test]
+    async fn a_third_identical_call_is_interrupted_with_an_error_result() {
+        let (rig, counter) = Rig::with_counted(vec![
+            tool_round(1, &[("counted", r#"{"k":1}"#)]),
+            tool_round(2, &[("counted", r#"{"k":1}"#)]),
+            tool_round(3, &[("counted", r#"{"k":1}"#)]),
+            deltas(&["收到"]),
+        ]);
+        let mut rig = rig;
+        let _answers = answer_all(&rig.gate, &rig.sink, 2);
+        assert_eq!(rig.run("别打转").await, StopReason::EndTurn);
+        assert_eq!(counter.calls().len(), 2, "第 3 次不许再执行");
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 3);
+        assert!(!results[0].1 && !results[1].1, "前两次正常执行");
+        assert!(results[2].1, "第 3 次以错误结果回给模型：{:?}", results[2]);
+        assert!(
+            results[2].2.contains("连续第 3 次"),
+            "错误结果要指出这是重复调用：{:?}",
+            results[2]
+        );
+        // R57 配对：history 结尾停在工具结果上。
+        assert_every_request_paired(&rig);
+    }
+
+    /// G07 另一半：出现**任何不同**的调用即复位 —— 两次相同 + 一次不同 + 再来原来的，
+    /// 最后这次是第 1 次而不是第 3 次，照常执行。
+    #[tokio::test]
+    async fn a_changed_argument_resets_the_doom_counter() {
+        let (rig, counter) = Rig::with_counted(vec![
+            tool_round(1, &[("counted", r#"{"k":1}"#)]),
+            tool_round(2, &[("counted", r#"{"k":1}"#)]),
+            tool_round(3, &[("counted", r#"{"k":2}"#)]),
+            tool_round(4, &[("counted", r#"{"k":1}"#)]),
+            deltas(&["收到"]),
+        ]);
+        let mut rig = rig;
+        let _answers = answer_all(&rig.gate, &rig.sink, 4);
+        assert_eq!(rig.run("换着来").await, StopReason::EndTurn);
+        assert_eq!(counter.calls().len(), 4, "全部执行，没有误伤");
+        let results = rig.sink.tool_results();
+        assert!(results.iter().all(|(_, err, _)| !err), "{results:?}");
+    }
+
+    /// 溢出识别只认端点文案里的这几个词；普通 4xx/网络错误不许误判成溢出。
+    #[test]
+    fn overflow_classification_matches_the_common_endpoint_wording() {
+        assert!(is_context_overflow(
+            "400 This model's maximum context length is exceeded"
+        ));
+        assert!(is_context_overflow("model requires a larger context window"));
+        assert!(is_context_overflow("请求失败：上下文长度超限"));
+        assert!(!is_context_overflow("模型返回错误: 401 Unauthorized invalid_api_key"));
+        assert!(!is_context_overflow("无法连接模型端点 https://x.test: dns error"));
+    }
+
     /// R56 的另外半张脸：取消出口被 `interrupting_mid_stream_...` 钉住了，报错出口用的是
     /// 同一个 `commit_partial`，但「流里已经攒下一个完整 tool_call，然后断了」这条组合此前
     /// 只有代码路径、没有断言。它造的形态正是下一轮会 400 的那个：history 结尾停在
@@ -1873,10 +2172,16 @@ mod tests {
             Some(StopReason::MaxTurns),
             "触顶必须显式告知，不可静默"
         );
+        // G06：触顶后要多请求一次做总结（工具声明收回）。夹具的第 26 轮仍是一个
+        // tool_call，它会被回错误结果而不执行，随后按 MaxTurns 收尾。
         assert_eq!(
             rig.reqs().len(),
-            cap as usize,
-            "每轮恰好问模型一次，触顶即停"
+            cap as usize + 1,
+            "触顶轮 + 一次强制总结请求"
+        );
+        assert!(
+            rig.reqs().last().unwrap().tools.is_empty(),
+            "总结请求必须收回全部工具声明"
         );
         assert_eq!(rig.sink.kinds().first().unwrap(), "turn_start");
         assert_eq!(rig.sink.kinds().last().unwrap(), "done");
@@ -1886,10 +2191,12 @@ mod tests {
                 .iter()
                 .filter(|k| *k == "turn_start")
                 .count(),
-            cap as usize
+            cap as usize + 1,
+            "总结轮也发 turn_start"
         );
 
-        // 触顶时 history 也必须停在成对状态：最后一轮的调用已经有结果。
+        // 触顶时 history 也必须停在成对状态：最后一轮的调用已经有结果，
+        // 总结轮里模型凭空喊出的调用也有回执（错误结果），R57 配对不破。
         assert_every_request_paired(&rig);
         let hist = rig.session.history();
         assert_eq!(
@@ -1899,9 +2206,23 @@ mod tests {
         );
         assert_eq!(
             tool_results_of(hist).len(),
-            cap as usize,
-            "每轮一个调用一个结果"
+            cap as usize + 1,
+            "cap 个正常结果 + 总结轮 1 个错误回执"
         );
+    }
+
+    /// G06 的正向半边：总结轮交出的是文本 ⇒ 按正常收尾（EndTurn），工作不白做。
+    #[tokio::test]
+    async fn the_step_cap_summary_turn_ends_normally_when_the_model_text_back() {
+        let mut rounds: Vec<Vec<ModelDelta>> = (0..25usize)
+            .map(|n| tool_round(n, &[("echo", r#"{"text":"loop"}"#)]))
+            .collect();
+        rounds.push(vec![ModelDelta::Text("总结收尾".into())]);
+        let mut rig = Rig::new(rounds);
+        assert_eq!(rig.run("跑满").await, StopReason::EndTurn);
+        assert_eq!(rig.reqs().len(), 26);
+        assert!(rig.reqs().last().unwrap().tools.is_empty());
+        assert!(rig.sink.texts().contains("总结收尾"));
     }
 
     // ---- 取消 ----

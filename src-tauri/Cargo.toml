@@ -58,6 +58,9 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "d
 # 已是传递依赖（reqwest→url/ipnet），提为直接依赖才能 `use`，cargo tree 无新增包。
 url = "2"
 ipnet = "2"
+# G01（OpenCode 对齐）：grep 工具按正则搜内容。regex 已是传递依赖（readability/htmd
+# 经 html5ever 一线带入），提为直接依赖才能 `use`，不新增编译负担。
+regex = "1"
 tokio-util = "0.7.20"
 uuid = { version = "1.28.0", features = ["v4"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }
