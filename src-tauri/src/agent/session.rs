@@ -14,6 +14,8 @@ use crate::permission::gate::PermissionGate;
 use crate::tools::edit_file;
 use crate::tools::glob;
 use crate::tools::grep;
+use crate::tools::todo;
+use crate::tools::undo;
 use crate::tools::read_file;
 use crate::tools::registry::{ToolCtx, ToolRegistry};
 use crate::tools::use_skill;
@@ -44,6 +46,17 @@ const DOOM_LOOP_NOTE: &str = "这已经是连续第 3 次发起完全相同的�
 /// 工具**已经开始执行**之后被取消：不能断言它没执行完（副作用可能已经发生），
 /// 只能说这份结果没有被采用。
 const TOOL_CANCELLED_NOTE: &str = "本轮已中断，工具结果未采用";
+/// G15：plan 模式拦下 Write/Exec 调用时的错误结果文案。三件事都在：这是什么模式、
+/// 为什么被拒、出路是什么（完成调研给方案 / 退出 plan 模式再改）。
+const PLAN_MODE_NOTE: &str = "Plan 模式：当前为只读研究，不能执行写入/命令类操作。请先完成调研并给出方案；退出 plan 模式后再执行修改。";
+
+/// G17：AGENTS.md 注入段落的标题（拼接格式见 `AgentSession::agents_md_section`）。
+const AGENTS_MD_HEADING: &str = "## 项目规则（AGENTS.md）";
+/// G17：单个 AGENTS.md 的字节上限 —— 防一个巨型文件顶爆预算（截断在 UTF-8 字符
+/// 边界上，见 `floor_char_boundary`）。
+const AGENTS_MD_MAX_BYTES: usize = 8 * 1024;
+/// G17：截断标记 —— 模型与测试都靠它知道「内容不完整」。
+const AGENTS_MD_TRUNCATED_NOTE: &str = "\n\n（AGENTS.md 超过 8 KiB，已截断）";
 
 /// 这条模型错误是不是「上下文超长」。判据只看错误文本：错误**分类**住 provider 层
 /// （`ModelError` 四个变体按「用户该去查什么」划分，不按内容），而溢出是端点自己的
@@ -61,14 +74,38 @@ fn is_context_overflow(message: &str) -> bool {
 /// 循环的护栏。`max_turns` 是防模型自我循环的保险丝（spec 4.6）：日常对话 1 轮收尾，
 /// 带工具的多为 2–5 轮，25 是上限而不是目标；触顶时发 `Done{MaxTurns}` 让 UI 明确提示，
 /// 而不是静默停止。
+///
+/// G15：`plan_mode` 把会话变成 OpenCode 的「只读研究」agent —— 模型只能看和读
+/// （Read 级工具照常），写入/命令类调用在工具循环里直接拒绝：不执行、不走权限门，
+/// 错误结果里写明退出方式。生产值来自 `Settings.plan_mode`（`ipc.rs::run_turn` 每轮
+/// 现取：改设置下一条消息生效）；不给就是 false（普通会话，行为一个字不变）。
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub max_turns: u32,
+    pub plan_mode: bool,
+    /// G18：诊断命令（`write_file`/`edit_file` 成功落盘后每轮跑一次，输出作为
+    /// 【自动诊断】合成 user 轮反馈给模型）。生产值来自 `Settings.diagnostics_command`
+    /// （`ipc.rs::run_turn` 每轮现取：改设置下一条消息生效）；`None`/空串 = 关闭
+    /// （历史组装与没有本功能时逐字节一致）。
+    pub diagnostics_command: Option<String>,
+    /// G19：agent 工具白名单（激活 agent 档案后生效）。`Some` 时双层生效：
+    /// 声明表只留名单内的工具（`filtered_tool_defs` 再滤一层），白名单外的调用在
+    /// 循环里被拒（不执行、不走权限门）。`None` = 不限制，一切照旧。
+    pub allowed_tools: Option<Vec<String>>,
+    /// G19：激活档案的名字（拒绝理由里点名「Agent「X」」用）。与 allowed_tools
+    /// 同源同设（装配点一起给）；None 时拒绝理由退化为「当前 Agent」。
+    pub active_agent_name: Option<String>,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self { max_turns: 25 }
+        Self {
+            max_turns: 25,
+            plan_mode: false,
+            diagnostics_command: None,
+            allowed_tools: None,
+            active_agent_name: None,
+        }
     }
 }
 
@@ -157,6 +194,20 @@ fn image_followup(images: &[ContentBlock]) -> Option<Message> {
     Some(Message::user(blocks))
 }
 
+/// G17：UTF-8 安全的截断点。`String::truncate` 在非字符边界会 panic，而 AGENTS.md 是
+/// 用户可手改的文件 —— 8 KiB 这刀不许让它炸。从 `max` 往回退到最近的字符边界
+/// （`is_char_boundary(0)` 恒真，循环必然终止）。
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
 /// `request()` 与预算估算共用这一份，避免「算的是全量注册表、发的是过滤后的表」。
 /// 隐藏只影响声明表、省一轮注定失败的调用，**不是**授权：模型凭空喊这两个名字
 /// 照样会走到工具自己的拒绝路径。
@@ -164,6 +215,7 @@ fn filtered_tool_defs(
     registry: &ToolRegistry,
     roots: &[PathBuf],
     has_skills: bool,
+    allowed_tools: Option<&[String]>,
 ) -> Vec<ToolDef> {
     let mut tools = registry.defs();
     if !glob::usable_with_roots(roots) {
@@ -181,8 +233,20 @@ fn filtered_tool_defs(
     if !edit_file::usable_with_roots(roots) {
         tools.retain(|d| d.name != edit_file::NAME);
     }
+    if !todo::usable_with_roots(roots) {
+        tools.retain(|d| d.name != todo::NAME);
+    }
+    if !undo::usable_with_roots(roots) {
+        tools.retain(|d| d.name != undo::NAME);
+    }
     if !has_skills {
         tools.retain(|d| d.name != use_skill::NAME);
+    }
+    // G19：agent 工具白名单再滤一层 —— 只留名单内的名字。与上面的既有过滤**叠加**
+    // （roots 空表隐藏 read_file 等照旧）：两层都是「这一轮到底给不给模型看」的
+    // 判据，隐藏不是授权，白名单外的调用另有循环拦截兜底。
+    if let Some(allowed) = allowed_tools {
+        tools.retain(|d| allowed.iter().any(|a| a == &d.name));
     }
     tools
 }
@@ -194,13 +258,14 @@ pub fn tool_defs_for_turn(
     roots: &[PathBuf],
     skills_dir: Option<&Path>,
     skills_disabled: &[String],
+    allowed_tools: Option<&[String]>,
 ) -> Vec<ToolDef> {
     let has_skills = skills_dir
         .map(crate::skills::discover)
         .unwrap_or_default()
         .iter()
         .any(|e| !skills_disabled.iter().any(|f| f == &e.folder));
-    filtered_tool_defs(registry, roots, has_skills)
+    filtered_tool_defs(registry, roots, has_skills, allowed_tools)
 }
 
 impl AgentSession {
@@ -235,6 +300,14 @@ impl AgentSession {
     /// `ToolCtx::resolve_within_roots` 拿到空表时是**全拒**，不是全放行）。
     pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.roots = roots;
+        self
+    }
+
+    /// G15：覆盖默认护栏。装配点（`ipc.rs::run_turn`）从 `Settings.plan_mode` 每轮现取
+    /// 后经这里注入。与 `with_roots` 同一形态 —— builder，不进 `SessionDeps`：这是
+    /// 「每轮现取的运行配置」，不是外部依赖（同 roots 的归属理由）。
+    pub fn with_config(mut self, cfg: SessionConfig) -> Self {
+        self.cfg = cfg;
         self
     }
 
@@ -312,6 +385,18 @@ impl AgentSession {
             roots: self.roots.clone(),
             skills_dir: self.skills_dir.clone(),
             skills_disabled: self.skills_disabled.clone(),
+            // G16：子代理运行器 —— 用同一套 model/registry/gate/温度/预算起独立子会话
+            // （agent/task.rs::LoopRunner）。文件作用域随 TaskTool 调用时的 ctx 传下去。
+            subagents: Some(Arc::new(crate::agent::task::LoopRunner {
+                model: self.deps.model.clone(),
+                registry: self.deps.registry.clone(),
+                gate: self.deps.gate.clone(),
+                temperature: self.deps.temperature,
+                context_cfg: self.deps.context.config(),
+            })),
+            // G20：事件出口原样交给工具（question 发多选题用）。与上面同一份 sink，
+            // 事件线只有一条；question 不经权限门，门与出口在这里就已分流。
+            events: Some(self.deps.sink.clone()),
         };
 
         // G05：一次 run() 只自动恢复一次溢出。第二次仍超限 = 预算收缩到下限也装不下，
@@ -384,6 +469,9 @@ impl AgentSession {
             // 工具**顺序**执行，不并行（spec 4.6 的刻意取舍：并行难追踪「哪个写操作改了
             // 哪个文件」，也和分级确认的交互顺序冲突）。
             let mut tool_images: Vec<ContentBlock> = Vec::new();
+            // G18：本轮是否有 write_file/edit_file **成功落盘** —— 有就等全部工具结果
+            // 处理完之后跑一次诊断命令（命令往往秒级，别每个文件各跑一遍）。
+            let mut wrote_file = false;
             for (id, name, input) in calls {
                 // risk 只从注册表查（`ToolCallView` 的注释就是这条）：模型或前端递来的
                 // 任何「我是 Read」都不作数 —— `ToolDef` 里压根没有 risk 字段。
@@ -422,6 +510,57 @@ impl AgentSession {
                             .push(Message::tool(&id, ToolOutput::text(DOOM_LOOP_NOTE), true));
                         continue;
                     }
+                }
+
+                // G15：plan 模式 = 只读研究 agent。Write/Exec 级调用在这里就被拒：
+                // 不执行、不走权限门 —— 门是「该不该执行」的闸，plan 模式已经裁定
+                // 不执行（与上面 doom 守卫同一归属：拦截发生在门之前）。
+                // 调用卡照发（上面的 tool_call 事件）：UI 仍然看得见模型尝试了什么；
+                // 模型也收到这条错误结果，可以接着做只读调研或改出方案。R57 配对：
+                // ToolResult 事件与 history 各记一条，结尾不停在 assistant 上。
+                if self.cfg.plan_mode && risk != Risk::Read {
+                    let started = Instant::now();
+                    let (preview, _) = ToolOutput::text(PLAN_MODE_NOTE).event_view();
+                    self.deps.sink.emit(AgentEvent::ToolResult {
+                        call_id: id.clone(),
+                        is_error: true,
+                        ms: started.elapsed().as_millis() as u64,
+                        preview,
+                        images: vec![],
+                    });
+                    self.history
+                        .push(Message::tool(&id, ToolOutput::text(PLAN_MODE_NOTE), true));
+                    continue;
+                }
+
+                // G19：agent 工具白名单的第二层（第一层是声明表过滤）。插在 plan 拦截
+                // 之后、gate 之前 —— 与 plan 同一归属（会话级护栏已经裁定不执行，轮不到
+                // 权限门），doom 守卫必须仍在其前：白名单内允许的调用照样要被计数，
+                // 白名单外被拒的调用不该污染 doom 计数。调用卡照发（UI 可见这次尝试），
+                // R57 配对不破。
+                if let Some(allowed) = &self.cfg.allowed_tools
+                    && !allowed.iter().any(|a| a == &name)
+                {
+                    let agent = self
+                        .cfg
+                        .active_agent_name
+                        .as_deref()
+                        .unwrap_or("当前 Agent");
+                    let note = format!(
+                        "Agent「{agent}」不允许使用工具 {name}（白名单: {}）",
+                        allowed.join(", ")
+                    );
+                    let started = Instant::now();
+                    let (preview, _) = ToolOutput::text(&note).event_view();
+                    self.deps.sink.emit(AgentEvent::ToolResult {
+                        call_id: id.clone(),
+                        is_error: true,
+                        ms: started.elapsed().as_millis() as u64,
+                        preview,
+                        images: vec![],
+                    });
+                    self.history.push(Message::tool(&id, ToolOutput::text(note), true));
+                    continue;
                 }
 
                 // 本轮已经把正文加载进上下文的技能又被点名：不重读，只回一句提示。
@@ -508,6 +647,12 @@ impl AgentSession {
                 });
                 tool_images.extend(images_of(&output));
                 self.history.push(Message::tool(&id, output, is_error));
+                // G18：诊断反馈的触发记账。is_error 的写不触发 —— 落盘都没发生，
+                // 诊断的是旧文件，反馈只会误导；被 plan 模式 / doom 守卫拦下的调用
+                // 走 `continue`，根本到不了这里。
+                if matches!(name.as_str(), "write_file" | "edit_file") && !is_error {
+                    wrote_file = true;
+                }
             }
             // R319：工具回的图片对**模型**不可见（`role:"tool"` 只能带文本，
             // openai_compat.rs:387-392）。要让 vision 模型真的看到，只能在 tool 消息之后
@@ -515,6 +660,21 @@ impl AgentSession {
             // R57 的配对不变量（N 个调用紧跟 N 条结果）因此不受影响。
             if let Some(followup) = image_followup(&tool_images) {
                 self.history.push(followup);
+            }
+            // G18：诊断反馈 —— OpenCode 把「编辑后的诊断（编译/LSP 错误）」送回模型的
+            // 离线等价物：配置了命令且本轮有写工具成功落盘时，**全部工具结果处理完之后
+            // 跑一次**，输出非空就补一条合成 user 轮。与 image_followup 同一先例：
+            // tool 消息之后给模型的补充上下文，不进 UI 事件流。命令失败/超时/被取消/
+            // 输出为空都不追加（不编造）；没有配置命令时这里一个字节都不动 —— 历史与
+            // 没有本功能时逐字节一致（有测试钉住）。
+            if wrote_file
+                && let Some(command) = self.cfg.diagnostics_command.as_deref()
+                && !command.trim().is_empty()
+                && let Some(diag) = self.run_diagnostics(command, &ctx).await
+            {
+                self.history.push(Message::user(vec![ContentBlock::Text {
+                    text: format!("【自动诊断】{diag}"),
+                }]));
             }
         }
 
@@ -660,6 +820,91 @@ impl AgentSession {
         }
     }
 
+    /// G17：扫 roots 下**根目录一级**的 `AGENTS.md`，拼出「项目规则」段。
+    /// `request()` 每轮调用 —— 每轮现读，用户改文件下一轮即生效，不落库
+    /// （与技能索引同一条 tail 组装路径，经 `build_with_extra` 天然参与预算）。
+    ///
+    /// · **只读根目录一级**，不做嵌套目录递归 —— MVP 取舍：OpenCode 的嵌套发现要沿
+    ///   目录树走且每个子目录一个作用域，lfttdo 的 roots 本来就是平铺的授权目录；
+    ///   子目录级规则等真有消费者（monorepo 场景）再加，扩展点就在这个循环里。
+    /// · 失败静默跳过：AGENTS.md 缺失不是错误（可选约定），读不动（权限/解码失败）
+    ///   同路。roots 已闸门化 —— 这里读的是用户授权的目录，不需要第二道 containment。
+    /// · 每份内容截到 [`AGENTS_MD_MAX_BYTES`] 并附截断标记（防巨型文件顶爆预算）。
+    /// · 多根时每段带 `### <根目录名>` 小标题分隔（归属可辨）；单根不带。
+    /// · 一个都没有（或全是空文件）⇒ `None`，tail 不加这段 —— 系统提示与功能
+    ///   不存在时逐字节一致（有测试钉）。
+    fn agents_md_section(&self) -> Option<String> {
+        let multi = self.roots.len() > 1;
+        let mut parts: Vec<String> = Vec::new();
+        for root in &self.roots {
+            let Ok(content) = std::fs::read_to_string(root.join("AGENTS.md")) else {
+                continue;
+            };
+            if content.trim().is_empty() {
+                // 空文件 / 纯空白不产生空段落（全部为空时整段消失）。
+                continue;
+            }
+            let mut content = content;
+            if content.len() > AGENTS_MD_MAX_BYTES {
+                let cut = floor_char_boundary(&content, AGENTS_MD_MAX_BYTES);
+                content.truncate(cut);
+                content.push_str(AGENTS_MD_TRUNCATED_NOTE);
+            }
+            if multi {
+                let name = root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| root.to_string_lossy().into_owned());
+                parts.push(format!("### {name}\n\n{content}"));
+            } else {
+                parts.push(content);
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!("{AGENTS_MD_HEADING}\n\n{}", parts.join("\n\n")))
+    }
+
+    /// G18：跑一次诊断命令，返回 Some(text) = 有非空输出要反馈给模型。
+    ///
+    /// · cwd：会话输出目录（`ctx.write_root`）；没有就退回 `roots[0]` —— 诊断命令
+    ///   通常要相对某个项目根才有意义。两处都没有 ⇒ 放弃（在任意进程 cwd 下跑
+    ///   用户没指定位置的命令，输出无法解释）。
+    /// · 15s 超时、随父令牌取消立即放弃（`select!` biased 取消臂优先）。
+    /// · **退出码不参与判定**：非零恰恰是「有诊断」（编译器报错走非零退出）；
+    ///   spawn 失败 / 超时才给 `None` —— 反馈只来自真实输出，不编造。
+    /// · stdout+stderr 合并，截到 4000 字符（按字符，UTF-8 安全）—— 这是给模型的
+    ///   反馈摘要，不是完整日志。
+    async fn run_diagnostics(&self, command: &str, ctx: &ToolCtx) -> Option<String> {
+        let mut parts = command.split_whitespace();
+        let program = parts.next()?;
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(parts);
+        let cwd = ctx
+            .write_root
+            .clone()
+            .or_else(|| ctx.roots.first().cloned())?;
+        cmd.current_dir(cwd);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return None,
+            res = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()) => {
+                // 超时（Elapsed）或 spawn 失败：没有可反馈的输出。
+                res.ok()?.ok()?
+            }
+        };
+        let mut merged = String::from_utf8_lossy(&output.stdout).into_owned();
+        merged.push_str(&String::from_utf8_lossy(&output.stderr));
+        let merged = merged.trim();
+        if merged.is_empty() {
+            return None;
+        }
+        Some(merged.chars().take(4000).collect())
+    }
+
     /// 交给模型的请求：滑窗组装出来的消息 + 注册表的工具声明。
     /// `&mut self` 只为记下这次请求的粗估（校准的分母）；`run()` 是它唯一的调用方。
     fn request(&mut self) -> ChatRequest {
@@ -711,6 +956,13 @@ impl AgentSession {
             tail.push_str(&crate::tools::fs_write::display_path(dir));
             tail.push_str("。生成的图片、视频和文档都写到这里；不要写到别的目录。");
         }
+        // G17：AGENTS.md 每轮现读（格式与取舍见 `agents_md_section`）—— 用户改文件
+        // 下一轮即生效，不落库；与技能索引同一条 tail 组装路径，走 build_with_extra
+        // 的 tail 参数参与预算（先 build 再往外贴会让请求凭空超线，同下）。
+        if let Some(section) = self.agents_md_section() {
+            tail.push_str("\n\n");
+            tail.push_str(&section);
+        }
         // 追加段交给 ContextBuilder 一起算预算：先 build 再往外贴会让请求凭空超线。
         let built = self.deps.context.build_with_extra(&self.history, &tail);
         self.last_est_input = built.est_input_tokens;
@@ -725,7 +977,12 @@ impl AgentSession {
         // R286：声明表按「这一轮到底能不能用」过滤，且与预算估算共用同一个函数
         // —— 算的是全量、发的是过滤后，会让估算虚高、校准系数偏低。
         // 隐藏不是授权：模型凭空喊这两个名字照样会走工具自己的拒绝路径。
-        let tools = filtered_tool_defs(&self.deps.registry, &self.roots, !skills.is_empty());
+        let tools = filtered_tool_defs(
+            &self.deps.registry,
+            &self.roots,
+            !skills.is_empty(),
+            self.cfg.allowed_tools.as_deref(),
+        );
         ChatRequest {
             messages: built.messages,
             // R66：`defs()` 已经是 `Vec<model::provider::ToolDef>`（registry.rs:143），
@@ -1070,16 +1327,46 @@ mod tests {
 
         /// 装配 + 一个记账工具（名字 `counted`，Write 级）。
         fn with_counted(rounds: Vec<Vec<ModelDelta>>) -> (Rig, Arc<CountingTool>) {
+            Self::with_counted_config(SessionConfig::default(), rounds)
+        }
+
+        /// G15：`with_counted` 的带 `SessionConfig` 变体 —— plan 模式要拦的正是
+        /// Write 级的 `counted`。
+        fn with_counted_config(
+            cfg: SessionConfig,
+            rounds: Vec<Vec<ModelDelta>>,
+        ) -> (Rig, Arc<CountingTool>) {
             let model = ScriptedModel::new(rounds);
             let recorder = model.recorder.clone();
             let tool = Arc::new(CountingTool::default());
-            let rig = Rig::assembled(
+            let (session, sink, gate) = parts(
                 model,
                 ContextConfig::default(),
-                recorder,
+                None,
                 vec![tool.clone()],
+                Vec::new(),
             );
+            let rig = Rig {
+                session: session.with_config(cfg),
+                sink,
+                gate,
+                recorder,
+            };
             (rig, tool)
+        }
+
+        /// G15：与 `new()` 唯一的区别是注入自定义 `SessionConfig`（echo/guarded 照常注册，
+        /// Read 级的对照测试用）。
+        fn with_config(cfg: SessionConfig, rounds: Vec<Vec<ModelDelta>>) -> Rig {
+            let model = ScriptedModel::new(rounds);
+            let recorder = model.recorder.clone();
+            let (session, sink, gate) = parts(model, ContextConfig::default(), None, vec![], Vec::new());
+            Rig {
+                session: session.with_config(cfg),
+                sink,
+                gate,
+                recorder,
+            }
         }
 
         /// 装配 + 一条 roots 表 + 额外的工具（T26 Step 4）。
@@ -2097,6 +2384,560 @@ mod tests {
         assert!(results.iter().all(|(_, err, _)| !err), "{results:?}");
     }
 
+    // ───────────────────────── G15：plan 模式（只读研究 agent） ─────────────────────────
+
+    /// plan 模式下 Write 级调用被拦：工具**未执行**、不走权限门（无 PermissionRequest），
+    /// 错误结果写明「Plan 模式」与退出方式；调用卡照发（UI 看得见这次尝试），
+    /// 模型收到错误结果后正常收尾。R57 配对不破。
+    #[tokio::test]
+    async fn plan_mode_rejects_write_tools_without_touching_the_gate() {
+        let (rig, counter) = Rig::with_counted_config(
+            SessionConfig {
+                plan_mode: true,
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("counted", r#"{"k":1}"#)]),
+                deltas(&["方案如下"]),
+            ],
+        );
+        let mut rig = rig;
+        // 不 spawn 应答任务：plan 模式必须拦在权限门**之前**，一旦这里挂死等弹窗
+        // 就说明拦截没生效（run 卡在 gate 上，测试超时红）。
+        assert_eq!(rig.run("改一下").await, StopReason::EndTurn);
+        assert!(
+            counter.calls().is_empty(),
+            "plan 模式下 Write 工具绝不能真的执行：{:?}",
+            counter.calls()
+        );
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1, "以错误结果回给模型：{:?}", results[0]);
+        assert!(
+            results[0].2.contains("Plan 模式") && results[0].2.contains("退出 plan 模式"),
+            "错误结果要点名模式与出路：{:?}",
+            results[0]
+        );
+        assert!(
+            rig.sink.permission_ids().is_empty(),
+            "不走权限门：不该有任何 PermissionRequest，实际 {:?}",
+            rig.sink.permission_ids()
+        );
+        assert_eq!(
+            rig.sink.kinds(),
+            [
+                "turn_start",
+                "tool_call",
+                "tool_result",
+                "turn_start", // 第二轮请求：模型拿到拒绝结果后改出文本方案
+                "text_delta",
+                "done"
+            ],
+            "调用卡照发（tool_call 在 tool_result 之前），模型回复正常送达：{:?}",
+            rig.sink.kinds()
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    /// plan 模式的另一半：Read 级照常执行（只读研究的「看和读」半边），零弹窗语义不变。
+    #[tokio::test]
+    async fn plan_mode_still_runs_read_tools() {
+        let mut rig = Rig::with_config(
+            SessionConfig {
+                plan_mode: true,
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("echo", r#"{"text":"调研记录"}"#)]),
+                deltas(&["读完"]),
+            ],
+        );
+        assert_eq!(rig.run("看看").await, StopReason::EndTurn);
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].1, "Read 级照常执行：{:?}", results[0]);
+        assert!(
+            results[0].2.contains("调研记录"),
+            "echo 的输出原样回给模型：{:?}",
+            results[0]
+        );
+        assert!(
+            rig.sink.permission_ids().is_empty(),
+            "Read 零弹窗语义不变：{:?}",
+            rig.sink.permission_ids()
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    // ───────────────────────── G17：AGENTS.md 注入 ─────────────────────────
+
+    /// 根下有 AGENTS.md ⇒ 系统提示含「项目规则」标题与文件内容。
+    #[tokio::test]
+    async fn agents_md_in_the_root_reaches_the_system_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "永远用中文回复").unwrap();
+        let mut rig = Rig::with_roots(
+            vec![deltas(&["好的"])],
+            vec![root.path().to_path_buf()],
+            vec![],
+        );
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        let system = rig.reqs()[0].messages[0].text_of();
+        assert!(system.contains(AGENTS_MD_HEADING), "要有段落标题：{system}");
+        assert!(
+            system.contains("永远用中文回复"),
+            "文件内容要进系统提示：{system}"
+        );
+    }
+
+    /// 两个根各有 AGENTS.md ⇒ 两个都进且带 `### <根目录名>` 小标题，顺序随 roots。
+    #[tokio::test]
+    async fn two_roots_each_get_a_named_subsection_in_root_order() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("AGENTS.md"), "A 的规矩").unwrap();
+        std::fs::write(b.path().join("AGENTS.md"), "B 的规矩").unwrap();
+        let mut rig = Rig::with_roots(
+            vec![deltas(&["好的"])],
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            vec![],
+        );
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        let system = rig.reqs()[0].messages[0].text_of();
+        let a_name = a.path().file_name().unwrap().to_string_lossy();
+        let b_name = b.path().file_name().unwrap().to_string_lossy();
+        assert!(
+            system.contains(&format!("### {a_name}")) && system.contains(&format!("### {b_name}")),
+            "多根要用根目录名做小标题分隔：{system}"
+        );
+        assert!(
+            system.contains("A 的规矩") && system.contains("B 的规矩"),
+            "两份内容都要进：{system}"
+        );
+        let a_pos = system.find("A 的规矩").unwrap();
+        let b_pos = system.find("B 的规矩").unwrap();
+        assert!(
+            a_pos < b_pos,
+            "roots 的顺序就是拼接顺序（可预期的归属）：{system}"
+        );
+    }
+
+    /// 没有 AGENTS.md ⇒ 系统提示与功能不存在时**逐字节一致**（两个 rig 对比）。
+    /// roots 本身不许把任何别的东西带进 tail —— 带进来这里就红了。
+    #[tokio::test]
+    async fn an_empty_root_keeps_the_system_prompt_byte_identical() {
+        let root = tempfile::tempdir().unwrap(); // 空目录：roots 非空但没有 AGENTS.md
+        let mut with_root = Rig::with_roots(
+            vec![deltas(&["好的"])],
+            vec![root.path().to_path_buf()],
+            vec![],
+        );
+        let mut without = Rig::with_roots(vec![deltas(&["好的"])], vec![], vec![]);
+        assert_eq!(with_root.run("hi").await, StopReason::EndTurn);
+        assert_eq!(without.run("hi").await, StopReason::EndTurn);
+        assert_eq!(
+            with_root.reqs()[0].messages[0].text_of(),
+            without.reqs()[0].messages[0].text_of(),
+            "缺 AGENTS.md 时系统提示必须与功能不存在时逐字节一致"
+        );
+    }
+
+    /// 内容 > 8 KiB ⇒ 截断标记出现、8 KiB 之后的字节不进提示、截断前的内容保留。
+    #[tokio::test]
+    async fn an_oversized_agents_md_is_truncated_with_a_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let mut big = "x".repeat(AGENTS_MD_MAX_BYTES + 100);
+        big.push_str("结尾的独有标记");
+        std::fs::write(root.path().join("AGENTS.md"), &big).unwrap();
+        let mut rig = Rig::with_roots(
+            vec![deltas(&["好的"])],
+            vec![root.path().to_path_buf()],
+            vec![],
+        );
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        let system = rig.reqs()[0].messages[0].text_of();
+        assert!(
+            system.contains(AGENTS_MD_TRUNCATED_NOTE),
+            "截断标记要出现：{system}"
+        );
+        assert!(
+            !system.contains("结尾的独有标记"),
+            "8 KiB 之后的字节不许进提示：{system}"
+        );
+        assert!(
+            system.contains(&"x".repeat(64)),
+            "截断前的内容要保留：{system}"
+        );
+    }
+
+    /// 截断点落在多字节字符中间时按字符边界退让：不许 panic、不许出现半个字符。
+    #[test]
+    fn truncation_respects_utf8_char_boundaries() {
+        // 8191 处是边界，8192 落在第一个「中」（3 字节）的中间。
+        let mut s = "x".repeat(AGENTS_MD_MAX_BYTES - 1);
+        s.push_str("中中中");
+        let cut = floor_char_boundary(&s, AGENTS_MD_MAX_BYTES);
+        assert_eq!(cut, AGENTS_MD_MAX_BYTES - 1, "退让到最近的字符边界");
+        let mut t = s.clone();
+        t.truncate(cut); // 非边界会 panic，这一行本身就是断言的一半
+        t.push_str(AGENTS_MD_TRUNCATED_NOTE);
+        assert!(t.ends_with(AGENTS_MD_TRUNCATED_NOTE), "{t:?}");
+    }
+
+    /// 每轮现读：第二轮请求同样带上；**改文件后下一轮请求反映新内容**（不落库 ——
+    /// 系统提示只活在请求上，历史里没有它）。
+    #[tokio::test]
+    async fn agents_md_is_reread_each_round_and_reflects_edits() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "第一版规矩").unwrap();
+        let mut rig = Rig::with_roots(
+            vec![
+                tool_round(1, &[("echo", r#"{"text":"记下了"}"#)]),
+                deltas(&["好"]),
+                deltas(&["继续办"]), // 第二次 run 的那一轮
+            ],
+            vec![root.path().to_path_buf()],
+            vec![],
+        );
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 2, "工具轮 + 收尾轮");
+        assert!(
+            reqs[0].messages[0].text_of().contains("第一版规矩"),
+            "第一轮要带上：{}",
+            reqs[0].messages[0].text_of()
+        );
+        assert!(
+            reqs[1].messages[0].text_of().contains("第一版规矩"),
+            "第二轮同样现读带上（不是装配时读一次缓存住）：{}",
+            reqs[1].messages[0].text_of()
+        );
+
+        // 改文件 → 同一会话再 run 一次：新文本出现、旧文本消失。
+        std::fs::write(root.path().join("AGENTS.md"), "第二版规矩").unwrap();
+        assert_eq!(rig.run("继续").await, StopReason::EndTurn);
+        let reqs = rig.reqs();
+        assert!(reqs.len() >= 3, "第二次 run 至少多一条请求：{}", reqs.len());
+        let system = reqs[2].messages[0].text_of();
+        assert!(
+            system.contains("第二版规矩"),
+            "改文件后下一轮要反映新内容：{system}"
+        );
+        assert!(!system.contains("第一版规矩"), "旧内容不许残留：{system}");
+    }
+
+    // ───────────────────────── G16：task 子代理 ─────────────────────────
+
+    /// LoopRunner 起独立子会话：父第 1 轮 task 调用（Write 弹窗放行这一次）→ 子请求
+    /// 返回「子结果」→ 父第 2 轮文本收尾。断言：父的 ToolResult 带回子结果；
+    /// 子会话历史隔离（子请求带 prompt、不带父的 user 原话）；全程恰好 3 次模型请求
+    /// （父子共用同一只脚本模型，请求序 = 父1、子、父2）。
+    #[tokio::test]
+    async fn the_task_tool_runs_a_child_session_and_brings_back_its_text() {
+        let model = ScriptedModel::new(vec![
+            tool_round(1, &[("task", r#"{"prompt":"去查 X 的资料"}"#)]),
+            deltas(&["子结果"]),
+            deltas(&["收尾"]),
+        ]);
+        let recorder = model.recorder.clone();
+        let mut rig = Rig::assembled(
+            model,
+            ContextConfig::default(),
+            recorder,
+            vec![Arc::new(crate::tools::task::TaskTool)],
+        );
+        // task 是 Write 档：后台应答放行这 1 次弹窗（子会话只跑一轮文本，没有别的弹窗）。
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("帮我派个子代理查资料").await, StopReason::EndTurn);
+
+        // 恰好 3 次模型请求：父(工具轮) + 子(子代理那轮) + 父(收尾轮)。
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 3, "父子共用同一只脚本模型：{}", reqs.len());
+
+        // 父的 ToolResult 把子代理的文本带了回来。
+        let results = rig.sink.tool_results();
+        assert!(
+            results
+                .iter()
+                .any(|(_, err, text)| !err && text.contains("子结果")),
+            "ToolResult 要带回子结果：{results:?}"
+        );
+
+        // 历史隔离：子请求（第 2 次）带着 prompt，但没有任何一条消息含父的 user 原话。
+        let child_joined: String = reqs[1].messages.iter().map(|m| m.text_of()).collect();
+        assert!(
+            child_joined.contains("去查 X 的资料"),
+            "子请求要带上 prompt：{child_joined}"
+        );
+        assert!(
+            !child_joined.contains("帮我派个子代理查资料"),
+            "子会话是独立 history，不许泄漏父会话的消息：{child_joined}"
+        );
+
+        // R57 配对（子会话自己的请求也在同一只 recorder 里，一起钉）。
+        assert_every_request_paired(&rig);
+    }
+
+    // ───────────────────────── G18：诊断反馈 ─────────────────────────
+
+    /// G18 夹具：只注册 write_file 的 rig；输出目录指向 out_dir（写工具唯一允许的
+    /// 写入面）；SessionConfig 原样注入（diagnostics_command 在 cfg 里）。
+    fn diagnostics_rig(cfg: SessionConfig, rounds: Vec<Vec<ModelDelta>>, out_dir: &Path) -> Rig {
+        let model = ScriptedModel::new(rounds);
+        let recorder = model.recorder.clone();
+        // roots 与 write_root（= 会话输出目录）都指向 out_dir：写工具先过
+        // `resolve_within_roots`（空表全拒）、再过 `ensure_within_write_root`，两个
+        // 闸门必须同时放行同一个目录。
+        let (session, sink, gate) = parts(
+            model,
+            ContextConfig::default(),
+            None,
+            vec![Arc::new(crate::tools::write_file::WriteFileTool)],
+            vec![out_dir.to_path_buf()],
+        );
+        Rig {
+            session: session
+                .with_config(cfg)
+                .with_output_dir(Some(out_dir.to_path_buf())),
+            sink,
+            gate,
+            recorder,
+        }
+    }
+
+    /// 跨平台守卫与 shell.rs 同款：脚本用例只在 unix 下跑（需要 shebang + 可执行位）。
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// 诊断脚本输出一行 ⇒ write_file 成功落盘后历史里出现【自动诊断】合成 user 轮
+    /// （位置：tool 结果之后、模型下一轮之前），且下一次请求的 messages 带上该文本。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_diagnostics_command_appends_a_synthetic_user_turn() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.sh", "printf 'error: missing semicolon'");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![tool_round(1, &[("write_file", args.as_str())]), deltas(&["收到"])],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+
+        // 历史形状：user → assistant(调用) → tool(结果) → user(【自动诊断】) → assistant。
+        let hist = rig.session.history();
+        assert_eq!(hist.len(), 5, "合成 user 轮恰好多出一条：{hist:?}");
+        assert_eq!(hist[3].role, Role::User);
+        let diag_text = hist[3].text_of();
+        assert!(
+            diag_text.contains("【自动诊断】") && diag_text.contains("missing semicolon"),
+            "诊断轮要带标记与脚本输出：{diag_text}"
+        );
+
+        // 下一次请求的 messages 里模型读得到这段反馈。
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 2);
+        let joined: String = reqs[1].messages.iter().map(|m| m.text_of()).collect();
+        assert!(
+            joined.contains("【自动诊断】") && joined.contains("missing semicolon"),
+            "第二次请求要带上诊断反馈：{joined}"
+        );
+        // R57 配对不受合成 user 轮影响（它在全部 tool 结果之后）。
+        assert_every_request_paired(&rig);
+    }
+
+    /// 诊断命令成功但**输出为空** ⇒ 不追加任何消息（没有可说的就不编造）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_diagnostics_output_appends_nothing() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.sh", "exit 0");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![tool_round(1, &[("write_file", args.as_str())]), deltas(&["收到"])],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+        let hist = rig.session.history();
+        assert_eq!(
+            hist.len(),
+            4,
+            "user → assistant(调用) → tool(结果) → assistant，没有诊断轮：{hist:?}"
+        );
+        assert!(
+            hist.iter().all(|m| !m.text_of().contains("【自动诊断】")),
+            "空输出不许出现诊断轮"
+        );
+    }
+
+    /// 没有配置命令 ⇒ 与现状**逐字节一致**：两个同配置 rig 跑同一脚本轮，
+    /// 历史完全相等，且都没有诊断轮。
+    #[tokio::test]
+    async fn without_a_command_the_history_is_byte_identical() {
+        let out = tempfile::tempdir().unwrap();
+        let file = out.path().join("note.txt");
+        // 预建目标文件：两个 rig 共用同一目录，若不预建，第一次写入回「新建」、
+        // 第二次回「覆盖」，结果文案不同会让逐字节比较失真。预建后两次都是覆盖。
+        std::fs::write(&file, "hello").unwrap();
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let rounds = vec![
+            tool_round(1, &[("write_file", args.as_str())]),
+            deltas(&["收到"]),
+        ];
+        let mut rig_a = diagnostics_rig(SessionConfig::default(), rounds.clone(), out.path());
+        let mut rig_b = diagnostics_rig(SessionConfig::default(), rounds, out.path());
+        let _answers_a = answer_all(&rig_a.gate, &rig_a.sink, 1);
+        let _answers_b = answer_all(&rig_b.gate, &rig_b.sink, 1);
+        assert_eq!(rig_a.run("写一下").await, StopReason::EndTurn);
+        assert_eq!(rig_b.run("写一下").await, StopReason::EndTurn);
+        assert_eq!(
+            rig_a.session.history(),
+            rig_b.session.history(),
+            "无命令时历史必须与现状逐字节一致"
+        );
+        assert!(
+            rig_a
+                .session
+                .history()
+                .iter()
+                .all(|m| !m.text_of().contains("【自动诊断】")),
+            "无命令不许出现诊断轮"
+        );
+    }
+
+    /// 命令失败（非零退出）且**无输出** ⇒ 不追加 —— 反馈只来自真实输出，不编造。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_silent_command_appends_nothing() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.sh", "exit 3");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![tool_round(1, &[("write_file", args.as_str())]), deltas(&["收到"])],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+        let hist = rig.session.history();
+        assert_eq!(
+            hist.len(),
+            4,
+            "失败且无输出 = 没有诊断轮：{hist:?}"
+        );
+        assert!(
+            hist.iter().all(|m| !m.text_of().contains("【自动诊断】")),
+            "不许把退出码编造成诊断文本"
+        );
+    }
+
+    // ───────────────────────── G19：agent 注册表（工具白名单） ─────────────────────────
+
+    /// allowed_tools 限 [echo] ⇒ 白名单外的 counted（Write）调用被拒：不执行、
+    /// 不走权限门（无 PermissionRequest —— 故意不 spawn 应答任务，拦截失效就挂死变红）；
+    /// 错误结果点名 Agent 与白名单；声明表只留 echo（第一层过滤）；
+    /// 白名单内的 echo 照常执行。R57 配对不破。
+    #[tokio::test]
+    async fn an_agent_allowlist_rejects_tools_outside_the_whitelist() {
+        let (rig, counter) = Rig::with_counted_config(
+            SessionConfig {
+                allowed_tools: Some(vec!["echo".into()]),
+                active_agent_name: Some("研究员".into()),
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("counted", r#"{"k":1}"#)]),
+                tool_round(2, &[("echo", r#"{"text":"白名单内"}"#)]),
+                deltas(&["收到"]),
+            ],
+        );
+        let mut rig = rig;
+        assert_eq!(rig.run("做点事").await, StopReason::EndTurn);
+
+        assert!(
+            counter.calls().is_empty(),
+            "白名单外的 Write 工具绝不能执行：{:?}",
+            counter.calls()
+        );
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1, "counted 以错误结果回给模型：{:?}", results[0]);
+        assert!(
+            results[0].2.contains("不允许使用工具")
+                && results[0].2.contains("研究员")
+                && results[0].2.contains("白名单: echo"),
+            "拒绝理由要点名 Agent 与白名单：{:?}",
+            results[0]
+        );
+        assert!(!results[1].1, "白名单内的 echo 照常执行：{:?}", results[1]);
+        assert!(
+            rig.sink.permission_ids().is_empty(),
+            "白名单拦截不走权限门，echo 零弹窗：{:?}",
+            rig.sink.permission_ids()
+        );
+        // 声明表（第一层）只剩 echo。
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 3);
+        for req in &reqs {
+            let names: Vec<&str> = req.tools.iter().map(|d| d.name.as_str()).collect();
+            assert_eq!(names, vec!["echo"], "声明表只留白名单内的工具：{names:?}");
+        }
+        assert_every_request_paired(&rig);
+    }
+
+    /// allowed_tools = None ⇒ 与现状逐字节一致：两个同配置 rig 跑同一脚本，
+    /// counted 照常弹窗放行并执行，历史完全相等、没有任何白名单拒绝文案。
+    #[tokio::test]
+    async fn without_an_allowlist_the_history_is_byte_identical() {
+        let rounds = vec![
+            tool_round(1, &[("counted", r#"{"k":1}"#)]),
+            deltas(&["收到"]),
+        ];
+        let (mut rig_a, counter_a) =
+            Rig::with_counted_config(SessionConfig::default(), rounds.clone());
+        let (mut rig_b, counter_b) = Rig::with_counted_config(SessionConfig::default(), rounds);
+        let _answers_a = answer_all(&rig_a.gate, &rig_a.sink, 1);
+        let _answers_b = answer_all(&rig_b.gate, &rig_b.sink, 1);
+        assert_eq!(rig_a.run("写一下").await, StopReason::EndTurn);
+        assert_eq!(rig_b.run("写一下").await, StopReason::EndTurn);
+        assert_eq!(
+            rig_a.session.history(),
+            rig_b.session.history(),
+            "无白名单时历史必须与现状逐字节一致"
+        );
+        assert_eq!(counter_a.calls().len(), 1, "counted 照常执行");
+        assert_eq!(counter_b.calls().len(), 1);
+        assert!(
+            rig_a
+                .session
+                .history()
+                .iter()
+                .all(|m| !m.text_of().contains("不允许使用工具")),
+            "无白名单不许出现拒绝文案"
+        );
+    }
+
     /// 溢出识别只认端点文案里的这几个词；普通 4xx/网络错误不许误判成溢出。
     #[test]
     fn overflow_classification_matches_the_common_endpoint_wording() {
@@ -2723,6 +3564,78 @@ mod tests {
         );
     }
 
+    // ---- G20：question 的答案回到对话 ----
+
+    /// 完整 run()：第 1 轮模型调 question（Read 档 ⇒ 零弹窗，不需要权限应答任务），
+    /// 测试从 rig 的 sink 取 Question 事件、经共享实例 `shared().resolve` 应答，
+    /// execute 的输出「用户选择了：选项二」在第 2 轮请求的 messages 里回到模型。
+    /// 注册表只装 question 一把（with_only）：这条量的是问答闭环，不是工具名单。
+    #[tokio::test]
+    async fn a_question_is_answered_through_the_shared_instance_and_reaches_the_next_request() {
+        let mut rig = Rig::with_only(
+            vec![
+                tool_round(
+                    1,
+                    &[(
+                        "question",
+                        r#"{"question":"用哪个方案？","options":["选项一","选项二"]}"#,
+                    )],
+                ),
+                deltas(&["好，按选项二来"]),
+            ],
+            Vec::new(),
+            vec![crate::tools::question::QuestionTool::shared()],
+        );
+        // 后台应答：等 sink 里出现 Question 事件（此刻 execute 已挂起），把选择送回去。
+        let answerer = tokio::spawn({
+            let sink = rig.sink.clone();
+            async move {
+                for _ in 0..500 {
+                    if let Some(id) = sink.events().into_iter().find_map(|e| match e {
+                        AgentEvent::Question { id, .. } => Some(id),
+                        _ => None,
+                    }) {
+                        crate::tools::question::QuestionTool::shared()
+                            .resolve(&id, "选项二".to_string());
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("等不到 Question 事件");
+            }
+        });
+
+        assert_eq!(rig.run("帮我拿个主意").await, StopReason::EndTurn);
+        answerer.await.unwrap();
+
+        // Read 档：提问全程不经过权限门（gate 的 sink 与事件线是同一份，取证无死角）。
+        assert!(
+            rig.sink.permission_ids().is_empty(),
+            "question 是 Read 档，不该有任何 PermissionRequest：{:?}",
+            rig.sink.permission_ids()
+        );
+        // 问答闭环的模型侧证据：第 2 次请求的 messages 带着工具结果（答案）。
+        // `text_of` 只收 Text 块，ToolResult 块要单独拆（gapcheck2 同一条经验）。
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 2, "第 1 轮 question + 第 2 轮收尾：{}", reqs.len());
+        let results: Vec<String> = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    output: ToolOutput::Text { text },
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.iter().any(|t| t.contains("用户选择了：选项二")),
+            "答案要回到第 2 轮请求：{results:?}"
+        );
+    }
+
     // ---- 技能包：索引进提示、正文按需读、没技能时隐藏 ----
 
     #[tokio::test]
@@ -2803,10 +3716,11 @@ mod tests {
         for t in production_tools() {
             registry.register(t);
         }
-        let expected: Vec<String> = tool_defs_for_turn(&registry, &roots, Some(skills.path()), &[])
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
+        let expected: Vec<String> =
+            tool_defs_for_turn(&registry, &roots, Some(skills.path()), &[], None)
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
         assert_eq!(
             declared, expected,
             "预算里算的工具声明必须就是请求里发出去的那一批"
@@ -2820,6 +3734,7 @@ mod tests {
             &roots,
             Some(skills.path()),
             &["translate".to_string()],
+            None,
         );
         assert!(
             !disabled.iter().any(|d| d.name == "use_skill"),

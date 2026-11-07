@@ -34,7 +34,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -798,68 +800,35 @@ async fn run_with_job_factory(
 /// 风险 `Risk::Exec`：每次调用弹窗，会话级放行的粒度是整条命令文本（门既有行为）。
 pub struct ShellTool {
     catalog: Arc<RwLock<ShellCatalog>>,
+    /// 后台任务表（G10）：task_id → 共享状态。spawn 侧与查询侧各拿一份克隆，
+    /// 完成后保留（模型可能查多次），表随工具实例存活（生产 = 整个进程）。
+    tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
+}
+
+/// 一条后台任务的共享状态：输出在任务结束时一次性写入（执行中的部分输出
+/// 拿不到 —— `run_with_job_factory` 不吐中间流，够用：查询的语义是「完成了吗」）。
+#[derive(Clone)]
+struct BackgroundTask {
+    command: String,
+    output: Arc<Mutex<String>>,
+    done: Arc<AtomicBool>,
 }
 
 impl ShellTool {
     pub fn new(catalog: Arc<RwLock<ShellCatalog>>) -> Self {
-        Self { catalog }
-    }
-}
-
-#[async_trait]
-impl Tool for ShellTool {
-    fn meta(&self) -> ToolMeta {
-        ToolMeta {
-            name: NAME.to_string(),
-            description: "在选定的 shell 后端里执行一条命令并返回它的 stdout 与 stderr；命令文本\
-                          由该 shell 解释。参数：command 必填；shell_id 可选（内置预设 id 是\
-                          bash/sh/zsh/fish/git-bash/pwsh/powershell/cmd 中**本机检测到**的子集，\
-                          或设置里的自定义 id；缺省用用户的默认 shell）；cwd 可选（绝对路径且\
-                          必须已存在，缺省是本会话的输出目录）；\
-                          timeout_ms 可选（毫秒，默认 30000，上限 600000，超时命令连同它启动的\
-                          子进程会被终止）。输出合计上限 524288 字节，超出部分截断并注明；命令\
-                          退出码非零时输出尾部带「[退出码 N]」（这不是工具错误）；输出含非 UTF-8 \
-                          字节时按替换字符转换并注明。每次调用都会向用户弹窗确认。"
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "要执行的命令文本，交给选定的 shell 解释"
-                    },
-                    "shell_id": {
-                        "type": "string",
-                        "description": "可选：shell profile 的 id（预设或自定义）；缺省用设置里的默认 shell"
-                    },
-                    "cwd": {
-                        "type": "string",
-                        "description": "可选：工作目录，绝对路径且必须已存在；缺省用当前会话的输出目录"
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "可选：超时毫秒数，默认 30000，上限 600000"
-                    }
-                },
-                "required": ["command"]
-            }),
-            risk: Risk::Exec,
+        Self {
+            catalog,
+            tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    async fn execute(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        // 工具侧那一次取消检查：在任何解析与文件系统访问之前（注册表侧也有一次，R53）。
-        if ctx.cancel.is_cancelled() {
-            return Err(ToolError::Cancelled);
-        }
-        // —— 以下到 build_command 为止是**契约桩已交付**的部分：入参形状、profile
-        // 解析、cwd 决定、程序存在性。它们的行为被类型级单测钉住，接线线与 UI 线
-        // 依赖的就是这段的语义。 ——
-        let command = required_command(&input)?;
-        let shell_id = optional_str(&input, "shell_id")?;
-        let cwd_raw = optional_str(&input, "cwd")?;
-        let timeout_ms = timeout_ms_of(&input)?;
+    /// 入参 → 一次执行的完整前置（profile 解析、cwd 决定、程序存在性）。
+    /// 同步与后台两条路径共用；原来内联在 execute 里的那一段原样搬入。
+    fn prepare(&self, input: &Value, ctx: &ToolCtx) -> Result<Prepared, ToolError> {
+        let command = required_command(input)?;
+        let shell_id = optional_str(input, "shell_id")?;
+        let cwd_raw = optional_str(input, "cwd")?;
+        let timeout_ms = timeout_ms_of(input)?;
 
         let catalog = crate::lock::read(&self.catalog).clone();
         let profile = catalog.resolve(shell_id).map_err(ToolError::BadInput)?;
@@ -891,19 +860,174 @@ impl Tool for ShellTool {
 
         // 执行前的强制校验（需求硬约束的第二个消费点；第一个是 IPC 校验命令）。
         ensure_executable(&profile.program, &path_search_dirs()).map_err(ToolError::Failed)?;
+        Ok(Prepared {
+            profile,
+            command,
+            cwd,
+            timeout_ms,
+        })
+    }
 
+    /// G10 后台启动：立即返回任务引用；命令在独立任务里跑（独立取消令牌 ——
+    /// 后台的意义就是活得比本轮对话久，停止按钮不杀它，超时是唯一自然终点）。
+    fn spawn_background(&self, prepared: Prepared) -> Result<ToolOutput, ToolError> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let task = BackgroundTask {
+            command: prepared.command.clone(),
+            output: Arc::new(Mutex::new(String::new())),
+            done: Arc::new(AtomicBool::new(false)),
+        };
+        self.tasks.lock().unwrap().insert(id.clone(), task.clone());
+        let token = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(async move {
+            let result = run_with_job_factory(
+                &create_kill_job,
+                &prepared.profile,
+                &prepared.command,
+                &prepared.cwd,
+                prepared.timeout_ms,
+                &token,
+            )
+            .await;
+            let text = match result {
+                Ok(out) => output_text(&out),
+                Err(e) => format!("[后台任务失败] {e}"),
+            };
+            *task.output.lock().unwrap() = text;
+            task.done.store(true, Ordering::Release);
+        });
+        Ok(ToolOutput::text(format!(
+            "已后台启动 (task_id: {id})。查询输出：run_command 传 {{\"task_id\": \"{id}\"}}；\
+             未完成时返回运行中，完成后返回全部输出。"
+        )))
+    }
+
+    /// G10 查询：按 task_id 取状态与输出。完成后每次都返回全文（任务表常驻）。
+    fn task_status(&self, task_id: &str) -> Result<ToolOutput, ToolError> {
+        let task = self
+            .tasks
+            .lock()
+            .unwrap()
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| {
+                ToolError::BadInput(format!(
+                    "没有这个 task_id: {task_id}（任务表只在本进程内有效）"
+                ))
+            })?;
+        // 回执带命令原文：模型跨轮查询时未必记得这条任务跑的是什么。
+        if task.done.load(Ordering::Acquire) {
+            let text = task.output.lock().unwrap().clone();
+            Ok(ToolOutput::text(format!(
+                "[后台任务已完成] 命令：{}\n{text}",
+                task.command
+            )))
+        } else {
+            // 运行中不带命令回显：查询的语义是「完成了吗」，回显会让模型侧的
+            // 轮询把「命令文本里恰好含有输出关键字」误判成已完成。
+            Ok(ToolOutput::text(
+                "[后台任务运行中；稍后再用同一个 task_id 查询]".to_string(),
+            ))
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ShellTool {
+    fn meta(&self) -> ToolMeta {
+        ToolMeta {
+            name: NAME.to_string(),
+            description: "在选定的 shell 后端里执行一条命令并返回它的 stdout 与 stderr；命令文本\
+                          由该 shell 解释。参数：command 必填；shell_id 可选（内置预设 id 是\
+                          bash/sh/zsh/fish/git-bash/pwsh/powershell/cmd 中**本机检测到**的子集，\
+                          或设置里的自定义 id；缺省用用户的默认 shell）；cwd 可选（绝对路径且\
+                          必须已存在，缺省是本会话的输出目录）；\
+                          timeout_ms 可选（毫秒，默认 30000，上限 600000，超时命令连同它启动的\
+                          子进程会被终止）。background: true 时立即返回 task_id 并后台执行\
+                          （查询：再调一次 run_command 只带 task_id 参数，未完成返回\
+                          运行中、完成返回全部输出；后台命令不随「停止」中断，超时是唯一终点）。\
+                          输出合计上限 524288 字节，超出部分截断并注明；命令\
+                          退出码非零时输出尾部带「[退出码 N]」（这不是工具错误）；输出含非 UTF-8 \
+                          字节时按替换字符转换并注明。每次调用都会向用户弹窗确认。"
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "要执行的命令文本，交给选定的 shell 解释"
+                    },
+                    "shell_id": {
+                        "type": "string",
+                        "description": "可选：shell profile 的 id（预设或自定义）；缺省用设置里的默认 shell"
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "可选：工作目录，绝对路径且必须已存在；缺省用当前会话的输出目录"
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "可选：超时毫秒数，默认 30000，上限 600000"
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "可选，true = 后台执行：立即返回 task_id，不等命令结束"
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": "可选：查询此前后台任务的输出；给出它时忽略 command"
+                    }
+                },
+                "required": ["command"]
+            }),
+            risk: Risk::Exec,
+        }
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        // 工具侧那一次取消检查：在任何解析与文件系统访问之前（注册表侧也有一次，R53）。
+        if ctx.cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        // G10 查询分支：带 task_id = 问进度/取输出，与「执行一条新命令」互斥。
+        if let Some(task_id) = optional_str(&input, "task_id")? {
+            return self.task_status(task_id);
+        }
+        let prepared = self.prepare(&input, ctx)?;
+        // G10 后台分支：立即返回任务引用，命令在独立任务里跑完。
+        if input.get("background").and_then(Value::as_bool).unwrap_or(false) {
+            return self.spawn_background(prepared);
+        }
         // spawn 之后的一切（job、超时、取消、输出捕获、编排）走可测缝：
         // 生产用 `create_kill_job`，测试注入假工厂。
         run_with_job_factory(
             &create_kill_job,
-            &profile,
-            &command,
-            &cwd,
-            timeout_ms,
+            &prepared.profile,
+            &prepared.command,
+            &prepared.cwd,
+            prepared.timeout_ms,
             &ctx.cancel,
         )
         .await
     }
+}
+
+/// ToolOutput → 纯文本（后台任务只捕获命令输出，Image/Multi 不会出现，兜底 Debug）。
+fn output_text(out: &ToolOutput) -> String {
+    match out {
+        ToolOutput::Text { text } => text.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// 从入参解析出的一次执行：profile / 命令文本 / 工作目录 / 超时。
+/// 同步、后台两条路径共用同一套前置校验（少一份就会开始漂移）。
+struct Prepared {
+    profile: ShellProfile,
+    command: String,
+    cwd: PathBuf,
+    timeout_ms: u64,
 }
 
 #[cfg(test)]
@@ -923,6 +1047,8 @@ mod tests {
             roots: Vec::new(),
             skills_dir: None,
             skills_disabled: Vec::new(),
+            subagents: None,
+            events: None,
         }
     }
 
@@ -1130,6 +1256,79 @@ mod tests {
         );
     }
 
+    // ———————— G10：后台执行 ————————
+
+    /// background:true 立即返回 task_id（不带命令输出），命令在后台跑完；
+    /// 凭 task_id 轮询拿到全部输出，副作用照常发生。
+    #[tokio::test]
+    async fn background_returns_a_task_reference_then_delivers_the_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out_file = tmp.path().join("out.txt");
+        let tool = ShellTool::new(catalog_with(Vec::new(), "bash"));
+        let ctx = test_ctx(Some(tmp.path().to_path_buf()));
+
+        let started = std::time::Instant::now();
+        let out = tool
+            .execute(
+                json!({
+                    "command": format!("sleep 1 && printf done > {}", out_file.display()),
+                    "background": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let ToolOutput::Text { text } = out else {
+            panic!("run_command 只产出文本");
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "后台启动必须立即返回，实际 {:?}",
+            started.elapsed()
+        );
+        let i = text.find("task_id").expect("返回的是任务引用");
+        let id: String = text[i + "task_id".len()..]
+            .chars()
+            .skip_while(|c| !c.is_ascii_alphanumeric())
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
+        assert!(!id.is_empty(), "{text}");
+
+        // 未完成 → 运行中；轮询到完成 → 全部输出 + 副作用发生。
+        let mut fetched = String::new();
+        for _ in 0..60 {
+            let out = tool
+                .execute(json!({ "task_id": id }), &ctx)
+                .await
+                .unwrap();
+            let ToolOutput::Text { text } = out else {
+                panic!("run_command 只产出文本");
+            };
+            fetched = text;
+            if fetched.contains("已完成") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(fetched.contains("已完成"), "{fetched}");
+        assert!(fetched.contains("done"), "命令输出要随查询交付：{fetched}");
+        assert_eq!(std::fs::read_to_string(&out_file).unwrap(), "done");
+    }
+
+    #[tokio::test]
+    async fn a_task_id_lookup_miss_is_a_clear_error() {
+        let tool = ShellTool::new(catalog_with(Vec::new(), "bash"));
+        let ctx = test_ctx(None);
+        let err = tool
+            .execute(json!({ "task_id": "nope" }), &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::BadInput(m) if m.contains("task_id")),
+            "{err:?}"
+        );
+    }
+
     // ———————— 工具声明（风险真相源 + schema 钉死） ————————
 
     #[test]
@@ -1141,13 +1340,14 @@ mod tests {
         assert_eq!(s["type"], json!("object"));
         assert_eq!(s["required"], json!(["command"]), "只有 command 必填");
         let props = s["properties"].as_object().expect("properties 必须是对象");
-        // serde_json 的 Map 按键序排列：比较**排序后**的键集 = 「恰好这四键，多一个少一个都算错」。
+        // serde_json 的 Map 按键序排列：比较**排序后**的键集 = 「恰好这些键，多一个少一个都算错」。
+        // G10 起新增 background / task_id（后台执行与查询）。
         let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["command", "cwd", "shell_id", "timeout_ms"],
-            "schema 与 spec §5.1 逐键对齐"
+            vec!["background", "command", "cwd", "shell_id", "task_id", "timeout_ms"],
+            "schema 与 spec §5.1 + G10 逐键对齐"
         );
         assert_eq!(props["timeout_ms"]["minimum"], json!(1));
         assert!(

@@ -116,6 +116,14 @@ impl ContextBuilder {
         self.tool_tokens = tokens;
     }
 
+    /// G16：取回装配时的配置副本（子代理的 `LoopRunner` 要用同一份预算/滑窗起
+    /// 子会话）。`ContextConfig` 是纯数据 Clone —— 返回副本而不是引用，调用方
+    /// 拿去就能用；builder 内部状态（calibration/memory_notes）不在其中，
+    /// 那些是本轮装配的运行时状态，不属于「配置」。
+    pub fn config(&self) -> ContextConfig {
+        self.cfg.clone()
+    }
+
     /// 用真实 usage 校准粗估系数：**factor 的语义是 `真实 ÷ 粗估`**，
     /// 因为 `est = 粗估 × calibration`（spec :362）。端点实际比粗估省 token → factor < 1；
     /// 反过来接成 `粗估 ÷ 真实` 不会报错，只会让估算一直朝危险的方向偏。
@@ -547,6 +555,27 @@ fn turn_start_indices(conv: &[&Message]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G16：config() 取回的副本与装配时逐字段一致 —— 子代理的 LoopRunner 靠它
+    /// 复用同一份预算/滑窗；builder 的运行时状态（calibration/memory_notes）不在其中。
+    #[test]
+    fn config_returns_the_assembled_copy() {
+        let cfg = ContextConfig {
+            budget_tokens: 12_345,
+            window_messages: 7,
+            system_prompt: "人设".into(),
+            ..ContextConfig::default()
+        };
+        let mut b = ContextBuilder::new(cfg.clone());
+        b.set_calibration(1.5); // 运行时状态：不许混进 config()
+        b.set_memory_notes(vec!["备注".into()]);
+        let got = b.config();
+        assert_eq!(got.budget_tokens, cfg.budget_tokens, "副本必须等于装配时的那份配置");
+        assert_eq!(got.window_messages, cfg.window_messages);
+        assert_eq!(got.system_prompt, cfg.system_prompt);
+        assert_eq!(got.reserve_output, cfg.reserve_output);
+        assert_eq!(got.compact_threshold, cfg.compact_threshold);
+    }
 
     /// G05：溢出收缩 = 预算与滑窗各减半，且有下限（不无限收缩）。
     #[test]

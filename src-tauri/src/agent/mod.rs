@@ -8,5 +8,7 @@ pub mod context;
 pub mod events;
 pub mod memory;
 pub mod session;
+// G16：task 子代理的运行器（`SubagentRunner` 的实现面）；trait 接缝在 tools 层。
+pub(crate) mod task;
 pub mod summarize;
 pub mod types;

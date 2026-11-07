@@ -46,6 +46,17 @@ pub enum AgentEvent {
         id: String,
         decision: Decision,
     },
+    /// G20：模型向用户提出的多选题（question 工具发出）。**问题经 `ToolCtx.events`
+    /// 直接发出，不经权限门——提问不是执行**（工具本身是 Read 档，出站只有这一条
+    /// 事件）。`id` 是应答回执键：工具侧挂起表按它登记 oneshot，前端把用户的选择
+    /// 经 ipc 的 `question_respond(id, choice)` 送回，execute 在 `用户选择了：{choice}`
+    /// 里拿到答案回到对话。位置排在权限对之后、tool_result 之前：提问发生在一次
+    /// 工具执行的**中途**，它的结果（工具卡）随后才到。
+    Question {
+        id: String,
+        question: String,
+        options: Vec<String>,
+    },
     ToolResult {
         call_id: String,
         is_error: bool,
@@ -363,7 +374,7 @@ mod tests {
         );
     }
 
-    /// 钉住全部 11 个事件的 `t` 标签：本任务的交付物就是线上格式，不能只测两个变体。
+    /// 钉住全部 13 个事件的 `t` 标签：本任务的交付物就是线上格式，不能只测两个变体。
     #[test]
     fn every_agent_event_variant_serializes_its_t_tag() {
         let call = ToolCallView {
@@ -383,6 +394,11 @@ mod tests {
             AgentEvent::PermissionResolved {
                 id: "p1".into(),
                 decision: Decision::allow(Scope::Once),
+            },
+            AgentEvent::Question {
+                id: "q1".into(),
+                question: String::new(),
+                options: Vec::new(),
             },
             AgentEvent::ToolResult {
                 call_id: "c1".into(),
@@ -416,6 +432,7 @@ mod tests {
             "tool_call",
             "permission_request",
             "permission_resolved",
+            "question",
             "tool_result",
             "usage",
             "context_compacted",
@@ -425,8 +442,8 @@ mod tests {
         ];
         assert_eq!(
             (events.len(), tags.len()),
-            (12, 12),
-            "AgentEvent 有 12 个变体，标签表必须一一对应；新增事件要同步补进这张表"
+            (13, 13),
+            "AgentEvent 有 13 个变体，标签表必须一一对应；新增事件要同步补进这张表"
         );
         for (e, tag) in events.iter().zip(tags) {
             let v = serde_json::to_value(e).unwrap();
@@ -437,7 +454,8 @@ mod tests {
     /// R160（F9 欠的债）：上面那条只断言 `v["t"]`，**嵌套层从来没有生产侧守卫** ——
     /// `tool_call.call{id,name,risk,input}`、`ContentBlock` 的 `type` 标签、`ToolOutput` 的
     /// `kind` 标签、`Decision` 手写的两个可选键（R98），目前全靠 T14 读一遍 Rust 源码。
-    /// 这里对 11 个变体各取实例，`to_value` 后与 `json!` 字面量**整块相等**：
+    /// 这里对 12 个变体各取实例（memory_saved 仍缺，见函数体内的欠账注释），
+    /// `to_value` 后与 `json!` 字面量**整块相等**：
     /// 改名、挪层、加 `flatten` 都会打红，而逐字段取值比较对这三件事是聋的。
     /// `permission_resolved` 破例给三份 decision —— `Deny` 的 `scope` 是**缺席**而不是
     /// `null`，`Allow` 的 `reason` 同理，这是全事件里唯一有可选键的地方。
@@ -554,6 +572,19 @@ mod tests {
                         "decision": { "allow": false, "reason": "用户拒绝" } }),
             ),
             (
+                // question 的全形状：id/question/options 三个键平铺在顶层，options 是
+                // 字符串数组 —— 前端按它渲染候选按钮，嵌套一层都会破坏镜像。
+                AgentEvent::Question {
+                    id: "q1".into(),
+                    question: "选哪个方案？".into(),
+                    options: vec!["方案一".into(), "方案二".into()],
+                },
+                json!({
+                    "t": "question", "id": "q1", "question": "选哪个方案？",
+                    "options": ["方案一", "方案二"]
+                }),
+            ),
+            (
                 AgentEvent::ToolResult {
                     call_id: "c1".into(),
                     is_error: false,
@@ -600,8 +631,10 @@ mod tests {
                 json!({ "t": "done", "stop_reason": "end_turn" }),
             ),
         ];
-        // 13 条 = 11 个变体 + `permission_resolved` 的另外两份 decision。
+        // 14 条 = 12 个有全形状样本的变体 + `permission_resolved` 的另外两份 decision。
         // 这条去重断言是「别漏变体」的守卫：新增事件而不在这里补形状，红的是这里。
+        // （memory_saved 至今没有全形状样本，是历史欠账 —— 补齐时应把下面的字面量
+        // 改成变体总数，并把本注释删掉。）
         let mut seen: Vec<&str> = cases
             .iter()
             .filter_map(|(_, want)| want["t"].as_str())
@@ -610,8 +643,8 @@ mod tests {
         seen.dedup();
         assert_eq!(
             seen.len(),
-            11,
-            "11 个变体必须各有至少一份全形状样本，漏一个就等于那一支的嵌套层没上锁"
+            12,
+            "每个在这里列出的 t 必须有全形状样本；新增事件漏补 = 那一支的嵌套层没上锁"
         );
         for (e, want) in &cases {
             assert_eq!(

@@ -150,9 +150,8 @@ impl Tool for GlobTool {
         roots.dedup();
 
         let mut files: Vec<PathBuf> = Vec::new();
-        let mut skipped = 0usize; // collect_files 的签名带它（grep 用于二进制报数）；glob 不消费
         for root in &roots {
-            collect_files(root, &mut files, &mut skipped);
+            collect_files(root, &mut files);
         }
         // 模式匹配的是「相对搜索起点的路径」：`**/*.rs` 从 root 出发才算得对。
         let mut hits: BTreeSet<PathBuf> = BTreeSet::new();
@@ -182,12 +181,14 @@ impl Tool for GlobTool {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        // 汇总与提示放最前（与 grep 同一布局：预览截断时提示必须还在）。
+        let mut head = format!("共 {} 个文件", hits.len());
         if truncated_by_cap {
-            text.push_str(&format!(
-                "\n[已达 {MAX_RESULTS} 条上限，结果被截断；请收窄 pattern]"
-            ));
+            head.push_str("；[已达上限，结果被截断，请收窄 pattern]");
         }
-        text.push_str(&format!("\n共 {} 个文件", hits.len()));
+        text = format!("{head}\n{text}");
+        // G09：超长输出截断 + 完整内容落盘（.lfttdo/outputs/）。
+        let text = crate::tools::output_bound::bound_tool_output(text, ctx);
         Ok(ToolOutput::Text { text })
     }
 }
@@ -217,6 +218,8 @@ mod tests {
             write_root: None,
             skills_dir: None,
             skills_disabled: vec![],
+            subagents: None,
+            events: None,
         }
     }
 

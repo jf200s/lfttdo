@@ -142,6 +142,8 @@ mod tests {
             roots: Vec::new(),
             skills_dir: None,
             skills_disabled: Vec::new(),
+            subagents: None,
+            events: None,
         }
     }
 
