@@ -18,6 +18,10 @@ pub const NAME: &str = "task";
 pub trait SubagentRunner: Send + Sync {
     /// 跑完一段自主工作，返回子代理的最终文本。
     ///
+    /// · `prompt`：交给子代理的任务描述（子会话是独立 history，只能看到这段话）。
+    /// · `agent`：G22 可选的档案名（如 `explore`）。实现方在自己的档案表里查找：
+    ///   找到 ⇒ 子会话换成该档案的人设与工具白名单（受限子代理）；`None` ⇒ 默认
+    ///   全工具子代理。名字在表里找不到 ⇒ 明确报错（fail-closed，不许静默回落）。
     /// · `ctx`：文件作用域（roots/write_root）与子代理一致 —— 子代理能碰的目录
     ///   就是父会话能碰的目录，不另开权限。
     /// · `cancel`：父会话的取消令牌。**父停 = 子停**：实现方必须把它接到子会话的
@@ -25,6 +29,7 @@ pub trait SubagentRunner: Send + Sync {
     async fn run(
         &self,
         prompt: String,
+        agent: Option<String>,
         ctx: &ToolCtx,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError>;
@@ -55,6 +60,11 @@ impl Tool for TaskTool {
                         "type": "string",
                         "minLength": 1,
                         "description": "交给子代理的任务描述（它看不到你这里的对话，只能看到这段话）"
+                    },
+                    "agent": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "可选：按设置里的 agent 档案名（如 explore）派一个受限子代理——它只带该档案的提示词与工具白名单。不填则用全工具集的默认子代理。"
                     }
                 },
                 "required": ["prompt"]
@@ -77,9 +87,19 @@ impl Tool for TaskTool {
         if prompt.is_empty() {
             return Err(ToolError::Failed(EMPTY_PROMPT_NOTE.into()));
         }
+        // G22：agent 是可选参数 —— 空白视作未点名（与 prompt 同一 trim 语义），
+        // 否则原样透传；档案表在实现方（agent 层），tools 层只搬运名字。
+        let agent = input
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         // 取消令牌就是 ctx.cancel（会话每轮现构 ToolCtx 时填的正是自己的令牌）——
         // 两个参数在这里指同一个令牌，签名分开是为了让实现方不必从 ctx 里「猜」。
-        let result = runner.run(prompt.to_string(), ctx, &ctx.cancel).await?;
+        let result = runner
+            .run(prompt.to_string(), agent, ctx, &ctx.cancel)
+            .await?;
         Ok(ToolOutput::text(result))
     }
 }
@@ -89,26 +109,31 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    /// 记录型 runner：记下收到的 prompt，回一句固定文本。
+    /// 记录型 runner：记下收到的 `(prompt, agent)`，回一句固定文本。
     #[derive(Default)]
-    struct RecordingRunner(Arc<Mutex<Vec<String>>>);
+    struct RecordingRunner(Arc<Mutex<Vec<(String, Option<String>)>>>);
 
     #[async_trait]
     impl SubagentRunner for RecordingRunner {
         async fn run(
             &self,
             prompt: String,
+            agent: Option<String>,
             _ctx: &ToolCtx,
             _cancel: &CancellationToken,
         ) -> Result<String, ToolError> {
-            self.0.lock().unwrap().push(prompt);
+            self.0.lock().unwrap().push((prompt, agent));
             Ok("子结果".to_string())
         }
     }
 
     impl RecordingRunner {
         fn prompts(&self) -> Vec<String> {
-            self.0.lock().unwrap().clone()
+            self.0.lock().unwrap().iter().map(|(p, _)| p.clone()).collect()
+        }
+
+        fn agents(&self) -> Vec<Option<String>> {
+            self.0.lock().unwrap().iter().map(|(_, a)| a.clone()).collect()
         }
     }
 
@@ -138,6 +163,8 @@ mod tests {
         assert_eq!(m.input_schema["type"], "object");
         assert_eq!(m.input_schema["properties"]["prompt"]["type"], "string");
         assert_eq!(m.input_schema["properties"]["prompt"]["minLength"], 1);
+        // G22：agent 是**可选**参数 —— 声明给模型，但不进 required（不点名 = 默认子代理）。
+        assert_eq!(m.input_schema["properties"]["agent"]["type"], "string");
         assert_eq!(m.input_schema["required"], json!(["prompt"]));
     }
 
@@ -186,9 +213,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runner.prompts(), vec!["去查 X".to_string()], "trim 后透传");
+        assert_eq!(runner.agents(), vec![None], "不点名 agent = None");
         match out {
             ToolOutput::Text { text } => assert_eq!(text, "子结果"),
             other => panic!("应当是纯文本输出：{other:?}"),
         }
+    }
+
+    /// G22：agent 入参原样透传给 runner；空白（含缺省）视作未点名 —— trim 语义与
+    /// prompt 一致，「点名了空档案名」和「没点名」必须是同一个事实。
+    #[tokio::test]
+    async fn the_agent_parameter_reaches_the_runner_verbatim() {
+        let runner = Arc::new(RecordingRunner::default());
+        let ctx = ctx_with(Some(runner.clone()));
+        for input in [
+            json!({"prompt": "查", "agent": "explore"}),
+            json!({"prompt": "查", "agent": "  explore "}),
+            json!({"prompt": "查", "agent": ""}),
+            json!({"prompt": "查"}),
+        ] {
+            TaskTool.execute(input, &ctx).await.expect("合法入参必须成功");
+        }
+        assert_eq!(
+            runner.agents(),
+            vec![
+                Some("explore".to_string()),
+                Some("explore".to_string()),
+                None,
+                None
+            ],
+            "agent 透传（trim）与空白归 None：{:?}",
+            runner.agents()
+        );
     }
 }

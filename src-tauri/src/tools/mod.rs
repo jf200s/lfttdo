@@ -1,6 +1,7 @@
 // 工具层与 Tauri 无关：本模块树下不得 `use tauri`（Plan A 约束，同 `agent/mod.rs`）。
 pub mod echo;
 pub mod edit_file;
+pub mod experiment;
 pub mod fetch;
 pub mod fetch_guard;
 pub mod glob;
@@ -19,4 +20,5 @@ pub mod todo;
 pub mod undo;
 pub mod use_skill;
 pub mod websearch;
+pub mod workflow;
 pub mod write_file;

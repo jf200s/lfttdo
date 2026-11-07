@@ -81,6 +81,29 @@ pub enum AgentEvent {
     MemorySaved {
         count: usize,
     },
+    /// G26：工作流单步进度（`workflow` 工具的 run 循环发出）。每步**开始前**发
+    /// `Running`，成功后发 `Done`，失败（含用户取消）发 `Failed` 后照旧返回错误。
+    /// `index` 1 起始、`total` 是步总数 —— 前端据此渲染「步骤 i/N」通知条。
+    /// 事件经 `ToolCtx.events` 发出，`None`（headless 会话）静默不发：进度是
+    /// 观察面不是执行面，工作流照跑不误。
+    WorkflowStep {
+        workflow: String,
+        step: String,
+        index: u32,
+        total: u32,
+        status: StepStatus,
+    },
+    /// G27：实验复跑进度（`experiment` 工具的 repeat 循环每次复跑完成后发出）。
+    /// `repeat` 是当次序号（1 起始）、`of` 是总复跑次数；`command_tail` 是基准
+    /// 命令的末 60 字符，`metrics` 是当次解析出的指标对象（没解析到 METRIC 时为
+    /// `null` —— 缺席与空对象在线上都辨不出「没跑」，null 才是「这一次没有指标」）。
+    /// 同 `WorkflowStep`：经 `ToolCtx.events`，`None` 静默。
+    ExperimentRun {
+        command_tail: String,
+        repeat: u32,
+        of: u32,
+        metrics: serde_json::Value,
+    },
     Error {
         #[serde(rename = "where")]
         at: ErrorWhere,
@@ -138,6 +161,16 @@ pub enum StopReason {
     MaxTurns,
     Interrupted,
     Error,
+}
+
+/// G26：工作流步骤的三态（`WorkflowStep.status`）。线上小写（`lowercase`），
+/// 与 `Risk`/`ErrorWhere` 同一条 rename 纪律。
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StepStatus {
+    Running,
+    Done,
+    Failed,
 }
 
 /// 只有两个无字段变体，derive 的 `Deserialize` 与手写的 `Serialize` 是同一个映射表，
@@ -270,6 +303,15 @@ mod tests {
         assert_eq!(serde_json::to_string(&Risk::Read).unwrap(), r#""read""#);
     }
 
+    /// G26：StepStatus 三态线上小写 —— 前端按它渲染（进行中/完成/失败），
+    /// 改名会让通知条的三种状态一起哑掉。
+    #[test]
+    fn step_status_is_lowercase_on_the_wire() {
+        assert_eq!(serde_json::to_string(&StepStatus::Running).unwrap(), r#""running""#);
+        assert_eq!(serde_json::to_string(&StepStatus::Done).unwrap(), r#""done""#);
+        assert_eq!(serde_json::to_string(&StepStatus::Failed).unwrap(), r#""failed""#);
+    }
+
     #[test]
     fn decision_allow_carries_scope() {
         let d = Decision::allow(Scope::Session);
@@ -374,7 +416,7 @@ mod tests {
         );
     }
 
-    /// 钉住全部 13 个事件的 `t` 标签：本任务的交付物就是线上格式，不能只测两个变体。
+    /// 钉住全部 15 个事件的 `t` 标签：本任务的交付物就是线上格式，不能只测两个变体。
     #[test]
     fn every_agent_event_variant_serializes_its_t_tag() {
         let call = ToolCallView {
@@ -416,6 +458,19 @@ mod tests {
                 summary_chars: 0,
             },
             AgentEvent::MemorySaved { count: 0 },
+            AgentEvent::WorkflowStep {
+                workflow: String::new(),
+                step: String::new(),
+                index: 0,
+                total: 0,
+                status: StepStatus::Running,
+            },
+            AgentEvent::ExperimentRun {
+                command_tail: String::new(),
+                repeat: 0,
+                of: 0,
+                metrics: serde_json::Value::Null,
+            },
             AgentEvent::Error {
                 at: ErrorWhere::Model,
                 message: String::new(),
@@ -437,13 +492,15 @@ mod tests {
             "usage",
             "context_compacted",
             "memory_saved",
+            "workflow_step",
+            "experiment_run",
             "error",
             "done",
         ];
         assert_eq!(
             (events.len(), tags.len()),
-            (13, 13),
-            "AgentEvent 有 13 个变体，标签表必须一一对应；新增事件要同步补进这张表"
+            (15, 15),
+            "AgentEvent 有 15 个变体，标签表必须一一对应；新增事件要同步补进这张表"
         );
         for (e, tag) in events.iter().zip(tags) {
             let v = serde_json::to_value(e).unwrap();
@@ -454,7 +511,7 @@ mod tests {
     /// R160（F9 欠的债）：上面那条只断言 `v["t"]`，**嵌套层从来没有生产侧守卫** ——
     /// `tool_call.call{id,name,risk,input}`、`ContentBlock` 的 `type` 标签、`ToolOutput` 的
     /// `kind` 标签、`Decision` 手写的两个可选键（R98），目前全靠 T14 读一遍 Rust 源码。
-    /// 这里对 12 个变体各取实例（memory_saved 仍缺，见函数体内的欠账注释），
+    /// 这里对 14 个变体各取实例（memory_saved 仍缺，见函数体内的欠账注释），
     /// `to_value` 后与 `json!` 字面量**整块相等**：
     /// 改名、挪层、加 `flatten` 都会打红，而逐字段取值比较对这三件事是聋的。
     /// `permission_resolved` 破例给三份 decision —— `Deny` 的 `scope` 是**缺席**而不是
@@ -625,13 +682,56 @@ mod tests {
                 json!({ "t": "error", "where": "mcp", "message": "spawn 失败", "fatal": true }),
             ),
             (
+                // workflow_step 的全形状：五键平铺在顶层，status 是 StepStatus 的
+                // 小写线上名 —— 嵌套枚举整块相等才守得住。
+                AgentEvent::WorkflowStep {
+                    workflow: "调研流水".into(),
+                    step: "第一步".into(),
+                    index: 1,
+                    total: 3,
+                    status: StepStatus::Running,
+                },
+                json!({
+                    "t": "workflow_step", "workflow": "调研流水", "step": "第一步",
+                    "index": 1, "total": 3, "status": "running"
+                }),
+            ),
+            (
+                // experiment_run 的全形状：metrics 是当次解析的对象（键=指标名，
+                // 值=数字）。没有解析到 METRIC 的那次是 `"metrics": null` 而不是
+                // `{}` 或缺键（缺席与空对象都辨不出「这一次没跑出指标」），单列一份。
+                AgentEvent::ExperimentRun {
+                    command_tail: "echo METRIC time=5".into(),
+                    repeat: 1,
+                    of: 3,
+                    metrics: json!({ "time": 5.0 }),
+                },
+                json!({
+                    "t": "experiment_run", "command_tail": "echo METRIC time=5",
+                    "repeat": 1, "of": 3, "metrics": { "time": 5.0 }
+                }),
+            ),
+            (
+                AgentEvent::ExperimentRun {
+                    command_tail: "echo hi".into(),
+                    repeat: 2,
+                    of: 2,
+                    metrics: serde_json::Value::Null,
+                },
+                json!({
+                    "t": "experiment_run", "command_tail": "echo hi",
+                    "repeat": 2, "of": 2, "metrics": null
+                }),
+            ),
+            (
                 AgentEvent::Done {
                     stop_reason: StopReason::EndTurn,
                 },
                 json!({ "t": "done", "stop_reason": "end_turn" }),
             ),
         ];
-        // 14 条 = 12 个有全形状样本的变体 + `permission_resolved` 的另外两份 decision。
+        // 17 条 = 14 个有全形状样本的变体 + `permission_resolved` 的另外两份 decision
+        // + `experiment_run` 的空 metrics 那一份。
         // 这条去重断言是「别漏变体」的守卫：新增事件而不在这里补形状，红的是这里。
         // （memory_saved 至今没有全形状样本，是历史欠账 —— 补齐时应把下面的字面量
         // 改成变体总数，并把本注释删掉。）
@@ -643,7 +743,7 @@ mod tests {
         seen.dedup();
         assert_eq!(
             seen.len(),
-            12,
+            14,
             "每个在这里列出的 t 必须有全形状样本；新增事件漏补 = 那一支的嵌套层没上锁"
         );
         for (e, want) in &cases {

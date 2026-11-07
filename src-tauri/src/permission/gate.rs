@@ -384,18 +384,35 @@ pub(crate) fn scope_of(name: &str, input: &serde_json::Value) -> String {
     "read".to_string()
 }
 
-/// G14：把 Exec 的 `command` 按 shell 的顺序连接符切段 —— `&&`、`||`、`;`、`|`、换行。
+/// G14/G28：把 Exec 的 `command` 按 shell 的命令连接符切段 —— `&&`、`&`、`||`、
+/// `;`、`|`、换行。
 /// 切段规则：
-/// · 双字符分隔符（`&&`/`||`）先于单字符判定 —— `||` 不许被切成两次 `|`；
-/// · 单个 `&` **不是**分隔符（规格只列了 `&&`/`||`/`;`/`|`/换行；后台运行的 `&`
-///   是另一层语义，这里不替工具层做主）；
+/// · 双字符分隔符（`&&`/`||`）先于单字符判定 —— `||` 不许被切成两次 `|`，
+///   `&&` 不许被切成两次 `&`；
+/// · 单个 `&` **也是分隔符**（G28）：它在 bash/POSIX 里是后台执行（`A & B` = A
+///   后台、B 顺序，**两条都会跑**），在 cmd.exe 里是顺序连接（`A & B` 两条都跑，
+///   还是 cmd 最常用的连接符）—— 两个平台语义不同，但「多条命令都会执行」这一点
+///   相同，权限判定就必须逐段。不切的话 `git status & rm -rf /x` 整段被 `git *`
+///   通配 allow，rm 段的 deny 被绕过（G28 前的真实缝隙，临时测试确认过）。
+///   `&` 与 `&&` 混用（`a & b && c`）按字符流自然处理：`&&` 先判成一段分隔符，
+///   落单的 `&` 再切 —— 三段；
 /// · 引号（`'`/`"`）内的分隔符**不切** —— `echo "a; b"` 是一段：规则匹配不该把
-///   引号里的文本当成新命令。已知 MVP 简化：只按字面字符做引号配对，不做 `\` 转义
+///   引号里的文本当成新命令（URL 里的 `&` 同理，`curl "http://x?a=1&b=2"` 不被
+///   切碎）。已知 MVP 简化：只按字面字符做引号配对，不做 `\` 转义
 ///   语义（`\"` 会提前闭合引号）—— 误切的后果由折叠兜住（切出的段各自过规则，
 ///   落 deny 或默认路径，都不会静默放行）；
 /// · 每段 trim；trim 后为空的段丢弃 —— `git status && ` 的悬挂分隔符不产生幽灵段
 ///   （空段会被 `*` 这类模式意外命中，等于给没写的命令造出判定）。
 /// 空输入 / 纯分隔符返回空表（调用方决定空表的语义，见 `check` 的回落分支）。
+///
+/// # 已知边界（G28 盘点，均为安全侧）
+///
+/// · **powershell 5.1 不支持 `&&`**（PS7 才有）：在那里整条命令语法错误、什么都不
+///   执行 = 失败侧（safe），不产生绕过；
+/// · PowerShell 的反引号 `` ` `` 续行**不识别**：反引号+换行的两条命令被当整段
+///   保留，落默认路径（弹窗/headless deny）= 安全侧；
+/// · cmd 的 `^` 转义**不识别**：`^&` 这种被转义的字面 `&` 仍会切段 —— 误切的段
+///   各自过规则，落 deny 或默认路径，不会静默放行（与引号配对的 MVP 简化同一兜底）。
 pub(crate) fn split_command_segments(command: &str) -> Vec<String> {
     let mut segments: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -436,7 +453,9 @@ pub(crate) fn split_command_segments(command: &str) -> Vec<String> {
                 chars.next();
                 segments.push(std::mem::take(&mut current));
             }
-            ';' | '|' | '\n' => segments.push(std::mem::take(&mut current)),
+            // G28：落单的 `&` 同样切段（bash 后台 / cmd 顺序连接 —— 两条都会跑）。
+            // 守卫臂没接住的 `&` 流到这里，`a & b && c` 的混用因此按字符流自然三段。
+            '&' | ';' | '|' | '\n' => segments.push(std::mem::take(&mut current)),
             _ => current.push(c),
         }
     }
@@ -574,7 +593,8 @@ impl PermissionGate {
         // 「都允许」静默推翻（与上面 Block 压过会话放行同一取向：显式配置 > 会话内授权）。
         // 规则 Allow 只给 `Scope::Once`，且不 remember_session：规则是常驻策略，每次调用
         // 都由规则自己判定，不需要也不该变成一次会话级买断。
-        // 匹配串（G14 分段）：Exec 的 `command` 按 shell 连接符（&&/||/;/|/换行）切段后
+        // 匹配串（G14 分段）：Exec 的 `command` 按 shell 连接符（&&/&/||/;/|/换行，
+        // G28 起单 & 也切 —— bash 后台 / cmd 顺序连接都跑多条命令）切段后
         // **逐段**判定 —— `git status && rm -rf /x` 里 git 段的 allow 不带过 rm 段；
         // 其余工具没有「段」，给单元素空串表，判定与 G13 逐字相同（裸字符串规则靠
         // 「pattern == 工具名」命中，见 `matching_rule`）。
@@ -1723,8 +1743,8 @@ mod tests {
 
     // ───────────────────────── G14：run_command 分段匹配 ─────────────────────────
 
-    /// 分段器覆盖规格点名的全部分隔符：&&、;、|、||（不许切成两次 |）、换行；
-    /// 无分隔符 = 单段；分隔符两侧多空格 trim；悬挂分隔符不产生空段；单个 & 不切。
+    /// 分段器覆盖规格点名的全部分隔符：&&、&（G28）、;、|、||（不许切成两次 |）、换行；
+    /// 无分隔符 = 单段；分隔符两侧多空格 trim；悬挂分隔符不产生空段。
     #[test]
     fn split_command_segments_covers_every_spec_delimiter() {
         assert_eq!(
@@ -1766,8 +1786,8 @@ mod tests {
         );
         assert_eq!(
             split_command_segments("sleep 5 & echo done"),
-            vec!["sleep 5 & echo done"],
-            "单个 & 不在分隔符清单里（&& 才是），不切"
+            vec!["sleep 5", "echo done"],
+            "单个 & 也是分隔符（G28：bash 后台 / cmd 顺序连接都跑两条命令）"
         );
         assert_eq!(
             split_command_segments("a && b || c; d | e\necho f"),
@@ -1801,6 +1821,28 @@ mod tests {
             split_command_segments("echo \"unterminated; ls"),
             vec!["echo \"unterminated; ls"],
             "未闭合引号：整段保留，落到默认路径而不是猜着切"
+        );
+    }
+
+    /// G28：单 `&` 切分与引号内 `&` 不切的分界 —— URL 查询串是单 `&` 最常见的
+    /// 藏身处，规则匹配不该把它看成两条命令；引号外的落单 `&` 照切，与 `&&`
+    /// 混用时按字符流自然处理（`&&` 先判成一段分隔符，落单的 `&` 再切）。
+    #[test]
+    fn a_single_ampersand_splits_outside_quotes_and_stays_whole_inside() {
+        assert_eq!(
+            split_command_segments(r#"curl "http://x?a=1&b=2""#),
+            vec![r#"curl "http://x?a=1&b=2""#],
+            "引号内的 `&` 不切（URL 查询串）：一条 curl 就是一段"
+        );
+        assert_eq!(
+            split_command_segments("a & b && c"),
+            vec!["a", "b", "c"],
+            "`&` 与 `&&` 混用按字符流自然处理：&& 先判，落单的 & 再切 —— 三段"
+        );
+        assert_eq!(
+            split_command_segments("sleep 5 && echo done & tail -f log"),
+            vec!["sleep 5", "echo done", "tail -f log"],
+            "结尾落单的 & 也切：bash 后台语义下后段照跑，权限判定逐段"
         );
     }
 
@@ -1918,6 +1960,80 @@ mod tests {
         assert!(
             matches!(&d, Decision::Deny { reason } if reason.contains("权限规则")),
             "整工具 deny 不许因 command 字段缺失而漏成弹窗：{d:?}"
+        );
+    }
+
+    /// G28 验收语义（门级）：单 `&` 连接的组合命令同样**逐段**判定 —— bash 的
+    /// 后台执行（`A & B` 两条都会跑）与 cmd.exe 的顺序连接（`A & B` 两条都会跑，
+    /// 且是 cmd 最常用的连接符）都不许让前段 allow 带过后段。修复前单 `&` 不切，
+    /// `git status & rm -rf /x` 整段被 `git *` 通配 allow，rm 段的 deny 被绕过
+    /// （临时测试确认过实得 `Allow{Once}`）。
+    #[tokio::test]
+    async fn a_single_ampersand_combo_does_not_bypass_a_deny_segment() {
+        let sink = Arc::new(VecSink::default());
+        let gate = PermissionGate::new().with_sink(sink.clone());
+        gate.set_rules_from_json(&json!({
+            "run_command": [
+                {"pattern": "git *", "action": "allow"},
+                {"pattern": "rm *", "action": "deny"}
+            ]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "run_command".into(),
+            risk: Risk::Exec,
+            input: json!({"command": "git status & rm -rf /x"}),
+        };
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert!(
+            matches!(&d, Decision::Deny { reason }
+                if reason.contains("权限规则") && reason.contains("rm *") && reason.contains("rm -rf /x")),
+            "单 & 组合命令里 deny 段要拦下整条，理由点名段与规则：{d:?}"
+        );
+        assert!(sink.events().is_empty(), "规则 deny 不弹窗，直接拒");
+    }
+
+    /// G28：全部段都命中 allow → 整体放行（单 `&` 不改变 allow 折叠语义）。
+    #[tokio::test]
+    async fn all_allow_segments_survive_a_single_ampersand_combo() {
+        let sink = Arc::new(VecSink::default());
+        let gate = PermissionGate::new().with_sink(sink.clone());
+        gate.set_rules_from_json(&json!({
+            "run_command": [{"pattern": "git *", "action": "allow"}]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "run_command".into(),
+            risk: Risk::Exec,
+            input: json!({"command": "git status & git log"}),
+        };
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert_eq!(d, Decision::allow(Scope::Once), "{d:?}");
+        assert!(sink.events().is_empty(), "规则 allow 不弹窗");
+    }
+
+    /// G28：allow 段 + 未命中段 → 落默认路径（单 `&` 同 `;`/`&&`：allow 前缀
+    /// 带不过没有任何规则覆盖的段）。headless 下默认路径 = deny(没有可应答的界面)。
+    #[tokio::test]
+    async fn a_single_ampersand_combo_with_an_uncovered_segment_falls_back_to_default() {
+        let gate = PermissionGate::new();
+        gate.set_rules_from_json(&json!({
+            "run_command": [{"pattern": "echo *", "action": "allow"}]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "run_command".into(),
+            risk: Risk::Exec,
+            input: json!({"command": "echo a & npm test"}),
+        };
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert!(
+            matches!(&d, Decision::Deny { reason }
+                if reason.contains("没有可应答的界面") && !reason.contains("权限规则")),
+            "allow 段 + 未命中段必须落默认路径（headless deny），不许被 allow 带过去：{d:?}"
         );
     }
 }

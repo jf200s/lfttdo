@@ -12,10 +12,12 @@ use crate::model::assistant_acc::AssistantAcc;
 use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider, ToolDef};
 use crate::permission::gate::PermissionGate;
 use crate::tools::edit_file;
+use crate::tools::experiment;
 use crate::tools::glob;
 use crate::tools::grep;
 use crate::tools::todo;
 use crate::tools::undo;
+use crate::tools::workflow;
 use crate::tools::read_file;
 use crate::tools::registry::{ToolCtx, ToolRegistry};
 use crate::tools::use_skill;
@@ -95,6 +97,12 @@ pub struct SessionConfig {
     /// G19：激活档案的名字（拒绝理由里点名「Agent「X」」用）。与 allowed_tools
     /// 同源同设（装配点一起给）；None 时拒绝理由退化为「当前 Agent」。
     pub active_agent_name: Option<String>,
+    /// G22：task 工具可点名的 agent 档案表（`task(agent:"explore")` 时在表里查找）。
+    /// 子代理的身份由 task 调用**显式点名**，父会话自己的 allowed_tools / 人设**不**
+    /// 自动传给子会话 —— 「审计员主会话」≠「审计员子代理」：主会话的白名单管的是
+    /// 主会话这一轮，子代理是谁、能干什么，是派活那一刻才定的事。Default 空表 =
+    /// 无档案可点名，task 的行为与从前逐字节一致。
+    pub agents: Vec<AgentProfile>,
 }
 
 impl Default for SessionConfig {
@@ -105,8 +113,22 @@ impl Default for SessionConfig {
             diagnostics_command: None,
             allowed_tools: None,
             active_agent_name: None,
+            agents: Vec::new(),
         }
     }
+}
+
+/// G22：task 工具可点名的子代理档案（OpenCode 的 explore/general 模式）。住 agent 层的
+/// **中性结构**，不放 settings.rs —— agent 层不许依赖 settings（Plan A 依赖方向），
+/// `AgentProfileJson → AgentProfile` 的映射归 ipc 装配层（`ipc.rs::agent_profiles`）。
+/// `prompt` 非空 ⇒ 子会话系统提示词整段替换（「只读调研员」这类人设）；
+/// `tools` 有表 ⇒ 子会话的工具白名单；两个 `None` 各自表示「不替换 / 不限制」。
+/// description（`AgentProfileJson` 里有）是给人看的档案说明，模型用不上，故不在此结构中。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentProfile {
+    pub name: String,
+    pub prompt: Option<String>,
+    pub tools: Option<Vec<String>>,
 }
 
 /// 会话的全部外部依赖，由装配点（Task 13）注入。每一项都是 `Arc`（`context` 除外），
@@ -238,6 +260,16 @@ fn filtered_tool_defs(
     }
     if !undo::usable_with_roots(roots) {
         tools.retain(|d| d.name != undo::NAME);
+    }
+    // G24：workflow 的定义面在 workspace 的 workflows/ 下（write_root/roots[0]），
+    // 没有工作目录时声明了也只会收到一句报错 —— 与 todo/undo 同一条隐藏判据。
+    if !workflow::usable_with_roots(roots) {
+        tools.retain(|d| d.name != workflow::NAME);
+    }
+    // G25：experiment 的命令与 git 都以 write_root/roots[0] 为 cwd，没有工作目录
+    // 时三个 action 全是死路 —— 同一条隐藏判据。
+    if !experiment::usable_with_roots(roots) {
+        tools.retain(|d| d.name != experiment::NAME);
     }
     if !has_skills {
         tools.retain(|d| d.name != use_skill::NAME);
@@ -387,12 +419,15 @@ impl AgentSession {
             skills_disabled: self.skills_disabled.clone(),
             // G16：子代理运行器 —— 用同一套 model/registry/gate/温度/预算起独立子会话
             // （agent/task.rs::LoopRunner）。文件作用域随 TaskTool 调用时的 ctx 传下去。
+            // G22：档案表从本会话的配置带下去 —— task 调用点名哪个档案（`task(agent:"explore")`），
+            // 子会话就换成哪个身份；表本身不自动传给子会话（孙代理不支持，取舍见 LoopRunner）。
             subagents: Some(Arc::new(crate::agent::task::LoopRunner {
                 model: self.deps.model.clone(),
                 registry: self.deps.registry.clone(),
                 gate: self.deps.gate.clone(),
                 temperature: self.deps.temperature,
                 context_cfg: self.deps.context.config(),
+                agents: self.cfg.agents.clone(),
             })),
             // G20：事件出口原样交给工具（question 发多选题用）。与上面同一份 sink，
             // 事件线只有一条；question 不经权限门，门与出口在这里就已分流。
@@ -2678,6 +2713,182 @@ mod tests {
         assert_every_request_paired(&rig);
     }
 
+    // ───────────────────────── G22：受限子代理（task 的 agent 档案） ─────────────────────────
+
+    /// G22 夹具：注册表恰好含 task + 两把「白名单外」的工具（write_file / run_command）
+    /// + 三把「白名单内」的（read_file / grep / glob），roots 指向真目录。
+    /// 「含/不含」的断言必须有真工具在场才有意义 —— 工具没注册的话「不含」是空真。
+    fn restricted_agent_rig(cfg: SessionConfig, rounds: Vec<Vec<ModelDelta>>, root: &Path) -> Rig {
+        let model = ScriptedModel::new(rounds);
+        let recorder = model.recorder.clone();
+        let sink = Arc::new(VecSink::default());
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(crate::tools::task::TaskTool));
+        registry.register(Arc::new(crate::tools::read_file::ReadFileTool));
+        registry.register(Arc::new(crate::tools::write_file::WriteFileTool));
+        registry.register(Arc::new(crate::tools::grep::GrepTool));
+        registry.register(Arc::new(crate::tools::glob::GlobTool));
+        registry.register(Arc::new(crate::tools::shell::ShellTool::new(Arc::new(
+            std::sync::RwLock::new(crate::tools::shell::ShellCatalog::from_parts(vec![], "")),
+        ))));
+        let gate = Arc::new(PermissionGate::new().with_sink(sink.clone()));
+        let session = AgentSession::new(SessionDeps {
+            model,
+            registry,
+            gate: gate.clone(),
+            sink: sink.clone(),
+            context: ContextBuilder::new(ContextConfig::default()),
+            temperature: None,
+        })
+        .with_roots(vec![root.to_path_buf()])
+        .with_config(cfg);
+        Rig {
+            session,
+            sink,
+            gate,
+            recorder,
+        }
+    }
+
+    /// 点名 `agent:"explore"` ⇒ 子会话换档案身份：system 含档案人设「只读调研员」，
+    /// 声明表含白名单内的 read_file、不含白名单外的 write_file / run_command；
+    /// 父子历史隔离与从前一致。三次请求 = 父1（task 调用）+ 子1 + 父2（收尾）。
+    #[tokio::test]
+    async fn a_task_agent_profile_swaps_the_child_session_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rig = restricted_agent_rig(
+            SessionConfig {
+                agents: vec![AgentProfile {
+                    name: "explore".into(),
+                    prompt: Some("你是只读调研员".into()),
+                    tools: Some(vec!["read_file".into(), "grep".into(), "glob".into()]),
+                }],
+                ..Default::default()
+            },
+            vec![
+                tool_round(
+                    1,
+                    &[("task", r#"{"prompt":"去查 X","agent":"explore"}"#)],
+                ),
+                deltas(&["子结果"]),
+                deltas(&["收尾"]),
+            ],
+            root.path(),
+        );
+        // task 是 Write 档：后台应答放行这 1 次弹窗（子会话只跑一轮文本，没有别的调用）。
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("派 explore 去查").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 3, "父1 + 子1 + 父2：{}", reqs.len());
+
+        // 子会话（第 2 次请求）的人设来自档案 prompt —— 整段替换生效。
+        let child = &reqs[1];
+        assert_eq!(child.messages[0].role, Role::System);
+        assert!(
+            child.messages[0].text_of().contains("你是只读调研员"),
+            "子会话 system 要含档案人设：{}",
+            child.messages[0].text_of()
+        );
+        // 工具白名单：名单内的在、名单外的不在（注册表里确实有那两把，见夹具注释）。
+        let names: Vec<&str> = child.tools.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            names.contains(&"read_file"),
+            "白名单内的 read_file 要在子会话声明表里：{names:?}"
+        );
+        for banned in ["write_file", "run_command"] {
+            assert!(
+                !names.contains(&banned),
+                "{banned} 不许进受限子会话的声明表：{names:?}"
+            );
+        }
+
+        // 历史隔离不变：子请求带 prompt、不带父的 user 原话。
+        let child_joined: String = child.messages.iter().map(|m| m.text_of()).collect();
+        assert!(
+            child_joined.contains("去查 X"),
+            "子请求要带上 prompt：{child_joined}"
+        );
+        assert!(
+            !child_joined.contains("派 explore 去查"),
+            "档案不改 task 的独立 history 语义：{child_joined}"
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    /// 点名一个不存在的档案 ⇒ 父的 ToolResult 是错误（含「没有这个 agent 档案」），
+    /// 子会话压根没被创建：总请求数 2，全是父的（fail-closed，绝不静默回落成全工具子代理）。
+    #[tokio::test]
+    async fn an_unknown_agent_name_fails_without_creating_a_child_session() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rig = restricted_agent_rig(
+            SessionConfig {
+                agents: vec![AgentProfile {
+                    name: "explore".into(),
+                    prompt: Some("你是只读调研员".into()),
+                    tools: Some(vec!["read_file".into()]),
+                }],
+                ..Default::default()
+            },
+            vec![
+                tool_round(
+                    1,
+                    &[("task", r#"{"prompt":"查一下","agent":"不存在"}"#)],
+                ),
+                deltas(&["收尾"]),
+            ],
+            root.path(),
+        );
+        // task 本身仍要过 Write 弹窗（拦截发生在档案查找**之后**的工具执行里）。
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("派一个不存在的档案").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 2, "父两次、无子请求：{}", reqs.len());
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].1 && results[0].2.contains("没有这个 agent 档案"),
+            "ToolResult 要是错误且点名档案缺失：{:?}",
+            results[0]
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    /// 回归：不点名 agent ⇒ 与现状一致 —— 子会话不吃任何白名单，
+    /// 声明表是注册表经 roots 过滤后的全量（write_file / run_command 都在）。
+    #[tokio::test]
+    async fn a_task_call_without_an_agent_keeps_the_full_toolset_child() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rig = restricted_agent_rig(
+            SessionConfig::default(),
+            vec![
+                tool_round(1, &[("task", r#"{"prompt":"去查 X"}"#)]),
+                deltas(&["子结果"]),
+                deltas(&["收尾"]),
+            ],
+            root.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("派子代理去查").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 3, "父1 + 子1 + 父2：{}", reqs.len());
+        let names: Vec<&str> = reqs[1].tools.iter().map(|d| d.name.as_str()).collect();
+        for expected in ["read_file", "write_file", "run_command"] {
+            assert!(
+                names.contains(&expected),
+                "无 agent 名 = 现状全量，{expected} 该在子会话声明表里：{names:?}"
+            );
+        }
+        assert!(
+            !reqs[1].messages[0].text_of().contains("你是只读调研员"),
+            "无档案时子会话沿用默认人设：{}",
+            reqs[1].messages[0].text_of()
+        );
+        assert_every_request_paired(&rig);
+    }
+
     // ───────────────────────── G18：诊断反馈 ─────────────────────────
 
     /// G18 夹具：只注册 write_file 的 rig；输出目录指向 out_dir（写工具唯一允许的
@@ -2712,6 +2923,17 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Windows 镜像夹具（与 unix 版同形状；Windows CI 上验证）：run_diagnostics 是
+    /// **直接 spawn**（按 whitespace 切 program+args，不经 shell），Windows 上最贴近
+    /// 的可执行形状是 .cmd 文件（std 的 Command 对 .bat/.cmd 走 cmd.exe 转发）——
+    /// 诊断反馈的逻辑跨平台，脚本形状平台各异（shebang+x 位 ↔ .cmd）。
+    #[cfg(windows)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
         path
     }
 
@@ -2846,6 +3068,102 @@ mod tests {
             4,
             "失败且无输出 = 没有诊断轮：{hist:?}"
         );
+        assert!(
+            hist.iter().all(|m| !m.text_of().contains("【自动诊断】")),
+            "不许把退出码编造成诊断文本"
+        );
+    }
+
+    // ───────────────── G18 的 Windows 镜像（逻辑跨平台；Windows CI 上验证） ─────────────────
+    // 脚本形状换成 .cmd（见 write_script 的 Windows 版）；断言与 unix 版逐条对应。
+
+    /// Windows 镜像：诊断脚本输出一行 ⇒【自动诊断】合成 user 轮照常落历史与请求。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_diagnostics_command_appends_a_synthetic_user_turn() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.cmd", "@echo error: missing semicolon");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![tool_round(1, &[("write_file", args.as_str())]), deltas(&["收到"])],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+
+        let hist = rig.session.history();
+        assert_eq!(hist.len(), 5, "合成 user 轮恰好多出一条：{hist:?}");
+        assert_eq!(hist[3].role, Role::User);
+        let diag_text = hist[3].text_of();
+        assert!(
+            diag_text.contains("【自动诊断】") && diag_text.contains("missing semicolon"),
+            "诊断轮要带标记与脚本输出：{diag_text}"
+        );
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 2);
+        let joined: String = reqs[1].messages.iter().map(|m| m.text_of()).collect();
+        assert!(
+            joined.contains("【自动诊断】") && joined.contains("missing semicolon"),
+            "第二次请求要带上诊断反馈：{joined}"
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    /// Windows 镜像：诊断命令成功但输出为空 ⇒ 不追加任何消息。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_empty_diagnostics_output_appends_nothing() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.cmd", "@exit /b 0");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![tool_round(1, &[("write_file", args.as_str())]), deltas(&["收到"])],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+        let hist = rig.session.history();
+        assert_eq!(
+            hist.len(),
+            4,
+            "user → assistant(调用) → tool(结果) → assistant，没有诊断轮：{hist:?}"
+        );
+        assert!(
+            hist.iter().all(|m| !m.text_of().contains("【自动诊断】")),
+            "空输出不许出现诊断轮"
+        );
+    }
+
+    /// Windows 镜像：命令失败（非零退出）且无输出 ⇒ 不追加。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_failing_silent_command_appends_nothing() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.cmd", "@exit /b 3");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![tool_round(1, &[("write_file", args.as_str())]), deltas(&["收到"])],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+        let hist = rig.session.history();
+        assert_eq!(hist.len(), 4, "失败且无输出 = 没有诊断轮：{hist:?}");
         assert!(
             hist.iter().all(|m| !m.text_of().contains("【自动诊断】")),
             "不许把退出码编造成诊断文本"
