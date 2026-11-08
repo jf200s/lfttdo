@@ -38,7 +38,9 @@ pub struct GrepTool;
 
 /// 最小通配匹配：`*` 任意段、`?` 单字符，其余按字面。文件名匹配（不含目录），
 /// 只服务 grep/glob 的 `glob` 过滤参数；完整的 glob 语义（`**`、字符类）不在本工具的面上。
-fn wildcard_match(name: &str, pattern: &str) -> bool {
+/// G13 起权限规则引擎（`permission/gate.rs`）也复用它匹配命令模式 —— R77：通配语义
+/// 全仓只许这一份实现，所以从 `fn` 提为 `pub(crate)`。
+pub(crate) fn wildcard_match(name: &str, pattern: &str) -> bool {
     // 经典双指针回溯：p 指模式，s 指名字。'*' 记位可回退，'?' 吃一个字符。
     let s: Vec<char> = name.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
