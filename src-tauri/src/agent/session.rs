@@ -37,6 +37,10 @@ const MAX_STEPS_DIRECTIVE: &str = "## 收尾\n\
  做了什么、结果在哪（文件/路径）、还剩什么没做。不要尝试调用工具。";
 /// 触顶后模型仍凭空喊出的工具调用，统一回这条错误结果（不执行）。
 const MAX_TURNS_NOTE: &str = "已到本轮步数上限，这个调用没有执行";
+/// doom-loop 防护（G07）触发时的错误结果文案：打断自我循环，但把出路写清楚。
+const DOOM_LOOP_NOTE: &str = "这已经是连续第 3 次发起完全相同的调用（工具与入参一字未改），本次没有执行。\
+ 上一轮的工具结果里通常已经有你需要的信息；请先读它。确需重试请换一种做法（改入参、换工具），\
+ 或先用文字向用户说明你在等什么。";
 /// 工具**已经开始执行**之后被取消：不能断言它没执行完（副作用可能已经发生），
 /// 只能说这份结果没有被采用。
 const TOOL_CANCELLED_NOTE: &str = "本轮已中断，工具结果未采用";
@@ -313,6 +317,11 @@ impl AgentSession {
         // G05：一次 run() 只自动恢复一次溢出。第二次仍超限 = 预算收缩到下限也装不下，
         // 走既有失败出口把控制权交回用户（改设置/换端点），而不是无限收缩。
         let mut overflow_retried = false;
+        // G07：doom-loop 计数器，跨轮存活（「连续」以整次 run() 计）；
+        // 签名 = 工具名 + 入参的 JSON 序列化（serde_json 的 Map 是 BTreeMap，
+        // 键序确定 ⇒ 签名可复现）。出现**任何不同**的调用即复位。
+        let mut doom_sig: Option<String> = None;
+        let mut doom_count: u32 = 0;
         for turn in 1..=self.cfg.max_turns {
             // 上一轮的工具跑完之后又被点了停止：成对状态已经落好，直接收尾。
             if self.cancel.is_cancelled() {
@@ -387,6 +396,36 @@ impl AgentSession {
                 };
                 // 构造函数负责钉住「顶层 risk == call.risk」这个不变量（agent/events.rs:75）。
                 self.deps.sink.emit(AgentEvent::tool_call(view.clone()));
+
+                // G07：doom-loop 防护。完全相同的「工具名 + 入参」连续第 3 次：不再执行，
+                // 回一条可读的错误结果打断自我循环。调用卡照发（UI 仍然看得见这次尝试）；
+                // 不走权限门 —— 门是「该不该执行」的闸，这里已经裁定不执行。
+                {
+                    let sig = format!("{name}\u{0}{input}");
+                    if doom_sig.as_deref() == Some(sig.as_str()) {
+                        doom_count += 1;
+                    } else {
+                        doom_sig = Some(sig);
+                        doom_count = 1;
+                    }
+                    if doom_count >= 3 {
+                        let started = Instant::now();
+                        let (preview, _) = ToolOutput::text(DOOM_LOOP_NOTE).event_view();
+                        self.deps.sink.emit(AgentEvent::ToolResult {
+                            call_id: id.clone(),
+                            is_error: true,
+                            ms: started.elapsed().as_millis() as u64,
+                            preview,
+                            images: vec![],
+                        });
+                        self.history.push(Message::tool(
+                            &id,
+                            ToolOutput::text(DOOM_LOOP_NOTE),
+                            true,
+                        ));
+                        continue;
+                    }
+                }
 
                 // 本轮已经把正文加载进上下文的技能又被点名：不重读，只回一句提示。
                 // 8B 实测会把同一份正文连读 2–3 遍，每遍都是白烧的输入 token；
@@ -1312,6 +1351,32 @@ mod tests {
         })
     }
 
+    /// 应答**所有**弹窗（G07 夹具用）：每出现一条新请求就放行（Once），
+    /// 放行 `total` 条后收工。5 秒上限，超时 panic —— 挂死不是通过。
+    fn answer_all(
+        gate: &Arc<PermissionGate>,
+        sink: &Arc<VecSink>,
+        total: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        let gate = gate.clone();
+        let sink = sink.clone();
+        tokio::spawn(async move {
+            let mut answered = 0usize;
+            for _ in 0..500 {
+                let ids = sink.permission_ids();
+                while answered < ids.len().min(total) {
+                    gate.resolve(&ids[answered], Decision::allow(Scope::Once));
+                    answered += 1;
+                }
+                if answered >= total {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("应答不到 {total} 条 PermissionRequest，只应答了 {answered} 条");
+        })
+    }
+
     /// 请求里所有工具结果消息的 `(call_id, is_error, 文本)`。
     fn tool_results_of(msgs: &[Message]) -> Vec<(String, bool, String)> {
         let mut out = Vec::new();
@@ -1985,6 +2050,52 @@ mod tests {
         assert!(errors[1].2, "第二次是 fatal");
         assert_eq!(rig.sink.done(), Some(StopReason::Error));
         assert_eq!(rig.reqs().len(), 2, "重试恰好一次，之后收尾");
+    }
+
+    /// G07 正向半边：完全相同的「工具名 + 入参」连续第 3 次不再执行，
+    /// 回一条可读的错误结果；前两次照常执行。
+    #[tokio::test]
+    async fn a_third_identical_call_is_interrupted_with_an_error_result() {
+        let (rig, counter) = Rig::with_counted(vec![
+            tool_round(1, &[("counted", r#"{"k":1}"#)]),
+            tool_round(2, &[("counted", r#"{"k":1}"#)]),
+            tool_round(3, &[("counted", r#"{"k":1}"#)]),
+            deltas(&["收到"]),
+        ]);
+        let mut rig = rig;
+        let _answers = answer_all(&rig.gate, &rig.sink, 2);
+        assert_eq!(rig.run("别打转").await, StopReason::EndTurn);
+        assert_eq!(counter.calls().len(), 2, "第 3 次不许再执行");
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 3);
+        assert!(!results[0].1 && !results[1].1, "前两次正常执行");
+        assert!(results[2].1, "第 3 次以错误结果回给模型：{:?}", results[2]);
+        assert!(
+            results[2].2.contains("连续第 3 次"),
+            "错误结果要指出这是重复调用：{:?}",
+            results[2]
+        );
+        // R57 配对：history 结尾停在工具结果上。
+        assert_every_request_paired(&rig);
+    }
+
+    /// G07 另一半：出现**任何不同**的调用即复位 —— 两次相同 + 一次不同 + 再来原来的，
+    /// 最后这次是第 1 次而不是第 3 次，照常执行。
+    #[tokio::test]
+    async fn a_changed_argument_resets_the_doom_counter() {
+        let (rig, counter) = Rig::with_counted(vec![
+            tool_round(1, &[("counted", r#"{"k":1}"#)]),
+            tool_round(2, &[("counted", r#"{"k":1}"#)]),
+            tool_round(3, &[("counted", r#"{"k":2}"#)]),
+            tool_round(4, &[("counted", r#"{"k":1}"#)]),
+            deltas(&["收到"]),
+        ]);
+        let mut rig = rig;
+        let _answers = answer_all(&rig.gate, &rig.sink, 4);
+        assert_eq!(rig.run("换着来").await, StopReason::EndTurn);
+        assert_eq!(counter.calls().len(), 4, "全部执行，没有误伤");
+        let results = rig.sink.tool_results();
+        assert!(results.iter().all(|(_, err, _)| !err), "{results:?}");
     }
 
     /// 溢出识别只认端点文案里的这几个词；普通 4xx/网络错误不许误判成溢出。
