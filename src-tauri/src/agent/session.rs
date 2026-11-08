@@ -46,6 +46,9 @@ const DOOM_LOOP_NOTE: &str = "这已经是连续第 3 次发起完全相同的�
 /// 工具**已经开始执行**之后被取消：不能断言它没执行完（副作用可能已经发生），
 /// 只能说这份结果没有被采用。
 const TOOL_CANCELLED_NOTE: &str = "本轮已中断，工具结果未采用";
+/// G15：plan 模式拦下 Write/Exec 调用时的错误结果文案。三件事都在：这是什么模式、
+/// 为什么被拒、出路是什么（完成调研给方案 / 退出 plan 模式再改）。
+const PLAN_MODE_NOTE: &str = "Plan 模式：当前为只读研究，不能执行写入/命令类操作。请先完成调研并给出方案；退出 plan 模式后再执行修改。";
 
 /// 这条模型错误是不是「上下文超长」。判据只看错误文本：错误**分类**住 provider 层
 /// （`ModelError` 四个变体按「用户该去查什么」划分，不按内容），而溢出是端点自己的
@@ -63,14 +66,23 @@ fn is_context_overflow(message: &str) -> bool {
 /// 循环的护栏。`max_turns` 是防模型自我循环的保险丝（spec 4.6）：日常对话 1 轮收尾，
 /// 带工具的多为 2–5 轮，25 是上限而不是目标；触顶时发 `Done{MaxTurns}` 让 UI 明确提示，
 /// 而不是静默停止。
+///
+/// G15：`plan_mode` 把会话变成 OpenCode 的「只读研究」agent —— 模型只能看和读
+/// （Read 级工具照常），写入/命令类调用在工具循环里直接拒绝：不执行、不走权限门，
+/// 错误结果里写明退出方式。生产值来自 `Settings.plan_mode`（`ipc.rs::run_turn` 每轮
+/// 现取：改设置下一条消息生效）；不给就是 false（普通会话，行为一个字不变）。
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub max_turns: u32,
+    pub plan_mode: bool,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self { max_turns: 25 }
+        Self {
+            max_turns: 25,
+            plan_mode: false,
+        }
     }
 }
 
@@ -243,6 +255,14 @@ impl AgentSession {
     /// `ToolCtx::resolve_within_roots` 拿到空表时是**全拒**，不是全放行）。
     pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.roots = roots;
+        self
+    }
+
+    /// G15：覆盖默认护栏。装配点（`ipc.rs::run_turn`）从 `Settings.plan_mode` 每轮现取
+    /// 后经这里注入。与 `with_roots` 同一形态 —— builder，不进 `SessionDeps`：这是
+    /// 「每轮现取的运行配置」，不是外部依赖（同 roots 的归属理由）。
+    pub fn with_config(mut self, cfg: SessionConfig) -> Self {
+        self.cfg = cfg;
         self
     }
 
@@ -433,6 +453,27 @@ impl AgentSession {
                         ));
                         continue;
                     }
+                }
+
+                // G15：plan 模式 = 只读研究 agent。Write/Exec 级调用在这里就被拒：
+                // 不执行、不走权限门 —— 门是「该不该执行」的闸，plan 模式已经裁定
+                // 不执行（与上面 doom 守卫同一归属：拦截发生在门之前）。
+                // 调用卡照发（上面的 tool_call 事件）：UI 仍然看得见模型尝试了什么；
+                // 模型也收到这条错误结果，可以接着做只读调研或改出方案。R57 配对：
+                // ToolResult 事件与 history 各记一条，结尾不停在 assistant 上。
+                if self.cfg.plan_mode && risk != Risk::Read {
+                    let started = Instant::now();
+                    let (preview, _) = ToolOutput::text(PLAN_MODE_NOTE).event_view();
+                    self.deps.sink.emit(AgentEvent::ToolResult {
+                        call_id: id.clone(),
+                        is_error: true,
+                        ms: started.elapsed().as_millis() as u64,
+                        preview,
+                        images: vec![],
+                    });
+                    self.history
+                        .push(Message::tool(&id, ToolOutput::text(PLAN_MODE_NOTE), true));
+                    continue;
                 }
 
                 // 本轮已经把正文加载进上下文的技能又被点名：不重读，只回一句提示。
@@ -1079,16 +1120,47 @@ mod tests {
 
         /// 装配 + 一个记账工具（名字 `counted`，Write 级）。
         fn with_counted(rounds: Vec<Vec<ModelDelta>>) -> (Rig, Arc<CountingTool>) {
+            Self::with_counted_config(SessionConfig::default(), rounds)
+        }
+
+        /// G15：`with_counted` 的带 `SessionConfig` 变体 —— plan 模式要拦的正是
+        /// Write 级的 `counted`。
+        fn with_counted_config(
+            cfg: SessionConfig,
+            rounds: Vec<Vec<ModelDelta>>,
+        ) -> (Rig, Arc<CountingTool>) {
             let model = ScriptedModel::new(rounds);
             let recorder = model.recorder.clone();
             let tool = Arc::new(CountingTool::default());
-            let rig = Rig::assembled(
+            let (session, sink, gate) = parts(
                 model,
                 ContextConfig::default(),
-                recorder,
+                None,
                 vec![tool.clone()],
+                Vec::new(),
             );
+            let rig = Rig {
+                session: session.with_config(cfg),
+                sink,
+                gate,
+                recorder,
+            };
             (rig, tool)
+        }
+
+        /// G15：与 `new()` 唯一的区别是注入自定义 `SessionConfig`（echo/guarded 照常注册，
+        /// Read 级的对照测试用）。
+        fn with_config(cfg: SessionConfig, rounds: Vec<Vec<ModelDelta>>) -> Rig {
+            let model = ScriptedModel::new(rounds);
+            let recorder = model.recorder.clone();
+            let (session, sink, gate) =
+                parts(model, ContextConfig::default(), None, vec![], Vec::new());
+            Rig {
+                session: session.with_config(cfg),
+                sink,
+                gate,
+                recorder,
+            }
         }
 
         /// 装配 + 一条 roots 表 + 额外的工具（T26 Step 4）。
@@ -2104,6 +2176,91 @@ mod tests {
         assert_eq!(counter.calls().len(), 4, "全部执行，没有误伤");
         let results = rig.sink.tool_results();
         assert!(results.iter().all(|(_, err, _)| !err), "{results:?}");
+    }
+
+    // ───────────────────────── G15：plan 模式（只读研究 agent） ─────────────────────────
+
+    /// plan 模式下 Write 级调用被拦：工具**未执行**、不走权限门（无 PermissionRequest），
+    /// 错误结果写明「Plan 模式」与退出方式；调用卡照发（UI 看得见这次尝试），
+    /// 模型收到错误结果后正常收尾。R57 配对不破。
+    #[tokio::test]
+    async fn plan_mode_rejects_write_tools_without_touching_the_gate() {
+        let (rig, counter) = Rig::with_counted_config(
+            SessionConfig {
+                plan_mode: true,
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("counted", r#"{"k":1}"#)]),
+                deltas(&["方案如下"]),
+            ],
+        );
+        let mut rig = rig;
+        // 不 spawn 应答任务：plan 模式必须拦在权限门**之前**，一旦这里挂死等弹窗
+        // 就说明拦截没生效（run 卡在 gate 上，测试超时红）。
+        assert_eq!(rig.run("改一下").await, StopReason::EndTurn);
+        assert!(
+            counter.calls().is_empty(),
+            "plan 模式下 Write 工具绝不能真的执行：{:?}",
+            counter.calls()
+        );
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1, "以错误结果回给模型：{:?}", results[0]);
+        assert!(
+            results[0].2.contains("Plan 模式") && results[0].2.contains("退出 plan 模式"),
+            "错误结果要点名模式与出路：{:?}",
+            results[0]
+        );
+        assert!(
+            rig.sink.permission_ids().is_empty(),
+            "不走权限门：不该有任何 PermissionRequest，实际 {:?}",
+            rig.sink.permission_ids()
+        );
+        assert_eq!(
+            rig.sink.kinds(),
+            [
+                "turn_start",
+                "tool_call",
+                "tool_result",
+                "turn_start", // 第二轮请求：模型拿到拒绝结果后改出文本方案
+                "text_delta",
+                "done"
+            ],
+            "调用卡照发（tool_call 在 tool_result 之前），模型回复正常送达：{:?}",
+            rig.sink.kinds()
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    /// plan 模式的另一半：Read 级照常执行（只读研究的「看和读」半边），零弹窗语义不变。
+    #[tokio::test]
+    async fn plan_mode_still_runs_read_tools() {
+        let mut rig = Rig::with_config(
+            SessionConfig {
+                plan_mode: true,
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("echo", r#"{"text":"调研记录"}"#)]),
+                deltas(&["读完"]),
+            ],
+        );
+        assert_eq!(rig.run("看看").await, StopReason::EndTurn);
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].1, "Read 级照常执行：{:?}", results[0]);
+        assert!(
+            results[0].2.contains("调研记录"),
+            "echo 的输出原样回给模型：{:?}",
+            results[0]
+        );
+        assert!(
+            rig.sink.permission_ids().is_empty(),
+            "Read 零弹窗语义不变：{:?}",
+            rig.sink.permission_ids()
+        );
+        assert_every_request_paired(&rig);
     }
 
     /// 溢出识别只认端点文案里的这几个词；普通 4xx/网络错误不许误判成溢出。

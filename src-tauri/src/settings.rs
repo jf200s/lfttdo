@@ -6,12 +6,13 @@
 // key「不写 settings 表、不进导出、不写日志」，三条里最容易失守的是第一条，而靠纪律
 // （「记得别写」）守的规矩一定会被下一次加字段破掉；字段不存在才是结构性防线：
 // serde 写不出一个不存在的字段，`{:?}` 打不出它，导出也就无从带上它。
-// `serialized_field_names_are_exactly_the_twenty_seven_settings_fields` 那条测试钉的正是这件事，
+// `serialized_field_names_are_exactly_the_twenty_eight_settings_fields` 那条测试钉的正是这件事，
 // 它同时也是 R89 的防线：加字段必须先给出它的消费者，否则 Plan A 里多一个没人读的键。
 // （T26 落 `roots` 时它的名字从 `twelve` 变成 `thirteen`，shell 选择功能落
 // `default_shell`/`shells` 时变到 `twenty_six`，G13 落 `permission_rules`（消费者是
-// `ipc.rs::send_message` → `PermissionGate`）时变到 `twenty_seven` —— 名字里的数字就是
-// 这条防线的读数。）
+// `ipc.rs::send_message` → `PermissionGate`）时变到 `twenty_seven`，G15 落 `plan_mode`
+// （消费者是 `ipc.rs::run_turn` → `SessionConfig`）时变到 `twenty_eight` —— 名字里的数字
+// 就是这条防线的读数。）
 //
 // 「不写日志」那一条还有第二道闸，而且不在结构体上：`SettingsError` 的 `Debug` 是**手写**的
 // （R94，见 `impl fmt::Debug`）。`keyring_core::Error` 自己 derive 了 `Debug`，而它的
@@ -184,7 +185,7 @@ pub enum SettingsError {
 /// 打成十进制转储 —— spec :473 说的「不写日志」在这种形态下守不住，而且 spec :543 计划的
 /// 「全文搜索 key 字符串」根本查不到十进制转储。Display 侧本来就安全（那两个变体的 Display
 /// 只说 "Password data is not valid UTF-8"），所以这里每一支都借 Display 落地。
-/// `serialized_field_names_are_exactly_the_twenty_seven_settings_fields` 同族的
+/// `serialized_field_names_are_exactly_the_twenty_eight_settings_fields` 同族的
 /// `credential_debug_never_prints_the_secret_bytes` 钉住它。
 impl std::fmt::Debug for SettingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -420,6 +421,13 @@ pub struct Settings {
     /// 回到默认弹窗路径；形状非法时装配侧 warn + 清空（fail-safe 方向：规则缺失只会
     /// 回到「按默认问人」，绝不静默沿用旧规则）。
     pub permission_rules: Option<serde_json::Value>,
+    /// G15：plan 模式（OpenCode 的「只读研究」agent）。`true` = 会话里写入/命令类
+    /// 工具调用被直接拒绝（session.rs 的 `PLAN_MODE_NOTE`，不执行、不走权限门），
+    /// 读类照常 —— 让模型先调研出方案，退出 plan 模式后再执行修改。消费方是
+    /// `ipc.rs::run_turn`（经 `SessionConfig.plan_mode` / `AgentSession::with_config`
+    /// 注入），每轮现取：改设置下一条消息生效。bool 无可钳位的形状，normalize
+    /// 不碰它（见 `normalize` 尾注）。
+    pub plan_mode: bool,
 }
 
 impl Default for Settings {
@@ -473,6 +481,8 @@ impl Default for Settings {
             default_shell: DEFAULT_PRESET_ID.into(),
             // G13：默认没有权限规则 —— 默认路径就是既有弹窗语义，一个字节都不多放行。
             permission_rules: None,
+            // G15：默认是普通会话 —— plan 拦截不存在，工具路径行为一个字不变。
+            plan_mode: false,
         }
     }
 }
@@ -766,6 +776,8 @@ impl Settings {
         // `None`，`Some` 原样保留：不改造、不预审形状（normalize 只调不报错的纪律
         // 管不到它，两条纪律在这里交汇的结果就是什么都不做 —— 这个「不做」是写明的，
         // 不是遗漏）。
+        // G15：`plan_mode` 是 bool，只有两个合法值，没有可钳位的形状 —— normalize
+        // 对它同样是刻意的不做。
     }
 
     /// 归一后的副本。派生方法用它，省掉「调用者忘了先 normalize」这条静默错误路径。
@@ -2580,7 +2592,7 @@ mod tests {
     // ---- R89：不加没有消费者的字段 ----
 
     #[test]
-    fn serialized_field_names_are_exactly_the_twenty_seven_settings_fields() {
+    fn serialized_field_names_are_exactly_the_twenty_eight_settings_fields() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let mut keys: Vec<&str> = json
             .as_object()
@@ -2611,6 +2623,7 @@ mod tests {
                 "mode",
                 "model",
                 "permission_rules",
+                "plan_mode",
                 "reserve_output",
                 "roots",
                 "shells",
@@ -3362,5 +3375,40 @@ mod tests {
             "文件里没有这个键 = None，不许编出一个规则来"
         );
         assert_eq!(got.model, "qwen-max", "其余设置不受影响");
+    }
+
+    // ---- G15：plan_mode ----
+
+    /// 字段默认 false（普通会话，plan 拦截不存在）；bool 无可钳位的形状，normalize
+    /// 对它透传（写明这个「不做」是刻意的）；round-trip 保住 true；旧文件缺键 = false
+    /// （serde(default) 的向前兼容）。
+    #[test]
+    fn plan_mode_defaults_to_false_and_survives_a_save_load_round_trip() {
+        assert!(
+            !Settings::default().plan_mode,
+            "默认必须是普通会话，plan 拦截不存在"
+        );
+        let n = Settings {
+            plan_mode: true,
+            ..Default::default()
+        }
+        .normalized();
+        assert!(n.plan_mode, "normalize 透传 bool，不许翻转");
+
+        let d = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(d.path());
+        store
+            .save(&Settings {
+                plan_mode: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(store.load().unwrap().plan_mode, "round-trip 要保住 true");
+
+        std::fs::write(store.path(), r#"{"model":"qwen-max"}"#).unwrap();
+        assert!(
+            !store.load().unwrap().plan_mode,
+            "文件里没有这个键 = false，不许自己开 plan 模式"
+        );
     }
 }
