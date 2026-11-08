@@ -9,6 +9,7 @@ import * as api from "./ipc/commands";
 import { useTextBuffer } from "./ipc/batching";
 import {
   appendUserTurn,
+  clearPendingQuestion,
   dropUserTurn,
   initialState,
   reduce,
@@ -432,6 +433,42 @@ export default function App() {
     [notice],
   );
 
+  /**
+   * G20：提问面板的应答入口。与 `onRespond`（权限卡）刻意不同：`question_respond`
+   * 的返回值**就是**收起面板的依据 —— 后端不会再为这道题发确认事件（答案以工具
+   * 结果的形式走 `tool_result` 通路），前端不收就永远挂着。
+   * - `true`：清面板 + 在消息流里补一条用户回答的本地记录。记录走 `appendUserTurn`
+   *   （与乐观插入同一份实现，R117），但它只属于本次会话的界面：库里没有这条
+   *   user 消息，重放不会回来 —— 这是「本地记录」而非第二份真相，答案本身的
+   *   持久化形态是那条工具结果。
+   * - `false`：无此 id（已应答、已取消或那一轮已收场）→ 通知条提示并清除面板。
+   * - 命令本身失败（IPC 层）：通知原文，面板留着 —— 那一笔还挂着，用户可以重试。
+   */
+  const onQuestionAnswer = useCallback(
+    (id: string, choice: string) => {
+      void (async () => {
+        let ok: boolean;
+        try {
+          ok = await api.questionRespond(id, choice);
+        } catch (e) {
+          notice(`提交回答失败：${String(e)}`);
+          return;
+        }
+        if (!ok) {
+          notice("这道提问已失效（可能已应答或会话已结束）");
+          setUi((s) => clearPendingQuestion(s, id));
+          return;
+        }
+        setUi((s) =>
+          appendUserTurn(clearPendingQuestion(s, id), [
+            { type: "text", text: choice },
+          ]),
+        );
+      })();
+    },
+    [notice],
+  );
+
   const stop = useCallback(() => {
     // 只打断，不改状态：`streaming` 的唯一出口是 `done`（R112），不做乐观恢复。
     api.interrupt().catch((e) => notice(`打断当前这一轮失败：${String(e)}`));
@@ -735,6 +772,7 @@ export default function App() {
           onRespond={onRespond}
           onOpenLink={openLink}
           onRevealPath={onRevealPath}
+          onAnswerQuestion={onQuestionAnswer}
         />
         <Composer
           streaming={ui.streaming}

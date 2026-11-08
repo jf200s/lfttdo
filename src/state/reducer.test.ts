@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { AGENT_CHANNEL } from "../types";
 import {
   appendUserTurn,
+  clearPendingQuestion,
   dropUserTurn,
   initialState,
   reduce,
@@ -675,6 +676,8 @@ describe("reducer", () => {
       toolCall("c2"),
       permRequest("p2"),
       { t: "permission_resolved", id: "p1", decision: { allow: false, reason: "不要" } },
+      // G20：提问臂也写成「换新对象」而不是原地改 —— 单槽挂起同样不许动入参。
+      { t: "question", id: "q9", question: "纯函数探针", options: ["甲"] },
       toolResult("c1", "结果", true, 4),
       { t: "usage", input_tokens: 7, output_tokens: 8 },
       { t: "context_compacted", dropped: 1, summary_chars: 2 },
@@ -768,6 +771,50 @@ describe("reducer", () => {
     expect(Object.keys(probe.error)).toEqual(["t", "where", "message", "fatal"]);
     expect(Object.keys(contentProbe.image)).toEqual(["type", "data", "mime"]);
     expect(CONTENT_TAGS).toHaveLength(4); // 对齐 types.rs:4-24 的四支
+  });
+});
+
+// ==== G20：question 挂起与清除（提问面板的状态面）====
+
+describe("question", () => {
+  const ask = (id: string, question: string, options: string[]): AgentEvent => ({
+    t: "question",
+    id,
+    question,
+    options,
+  });
+
+  it("records a pending question and keeps the legacy notice behaviour", () => {
+    const s = reduce(initialState(), ask("q1", "选哪个方案？", ["方案一", "方案二"]));
+    // 面板的数据面：id/question/options 三键原样落地，不加工（线格式镜像的同一口径）。
+    expect(s.pendingQuestion).toEqual({
+      id: "q1",
+      question: "选哪个方案？",
+      options: ["方案一", "方案二"],
+    });
+    // 旧通知行为不回归：通知条仍透传问题与候选（notices 是重放可审计的那条通道）。
+    expect(s.notices.join()).toContain("模型提问");
+    expect(s.notices.join()).toContain("选哪个方案？");
+    expect(s.notices.join()).toContain("方案一 / 方案二");
+  });
+
+  it("keeps a single slot: a newer question overwrites the older one", () => {
+    const first = reduce(initialState(), ask("q1", "第一问", ["甲"]));
+    const second = reduce(first, ask("q2", "第二问", []));
+    expect(second.pendingQuestion).toEqual({ id: "q2", question: "第二问", options: [] });
+  });
+
+  it("clears a pending question by id and ignores a stale clear", () => {
+    const s = reduce(initialState(), ask("q1", "第一问", ["甲"]));
+    // 单槽已被新问覆盖时，旧 id 的迟到清除是 no-op（原样返回，不造新对象）。
+    const overwritten = reduce(s, ask("q2", "第二问", []));
+    expect(clearPendingQuestion(overwritten, "q1")).toBe(overwritten);
+    const cleared = clearPendingQuestion(overwritten, "q2");
+    expect(cleared.pendingQuestion).toBeNull();
+    // 空状态与「本来就没有题」同样是 no-op。
+    const empty = initialState();
+    expect(clearPendingQuestion(empty, "q1")).toBe(empty);
+    expect(clearPendingQuestion(cleared, "q2")).toBe(cleared);
   });
 });
 

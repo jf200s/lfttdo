@@ -43,6 +43,7 @@ export function initialState(): UiState {
     notices: [],
     toolIndex: {},
     permIndex: {},
+    pendingQuestion: null,
   };
 }
 
@@ -154,6 +155,17 @@ export function dropUserTurn(state: UiState, blocks: ContentBlock[]): UiState {
 export function appendUserTurn(state: UiState, blocks: ContentBlock[]): UiState {
   const { state: opened, index } = startTurn(state, "user");
   return mapTurn(opened, index, (t) => ({ ...t, blocks: userBlocks(blocks) }));
+}
+
+/**
+ * 收起提问面板。事件流里没有「这道题已被应答」的帧（答案以工具结果的形式走
+ * `tool_result` 通路），所以由 App 在 `question_respond` 返回后调用 —— 应答成功
+ * 与「无此 id」（已应答、已取消、那一轮已收场）两条路都用它收口。
+ * id 不匹配时原样返回：迟到的清除不许抹掉后来那道新题（单槽被覆盖后旧 id 已无关）。
+ */
+export function clearPendingQuestion(state: UiState, id: string): UiState {
+  if (state.pendingQuestion?.id !== id) return state;
+  return { ...state, pendingQuestion: null };
 }
 
 /**
@@ -275,13 +287,20 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
       }));
     }
 
-    // G20：模型的多选题。此刻的最小处理 = 一条通知（问题 + 候选原样透传），
-    // 用户的选择经 ipc 的 `question_respond` 命令回给 Rust，答案以工具结果的形式
-    // 走既有的 `tool_result` 通路进时间线。提问面板（把 options 渲染成可点按钮、
-    // 挂起到应答为止）是后续 UI 任务——这里不发明卡片、不猜状态，与
-    // `tool_result` 归位不了时的取向一致：承认现状，别静默吞掉。
+    // G20：模型的多选题。既有的通知条行为保留（问题 + 候选原样透传，不回归），
+    // 同时把题挂进 `pendingQuestion` 单槽 —— 提问面板（QuestionCard）由它渲染。
+    // 用户的选择经 App 的应答回调走 ipc 的 `question_respond` 命令回给 Rust，答案
+    // 以工具结果的形式走既有的 `tool_result` 通路进时间线。事件流里没有「已应答」
+    // 这一帧，所以清除不在 reducer 的事件臂里：`clearPendingQuestion` 供 App 在
+    // 命令返回后调用（与 `appendUserTurn`/`dropUserTurn` 同一条惯例）。
     case "question":
-      return notice(state, `模型提问：${e.question}（${e.options.join(" / ")}）`);
+      return notice(
+        {
+          ...state,
+          pendingQuestion: { id: e.id, question: e.question, options: e.options },
+        },
+        `模型提问：${e.question}（${e.options.join(" / ")}）`,
+      );
 
     case "usage":
       return { ...state, usage: { input: e.input_tokens, output: e.output_tokens } };

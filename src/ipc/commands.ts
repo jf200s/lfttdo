@@ -48,6 +48,16 @@ export async function sendMessage(
 export const respond = (requestId: string, decision: Decision) =>
   invoke<boolean>("respond", { requestId, decision });
 
+/**
+ * G20：把用户对 question 多选题的选择（或自由输入的回答）递回挂起的那道题。
+ * 返回的 `bool` 含义是「确实有这道挂起的题被闭合」。与上面的 `respond` 刻意不同：
+ * 这里的 `false` **就是**前端收起提问面板的依据 —— 后端不会再为这道题发确认事件
+ * （答案以工具结果的形式走 `tool_result` 通路），前端不收它就永远挂着。
+ * 参数两端同名（`id`/`choice`），无 camelCase 映射问题。
+ */
+export const questionRespond = (id: string, choice: string) =>
+  invoke<boolean>("question_respond", { id, choice });
+
 /** 打断当前这一轮。令牌一次性（R63），打不到正在跑的轮次也是 Ok。 */
 export const interrupt = () => invoke("interrupt");
 

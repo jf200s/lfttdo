@@ -485,6 +485,17 @@ export interface PermCard {
   scope?: Scope;
 }
 
+/**
+ * G20：一道挂起的模型提问（`question` 事件的负载原样落地，`UiState.pendingQuestion`
+ * 的元素）。`id` 是应答回执键：用户的选择经 ipc 的 `question_respond(id, choice)` 送回
+ * Rust，`false` = 没有这道挂起的题（已应答、已取消或那一轮已收场）。
+ */
+export interface PendingQuestion {
+  id: string;
+  question: string;
+  options: string[];
+}
+
 /** 界面上的一块。`tool`/`perm` 来自事件流，`text`/`image` 来自事件流或 `ContentBlock` 映射。 */
 export type UiBlock =
   | { kind: "text"; text: string }
@@ -577,4 +588,20 @@ export interface UiState {
   toolIndex: Record<string, BlockLocation>;
   /** 同 `toolIndex`：只增不减，会话切换靠 `initialState()` 清空（评审 F5）。 */
   permIndex: Record<string, BlockLocation>;
+  /**
+   * G20：当前挂起的模型提问，提问面板（`QuestionCard`）由它渲染。**单槽**：一条轮里
+   * 先后来了两问时新问覆盖旧问 —— 旧问的 id 在后端挂起表里还在，界面却只呈现一道题，
+   * 用户对旧问的应答会走 `question_respond` 返回 `false` 的通路（通知 + 清除）。
+   *
+   * 清除不发生在 reducer 的事件臂里：事件流里**没有**「这道题已被应答」的帧（答案以
+   * 工具结果的形式走 `tool_result` 通路），所以收起面板由 App 在命令返回后调
+   * `clearPendingQuestion` —— 与 `appendUserTurn`/`dropUserTurn` 同一条
+   * 「非事件动作也走 reducer 导出函数」的惯例（R117 的一块一入口）。
+   *
+   * **为什么是可选的**：与 `memorySaved` 同一条理由 —— `MessageList.test.tsx` 那类
+   * 夹具用全量字面量 + `Partial<UiState>` 展开构造 `UiState`，多一个必填键就会让
+   * 那份不在本切片范围内的测试当场 TS2322。消费方把 `undefined` 与 `null` 读成
+   * 同一件事（`App` / `MessageList` 用 `if (!…)`）。
+   */
+  pendingQuestion?: PendingQuestion | null;
 }

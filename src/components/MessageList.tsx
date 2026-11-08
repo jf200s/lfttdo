@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { MessageBubble } from "./MessageBubble";
+import { QuestionCard } from "./QuestionCard";
 import type { Decision, ErrorWhere, UiState } from "../types";
 
 /** 距底多少像素以内算「还想跟着看」：太高会误粘、太低会在一次小增量后脱落。 */
@@ -83,12 +84,19 @@ export function MessageList({
   onRespond,
   onOpenLink,
   onRevealPath,
+  onAnswerQuestion,
 }: {
   state: UiState;
   onRespond: (id: string, d: Decision) => void;
   /** Markdown 链接的出口（App 接 `open_url`）；测试与纯展示场景可以不传。 */
   onOpenLink?: (url: string) => void;
   onRevealPath?: (path: string) => void;
+  /**
+   * G20 提问面板的应答出口（App 接 `question_respond`）；测试与纯展示场景可以不传。
+   * 面板排在消息流末尾：提问发生在一次工具执行的**中途**，模型此刻就停在这道题上，
+   * 它是时间线上最新的一件事。
+   */
+  onAnswerQuestion?: (id: string, choice: string) => void;
 }) {
   const lastTurn = state.turns.length - 1;
 
@@ -139,6 +147,17 @@ export function MessageList({
           />
         ))}
       </div>
+      {/* G20：`key` 用题的 id —— 单槽被新问覆盖时强制重挂载，用户给旧题打的草稿
+          不许残留到一道不同的题上。 */}
+      {state.pendingQuestion && onAnswerQuestion ? (
+        <div className="question-region">
+          <QuestionCard
+            key={state.pendingQuestion.id}
+            pending={state.pendingQuestion}
+            onAnswer={onAnswerQuestion}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
