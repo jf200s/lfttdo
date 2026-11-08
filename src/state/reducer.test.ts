@@ -166,6 +166,22 @@ const probe: Record<AgentEvent["t"], AgentEvent> = {
   context_compacted: { t: "context_compacted", dropped: 4, summary_chars: 120 },
   // P1：放在 Rust 名单里的同一位置（`context_compacted` 与 `error` 之间）。
   memory_saved: { t: "memory_saved", count: 2 },
+  // G26/G27：放在 Rust 名单里的同一位置（`memory_saved` 与 `error` 之间）。
+  workflow_step: {
+    t: "workflow_step",
+    workflow: "调研流水",
+    step: "第一步",
+    index: 1,
+    total: 3,
+    status: "running",
+  },
+  experiment_run: {
+    t: "experiment_run",
+    command_tail: "echo METRIC time=5",
+    repeat: 1,
+    of: 3,
+    metrics: { time: 5 },
+  },
   error: { t: "error", where: "loop", message: "循环了", fatal: false },
   done: done(),
 };
@@ -493,14 +509,14 @@ describe("reducer", () => {
     expect(replay([{ t: "user_message", blocks: b }])).toEqual(appendUserTurn(initialState(), b));
   });
 
-  // ==== R118：13 个标签表驱动 ====
+  // ==== R118：15 个标签表驱动 ====
 
-  it("handles every one of the 13 wire t tags without falling through to default", () => {
+  it("handles every one of the 15 wire t tags without falling through to default", () => {
     // 名单来自 `Object.keys(probe)`，probe 的类型是 `Record<AgentEvent["t"], AgentEvent>`：
-    // 镜像有第 14 支而 probe 没补 → tsc 红；probe 补了而 reducer 没写臂 → reducer 的
+    // 镜像有第 16 支而 probe 没补 → tsc 红；probe 补了而 reducer 没写臂 → reducer 的
     // never 守卫红（tsc）+ 这里的 swallowed 断言红。三层都在（评审 F1③）。
     // R202：锚点写 Rust 的测试函数名，不写行号 —— 行号每次上游插删就指偏，名字不会。
-    expect(WIRE_TAGS).toHaveLength(13); // 锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 那条 (13, 13) 断言上
+    expect(WIRE_TAGS).toHaveLength(15); // 锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 那条 (15, 15) 断言上
     const base = replay([start(1), d("在写正文"), toolCall("c1"), permRequest("p1")]);
     const swallowed = WIRE_TAGS.filter((tag) => reduce(base, probe[tag]) === base);
     expect(swallowed).toEqual([]);
@@ -555,13 +571,13 @@ describe("reducer", () => {
     // （`events.rs:358` 只指到函数名那一行，计数断言在它下面十几行）。定位改用**测试函数名**。
     const handoff =
       "这个计数锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 里那条 " +
-      "`assert_eq!((events.len(), tags.len()), (13, 13))` 断言上；" +
-      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那个测试里的 tags 表和 (13, 13)）、" +
+      "`assert_eq!((events.len(), tags.len()), (15, 15))` 断言上；" +
+      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那个测试里的 tags 表和 (15, 15)）、" +
       "src/types.ts 的 AgentEvent、本文件的 probe 表，" +
-      "以及本文件那三处计数断言（用例 `handles every one of the 13 wire t tags without falling through to default` " +
+      "以及本文件那三处计数断言（用例 `handles every one of the 15 wire t tags without falling through to default` " +
       "里的 WIRE_TAGS，和**本用例**里的 rust 与 WIRE_TAGS 两条 toHaveLength）";
-    expect(rust, `events.rs 的 tags 表读到 ${rust.length} 支：${JSON.stringify(rust)}。${handoff}`).toHaveLength(13);
-    expect(WIRE_TAGS, `TS 侧镜像只有 ${WIRE_TAGS.length} 支：${JSON.stringify(WIRE_TAGS)}。${handoff}`).toHaveLength(13);
+    expect(rust, `events.rs 的 tags 表读到 ${rust.length} 支：${JSON.stringify(rust)}。${handoff}`).toHaveLength(15);
+    expect(WIRE_TAGS, `TS 侧镜像只有 ${WIRE_TAGS.length} 支：${JSON.stringify(WIRE_TAGS)}。${handoff}`).toHaveLength(15);
     // 集合相等，**不**比顺序：Rust 那边把 tags 数组重新排序不影响线格式，
     // 断言顺序只会造出一个假红。
     // 差集要**点名**（评审 R176）：两边各多出哪几支直接写进消息，别让人去猜 diff。
@@ -678,6 +694,9 @@ describe("reducer", () => {
       { t: "permission_resolved", id: "p1", decision: { allow: false, reason: "不要" } },
       // G20：提问臂也写成「换新对象」而不是原地改 —— 单槽挂起同样不许动入参。
       { t: "question", id: "q9", question: "纯函数探针", options: ["甲"] },
+      // G26/G27：进度臂同样只换新对象（notice 追加数组，不许 push 进参里的那个）。
+      { t: "workflow_step", workflow: "流水", step: "步", index: 1, total: 2, status: "running" },
+      { t: "experiment_run", command_tail: "echo hi", repeat: 1, of: 2, metrics: null },
       toolResult("c1", "结果", true, 4),
       { t: "usage", input_tokens: 7, output_tokens: 8 },
       { t: "context_compacted", dropped: 1, summary_chars: 2 },
@@ -815,6 +834,53 @@ describe("question", () => {
     const empty = initialState();
     expect(clearPendingQuestion(empty, "q1")).toBe(empty);
     expect(clearPendingQuestion(cleared, "q2")).toBe(cleared);
+  });
+});
+
+// ==== G26/G27：进度可见性事件（通知条降级）====
+
+describe("progress events (G26/G27)", () => {
+  const step = (
+    index: number,
+    status: "running" | "done" | "failed",
+  ): AgentEvent => ({
+    t: "workflow_step",
+    workflow: "调研流水",
+    step: "第一步",
+    index,
+    total: 3,
+    status,
+  });
+
+  it("renders a workflow step as a notice naming workflow, index and status", () => {
+    const running = reduce(initialState(), step(1, "running"));
+    expect(running.notices.join()).toContain("工作流「调研流水」步骤 1/3：第一步（进行中）");
+    expect(reduce(initialState(), step(1, "done")).notices.join()).toContain("（完成）");
+    expect(reduce(initialState(), step(1, "failed")).notices.join()).toContain("（失败）");
+    // 通知条降级：不开气泡、不动 streaming（进度是对话外的观察面）。
+    expect(running.turns).toEqual([]);
+    expect(running.streaming).toBe(false);
+    expect(running.toolIndex).toEqual({});
+  });
+
+  it("renders an experiment run as a notice with the per-run metrics summary", () => {
+    const s = reduce(initialState(), {
+      t: "experiment_run",
+      command_tail: "echo METRIC time=5",
+      repeat: 2,
+      of: 3,
+      metrics: { time: 5 },
+    });
+    expect(s.notices.join()).toContain("实验复跑 2/3：time=5");
+    // metrics 是 null = 这一次没解析到 METRIC：如实说「无」，不渲染成空摘要。
+    const empty = reduce(initialState(), {
+      t: "experiment_run",
+      command_tail: "echo hi",
+      repeat: 1,
+      of: 1,
+      metrics: null,
+    });
+    expect(empty.notices.join()).toContain("实验复跑 1/1：无 METRIC");
   });
 });
 

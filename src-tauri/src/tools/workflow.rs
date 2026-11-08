@@ -18,13 +18,15 @@
 //! 工具从不代写。run 用的名字是**文件名**（`workflows/<name>.json` 的 `<name>`）；
 //! list 展示的是定义里的 name —— 约定两者一致，不一致时以文件名为准。
 //!
-//! # 步骤可见性事件（扩展点，本轮不做）
+//! # 步骤可见性事件（G26）
 //!
-//! run 期间用户只能看到最终报告，看不到「跑到第几步」。要做时的接线（与 G20 的
-//! question 同一条路）：`agent/events.rs` 的 `AgentEvent` 加 `WorkflowStep
-//! { workflow, step, index }` 变体 → 同文件那张变体标签表补行（新增事件漏补会
-//! 打红）→ 前端 reducer 加分支 → 本文件的 run 循环在每步前后经 `ctx.events` emit。
-//! `ToolCtx.events` 已经在手，缺的只是事件形状与前端。
+//! run 循环在每步**开始前**经 `ctx.events` emit `AgentEvent::WorkflowStep
+//! { status: Running }`，成功后 emit `Done`，失败（含用户取消）emit `Failed`
+//! 后照旧返回错误 —— 用户在逐步报告之外，还能看到「跑到第几步」。进度是观察面
+//! 不是执行面：`ctx.events` 为 `None`（headless 会话）时静默不发，工作流照跑
+//! 不误；`EventSink::emit` 返回 `()`，事件出口的任何故障都不会阻塞或打断编排。
+//! 前端 reducer 把它降级成通知条（与 G20 的 question 同一条路）。
+use crate::agent::events::{AgentEvent, StepStatus};
 use crate::agent::types::{Risk, ToolOutput};
 use crate::tools::output_bound::bound_tool_output;
 use crate::tools::registry::{Tool, ToolCtx, ToolError, ToolMeta};
@@ -298,6 +300,28 @@ fn report_section(name: &str, value: &str) -> String {
     }
 }
 
+/// G26：发一条步骤进度事件。`ctx.events` 缺席 = headless 会话，静默不发
+/// （进度是观察面不是执行面，工作流照跑不误）；`emit` 返回 `()`，出口的任何
+/// 故障都不会上抛打断编排。
+fn emit_step(
+    ctx: &ToolCtx,
+    workflow: &str,
+    step: &str,
+    index: u32,
+    total: u32,
+    status: StepStatus,
+) {
+    if let Some(sink) = &ctx.events {
+        sink.emit(AgentEvent::WorkflowStep {
+            workflow: workflow.to_string(),
+            step: step.to_string(),
+            index,
+            total,
+            status,
+        });
+    }
+}
+
 pub struct WorkflowTool;
 
 impl WorkflowTool {
@@ -332,26 +356,42 @@ impl WorkflowTool {
         })?;
         let def = parse_workflow(&text).map_err(ToolError::Failed)?;
         let mut results: Vec<(String, String)> = Vec::new();
+        let total = def.steps.len() as u32;
         for (idx, step) in def.steps.iter().enumerate() {
             // 步间查取消：注册表的守卫只拦「工具开始之前」，管不到多步循环的
             // 中间 —— 用户在两步之间按下停止，后续步骤不许再烧请求。
             if ctx.cancel.is_cancelled() {
                 return Err(ToolError::Cancelled);
             }
+            let index = (idx + 1) as u32;
+            emit_step(
+                ctx,
+                &def.name,
+                &step.name,
+                index,
+                total,
+                StepStatus::Running,
+            );
             let prompt = substitute(&step.prompt, &results);
             match runner
                 .run(prompt, step.agent.clone(), ctx, &ctx.cancel)
                 .await
             {
-                Ok(out) => results.push((step.name.clone(), out)),
+                Ok(out) => {
+                    results.push((step.name.clone(), out));
+                    emit_step(ctx, &def.name, &step.name, index, total, StepStatus::Done);
+                }
                 // 用户停止就是停止：不套「第几步」的外衣，取消语义保持原样上抛。
-                Err(ToolError::Cancelled) => return Err(ToolError::Cancelled),
+                // 这一步没跑完，进度上同样记 Failed（用户可见的「失败」含被停）。
+                Err(ToolError::Cancelled) => {
+                    emit_step(ctx, &def.name, &step.name, index, total, StepStatus::Failed);
+                    return Err(ToolError::Cancelled);
+                }
                 Err(e) => {
+                    emit_step(ctx, &def.name, &step.name, index, total, StepStatus::Failed);
                     return Err(ToolError::Failed(format!(
                         "工作流「{}」在第 {} 步「{}」停止：{e}",
-                        def.name,
-                        idx + 1,
-                        step.name
+                        def.name, index, step.name
                     )));
                 }
             }
@@ -417,6 +457,7 @@ impl Tool for WorkflowTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::events::EventSink;
     use crate::tools::task::SubagentRunner;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -835,6 +876,148 @@ mod tests {
             "错误要点名停在第几步与原因：{err}"
         );
         assert_eq!(runner.prompts().len(), 2, "第二步失败后不许再派第三步");
+    }
+
+    // ---- G26：步骤进度事件 ----
+
+    /// 记录型事件出口（与 gapcheck 的 VecSink 同形状；自含一份）。
+    #[derive(Default)]
+    struct EventLog(Mutex<Vec<AgentEvent>>);
+
+    impl EventSink for EventLog {
+        fn emit(&self, e: AgentEvent) {
+            self.0.lock().unwrap().push(e);
+        }
+    }
+
+    impl EventLog {
+        fn events(&self) -> Vec<AgentEvent> {
+            self.0.lock().unwrap().clone()
+        }
+
+        /// 发出过的 WorkflowStep 事件 `(workflow, step, index, total, status)`。
+        fn steps(&self) -> Vec<(String, String, u32, u32, StepStatus)> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::WorkflowStep {
+                        workflow,
+                        step,
+                        index,
+                        total,
+                        status,
+                    } => Some((workflow.clone(), step.clone(), *index, *total, *status)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// 三步流水：每步开始前 Running、成功后 Done，按步序交错成 6 条（3×Running+Done），
+    /// index 1 起始、total 恒为步总数；sink 里只有这一种事件（进度是这条工具唯一的出站）。
+    #[tokio::test]
+    async fn every_step_emits_running_then_done_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_def(
+            tmp.path(),
+            "p",
+            json!({
+                "name": "三步流水",
+                "steps": [
+                    {"name": "第1步", "prompt": "查 A"},
+                    {"name": "第2步", "prompt": "查 B"},
+                    {"name": "第3步", "prompt": "汇总"}
+                ]
+            }),
+        );
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            Ok("一".into()),
+            Ok("二".into()),
+            Ok("三".into()),
+        ]));
+        let sink = Arc::new(EventLog::default());
+        let mut ctx = ctx_with(vec![tmp.path().to_path_buf()], Some(runner));
+        ctx.events = Some(sink.clone());
+        WorkflowTool
+            .execute(json!({"action": "run", "name": "p"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.steps(),
+            vec![
+                ("三步流水".into(), "第1步".into(), 1, 3, StepStatus::Running),
+                ("三步流水".into(), "第1步".into(), 1, 3, StepStatus::Done),
+                ("三步流水".into(), "第2步".into(), 2, 3, StepStatus::Running),
+                ("三步流水".into(), "第2步".into(), 2, 3, StepStatus::Done),
+                ("三步流水".into(), "第3步".into(), 3, 3, StepStatus::Running),
+                ("三步流水".into(), "第3步".into(), 3, 3, StepStatus::Done),
+            ],
+            "每步一对 Running/Done，序号 1 起始"
+        );
+        assert_eq!(
+            sink.events().len(),
+            6,
+            "工具不再发别的（进度是唯一出站事件）"
+        );
+    }
+
+    /// 失败路径：失败那步先 Running 再 Failed，错误结果照旧返回（进度不打断语义）；
+    /// 成功的前一步仍是 Running+Done。
+    #[tokio::test]
+    async fn a_failing_step_emits_running_then_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_def(
+            tmp.path(),
+            "p",
+            json!({
+                "name": "会炸的流水",
+                "steps": [
+                    {"name": "第一步", "prompt": "查 A"},
+                    {"name": "第二步", "prompt": "查 B"}
+                ]
+            }),
+        );
+        let runner = Arc::new(ScriptedRunner::new(vec![
+            Ok("结果一".into()),
+            Err("子代理炸了".into()),
+        ]));
+        let sink = Arc::new(EventLog::default());
+        let mut ctx = ctx_with(vec![tmp.path().to_path_buf()], Some(runner));
+        ctx.events = Some(sink.clone());
+        WorkflowTool
+            .execute(json!({"action": "run", "name": "p"}), &ctx)
+            .await
+            .expect_err("失败路径照旧返回错误");
+        assert_eq!(
+            sink.steps(),
+            vec![
+                (
+                    "会炸的流水".into(),
+                    "第一步".into(),
+                    1,
+                    2,
+                    StepStatus::Running
+                ),
+                ("会炸的流水".into(), "第一步".into(), 1, 2, StepStatus::Done),
+                (
+                    "会炸的流水".into(),
+                    "第二步".into(),
+                    2,
+                    2,
+                    StepStatus::Running
+                ),
+                (
+                    "会炸的流水".into(),
+                    "第二步".into(),
+                    2,
+                    2,
+                    StepStatus::Failed
+                ),
+            ],
+            "失败那步记 Failed，之后的步骤不再发事件"
+        );
     }
 
     /// 没装配 runner ⇒ 明确报错（fail-closed），与 task 同一句取向。

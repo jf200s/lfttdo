@@ -51,6 +51,12 @@ export type StopReason = "end_turn" | "max_turns" | "interrupted" | "error";
 /** `ErrorWhere`（events.rs:103-111）。线上键名是 `where`（Rust 字段 `at`，events.rs:64 手写 rename）。 */
 export type ErrorWhere = "model" | "tool" | "mcp" | "loop" | "store";
 
+/**
+ * G26：`StepStatus`（events.rs 的 `rename_all = "lowercase"` 枚举）——
+ * 工作流单步的三态，前端按它渲染「进行中/完成/失败」。
+ */
+export type StepStatus = "running" | "done" | "failed";
+
 /** `ToolCallView`（types.rs:158-165）。`input` 是任意 JSON，镜像成 `unknown` 由渲染层收窄。 */
 export interface ToolCallView {
   id: string;
@@ -117,6 +123,34 @@ export type ContentBlock =
   | { type: "image"; data: string; mime: ImageMime }
   | { type: "tool_call"; id: string; name: string; input: unknown }
   | { type: "tool_result"; call_id: string; is_error: boolean; output: ToolOutput };
+
+/**
+ * G26：工作流单步进度（events.rs 的 `WorkflowStep`）。每步开始前 `running`、
+ * 成功后 `done`、失败（含取消）后 `failed`；`index` 1 起始、`total` 是步总数。
+ * reducer 按既有模式降级成通知条（同 `context_compacted`）。
+ */
+export interface WorkflowStepEvent {
+  t: "workflow_step";
+  workflow: string;
+  step: string;
+  index: number;
+  total: number;
+  status: StepStatus;
+}
+
+/**
+ * G27：实验复跑进度（events.rs 的 `ExperimentRun`）。`repeat` 是当次序号
+ * （1 起始）、`of` 是总复跑次数；`command_tail` 是基准命令末 60 字符。
+ * `metrics` 是当次解析出的指标对象（Rust 侧只有 f64），**没解析到 METRIC 时
+ * 是 `null`** 而不是 `{}` —— 缺席与空对象都辨不出「这一次没跑出指标」。
+ */
+export interface ExperimentRunEvent {
+  t: "experiment_run";
+  command_tail: string;
+  repeat: number;
+  of: number;
+  metrics: Record<string, number> | null;
+}
 
 /**
  * `Decision`（events.rs:134-168）：手写序列化，恒定两个键、`allow` 在最前。
@@ -360,14 +394,15 @@ export interface MemoryView {
 }
 
 /**
- * `AgentEvent` 的 13 个 `t` 标签，源头是 events.rs 的
+ * `AgentEvent` 的 15 个 `t` 标签，源头是 events.rs 的
  * `every_agent_event_variant_serializes_its_t_tag`（名单本身定义在那条测试里）：
  *
  *   "turn_start", "text_delta", "user_message", "tool_call",
  *   "permission_request", "permission_resolved", "question", "tool_result",
- *   "usage", "context_compacted", "memory_saved", "error", "done"
+ *   "usage", "context_compacted", "memory_saved", "workflow_step",
+ *   "experiment_run", "error", "done"
  *
- * 本表是镜像：union 必须与那 13 支**逐一对应**，少一支就会让 reducer 的
+ * 本表是镜像：union 必须与那 15 支**逐一对应**，少一支就会让 reducer 的
  * `default` 静默丢数据（R111 漏 `user_message` 就是活例子）。
  *
  * 下面这份字面量清单只是**人读的注释**：`reducer.test.ts` 的 `WIRE_TAGS` 由 `AgentEvent`
@@ -410,6 +445,13 @@ export type AgentEvent =
    * **集合**（顺序不参与判定），所以挪位置不会制造假红；保持同序只是为了读镜像时一眼对得上。
    */
   | { t: "memory_saved"; count: number }
+  /**
+   * G26/G27：工作流步骤与实验复跑的进度事件（具名接口镜像见上）。都是工具执行的
+   * **中途**观察面，reducer 降级成通知条，不开气泡、不动 streaming。
+   * 位置与 Rust 的 tags 表一致（`memory_saved` 与 `error` 之间）。
+   */
+  | WorkflowStepEvent
+  | ExperimentRunEvent
   | { t: "error"; where: ErrorWhere; message: string; fatal: boolean }
   | { t: "done"; stop_reason: StopReason };
 

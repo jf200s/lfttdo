@@ -27,6 +27,7 @@
 //! 注册表存活于整个应用会话，所以纪律是「本实例最近一次 run」而不是「紧邻上一
 //! 次调用」—— 中间再插一次 run 会覆盖 last_run，keep 保留的永远是最近一次的
 //! 结果。跨实例（重建注册表）last_run 归零，keep 明确报错让模型先跑再留。
+use crate::agent::events::AgentEvent;
 use crate::agent::types::{Risk, ToolOutput};
 use crate::tools::registry::{Tool, ToolCtx, ToolError, ToolMeta};
 use crate::tools::todo::{APP_STATE_DIR, usable_with_roots as base_usable};
@@ -354,7 +355,7 @@ impl ExperimentTool {
         let mut all_runs: Vec<Vec<(String, f64)>> = Vec::new();
         let mut last_output = String::new();
         let mut last_code_ok = true;
-        for _ in 1..=repeat {
+        for i in 1..=repeat {
             if ctx.cancel.is_cancelled() {
                 return Err(ToolError::Cancelled);
             }
@@ -371,6 +372,21 @@ impl ExperimentTool {
                 entry["primary"] = json!(metrics[0].0);
             }
             append_ledger(&base, &entry);
+            // G27：这次复跑完成了，把当次指标发给用户（实验复跑 i/N 的可见性）。
+            // `ctx.events` 缺席 = headless 会话，静默不发 —— 进度是观察面不是执行面，
+            // 实验循环照跑不误；`emit` 返回 `()`，出口故障不会上抛打断复跑。
+            if let Some(sink) = &ctx.events {
+                sink.emit(AgentEvent::ExperimentRun {
+                    command_tail: tail_chars(command, 60).to_string(),
+                    repeat: i as u32,
+                    of: repeat as u32,
+                    metrics: if metrics.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        metrics_object(&metrics)
+                    },
+                });
+            }
             all_runs.push(metrics);
             last_output = output;
             last_code_ok = ok;
@@ -597,6 +613,7 @@ impl Tool for ExperimentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::events::EventSink;
     use std::process::Command as StdCommand;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
@@ -660,6 +677,36 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).expect("账本每行都必须是合法 JSON"))
             .collect()
+    }
+
+    /// 记录型事件出口（与 gapcheck 的 VecSink 同形状；自含一份）。
+    #[derive(Default)]
+    struct EventLog(Mutex<Vec<AgentEvent>>);
+
+    impl EventSink for EventLog {
+        fn emit(&self, e: AgentEvent) {
+            self.0.lock().unwrap().push(e);
+        }
+    }
+
+    impl EventLog {
+        /// 发出过的 ExperimentRun 事件 `(command_tail, repeat, of, metrics)`。
+        fn runs(&self) -> Vec<(String, u32, u32, Value)> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::ExperimentRun {
+                        command_tail,
+                        repeat,
+                        of,
+                        metrics,
+                    } => Some((command_tail.clone(), *repeat, *of, metrics.clone())),
+                    _ => None,
+                })
+                .collect()
+        }
     }
 
     // ---- meta / 注册钉子 ----
@@ -864,6 +911,72 @@ mod tests {
             assert_eq!(line["action"], "run");
             assert_eq!(line["repeat"], 3);
         }
+    }
+
+    /// G27：repeat 循环每次复跑完成后发一条 ExperimentRun —— 按序 1/3、2/3、3/3，
+    /// metrics 是**当次**解析的对象（不是中位数、也不是最后一次的值）；
+    /// command_tail 是命令末 60 字符（超长截尾）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeat_runs_emit_one_experiment_run_event_per_iteration_in_order() {
+        let (_dir, repo) = temp_git_repo();
+        let sink = Arc::new(EventLog::default());
+        let mut ctx = ctx_with(vec![repo.clone()], None);
+        ctx.events = Some(sink.clone());
+        let tool = ExperimentTool::new();
+        // 计数器命令：每次执行自增并打印（跨复跑可区分当次指标）。
+        let cmd = "n=$(cat c.txt 2>/dev/null || echo 0); n=$((n+1)); echo $n > c.txt; echo \"METRIC time=$n\"";
+        tool.execute(
+            json!({"action": "experiment_run", "command": cmd, "repeat": 3}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let runs = sink.runs();
+        assert_eq!(
+            runs,
+            vec![
+                (runs[0].0.clone(), 1, 3, json!({"time": 1.0}),),
+                (runs[1].0.clone(), 2, 3, json!({"time": 2.0})),
+                (runs[2].0.clone(), 3, 3, json!({"time": 3.0})),
+            ],
+            "每次复跑一条事件，序号 1 起始、按序推进，metrics 是当次值：{runs:?}"
+        );
+        for (tail, _, _, _) in &runs {
+            assert_eq!(
+                tail.chars().count(),
+                60,
+                "command_tail 恒为 60 字符：{tail}"
+            );
+            assert!(
+                tail.ends_with("echo \"METRIC time=$n\""),
+                "截尾保的是命令末段：{tail}"
+            );
+        }
+    }
+
+    /// G27 的两个边界：没解析到 METRIC 的复跑 metrics 是 `null`（不是 `{}` 也不是
+    /// 缺键）；命令不足 60 字符时 command_tail 原样透传（不垫空格）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_without_metrics_emits_null_and_a_short_command_stays_whole() {
+        let (_dir, repo) = temp_git_repo();
+        let sink = Arc::new(EventLog::default());
+        let mut ctx = ctx_with(vec![repo.clone()], None);
+        ctx.events = Some(sink.clone());
+        let tool = ExperimentTool::new();
+        tool.execute(
+            json!({"action": "experiment_run", "command": "echo hi"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sink.runs(),
+            vec![("echo hi".to_string(), 1, 1, Value::Null)],
+            "无指标 → null，短命令原样：{:?}",
+            sink.runs()
+        );
     }
 
     /// 非 git 目录：run 照常（不需要 git），keep/discard 明确报「不是 git 仓库」。

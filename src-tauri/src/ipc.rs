@@ -3724,6 +3724,8 @@ mod tests {
             AgentEvent::Usage { .. } => "usage",
             AgentEvent::ContextCompacted { .. } => "context_compacted",
             AgentEvent::MemorySaved { .. } => "memory_saved",
+            AgentEvent::WorkflowStep { .. } => "workflow_step",
+            AgentEvent::ExperimentRun { .. } => "experiment_run",
             AgentEvent::Error { .. } => "error",
             AgentEvent::Done { .. } => "done",
         }

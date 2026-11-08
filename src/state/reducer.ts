@@ -322,6 +322,28 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
         memorySaved: { count: e.count, at: (state.memorySaved?.at ?? 0) + 1 },
       };
 
+    // G26：工作流单步进度 —— 最小处理 = 通知条（不开气泡、不动 streaming，
+    // 进度是对话外的观察面，与 context_compacted 同一条降级路径）。
+    // status 三态是 Rust `StepStatus` 的小写线上名（types.ts 的 StepStatus 镜像）。
+    case "workflow_step": {
+      const word = e.status === "running" ? "进行中" : e.status === "done" ? "完成" : "失败";
+      return notice(
+        state,
+        `工作流「${e.workflow}」步骤 ${e.index}/${e.total}：${e.step}（${word}）`,
+      );
+    }
+
+    // G27：实验复跑进度 —— 同上，通知条。metrics 是当次解析的对象，null =
+    // 这一次没解析到 METRIC（不渲染成空摘要，如实说没有）。
+    case "experiment_run": {
+      const summary = e.metrics
+        ? Object.entries(e.metrics)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(", ")
+        : "无 METRIC";
+      return notice(state, `实验复跑 ${e.repeat}/${e.of}：${summary}`);
+    }
+
     case "error":
       return e.fatal
         ? { ...state, fatal: { message: e.message, where: e.where } }
