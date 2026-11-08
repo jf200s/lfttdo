@@ -27,9 +27,7 @@ const MAX_RESULTS: usize = 1000;
 /// `*` = 不含 `/` 的任意段内字符，`?` = 单个非 `/` 字符，其余按字面转义。
 fn path_glob_regex(pattern: &str) -> Result<regex::Regex, ToolError> {
     if pattern.trim().is_empty() {
-        return Err(ToolError::BadInput(
-            "glob 需要非空字符串参数 pattern".to_string(),
-        ));
+        return Err(ToolError::BadInput("glob 需要非空字符串参数 pattern".to_string()));
     }
     let mut re = String::from("^");
     let chars: Vec<char> = pattern.chars().collect();

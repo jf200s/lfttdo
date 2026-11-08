@@ -81,7 +81,7 @@ fn match_line(path: &Path, line_no: usize, line: &str) -> String {
 
 /// 递归收集待搜文件。返回 (文件表, 被跳过的非文本文件数)。
 #[allow(clippy::only_used_in_recursion)]
-pub(crate) fn collect_files(root: &Path, files: &mut Vec<PathBuf>, skipped: &mut usize) {
+pub(crate) pub(crate) fn collect_files(root: &Path, files: &mut Vec<PathBuf>, skipped: &mut usize) {
     fn walk(dir: &Path, depth: usize, files: &mut Vec<PathBuf>, skipped: &mut usize) {
         if depth > MAX_DEPTH || files.len() >= MAX_FILES {
             return;
