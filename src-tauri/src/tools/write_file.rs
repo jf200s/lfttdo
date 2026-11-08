@@ -92,6 +92,8 @@ impl Tool for WriteFileTool {
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+        // G11：变更前快照（全部校验已通过；撤销链在这里生成，失败的调用不留痕）。
+        crate::tools::undo::snapshot_before(ctx, &guarded)?;
         crate::tools::fs_write::atomic_write(&guarded, &new_text)?;
         let action = if existing.is_some() {
             "覆盖"

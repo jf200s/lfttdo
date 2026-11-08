@@ -14,5 +14,6 @@ pub mod registry;
 // spec 见 docs/superpowers/specs/2026-11-01-agent-shell-selection-design.md。
 pub mod shell;
 pub mod todo;
+pub mod undo;
 pub mod use_skill;
 pub mod write_file;
