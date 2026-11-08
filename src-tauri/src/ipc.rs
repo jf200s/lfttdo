@@ -24,6 +24,7 @@ use crate::settings::{Settings, SettingsStore, effective_roots};
 use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::store::memory::{MemoryRow, MemoryWrite, RecallCfg};
 use crate::tools::edit_file::EditFileTool;
+use crate::tools::experiment::ExperimentTool;
 use crate::tools::fetch::FetchTool;
 use crate::tools::glob::GlobTool;
 use crate::tools::grep::GrepTool;
@@ -2950,6 +2951,10 @@ pub fn build_production_registry(
     registry.register(Arc::new(MemorySearchTool::new(db)));
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
+    // G25：experiment 实验循环（autoresearch 精华移植）。Risk::Exec —— 跑任意命令
+    // 且直接改 git 状态（keep 提交 / discard 回滚），每次调用都弹窗；
+    // base 与 git 都从 ctx.roots/write_root 来，实例状态（last_run）在工具实例上。
+    registry.register(Arc::new(ExperimentTool::new()));
     registry.register(Arc::new(ShellTool::new(shells)));
     // G16：task 子代理。runner 由会话循环装配进 ToolCtx（`session::run`）——
     // 注册表只注册工具壳，没有 runner 的执行上下文里它会明确报错（fail-closed）。
@@ -4171,6 +4176,7 @@ mod tests {
             names,
             vec![
                 "edit_file",
+                "experiment",
                 "fetch_url",
                 "glob",
                 "grep",
@@ -4213,6 +4219,13 @@ mod tests {
                 "{name} 必须走 Write 档，权限门才会弹窗；降成 Read 等于绕开用户"
             );
         }
+        // G25：experiment 是 Exec 档 —— 跑任意命令 + 直接改 git 状态（keep 提交 /
+        // discard 回滚），每一次调用都要用户点头，没有会话级免弹窗的形态。
+        assert_eq!(
+            r.risk_of("experiment"),
+            Risk::Exec,
+            "experiment 必须走 Exec 档：实验循环连续改工作区，用户要每步看得见、拦得住"
+        );
         // G16：task 是 Write 档 —— 子代理自主烧多轮请求，这一下必须弹窗；
         // 降 Read 等于绕开权限门。
         assert_eq!(

@@ -12,6 +12,7 @@ use crate::model::assistant_acc::AssistantAcc;
 use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider, ToolDef};
 use crate::permission::gate::PermissionGate;
 use crate::tools::edit_file;
+use crate::tools::experiment;
 use crate::tools::glob;
 use crate::tools::grep;
 use crate::tools::read_file;
@@ -264,6 +265,11 @@ fn filtered_tool_defs(
     // 没有工作目录时声明了也只会收到一句报错 —— 与 todo/undo 同一条隐藏判据。
     if !workflow::usable_with_roots(roots) {
         tools.retain(|d| d.name != workflow::NAME);
+    }
+    // G25：experiment 的命令与 git 都以 write_root/roots[0] 为 cwd，没有工作目录
+    // 时三个 action 全是死路 —— 同一条隐藏判据。
+    if !experiment::usable_with_roots(roots) {
+        tools.retain(|d| d.name != experiment::NAME);
     }
     if !has_skills {
         tools.retain(|d| d.name != use_skill::NAME);
