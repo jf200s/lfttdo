@@ -28,6 +28,7 @@ use crate::tools::fetch::FetchTool;
 use crate::tools::glob::GlobTool;
 use crate::tools::grep::GrepTool;
 use crate::tools::memory_search::MemorySearchTool;
+use crate::tools::question::QuestionTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::shell::{
@@ -1810,6 +1811,20 @@ pub fn respond(
     Ok(state.gate.resolve(&request_id, decision))
 }
 
+/// G20：前端把用户对 question 多选题的选择递回来。**一行薄壳**：真正的判定
+/// （未知 id、通道关闭、一次性应答）在 [`QuestionTool::resolve`] 里且被单测直接
+/// 钉住 —— `#[tauri::command]` 在单测里调不动（R103 同款），命令体只许做转发。
+/// 返回 false = 没有这道挂起的题（已应答、已取消），前端据此收起提问面板。
+/// `state` 按命令族惯例保留（Tauri 注入，前端 invoke 不传它）。
+#[tauri::command]
+pub fn question_respond(
+    _state: State<'_, AppState>,
+    id: String,
+    choice: String,
+) -> Result<bool, String> {
+    Ok(QuestionTool::shared().resolve(&id, choice))
+}
+
 #[tauri::command]
 pub async fn session_list(state: State<'_, AppState>) -> Result<Vec<SessionRow>, String> {
     let db = state.db.clone();
@@ -2915,6 +2930,10 @@ pub fn build_production_registry(
     // G21：websearch。Risk::Read —— 唯一出站目标是写死的 DuckDuckGo 端点（fetch 同款
     // 只读取向）；provider 可注入，网络行为不进 CI（见 tools/websearch.rs 文件头）。
     registry.register(Arc::new(WebSearchTool::new()));
+    // G20：question。Risk::Read —— 提问不是执行，出站只有一条事件。注册的是进程级
+    // shared() 实例：挂起表必须跨装配共享，否则上一轮挂起的题在这一轮的注册表里
+    // 永远等不到应答（见 tools/question.rs 文件头）。
+    registry.register(QuestionTool::shared());
     registry
 }
 
@@ -3246,6 +3265,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             send_message,
             respond,
+            question_respond,
             interrupt,
             open_url,
             reveal_path,
@@ -3660,6 +3680,7 @@ mod tests {
             AgentEvent::ToolCall { .. } => "tool_call",
             AgentEvent::PermissionRequest { .. } => "permission_request",
             AgentEvent::PermissionResolved { .. } => "permission_resolved",
+            AgentEvent::Question { .. } => "question",
             AgentEvent::ToolResult { .. } => "tool_result",
             AgentEvent::Usage { .. } => "usage",
             AgentEvent::ContextCompacted { .. } => "context_compacted",
@@ -4118,6 +4139,7 @@ mod tests {
                 "glob",
                 "grep",
                 "memory_search",
+                "question",
                 "read_file",
                 "run_command",
                 "task",
@@ -4129,7 +4151,13 @@ mod tests {
             ],
             "模型看到的工具集必须是这份名单；echo/guarded 这类测试工具绝不能进生产（它们只活在 #[cfg(test)]）"
         );
-        for name in ["fetch_url", "read_file", "use_skill", "websearch"] {
+        for name in [
+            "fetch_url",
+            "read_file",
+            "use_skill",
+            "websearch",
+            "question",
+        ] {
             assert_eq!(
                 r.risk_of(name),
                 Risk::Read,
@@ -6166,6 +6194,7 @@ mod tests {
                     skills_dir: None,
                     skills_disabled: Vec::new(),
                     subagents: None,
+                    events: None,
                 },
             )
             .await

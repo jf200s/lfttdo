@@ -1416,6 +1416,7 @@ mod tests {
             skills_dir: None,
             skills_disabled: Vec::new(),
             subagents: None,
+            events: None,
         };
         let output = tool
             .execute(serde_json::json!({"q": "x"}), &ctx)

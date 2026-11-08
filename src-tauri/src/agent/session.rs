@@ -394,6 +394,9 @@ impl AgentSession {
                 temperature: self.deps.temperature,
                 context_cfg: self.deps.context.config(),
             })),
+            // G20：事件出口原样交给工具（question 发多选题用）。与上面同一份 sink，
+            // 事件线只有一条；question 不经权限门，门与出口在这里就已分流。
+            events: Some(self.deps.sink.clone()),
         };
 
         // G05：一次 run() 只自动恢复一次溢出。第二次仍超限 = 预算收缩到下限也装不下，
@@ -3572,6 +3575,83 @@ mod tests {
                 "write_file".to_string(),
             ]],
             "有一条可用 root ⇒ 读与写工具都必须出现，否则它们对用户永久隐形"
+        );
+    }
+
+    // ---- G20：question 的答案回到对话 ----
+
+    /// 完整 run()：第 1 轮模型调 question（Read 档 ⇒ 零弹窗，不需要权限应答任务），
+    /// 测试从 rig 的 sink 取 Question 事件、经共享实例 `shared().resolve` 应答，
+    /// execute 的输出「用户选择了：选项二」在第 2 轮请求的 messages 里回到模型。
+    /// 注册表只装 question 一把（with_only）：这条量的是问答闭环，不是工具名单。
+    #[tokio::test]
+    async fn a_question_is_answered_through_the_shared_instance_and_reaches_the_next_request() {
+        let mut rig = Rig::with_only(
+            vec![
+                tool_round(
+                    1,
+                    &[(
+                        "question",
+                        r#"{"question":"用哪个方案？","options":["选项一","选项二"]}"#,
+                    )],
+                ),
+                deltas(&["好，按选项二来"]),
+            ],
+            Vec::new(),
+            vec![crate::tools::question::QuestionTool::shared()],
+        );
+        // 后台应答：等 sink 里出现 Question 事件（此刻 execute 已挂起），把选择送回去。
+        let answerer = tokio::spawn({
+            let sink = rig.sink.clone();
+            async move {
+                for _ in 0..500 {
+                    if let Some(id) = sink.events().into_iter().find_map(|e| match e {
+                        AgentEvent::Question { id, .. } => Some(id),
+                        _ => None,
+                    }) {
+                        crate::tools::question::QuestionTool::shared()
+                            .resolve(&id, "选项二".to_string());
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                panic!("等不到 Question 事件");
+            }
+        });
+
+        assert_eq!(rig.run("帮我拿个主意").await, StopReason::EndTurn);
+        answerer.await.unwrap();
+
+        // Read 档：提问全程不经过权限门（gate 的 sink 与事件线是同一份，取证无死角）。
+        assert!(
+            rig.sink.permission_ids().is_empty(),
+            "question 是 Read 档，不该有任何 PermissionRequest：{:?}",
+            rig.sink.permission_ids()
+        );
+        // 问答闭环的模型侧证据：第 2 次请求的 messages 带着工具结果（答案）。
+        // `text_of` 只收 Text 块，ToolResult 块要单独拆（gapcheck2 同一条经验）。
+        let reqs = rig.reqs();
+        assert_eq!(
+            reqs.len(),
+            2,
+            "第 1 轮 question + 第 2 轮收尾：{}",
+            reqs.len()
+        );
+        let results: Vec<String> = reqs[1]
+            .messages
+            .iter()
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    output: ToolOutput::Text { text },
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.iter().any(|t| t.contains("用户选择了：选项二")),
+            "答案要回到第 2 轮请求：{results:?}"
         );
     }
 

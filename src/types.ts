@@ -22,7 +22,7 @@
 // （评审 F7）。除它以外本文件不产生任何运行期代码 —— 长期记忆切片追加的 `MemoryView`
 // 也只是 interface，同样零运行期产物。
 //
-// Task 17 手测时还要对一次真实帧。若 Rust 加了第 12 支，前端这份镜像的缺口会被**机器**喊出来
+// Task 17 手测时还要对一次真实帧。若 Rust 加了第 14 支，前端这份镜像的缺口会被**机器**喊出来
 // （R118；本轮修复后不再只是注释，评审 F1）：
 //   1. `reducer.test.ts` 的跨语言用例用 `node:fs` 把 `events.rs` 里 `let tags = [ ... ];`
 //      这段**有界切片**的标签原样读出来，和 `WIRE_TAGS` 做集合相等 —— Rust 加一支而镜像没跟上，
@@ -360,14 +360,14 @@ export interface MemoryView {
 }
 
 /**
- * `AgentEvent` 的 12 个 `t` 标签，源头是 events.rs:400-412 的
- * `every_agent_event_variant_serializes_its_t_tag`（名单本身定义在 events.rs:358 那条测试里）：
+ * `AgentEvent` 的 13 个 `t` 标签，源头是 events.rs 的
+ * `every_agent_event_variant_serializes_its_t_tag`（名单本身定义在那条测试里）：
  *
  *   "turn_start", "text_delta", "user_message", "tool_call",
- *   "permission_request", "permission_resolved", "tool_result",
+ *   "permission_request", "permission_resolved", "question", "tool_result",
  *   "usage", "context_compacted", "memory_saved", "error", "done"
  *
- * 本表是镜像：union 必须与那 12 支**逐一对应**，少一支就会让 reducer 的
+ * 本表是镜像：union 必须与那 13 支**逐一对应**，少一支就会让 reducer 的
  * `default` 静默丢数据（R111 漏 `user_message` 就是活例子）。
  *
  * 下面这份字面量清单只是**人读的注释**：`reducer.test.ts` 的 `WIRE_TAGS` 由 `AgentEvent`
@@ -384,6 +384,14 @@ export type AgentEvent =
   | { t: "tool_call"; call: ToolCallView; risk: Risk }
   | { t: "permission_request"; id: string; call: ToolCallView; risk: Risk }
   | { t: "permission_resolved"; id: string; decision: Decision }
+  /**
+   * G20：模型向用户提出的多选题（events.rs 的 `Question { id, question, options }`）。
+   * `id` 是应答回执键：用户的选择经 ipc 的 `question_respond(id, choice)` 送回 Rust，
+   * 答案以工具结果（`用户选择了：…`）的形式回到对话。真正的提问面板是后续 UI 任务，
+   * reducer 此刻按既有模式降级成一条通知（见 reducer.ts 的 `question` 分支）。
+   * 位置与 Rust 的 tags 表一致（`permission_resolved` 与 `tool_result` 之间）。
+   */
+  | { t: "question"; id: string; question: string; options: string[] }
   | {
       t: "tool_result";
       call_id: string;

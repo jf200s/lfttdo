@@ -275,6 +275,14 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
       }));
     }
 
+    // G20：模型的多选题。此刻的最小处理 = 一条通知（问题 + 候选原样透传），
+    // 用户的选择经 ipc 的 `question_respond` 命令回给 Rust，答案以工具结果的形式
+    // 走既有的 `tool_result` 通路进时间线。提问面板（把 options 渲染成可点按钮、
+    // 挂起到应答为止）是后续 UI 任务——这里不发明卡片、不猜状态，与
+    // `tool_result` 归位不了时的取向一致：承认现状，别静默吞掉。
+    case "question":
+      return notice(state, `模型提问：${e.question}（${e.options.join(" / ")}）`);
+
     case "usage":
       return { ...state, usage: { input: e.input_tokens, output: e.output_tokens } };
 
@@ -312,7 +320,7 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
       // 前向兼容：Rust 侧新增事件时前端不许崩（brief:339）——运行期仍然原样返回。
       //
       // 但这一支**不许**兜住任何已经存在于线格式的变体（R111 漏 `user_message` 就是活例子），
-      // 所以把它做成编译期穷尽守卫（评审 F1①）：`AgentEvent` 加了第 12 支而这里没写臂，
+      // 所以把它做成编译期穷尽守卫（评审 F1①）：`AgentEvent` 加了第 13 支而这里没写臂，
       // `e` 在 default 上就不再是 `never`，`tsc` 直接 TS2322 —— 「镜像有臂、reducer 没写」
       // 从「只靠测试」升级成「编译不过」。
       const _exhaustive: never = e;

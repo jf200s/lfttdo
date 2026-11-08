@@ -157,11 +157,13 @@ const probe: Record<AgentEvent["t"], AgentEvent> = {
   tool_call: toolCall("c2"),
   permission_request: permRequest("p2"),
   permission_resolved: { t: "permission_resolved", id: "p1", decision: { allow: true, scope: "once" } },
+  // G20：放在 Rust 名单里的同一位置（`permission_resolved` 与 `tool_result` 之间）。
+  // 这条键本身就是「镜像有 13 支、reducer 有 13 臂」的机器判据之一（缺键 TS2741）。
+  question: { t: "question", id: "q1", question: "选哪个方案？", options: ["方案一", "方案二"] },
   tool_result: toolResult("c1", "结果"),
   usage: { t: "usage", input_tokens: 1, output_tokens: 2 },
   context_compacted: { t: "context_compacted", dropped: 4, summary_chars: 120 },
   // P1：放在 Rust 名单里的同一位置（`context_compacted` 与 `error` 之间）。
-  // 这条键本身就是「镜像有 12 支、reducer 有 12 臂」的机器判据之一（缺键 TS2741）。
   memory_saved: { t: "memory_saved", count: 2 },
   error: { t: "error", where: "loop", message: "循环了", fatal: false },
   done: done(),
@@ -490,21 +492,21 @@ describe("reducer", () => {
     expect(replay([{ t: "user_message", blocks: b }])).toEqual(appendUserTurn(initialState(), b));
   });
 
-  // ==== R118：12 个标签表驱动 ====
+  // ==== R118：13 个标签表驱动 ====
 
-  it("handles every one of the 12 wire t tags without falling through to default", () => {
+  it("handles every one of the 13 wire t tags without falling through to default", () => {
     // 名单来自 `Object.keys(probe)`，probe 的类型是 `Record<AgentEvent["t"], AgentEvent>`：
-    // 镜像有第 13 支而 probe 没补 → tsc 红；probe 补了而 reducer 没写臂 → reducer 的
+    // 镜像有第 14 支而 probe 没补 → tsc 红；probe 补了而 reducer 没写臂 → reducer 的
     // never 守卫红（tsc）+ 这里的 swallowed 断言红。三层都在（评审 F1③）。
     // R202：锚点写 Rust 的测试函数名，不写行号 —— 行号每次上游插删就指偏，名字不会。
-    expect(WIRE_TAGS).toHaveLength(12); // 锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 那条 (12, 12) 断言上
+    expect(WIRE_TAGS).toHaveLength(13); // 锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 那条 (13, 13) 断言上
     const base = replay([start(1), d("在写正文"), toolCall("c1"), permRequest("p1")]);
     const swallowed = WIRE_TAGS.filter((tag) => reduce(base, probe[tag]) === base);
     expect(swallowed).toEqual([]);
   });
 
   it("still mirrors the tag list that events.rs actually serializes", () => {
-    // 评审 F1④：这条才是「Rust 加第 12 支而前端镜像没跟上」的唯一机器判据。
+    // 评审 F1④：这条才是「Rust 加第 14 支而前端镜像没跟上」的唯一机器判据。
     // 之前 WIRE_TAGS 是手抄字面量，全仓库没有任何一条测试把它和 events.rs 连起来 ——
     // Rust 加一支、镜像不动 ⇒ 测试与 tsc 双双全绿，那条事件在 reduce 的 default 里被静默吞掉。
     const src = readSource("../../src-tauri/src/agent/events.rs");
@@ -545,20 +547,20 @@ describe("reducer", () => {
     // 表现得像 Rust 真少了一支，而且名单被截断成 `…(8)`，谁都读不出是哪一支。
     const rust = [...slice.matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]);
     // 三条都要：只比集合的话，切片一旦被收紧成空列表就会「两边都缺同一支」地悄悄通过。
-    // 消息里必须**打印读到的名单**（评审 R176/R177）：12 支的红要能点出多出来那一支的名字，
+    // 消息里必须**打印读到的名单**（评审 R176/R177）：多一支的红要能点出多出来那一支的名字，
     // 只报一个数字的话，改的人还得先去 events.rs 里数一遍。
     // R202（评审 NIT2）：失败消息里**一律不许写行号** —— 本文件的行号每加一条断言就整体下移
     // （本轮自己插了 21 行就重算过一次，而没有任何测试守着它），评审引用的 Rust 行号也已经指偏
     // （`events.rs:358` 只指到函数名那一行，计数断言在它下面十几行）。定位改用**测试函数名**。
     const handoff =
       "这个计数锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 里那条 " +
-      "`assert_eq!((events.len(), tags.len()), (12, 12))` 断言上；" +
-      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那个测试里的 tags 表和 (12, 12)）、" +
+      "`assert_eq!((events.len(), tags.len()), (13, 13))` 断言上；" +
+      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那个测试里的 tags 表和 (13, 13)）、" +
       "src/types.ts 的 AgentEvent、本文件的 probe 表，" +
-      "以及本文件那三处计数断言（用例 `handles every one of the 12 wire t tags without falling through to default` " +
+      "以及本文件那三处计数断言（用例 `handles every one of the 13 wire t tags without falling through to default` " +
       "里的 WIRE_TAGS，和**本用例**里的 rust 与 WIRE_TAGS 两条 toHaveLength）";
-    expect(rust, `events.rs 的 tags 表读到 ${rust.length} 支：${JSON.stringify(rust)}。${handoff}`).toHaveLength(12);
-    expect(WIRE_TAGS, `TS 侧镜像只有 ${WIRE_TAGS.length} 支：${JSON.stringify(WIRE_TAGS)}。${handoff}`).toHaveLength(12);
+    expect(rust, `events.rs 的 tags 表读到 ${rust.length} 支：${JSON.stringify(rust)}。${handoff}`).toHaveLength(13);
+    expect(WIRE_TAGS, `TS 侧镜像只有 ${WIRE_TAGS.length} 支：${JSON.stringify(WIRE_TAGS)}。${handoff}`).toHaveLength(13);
     // 集合相等，**不**比顺序：Rust 那边把 tags 数组重新排序不影响线格式，
     // 断言顺序只会造出一个假红。
     // 差集要**点名**（评审 R176）：两边各多出哪几支直接写进消息，别让人去猜 diff。

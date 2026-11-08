@@ -94,6 +94,7 @@ mod tests {
             skills_dir,
             skills_disabled,
             subagents: None,
+            events: None,
         }
     }
 
