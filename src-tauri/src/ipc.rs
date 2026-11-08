@@ -401,6 +401,10 @@ pub struct TurnDeps {
     /// 消息生效。`true` 时 Write/Exec 级工具调用在会话循环里被拒（session.rs 的
     /// `PLAN_MODE_NOTE`，不执行、不走权限门），Read 级照常。
     pub plan_mode: bool,
+    /// G18：诊断命令（write_file/edit_file 成功落盘后每轮跑一次，输出作为
+    /// 【自动诊断】合成 user 轮反馈给模型）。与 plan_mode 同一条线：`send_message`
+    /// 从本轮 `Settings` 现取，改设置下一条消息生效；`None`/空串 = 关闭。
+    pub diagnostics_command: Option<String>,
     /// T5：记忆的四项开关（spec §7），由 `send_message` 从本轮那份 `Settings` 现取
     /// （context/temperature 同一条线：会话不自己读 `Settings`）。`enabled=false` 的
     /// 语义有两级：压缩段零抽取（记忆侧模型调用一个不发起）+ 请求头零备注（连召回
@@ -1299,6 +1303,7 @@ pub async fn run_turn(
         context,
         temperature,
         plan_mode,
+        diagnostics_command,
         memory,
         embed,
         mut roots,
@@ -1472,6 +1477,7 @@ pub async fn run_turn(
     // `max_turns` 保持默认 25：它是防自我循环的保险丝而不是旋钮（spec 4.6），不进 Settings。
     .with_config(SessionConfig {
         plan_mode,
+        diagnostics_command,
         ..Default::default()
     });
     session.defer_done();
@@ -1709,6 +1715,8 @@ pub async fn send_message(
             // G15：plan 模式与上面各项同一条线 —— 同一份 `store.load()` 现取，改完设置
             // 下一条消息生效（run_turn 经 `with_config` 注入会话；轮内不变）。
             plan_mode: settings.plan_mode,
+            // G18：诊断命令同线现取（每轮一次、写在成功落盘之后，见 session.rs）。
+            diagnostics_command: settings.diagnostics_command.clone(),
             extract_locks: state.extracting.clone(),
             // T26（R276）：roots 和上面两项同源 —— 同一个 `store.load()` 的每一轮现取，
             // 因此**用户改完设置发下一条消息就生效**，这里没有任何缓存可以过期。
@@ -3563,6 +3571,7 @@ mod tests {
                     // `the_session_temperature_reaches_the_chat_request` 钉）。
                     temperature: None,
                     plan_mode: false,
+                    diagnostics_command: None,
                     // 夹具默认不带 roots：除了那条专门量 roots 的测试（它自己搭 `TurnDeps`），
                     // T27（R286）之后这里还要多说一句：`build_production_registry()` 的表里
                     // **有** `read_file`，但空 roots 那一轮交给模型的声明表里没有它，
@@ -3942,6 +3951,7 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: roots.clone(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -4018,6 +4028,7 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -4741,6 +4752,7 @@ mod tests {
                 context: compacting_cfg(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -4808,6 +4820,7 @@ mod tests {
                 context: compacting_cfg(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5189,6 +5202,7 @@ mod tests {
                 context: compacting_cfg(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -5788,6 +5802,7 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5966,6 +5981,7 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6030,6 +6046,7 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6176,6 +6193,7 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6346,6 +6364,7 @@ mod tests {
                 context: compacting_cfg(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6487,6 +6506,7 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg {
                     enabled: false,
@@ -6544,6 +6564,7 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory,
                 embed,
@@ -6879,6 +6900,7 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 extract_locks: ExtractLocks::default(),
@@ -7369,6 +7391,7 @@ mod tests {
                 context: ContextConfig::default(),
                 temperature: None,
                 plan_mode: false,
+                diagnostics_command: None,
                 roots: Vec::new(),
                 memory,
                 embed: None,
@@ -8339,6 +8362,7 @@ mod tests {
                     },
                     temperature: None,
                     plan_mode: false,
+                    diagnostics_command: None,
                     roots: Vec::new(),
                     skills_dir: None,
                     skills_disabled: Vec::new(),

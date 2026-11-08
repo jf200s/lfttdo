@@ -83,6 +83,11 @@ fn is_context_overflow(message: &str) -> bool {
 pub struct SessionConfig {
     pub max_turns: u32,
     pub plan_mode: bool,
+    /// G18：诊断命令（`write_file`/`edit_file` 成功落盘后每轮跑一次，输出作为
+    /// 【自动诊断】合成 user 轮反馈给模型）。生产值来自 `Settings.diagnostics_command`
+    /// （`ipc.rs::run_turn` 每轮现取：改设置下一条消息生效）；`None`/空串 = 关闭
+    /// （历史组装与没有本功能时逐字节一致）。
+    pub diagnostics_command: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -90,6 +95,7 @@ impl Default for SessionConfig {
         Self {
             max_turns: 25,
             plan_mode: false,
+            diagnostics_command: None,
         }
     }
 }
@@ -443,6 +449,9 @@ impl AgentSession {
             // 工具**顺序**执行，不并行（spec 4.6 的刻意取舍：并行难追踪「哪个写操作改了
             // 哪个文件」，也和分级确认的交互顺序冲突）。
             let mut tool_images: Vec<ContentBlock> = Vec::new();
+            // G18：本轮是否有 write_file/edit_file **成功落盘** —— 有就等全部工具结果
+            // 处理完之后跑一次诊断命令（命令往往秒级，别每个文件各跑一遍）。
+            let mut wrote_file = false;
             for (id, name, input) in calls {
                 // risk 只从注册表查（`ToolCallView` 的注释就是这条）：模型或前端递来的
                 // 任何「我是 Read」都不作数 —— `ToolDef` 里压根没有 risk 字段。
@@ -591,6 +600,12 @@ impl AgentSession {
                 });
                 tool_images.extend(images_of(&output));
                 self.history.push(Message::tool(&id, output, is_error));
+                // G18：诊断反馈的触发记账。is_error 的写不触发 —— 落盘都没发生，
+                // 诊断的是旧文件，反馈只会误导；被 plan 模式 / doom 守卫拦下的调用
+                // 走 `continue`，根本到不了这里。
+                if matches!(name.as_str(), "write_file" | "edit_file") && !is_error {
+                    wrote_file = true;
+                }
             }
             // R319：工具回的图片对**模型**不可见（`role:"tool"` 只能带文本，
             // openai_compat.rs:387-392）。要让 vision 模型真的看到，只能在 tool 消息之后
@@ -598,6 +613,21 @@ impl AgentSession {
             // R57 的配对不变量（N 个调用紧跟 N 条结果）因此不受影响。
             if let Some(followup) = image_followup(&tool_images) {
                 self.history.push(followup);
+            }
+            // G18：诊断反馈 —— OpenCode 把「编辑后的诊断（编译/LSP 错误）」送回模型的
+            // 离线等价物：配置了命令且本轮有写工具成功落盘时，**全部工具结果处理完之后
+            // 跑一次**，输出非空就补一条合成 user 轮。与 image_followup 同一先例：
+            // tool 消息之后给模型的补充上下文，不进 UI 事件流。命令失败/超时/被取消/
+            // 输出为空都不追加（不编造）；没有配置命令时这里一个字节都不动 —— 历史与
+            // 没有本功能时逐字节一致（有测试钉住）。
+            if wrote_file
+                && let Some(command) = self.cfg.diagnostics_command.as_deref()
+                && !command.trim().is_empty()
+                && let Some(diag) = self.run_diagnostics(command, &ctx).await
+            {
+                self.history.push(Message::user(vec![ContentBlock::Text {
+                    text: format!("【自动诊断】{diag}"),
+                }]));
             }
         }
 
@@ -785,6 +815,45 @@ impl AgentSession {
             return None;
         }
         Some(format!("{AGENTS_MD_HEADING}\n\n{}", parts.join("\n\n")))
+    }
+
+    /// G18：跑一次诊断命令，返回 Some(text) = 有非空输出要反馈给模型。
+    ///
+    /// · cwd：会话输出目录（`ctx.write_root`）；没有就退回 `roots[0]` —— 诊断命令
+    ///   通常要相对某个项目根才有意义。两处都没有 ⇒ 放弃（在任意进程 cwd 下跑
+    ///   用户没指定位置的命令，输出无法解释）。
+    /// · 15s 超时、随父令牌取消立即放弃（`select!` biased 取消臂优先）。
+    /// · **退出码不参与判定**：非零恰恰是「有诊断」（编译器报错走非零退出）；
+    ///   spawn 失败 / 超时才给 `None` —— 反馈只来自真实输出，不编造。
+    /// · stdout+stderr 合并，截到 4000 字符（按字符，UTF-8 安全）—— 这是给模型的
+    ///   反馈摘要，不是完整日志。
+    async fn run_diagnostics(&self, command: &str, ctx: &ToolCtx) -> Option<String> {
+        let mut parts = command.split_whitespace();
+        let program = parts.next()?;
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(parts);
+        let cwd = ctx
+            .write_root
+            .clone()
+            .or_else(|| ctx.roots.first().cloned())?;
+        cmd.current_dir(cwd);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return None,
+            res = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()) => {
+                // 超时（Elapsed）或 spawn 失败：没有可反馈的输出。
+                res.ok()?.ok()?
+            }
+        };
+        let mut merged = String::from_utf8_lossy(&output.stdout).into_owned();
+        merged.push_str(&String::from_utf8_lossy(&output.stderr));
+        let merged = merged.trim();
+        if merged.is_empty() {
+            return None;
+        }
+        Some(merged.chars().take(4000).collect())
     }
 
     /// 交给模型的请求：滑窗组装出来的消息 + 注册表的工具声明。
@@ -2554,6 +2623,185 @@ mod tests {
 
         // R57 配对（子会话自己的请求也在同一只 recorder 里，一起钉）。
         assert_every_request_paired(&rig);
+    }
+
+    // ───────────────────────── G18：诊断反馈 ─────────────────────────
+
+    /// G18 夹具：只注册 write_file 的 rig；输出目录指向 out_dir（写工具唯一允许的
+    /// 写入面）；SessionConfig 原样注入（diagnostics_command 在 cfg 里）。
+    fn diagnostics_rig(cfg: SessionConfig, rounds: Vec<Vec<ModelDelta>>, out_dir: &Path) -> Rig {
+        let model = ScriptedModel::new(rounds);
+        let recorder = model.recorder.clone();
+        // roots 与 write_root（= 会话输出目录）都指向 out_dir：写工具先过
+        // `resolve_within_roots`（空表全拒）、再过 `ensure_within_write_root`，两个
+        // 闸门必须同时放行同一个目录。
+        let (session, sink, gate) = parts(
+            model,
+            ContextConfig::default(),
+            None,
+            vec![Arc::new(crate::tools::write_file::WriteFileTool)],
+            vec![out_dir.to_path_buf()],
+        );
+        Rig {
+            session: session
+                .with_config(cfg)
+                .with_output_dir(Some(out_dir.to_path_buf())),
+            sink,
+            gate,
+            recorder,
+        }
+    }
+
+    /// 跨平台守卫与 shell.rs 同款：脚本用例只在 unix 下跑（需要 shebang + 可执行位）。
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// 诊断脚本输出一行 ⇒ write_file 成功落盘后历史里出现【自动诊断】合成 user 轮
+    /// （位置：tool 结果之后、模型下一轮之前），且下一次请求的 messages 带上该文本。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_diagnostics_command_appends_a_synthetic_user_turn() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.sh", "printf 'error: missing semicolon'");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("write_file", args.as_str())]),
+                deltas(&["收到"]),
+            ],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+
+        // 历史形状：user → assistant(调用) → tool(结果) → user(【自动诊断】) → assistant。
+        let hist = rig.session.history();
+        assert_eq!(hist.len(), 5, "合成 user 轮恰好多出一条：{hist:?}");
+        assert_eq!(hist[3].role, Role::User);
+        let diag_text = hist[3].text_of();
+        assert!(
+            diag_text.contains("【自动诊断】") && diag_text.contains("missing semicolon"),
+            "诊断轮要带标记与脚本输出：{diag_text}"
+        );
+
+        // 下一次请求的 messages 里模型读得到这段反馈。
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 2);
+        let joined: String = reqs[1].messages.iter().map(|m| m.text_of()).collect();
+        assert!(
+            joined.contains("【自动诊断】") && joined.contains("missing semicolon"),
+            "第二次请求要带上诊断反馈：{joined}"
+        );
+        // R57 配对不受合成 user 轮影响（它在全部 tool 结果之后）。
+        assert_every_request_paired(&rig);
+    }
+
+    /// 诊断命令成功但**输出为空** ⇒ 不追加任何消息（没有可说的就不编造）。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_diagnostics_output_appends_nothing() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.sh", "exit 0");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("write_file", args.as_str())]),
+                deltas(&["收到"]),
+            ],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+        let hist = rig.session.history();
+        assert_eq!(
+            hist.len(),
+            4,
+            "user → assistant(调用) → tool(结果) → assistant，没有诊断轮：{hist:?}"
+        );
+        assert!(
+            hist.iter().all(|m| !m.text_of().contains("【自动诊断】")),
+            "空输出不许出现诊断轮"
+        );
+    }
+
+    /// 没有配置命令 ⇒ 与现状**逐字节一致**：两个同配置 rig 跑同一脚本轮，
+    /// 历史完全相等，且都没有诊断轮。
+    #[tokio::test]
+    async fn without_a_command_the_history_is_byte_identical() {
+        let out = tempfile::tempdir().unwrap();
+        let file = out.path().join("note.txt");
+        // 预建目标文件：两个 rig 共用同一目录，若不预建，第一次写入回「新建」、
+        // 第二次回「覆盖」，结果文案不同会让逐字节比较失真。预建后两次都是覆盖。
+        std::fs::write(&file, "hello").unwrap();
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let rounds = vec![
+            tool_round(1, &[("write_file", args.as_str())]),
+            deltas(&["收到"]),
+        ];
+        let mut rig_a = diagnostics_rig(SessionConfig::default(), rounds.clone(), out.path());
+        let mut rig_b = diagnostics_rig(SessionConfig::default(), rounds, out.path());
+        let _answers_a = answer_all(&rig_a.gate, &rig_a.sink, 1);
+        let _answers_b = answer_all(&rig_b.gate, &rig_b.sink, 1);
+        assert_eq!(rig_a.run("写一下").await, StopReason::EndTurn);
+        assert_eq!(rig_b.run("写一下").await, StopReason::EndTurn);
+        assert_eq!(
+            rig_a.session.history(),
+            rig_b.session.history(),
+            "无命令时历史必须与现状逐字节一致"
+        );
+        assert!(
+            rig_a
+                .session
+                .history()
+                .iter()
+                .all(|m| !m.text_of().contains("【自动诊断】")),
+            "无命令不许出现诊断轮"
+        );
+    }
+
+    /// 命令失败（非零退出）且**无输出** ⇒ 不追加 —— 反馈只来自真实输出，不编造。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_silent_command_appends_nothing() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.sh", "exit 3");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("write_file", args.as_str())]),
+                deltas(&["收到"]),
+            ],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+        let hist = rig.session.history();
+        assert_eq!(hist.len(), 4, "失败且无输出 = 没有诊断轮：{hist:?}");
+        assert!(
+            hist.iter().all(|m| !m.text_of().contains("【自动诊断】")),
+            "不许把退出码编造成诊断文本"
+        );
     }
 
     /// 溢出识别只认端点文案里的这几个词；普通 4xx/网络错误不许误判成溢出。
