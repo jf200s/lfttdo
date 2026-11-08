@@ -545,6 +545,35 @@ button.path-chip:disabled {
   flex: 1 1 120px;
 }
 
+/* ==== G20 提问面板 ====
+   挂起的模型提问渲染成消息流末尾一张水平居中的小卡：底座（背景/边框/投影/内边距）
+   全部来自 `.card`，这里只补「居中 + 行宽上限」与两个内部行。色值一律
+   `var(--token)`（文件头第 ② 条），宽度借 `--bubble-max-w` 与气泡列同宽。 */
+.question-region {
+  display: flex;
+  justify-content: center;
+}
+
+.question {
+  width: min(100%, var(--bubble-max-w));
+}
+
+.question-text {
+  margin: 0;
+}
+
+.question-options,
+.question-custom {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.question-custom input {
+  flex: 1 1 120px;
+}
+
 /* ==== 输入区 ==== */
 
 .composer {

@@ -93,6 +93,8 @@ mod tests {
             roots: Vec::new(),
             skills_dir,
             skills_disabled,
+            subagents: None,
+            events: None,
         }
     }
 

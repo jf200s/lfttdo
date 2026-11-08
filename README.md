@@ -13,12 +13,17 @@ Windows 桌面 AI 助理：聊天、看图、联网抓取、MCP 工具调用，�
 - **看图**：粘贴 / 拖拽 / 选文件三种入口，统一走同一条图片归一化（缩放、转码、体积闸门）；视觉模型可描述图片。
 - **联网抓取**：内置 `fetch_url`，按内容抽取正文；每跳重定向都过 SSRF 判定（拒绝非 http(s)、本机、内网与元数据地址）。
 - **本地文件**：设置页「文件访问」列出的目录作为**只读**范围；生成/修改文件写到当前输出目录（工作文件夹或默认储存位置），写入走权限弹窗、可放行本会话。路径逐次校验（绝对路径、junction/越界一律拒绝），非 UTF-8 文件明确拒绝而不是静默转码。
-- **命令执行**：内置 `run_command`，命令交给选定的 shell 后端执行。shell 可选：设置页「Shell」区块内置 8 个预设 profile（bash、sh、zsh、fish、git-bash、pwsh、powershell、cmd），也支持自定义 profile（任意可执行文件路径，可校验「程序存在且可执行」）；默认 shell 存在设置里，单次调用还可临时指定；每次调用都弹 Exec 确认。
+- **命令执行**：内置 `run_command`，命令交给选定的 shell 后端执行。shell 可选：设置页「Shell」区块内置 8 个预设 profile（bash、sh、zsh、fish、git-bash、pwsh、powershell、cmd），也支持自定义 profile（任意可执行文件路径，可校验「程序存在且可执行」）；默认 shell 存在设置里，单次调用还可临时指定；每次调用都弹 Exec 确认。`background: true` 可后台执行：立即返回 `task_id`，随后凭它查询运行状态与输出（运行中不回显命令原文）。
 - **工作文件夹**：每个会话可选择一个工作文件夹；没选时用设置里的「默认储存位置」（默认是文档目录下的 `LFTTDO`，按会话建子目录）。生成的图片和文件落在输出目录：图片在 `images/`、文件在根目录；写入只允许发生在该输出目录，全局 roots 只读。工具卡会显示文件和图片的绝对路径，点击可在资源管理器中选中。
+- **内置工具集**：`grep`（正则内容搜索，结果带起始行号；目录递归有界，自动跳过 `.git`/`node_modules`/`target` 与二进制/非 UTF-8 文件）、`glob`（按 `**/*.rs` 这类模式列出文件，字典序返回绝对路径）、`todo_write`（结构化任务清单，持久化到工作目录的 `.lfttdo/todos.json`，状态机 pending/in_progress/completed）、`undo`（撤销最近一次 write/edit 的内容变更；新建文件不参与撤销——undo 永不删除用户文件）、`task`（派子代理：起一个独立历史的子会话自主完成任务，最终文本回注父对话；可选 `agent` 参数按设置里的 agent 档案派受限子代理——子会话继承该档案的 tools 白名单与非空提示词（如只读调研员），不指定则用全工具集的默认子代理；调用需一次权限确认）、`websearch`（联网搜索：DuckDuckGo 的 HTML 端点，返回「N. 标题 — URL（摘要）」编号清单，最多 10 条；结果与网络可达性受环境限制，反爬页会如实报零命中；只读不弹窗）、`question`（向用户提多选题：2..=6 个候选，答案以「用户选择了：…」回注对话，前端经 `question_respond` 命令回填，提问面板也可自由输入回答；只读不弹窗）、`workflow`（多步编排：工作目录的 `workflows/<name>.json` 定义步骤，每步可选指定 `agent` 档案派受限子代理，`{{上一步名}}` 把上一步结果注入下一步提示词（单次注入上限 8000 字符，超出截断注明）；`list` / `run` 两种动作，某步失败立即停止并在错误里注明停在第几步；run 期间每步开始/结束都向前端发进度事件（工作流名、步骤名、序号 i/N、进行中/完成/失败，界面以通知条显示）；Write 档弹窗）、`experiment`（自优化实验循环：`experiment_run` 在工作目录用平台 shell 跑基准命令并从输出解析 `METRIC 名=值` 行（可 `repeat` 1..=5 复跑取中位数；每次复跑完成后向前端发进度事件——复跑序号 i/N 与当次解析到的指标）、`experiment_keep` 把当前变更 git commit 留存（`experiment:` 前缀提交）、`experiment_discard` 回滚到上次提交（未跟踪新产物一并清理）；账本在 `.lfttdo/experiments.jsonl`；Exec 档每次弹窗，`.lfttdo` 不进 git）。
 - **MCP 客户端**：stdio 与 streamable-http 两种传输，启动后台连接、工具命名走 `mcp__{server}__{tool}`、每台 server 可设信任档（全部允许 / 每次询问 / 禁止），信任设置持久化；侧栏 MCP 面板可在应用内直接编辑 `mcp.json`，可配置多个 stdio / streamable-http server（严格校验、重启生效）。工具返回的图片会直接显示在工具卡片里（最多 4 张、合计 base64 ≤ 8 MB；超出的在预览里注明），模型侧按既有的最近 3 张保留上限接收图片。
 - **长期记忆**：跨会话记住事实、偏好、画像与待办；在上下文压缩、空闲、切换会话时自动抽取，每轮按相关度召回；设置页可查看、编辑、新增、删除、清空。
-- **工具权限门**：Read 自动放行；Write/Exec 弹窗确认；MCP 工具默认每次询问；未知工具按最严一档处理。
+- **工具权限门**：Read 自动放行；Write/Exec 弹窗确认；MCP 工具默认每次询问；未知工具按最严一档处理。设置里可写 `permission_rules`（JSON 规则：allow/ask/deny + `*`/`?` 通配；`run_command` 按 `&&`/`&`/`||`/`;`/`|`/换行分段匹配——`git status && rm -rf /x` 不会被 git 前缀的 allow 带过；单个 `&` 同样切段：bash 里 `A & B` 是 A 后台执行、cmd 里 `A & B` 是顺序连接，两种语义下 B 都会跑，判定必须逐段。已知边界均为安全侧：powershell 5.1 不支持 `&&`（整条语法失败、不会执行）、PowerShell 反引号续行不识别（整段落回默认路径弹窗）；规则 deny 压过会话记住的放行），改完设置下一条消息生效。
+- **Plan 模式**：设置开关打开后模型只能看和读——写入/命令类调用被直接拒绝（提示先完成调研给出方案、退出 plan 模式再执行修改），Read 类照常；同样改设置下一条消息生效。
+- **长任务护栏**：上下文超限自动收缩重试一次；步数触顶收回工具声明、强制模型文字总结收尾；工具输出超长自动截断并把全文落盘到 `.lfttdo/outputs/`（返回里给出可再读的路径）；roots 下的 `AGENTS.md` 每轮现读注入系统提示（单份 8 KiB 截断）。长对话压缩的摘要是结构化交接：按客观/已完成/决定/阻塞/下一步/涉及文件六节组织，上限 600 字。
+- **自动诊断**：设置里配 `diagnostics_command`（如 `cargo check --message-format short`）后，每次 `write_file` / `edit_file` 落盘成功都在工作目录自动运行一次，输出以【自动诊断】追加进对话（合并 stdout/stderr、截 4000 字符）；空输出、命令跑不起来、超时（15 秒）不追加，退出码不参与判定（编译器报错走非零退出，照样追加）。慢命令会拖慢每次写文件之后的节奏，建议配短平快的检查。
 - **人设**：设置页可直接编辑系统提示词，支持从 `.txt`（UTF-8）导入、导出 `.txt`、恢复内置；留空使用内置提示词，内容只保存在本机 `settings.json`，保存后下一条消息生效。
+- **自定义 Agent**：设置里可维护 `agents` 档案（name / description / prompt / tools 白名单）并用 `active_agent` 指定生效档案；激活后非空 prompt **整段替换**系统提示词（优先于用户人设），tools 白名单双层生效——声明表只留名单内工具、白名单外的调用在执行前被拒（不执行、不弹窗）；未激活的档案只是存档。档案还与 `task` / `workflow` 联动：`task` 按档案名派出的子代理继承该档案的提示词与工具白名单，`workflow` 的步骤同样可用 `agent` 指定档案（受限子代理）。改设置下一条消息生效。
 - **技能包**：`skills/<名字>/SKILL.md` 放一份说明，索引自动进系统提示；模型需要时调用
   `use_skill` 读取正文，用户这句话里带到技能名或 `keywords` 时正文直接自动加载。
   只读本地文本，不执行脚本；加/改技能不用重启（下一条消息生效）。
@@ -55,11 +60,12 @@ npm run tauri build        # 打包（NSIS 安装器）
 
 常规安装的数据都在 `%APPDATA%\com.qwa.do\`：
 
-- `settings.json`：模型地址与模型名、上下文预算、主题、长期记忆开关、`system_prompt`（人设）、自定义 shell profile 与默认 shell
+- `settings.json`：模型地址与模型名、上下文预算、主题、长期记忆开关、`system_prompt`（人设）、自定义 shell profile 与默认 shell、权限规则（`permission_rules`）、plan 模式开关（`plan_mode`）、自动诊断命令（`diagnostics_command`）、自定义 agent 档案与生效档案（`agents` / `active_agent`）
 - `qwen-do.db`：会话、消息与长期记忆
 - `skills/`：技能包；`skills.json` 记录每个技能的启停
 - `mcp.json`：MCP 服务器配置（可选）；`mcp_trust.json` 记录每台服务器的信任档
 - `window.json`、`qwen-do.log`：窗口位置与日志
+- 工作目录侧（会话选定的工作文件夹，不在 `%APPDATA%`）：`workflows/`（workflow 的多步编排定义，`workflows/<name>.json`）、`.lfttdo/experiments.jsonl`（experiment 的实验账本；整个 `.lfttdo/` 不进 git——experiment 提交时排除、回滚时保全）
 
 ## 技能包（skills）
 
@@ -104,8 +110,9 @@ Rust 侧需 MSVC 工具链：默认工具链不是 MSVC 的机器，用 `rustup 
 字符的仓库路径下链接器会崩）。仓库路径含非 ASCII 字符时，aws-lc-sys 的 NASM 构建步骤也会失败，
 可设 `AWS_LC_SYS_PREBUILT_NASM=1` 改用预编译汇编，或把仓库放到纯 ASCII 路径。
 
-当前读数：Rust 797 passed / 1 ignored + 集成 3 passed；前端 294 passed；clippy 无新增
-（Windows 目标也已是 `-D warnings` 门禁）。
+当前读数：Rust 957 passed / 1 ignored + 集成 28 passed（gapcheck 12 + gapcheck2 15）；前端 308 passed；clippy 无新增
+（Windows 目标也已是 `-D warnings` 门禁）。权限分段、实验与诊断相关用例带 Windows 镜像：push 后 windows-latest
+会实跑同一逻辑（`run_command` 的 shell 执行用例仍为 unix 专属——sh 语法）。
 
 ## 目录结构
 
@@ -114,7 +121,7 @@ src/                前端（组件、IPC 封装、状态 reducer、主题 token
 src-tauri/src/
   agent/            会话循环、上下文组装、摘要压缩、长期记忆、事件类型
   model/            OpenAI 兼容适配器（含 reasoning 流）
-  tools/            内置工具与注册表（fetch_url、read_file、use_skill、memory_search、write_file、edit_file、run_command〔可选 shell 后端〕）
+  tools/            内置工具与注册表（fetch_url、read_file、write_file、edit_file、grep、glob、run_command〔可选 shell 后端〕、todo_write、undo、use_skill、memory_search、task、websearch、question、workflow、experiment）
   permission/       权限门与信任档
   mcp/              mcp.json 读取/编辑、工具命名、stdio / HTTP 桥、进程树回收
   store/            SQLite 会话与长期记忆持久化
@@ -146,7 +153,8 @@ release/            本地发布说明与各版本源码归档（gitignored，�
 - 文件工具只接受 roots 或当前会话输出目录内的绝对路径；写盘走同目录临时文件 + 原子替换，非 UTF-8 目标不会被静默转码。写工具只允许写当前会话输出目录，想编辑其它目录请把它设为工作文件夹。
 - 前端无 shell / 文件系统权限，进程执行全部在 Rust 侧。
 - `run_command` 是 `Risk::Exec`：每次调用都弹窗、会话级放行的粒度是**整条命令文本**（逐字相同才放行）；
-  命令结束整棵进程树被回收，不留后台进程。
+  前台命令结束整棵进程树被回收，不留后台进程。`background: true` 的后台任务不随「停止」中断，
+  以超时为唯一终点，到点同样回收整棵进程树。
 - 应用内配置编辑器会把 `mcp.json` 原文（含 env/headers）显示在界面里；MCP 列表与状态命令始终不返回这些值。
 - Markdown 链接经 `open_url` 交给系统默认浏览器（只允许 http/https），不导航 WebView；
   WebView 顶层导航另有白名单（只放行应用自身来源与本机开发服务器）。

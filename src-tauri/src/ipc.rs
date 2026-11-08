@@ -10,7 +10,7 @@ use crate::agent::memory::{
     MemoryCandidate, MemoryDecision, PROFILE_CHAR_CAP, consolidate_memory, extract_memories,
     merge_profile,
 };
-use crate::agent::session::{AgentSession, SessionDeps};
+use crate::agent::session::{AgentProfile, AgentSession, SessionConfig, SessionDeps};
 use crate::agent::summarize::{SUMMARY_OMITTED, collect_summary, summary_note, summary_request};
 use crate::agent::types::{ContentBlock, Message, Role};
 use crate::mcp::bridge::{McpBridge, McpTool, ServerStatus};
@@ -24,15 +24,24 @@ use crate::settings::{Settings, SettingsStore, effective_roots};
 use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::store::memory::{MemoryRow, MemoryWrite, RecallCfg};
 use crate::tools::edit_file::EditFileTool;
+use crate::tools::experiment::ExperimentTool;
 use crate::tools::fetch::FetchTool;
+use crate::tools::glob::GlobTool;
+use crate::tools::grep::GrepTool;
 use crate::tools::memory_search::MemorySearchTool;
+use crate::tools::question::QuestionTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::shell::{
     ShellCatalog, ShellProfile, ShellTool, detected_presets, ensure_executable, path_search_dirs,
     validate_custom,
 };
+use crate::tools::task::TaskTool;
+use crate::tools::todo::TodoTool;
+use crate::tools::undo::UndoTool;
 use crate::tools::use_skill::UseSkillTool;
+use crate::tools::websearch::WebSearchTool;
+use crate::tools::workflow::WorkflowTool;
 use crate::tools::write_file::WriteFileTool;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
 use serde::Serialize;
@@ -390,6 +399,26 @@ pub struct TurnDeps {
     /// 由 `Settings::to_model_config()` 给（T39）：`None` = 请求体不带 `temperature`，
     /// 端点自己定。和 `context` 同样理由 —— 会话不许自己去读 `Settings`。
     pub temperature: Option<f32>,
+    /// G15：plan 模式开关（OpenCode 的「只读研究」agent）。由 `send_message` 从本轮
+    /// 那份 `Settings` 现取（context/temperature/memory 同一条线：会话不自己读
+    /// `Settings`），`run_turn` 经 `AgentSession::with_config` 注入 —— 改设置下一条
+    /// 消息生效。`true` 时 Write/Exec 级工具调用在会话循环里被拒（session.rs 的
+    /// `PLAN_MODE_NOTE`，不执行、不走权限门），Read 级照常。
+    pub plan_mode: bool,
+    /// G18：诊断命令（write_file/edit_file 成功落盘后每轮跑一次，输出作为
+    /// 【自动诊断】合成 user 轮反馈给模型）。与 plan_mode 同一条线：`send_message`
+    /// 从本轮 `Settings` 现取，改设置下一条消息生效；`None`/空串 = 关闭。
+    pub diagnostics_command: Option<String>,
+    /// G19：agent 工具白名单（激活档案的 `tools`）。与 plan_mode 同一条线现取；
+    /// `None` = 不限制。会话里双层生效：声明表过滤（`tool_defs_for_turn` 的估算与
+    /// `request()` 同参）+ 循环拦截。
+    pub allowed_tools: Option<Vec<String>>,
+    /// G19：激活档案的名字（拒绝理由点名用）。与 allowed_tools 同源同设。
+    pub active_agent_name: Option<String>,
+    /// G22：task 工具可点名的 agent 档案表。与 allowed_tools 同一条线现取
+    /// （`send_message` 经 [`agent_profiles`] 从 `Settings.agents` 映射，改设置下一条
+    /// 消息生效），`run_turn` 装进 `SessionConfig.agents`。
+    pub agents: Vec<AgentProfile>,
     /// T5：记忆的四项开关（spec §7），由 `send_message` 从本轮那份 `Settings` 现取
     /// （context/temperature 同一条线：会话不自己读 `Settings`）。`enabled=false` 的
     /// 语义有两级：压缩段零抽取（记忆侧模型调用一个不发起）+ 请求头零备注（连召回
@@ -1035,6 +1064,23 @@ pub(crate) fn memory_turn_cfg(settings: &Settings) -> MemoryTurnCfg {
     }
 }
 
+/// G22:`Settings.agents → Vec<AgentProfile>` 的**唯一**转换点(与 `memory_turn_cfg`
+/// 同一条纪律:`#[tauri::command]` 在单测里调不动,映射抽成纯函数才能单测钉住;
+/// 放 ipc 不做成 `Settings` 的派生方法,理由同 `memory_turn_cfg` —— settings.rs 是
+/// 不依赖上层的底层文件)。只映射 name/prompt/tools:`description` 是给人看的档案
+/// 说明,模型与子会话都用不上 —— 丢在这里是有意的,不是漏搬。
+pub(crate) fn agent_profiles(settings: &Settings) -> Vec<AgentProfile> {
+    settings
+        .agents
+        .iter()
+        .map(|p| AgentProfile {
+            name: p.name.clone(),
+            prompt: p.prompt.clone(),
+            tools: p.tools.clone(),
+        })
+        .collect()
+}
+
 /// T10(机制一:编码特异性):召回 query 拼上**上一轮**用户消息的文本。
 ///
 /// 人回忆时并不只用当前这句话当线索:追问(「那它呢」「还有别的吗」)本身没有实体,
@@ -1287,6 +1333,11 @@ pub async fn run_turn(
         sink,
         context,
         temperature,
+        plan_mode,
+        diagnostics_command,
+        allowed_tools,
+        active_agent_name,
+        agents,
         memory,
         embed,
         mut roots,
@@ -1314,11 +1365,14 @@ pub async fn run_turn(
     // roots 为空时、use_skill 在无启用技能时会被 request() 隐藏），与 request()
     // 共用同一个过滤函数。否则估算虚高 → 校准系数偏低 → 预算越放越宽。
     let roots_for_estimate = effective_roots(&roots);
+    // G19：白名单同参传入 —— 预算估算与 `request()` 的声明表共用同一份过滤
+    // （算的是全量、发的是过滤后会让估算虚高、校准系数偏低，R286 同理）。
     let tool_defs = crate::agent::session::tool_defs_for_turn(
         &registry,
         &roots_for_estimate,
         skills_dir.as_deref(),
         &skills_disabled,
+        allowed_tools.as_deref(),
     );
     builder.set_tool_tokens(crate::agent::context::tool_defs_tokens(&tool_defs));
 
@@ -1454,7 +1508,19 @@ pub async fn run_turn(
     .with_roots(effective_roots(&roots))
     .with_output_dir(output_dir)
     .with_skills_dir(skills_dir)
-    .with_skills_disabled(skills_disabled);
+    .with_skills_disabled(skills_disabled)
+    // G15：plan 模式每轮现取（改设置下一条消息生效）—— 会话里 Write/Exec 级调用被拒、
+    // Read 照常，语义归 session.rs（`SessionConfig.plan_mode` / `PLAN_MODE_NOTE`）。
+    // `max_turns` 保持默认 25：它是防自我循环的保险丝而不是旋钮（spec 4.6），不进 Settings。
+    // G22：agents 档案表同线装配 —— 会话再经 LoopRunner 喂给 task 工具（session.rs）。
+    .with_config(SessionConfig {
+        plan_mode,
+        diagnostics_command,
+        allowed_tools,
+        active_agent_name,
+        agents,
+        ..Default::default()
+    });
     session.defer_done();
     let session_cancel = session.cancel_handle();
     token.install(session_cancel.clone());
@@ -1609,6 +1675,24 @@ pub async fn send_message(
     // 每次执行看到的都是这份。这一行没法单测（`#[tauri::command]` 在单测里调不动），
     // 「值真的可解析」由 `shell_catalog_of` 的纯函数测试与 settings 侧 normalize 钉着。
     *crate::lock::write(&state.shells) = shell_catalog_of(&settings);
+    // G13：工具级权限规则（`settings.permission_rules` → gate）。生效时机与上面的 shell
+    // catalog、下面的 roots 同一条线 —— 每轮开头现读设置，**改完设置发下一条消息就生效**，
+    // 不做实时热更（轮内不变：正在跑的那一轮不换规则表）。
+    // `None`（没配过 / 已清空）时清空规则表，回到默认路径；形状非法时
+    // `set_rules_from_json` 报 Err，这里降级为 warn + 清空 —— fail-safe：规则缺失只会
+    // 回到「按默认问人」，绝不静默沿用上一轮的旧规则，也绝不让一条配错的规则拦停整条消息。
+    // 这一段没法单测（`#[tauri::command]` 在单测里调不动，同上面 shell catalog 那行）：
+    // 解析/替换/Err 语义由 `gate.rs` 的内联测试钉着，端到端行为由 `tests/gapcheck2.rs`
+    // 的 G13 验收测试钉着。
+    match &settings.permission_rules {
+        Some(v) => {
+            if let Err(reason) = state.gate.set_rules_from_json(v) {
+                tracing::warn!("permission_rules 形状非法，本轮忽略并清空规则：{reason}");
+                state.gate.rules().clear_tool_rules();
+            }
+        }
+        None => state.gate.rules().clear_tool_rules(),
+    }
     // R90：`normalize_base_url("")` 返回空串，settings.rs 不替用户编一个默认端点，
     // 所以这道守卫必须住在装配层 —— 空 base_url 到这里就停。
     if settings.base_url.trim().is_empty() {
@@ -1657,6 +1741,16 @@ pub async fn send_message(
     // 会话作用域在**真正开跑**之前对齐：配置/凭据失败的那次发送没有开跑，
     // 不该顺手清掉上一轮用户答过的授权。
     enter_session_scope(&state.last_session, &state.gate, &session_id);
+    // G19：激活的 agent 档案。prompt 是**整段替换**（与用户人设同一语义）且
+    // **优先于人设**——档案是「这个会话此刻是谁」的完整定义，人设只是它的缺省。
+    // tools 白名单交给会话双层执行（声明表过滤 + 循环拦截，见 session.rs）。
+    // 生效提示词的解析是纯函数（`Settings::effective_agent_prompt`，settings.rs
+    // 单测钉住），这里只做一行装配 —— `#[tauri::command]` 在单测里调不动。
+    let profile = settings.active_agent_profile();
+    let mut context_settings = settings.clone();
+    if let Some(prompt) = settings.effective_agent_prompt() {
+        context_settings.system_prompt = prompt;
+    }
     let out = run_turn(
         TurnDeps {
             output_dir: Some(output_dir),
@@ -1666,9 +1760,23 @@ pub async fn send_message(
             model,
             sink: emitter.clone(),
             // R100：钳位与预算只有一处定义，手搭 `ContextConfig{..}` 等于绕过 `normalize()`。
-            context: settings.to_context_config(),
+            // G19：context_settings = settings.clone() + 激活档案的 prompt 覆盖
+            //（未激活时与 settings 相同，行为不变）。
+            context: context_settings.to_context_config(),
             // T39：同上，温度的唯一来源是上面那个 `ModelConfig`（同一个 `normalize()` 出来的）。
             temperature,
+            // G15：plan 模式与上面各项同一条线 —— 同一份 `store.load()` 现取，改完设置
+            // 下一条消息生效（run_turn 经 `with_config` 注入会话；轮内不变）。
+            plan_mode: settings.plan_mode,
+            // G18：诊断命令同线现取（每轮一次、写在成功落盘之后，见 session.rs）。
+            diagnostics_command: settings.diagnostics_command.clone(),
+            // G19：agent 白名单与档案名同线现取（未激活 = 两个 None，会话行为不变）。
+            allowed_tools: profile.as_ref().and_then(|p| p.tools.clone()),
+            active_agent_name: profile.as_ref().map(|p| p.name.clone()),
+            // G22：task 可点名的档案表 —— 同一份 `store.load()` 现取，经 `agent_profiles`
+            // 映射（只搬 name/prompt/tools，见该函数注释）。空表 = 没有档案可点名，
+            // task 的行为与从前一致。
+            agents: agent_profiles(&settings),
             extract_locks: state.extracting.clone(),
             // T26（R276）：roots 和上面两项同源 —— 同一个 `store.load()` 的每一轮现取，
             // 因此**用户改完设置发下一条消息就生效**，这里没有任何缓存可以过期。
@@ -1731,6 +1839,20 @@ pub fn respond(
 ) -> Result<bool, String> {
     // 返回 false = pending 里没有这个 id（已经答过、或那一轮已经收场），前端据此收起弹窗。
     Ok(state.gate.resolve(&request_id, decision))
+}
+
+/// G20：前端把用户对 question 多选题的选择递回来。**一行薄壳**：真正的判定
+/// （未知 id、通道关闭、一次性应答）在 [`QuestionTool::resolve`] 里且被单测直接
+/// 钉住 —— `#[tauri::command]` 在单测里调不动（R103 同款），命令体只许做转发。
+/// 返回 false = 没有这道挂起的题（已应答、已取消），前端据此收起提问面板。
+/// `state` 按命令族惯例保留（Tauri 注入，前端 invoke 不传它）。
+#[tauri::command]
+pub fn question_respond(
+    _state: State<'_, AppState>,
+    id: String,
+    choice: String,
+) -> Result<bool, String> {
+    Ok(QuestionTool::shared().resolve(&id, choice))
 }
 
 #[tauri::command]
@@ -2822,12 +2944,34 @@ pub fn build_production_registry(
 ) -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     registry.register(Arc::new(FetchTool::new()));
+    registry.register(Arc::new(GlobTool));
+    registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(UseSkillTool));
     registry.register(Arc::new(MemorySearchTool::new(db)));
     registry.register(Arc::new(WriteFileTool));
     registry.register(Arc::new(EditFileTool));
+    // G25：experiment 实验循环（autoresearch 精华移植）。Risk::Exec —— 跑任意命令
+    // 且直接改 git 状态（keep 提交 / discard 回滚），每次调用都弹窗；
+    // base 与 git 都从 ctx.roots/write_root 来，实例状态（last_run）在工具实例上。
+    registry.register(Arc::new(ExperimentTool::new()));
     registry.register(Arc::new(ShellTool::new(shells)));
+    // G16：task 子代理。runner 由会话循环装配进 ToolCtx（`session::run`）——
+    // 注册表只注册工具壳，没有 runner 的执行上下文里它会明确报错（fail-closed）。
+    registry.register(Arc::new(TaskTool));
+    // G24：workflow 编排。Risk::Write —— 按定义连续派子代理执行任意组合动作
+    // （task 的 N 连发），这一下必须弹窗；定义文件在 workspace 的
+    // workflows/<name>.json（解析即验 + `{{步骤名}}` 结果传递，见 tools/workflow.rs）。
+    registry.register(Arc::new(WorkflowTool));
+    registry.register(Arc::new(TodoTool));
+    registry.register(Arc::new(UndoTool));
+    // G21：websearch。Risk::Read —— 唯一出站目标是写死的 DuckDuckGo 端点（fetch 同款
+    // 只读取向）；provider 可注入，网络行为不进 CI（见 tools/websearch.rs 文件头）。
+    registry.register(Arc::new(WebSearchTool::new()));
+    // G20：question。Risk::Read —— 提问不是执行，出站只有一条事件。注册的是进程级
+    // shared() 实例：挂起表必须跨装配共享，否则上一轮挂起的题在这一轮的注册表里
+    // 永远等不到应答（见 tools/question.rs 文件头）。
+    registry.register(QuestionTool::shared());
     registry
 }
 
@@ -3159,6 +3303,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             send_message,
             respond,
+            question_respond,
             interrupt,
             open_url,
             reveal_path,
@@ -3515,6 +3660,11 @@ mod tests {
                     // （`run_turn` 侧的那条线由 `session.rs` 的
                     // `the_session_temperature_reaches_the_chat_request` 钉）。
                     temperature: None,
+                    plan_mode: false,
+                    diagnostics_command: None,
+                    allowed_tools: None,
+                    active_agent_name: None,
+                    agents: Vec::new(),
                     // 夹具默认不带 roots：除了那条专门量 roots 的测试（它自己搭 `TurnDeps`），
                     // T27（R286）之后这里还要多说一句：`build_production_registry()` 的表里
                     // **有** `read_file`，但空 roots 那一轮交给模型的声明表里没有它，
@@ -3569,10 +3719,13 @@ mod tests {
             AgentEvent::ToolCall { .. } => "tool_call",
             AgentEvent::PermissionRequest { .. } => "permission_request",
             AgentEvent::PermissionResolved { .. } => "permission_resolved",
+            AgentEvent::Question { .. } => "question",
             AgentEvent::ToolResult { .. } => "tool_result",
             AgentEvent::Usage { .. } => "usage",
             AgentEvent::ContextCompacted { .. } => "context_compacted",
             AgentEvent::MemorySaved { .. } => "memory_saved",
+            AgentEvent::WorkflowStep { .. } => "workflow_step",
+            AgentEvent::ExperimentRun { .. } => "experiment_run",
             AgentEvent::Error { .. } => "error",
             AgentEvent::Done { .. } => "done",
         }
@@ -3893,6 +4046,11 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: roots.clone(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -3968,6 +4126,11 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -4001,7 +4164,7 @@ mod tests {
     /// `echo` / `guarded` 这类替身只该活在 `#[cfg(test)]` 里 —— 它们的名字一旦进生产，
     /// 请求体里就多出一条用户看不懂、实现也不是给用户的工具。
     #[test]
-    fn production_registry_ships_the_seven_builtin_tools() {
+    fn production_registry_ships_the_builtin_tools() {
         let (_dir, db) = (
             tempfile::tempdir().unwrap(),
             Arc::new(Db::open(&tempfile::tempdir().unwrap().path().join("r.db")).unwrap()),
@@ -4015,16 +4178,31 @@ mod tests {
             names,
             vec![
                 "edit_file",
+                "experiment",
                 "fetch_url",
+                "glob",
+                "grep",
                 "memory_search",
+                "question",
                 "read_file",
                 "run_command",
+                "task",
+                "todo_write",
+                "undo",
                 "use_skill",
+                "websearch",
+                "workflow",
                 "write_file",
             ],
             "模型看到的工具集必须是这份名单；echo/guarded 这类测试工具绝不能进生产（它们只活在 #[cfg(test)]）"
         );
-        for name in ["fetch_url", "read_file", "use_skill"] {
+        for name in [
+            "fetch_url",
+            "read_file",
+            "use_skill",
+            "websearch",
+            "question",
+        ] {
             assert_eq!(
                 r.risk_of(name),
                 Risk::Read,
@@ -4043,6 +4221,27 @@ mod tests {
                 "{name} 必须走 Write 档，权限门才会弹窗；降成 Read 等于绕开用户"
             );
         }
+        // G25：experiment 是 Exec 档 —— 跑任意命令 + 直接改 git 状态（keep 提交 /
+        // discard 回滚），每一次调用都要用户点头，没有会话级免弹窗的形态。
+        assert_eq!(
+            r.risk_of("experiment"),
+            Risk::Exec,
+            "experiment 必须走 Exec 档：实验循环连续改工作区，用户要每步看得见、拦得住"
+        );
+        // G16：task 是 Write 档 —— 子代理自主烧多轮请求，这一下必须弹窗；
+        // 降 Read 等于绕开权限门。
+        assert_eq!(
+            r.risk_of("task"),
+            Risk::Write,
+            "task 必须走 Write 档：派子代理前让用户看得见、拦得住"
+        );
+        // G24：workflow 是 Write 档 —— 按定义连续派子代理（task 的 N 连发），
+        // 降 Read 等于把一串该弹窗的调用折叠成一次静默放行。
+        assert_eq!(
+            r.risk_of("workflow"),
+            Risk::Write,
+            "workflow 必须走 Write 档：编排多个子代理前让用户看得见、拦得住"
+        );
         // Agent Shell（spec §2/§8）：`run_command` 是第一把内置 Exec 工具，风险唯一真相源
         // 是 `ShellTool::meta()`（经 `risk_of` 出）。它降档就等于绕开权限门的每次弹窗。
         assert_eq!(
@@ -4183,6 +4382,28 @@ mod tests {
         let hit = dir.path().join("mysh");
         std::fs::write(&hit, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&hit, std::fs::Permissions::from_mode(0o755)).unwrap();
+        validate_shell_profile_with_dirs(
+            ShellProfile {
+                id: " mine ".into(),
+                label: " 显示名 ".into(),
+                program: "mysh".into(),
+                args: vec![" -c ".into()],
+            },
+            &[dir.path().to_path_buf()],
+        )
+        .expect("裸名在注入目录里命中必须 Ok");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Windows 镜像（与 unix 版同形状；Windows CI 上验证）：裸名按 PATHEXT 展开候选
+    /// （shell.rs 的 `candidate_names`），可执行判定看扩展名而不是 x 位 —— 夹具
+    /// 相应地放一个 `mysh.cmd`，裸名 `mysh` 必须经 `.CMD` 候选命中。
+    #[cfg(windows)]
+    #[test]
+    fn shell_profile_validate_hits_a_bare_name_in_the_injected_search_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let hit = dir.path().join("mysh.cmd");
+        std::fs::write(&hit, b"@echo off\r\n").unwrap();
         validate_shell_profile_with_dirs(
             ShellProfile {
                 id: " mine ".into(),
@@ -4678,6 +4899,11 @@ mod tests {
                 sink: sink.clone(),
                 context: compacting_cfg(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -4744,6 +4970,11 @@ mod tests {
                 sink: sink.clone(),
                 context: compacting_cfg(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5124,6 +5355,11 @@ mod tests {
                 sink: sink.clone(),
                 context: compacting_cfg(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -5722,6 +5958,11 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5899,6 +6140,11 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5962,6 +6208,11 @@ mod tests {
                 sink: sink2.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6029,6 +6280,8 @@ mod tests {
                     roots: Vec::new(),
                     skills_dir: None,
                     skills_disabled: Vec::new(),
+                    subagents: None,
+                    events: None,
                 },
             )
             .await
@@ -6106,6 +6359,11 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6275,6 +6533,11 @@ mod tests {
                 sink: sink.clone(),
                 context: compacting_cfg(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6415,6 +6678,11 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg {
                     enabled: false,
@@ -6471,6 +6739,11 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory,
                 embed,
@@ -6601,6 +6874,39 @@ mod tests {
         assert_eq!(c.embedding_model, s.memory_embedding_model);
         // source 归一后只有两种取值,布尔与字符串的换算因此是精确的(没有第三态可漏)。
         assert_eq!(s.memory_embedding_source, "endpoint");
+    }
+
+    /// G22:`agent_profiles` 是 `Settings.agents → Vec<AgentProfile>` 的唯一转换点。
+    /// name/prompt/tools 逐字映射;`description` 是给人看的,映射时**丢弃** ——
+    /// 「少搬一个字段」只能这样钉住:给 description 塞哨兵值,断言目标结构里没有它。
+    #[test]
+    fn agent_profiles_maps_name_prompt_tools_and_drops_the_description() {
+        use crate::settings::AgentProfileJson;
+        let s = Settings {
+            agents: vec![AgentProfileJson {
+                name: "explore".into(),
+                description: "只读调研员的说明(给人看)".into(),
+                prompt: Some("你是只读调研员".into()),
+                tools: Some(vec!["read_file".into(), "grep".into(), "glob".into()]),
+            }],
+            ..Default::default()
+        };
+        let got = agent_profiles(&s);
+        assert_eq!(got.len(), 1, "档案逐条映射:{got:?}");
+        // 与「不含 description 的字面值」精确相等:name/prompt/tools 逐字透传。
+        // `AgentProfile` 本身就没有 description 字段(编译期事实),将来谁往结构里加
+        // 字段、往映射里塞多余的值,这条等式当场红。
+        assert_eq!(
+            got[0],
+            AgentProfile {
+                name: "explore".into(),
+                prompt: Some("你是只读调研员".into()),
+                tools: Some(vec!["read_file".into(), "grep".into(), "glob".into()]),
+            },
+            "name/prompt/tools 逐字透传,description 不在目标结构里"
+        );
+        // 空档案表 = 空表:未配置时 task 的行为与从前一致。
+        assert!(agent_profiles(&Settings::default()).is_empty());
     }
 
     /// T12:装配函数是 `Settings → MemoryTurnCfg` 的唯一一处转换,所以两个新设置项
@@ -6805,6 +7111,11 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 extract_locks: ExtractLocks::default(),
@@ -7294,6 +7605,11 @@ mod tests {
                 sink: sink.clone(),
                 context: ContextConfig::default(),
                 temperature: None,
+                plan_mode: false,
+                diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory,
                 embed: None,
@@ -8263,6 +8579,11 @@ mod tests {
                         ..Default::default()
                     },
                     temperature: None,
+                    plan_mode: false,
+                    diagnostics_command: None,
+                    allowed_tools: None,
+                    active_agent_name: None,
+                    agents: Vec::new(),
                     roots: Vec::new(),
                     skills_dir: None,
                     skills_disabled: Vec::new(),

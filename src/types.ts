@@ -22,7 +22,7 @@
 // （评审 F7）。除它以外本文件不产生任何运行期代码 —— 长期记忆切片追加的 `MemoryView`
 // 也只是 interface，同样零运行期产物。
 //
-// Task 17 手测时还要对一次真实帧。若 Rust 加了第 12 支，前端这份镜像的缺口会被**机器**喊出来
+// Task 17 手测时还要对一次真实帧。若 Rust 加了第 14 支，前端这份镜像的缺口会被**机器**喊出来
 // （R118；本轮修复后不再只是注释，评审 F1）：
 //   1. `reducer.test.ts` 的跨语言用例用 `node:fs` 把 `events.rs` 里 `let tags = [ ... ];`
 //      这段**有界切片**的标签原样读出来，和 `WIRE_TAGS` 做集合相等 —— Rust 加一支而镜像没跟上，
@@ -50,6 +50,12 @@ export type StopReason = "end_turn" | "max_turns" | "interrupted" | "error";
 
 /** `ErrorWhere`（events.rs:103-111）。线上键名是 `where`（Rust 字段 `at`，events.rs:64 手写 rename）。 */
 export type ErrorWhere = "model" | "tool" | "mcp" | "loop" | "store";
+
+/**
+ * G26：`StepStatus`（events.rs 的 `rename_all = "lowercase"` 枚举）——
+ * 工作流单步的三态，前端按它渲染「进行中/完成/失败」。
+ */
+export type StepStatus = "running" | "done" | "failed";
 
 /** `ToolCallView`（types.rs:158-165）。`input` 是任意 JSON，镜像成 `unknown` 由渲染层收窄。 */
 export interface ToolCallView {
@@ -117,6 +123,34 @@ export type ContentBlock =
   | { type: "image"; data: string; mime: ImageMime }
   | { type: "tool_call"; id: string; name: string; input: unknown }
   | { type: "tool_result"; call_id: string; is_error: boolean; output: ToolOutput };
+
+/**
+ * G26：工作流单步进度（events.rs 的 `WorkflowStep`）。每步开始前 `running`、
+ * 成功后 `done`、失败（含取消）后 `failed`；`index` 1 起始、`total` 是步总数。
+ * reducer 按既有模式降级成通知条（同 `context_compacted`）。
+ */
+export interface WorkflowStepEvent {
+  t: "workflow_step";
+  workflow: string;
+  step: string;
+  index: number;
+  total: number;
+  status: StepStatus;
+}
+
+/**
+ * G27：实验复跑进度（events.rs 的 `ExperimentRun`）。`repeat` 是当次序号
+ * （1 起始）、`of` 是总复跑次数；`command_tail` 是基准命令末 60 字符。
+ * `metrics` 是当次解析出的指标对象（Rust 侧只有 f64），**没解析到 METRIC 时
+ * 是 `null`** 而不是 `{}` —— 缺席与空对象都辨不出「这一次没跑出指标」。
+ */
+export interface ExperimentRunEvent {
+  t: "experiment_run";
+  command_tail: string;
+  repeat: number;
+  of: number;
+  metrics: Record<string, number> | null;
+}
 
 /**
  * `Decision`（events.rs:134-168）：手写序列化，恒定两个键、`allow` 在最前。
@@ -360,14 +394,15 @@ export interface MemoryView {
 }
 
 /**
- * `AgentEvent` 的 12 个 `t` 标签，源头是 events.rs:400-412 的
- * `every_agent_event_variant_serializes_its_t_tag`（名单本身定义在 events.rs:358 那条测试里）：
+ * `AgentEvent` 的 15 个 `t` 标签，源头是 events.rs 的
+ * `every_agent_event_variant_serializes_its_t_tag`（名单本身定义在那条测试里）：
  *
  *   "turn_start", "text_delta", "user_message", "tool_call",
- *   "permission_request", "permission_resolved", "tool_result",
- *   "usage", "context_compacted", "memory_saved", "error", "done"
+ *   "permission_request", "permission_resolved", "question", "tool_result",
+ *   "usage", "context_compacted", "memory_saved", "workflow_step",
+ *   "experiment_run", "error", "done"
  *
- * 本表是镜像：union 必须与那 12 支**逐一对应**，少一支就会让 reducer 的
+ * 本表是镜像：union 必须与那 15 支**逐一对应**，少一支就会让 reducer 的
  * `default` 静默丢数据（R111 漏 `user_message` 就是活例子）。
  *
  * 下面这份字面量清单只是**人读的注释**：`reducer.test.ts` 的 `WIRE_TAGS` 由 `AgentEvent`
@@ -384,6 +419,14 @@ export type AgentEvent =
   | { t: "tool_call"; call: ToolCallView; risk: Risk }
   | { t: "permission_request"; id: string; call: ToolCallView; risk: Risk }
   | { t: "permission_resolved"; id: string; decision: Decision }
+  /**
+   * G20：模型向用户提出的多选题（events.rs 的 `Question { id, question, options }`）。
+   * `id` 是应答回执键：用户的选择经 ipc 的 `question_respond(id, choice)` 送回 Rust，
+   * 答案以工具结果（`用户选择了：…`）的形式回到对话。真正的提问面板是后续 UI 任务，
+   * reducer 此刻按既有模式降级成一条通知（见 reducer.ts 的 `question` 分支）。
+   * 位置与 Rust 的 tags 表一致（`permission_resolved` 与 `tool_result` 之间）。
+   */
+  | { t: "question"; id: string; question: string; options: string[] }
   | {
       t: "tool_result";
       call_id: string;
@@ -402,6 +445,13 @@ export type AgentEvent =
    * **集合**（顺序不参与判定），所以挪位置不会制造假红；保持同序只是为了读镜像时一眼对得上。
    */
   | { t: "memory_saved"; count: number }
+  /**
+   * G26/G27：工作流步骤与实验复跑的进度事件（具名接口镜像见上）。都是工具执行的
+   * **中途**观察面，reducer 降级成通知条，不开气泡、不动 streaming。
+   * 位置与 Rust 的 tags 表一致（`memory_saved` 与 `error` 之间）。
+   */
+  | WorkflowStepEvent
+  | ExperimentRunEvent
   | { t: "error"; where: ErrorWhere; message: string; fatal: boolean }
   | { t: "done"; stop_reason: StopReason };
 
@@ -475,6 +525,17 @@ export interface PermCard {
   reason?: string;
   /** 放行范围，来自 `Decision::Allow { scope }`。 */
   scope?: Scope;
+}
+
+/**
+ * G20：一道挂起的模型提问（`question` 事件的负载原样落地，`UiState.pendingQuestion`
+ * 的元素）。`id` 是应答回执键：用户的选择经 ipc 的 `question_respond(id, choice)` 送回
+ * Rust，`false` = 没有这道挂起的题（已应答、已取消或那一轮已收场）。
+ */
+export interface PendingQuestion {
+  id: string;
+  question: string;
+  options: string[];
 }
 
 /** 界面上的一块。`tool`/`perm` 来自事件流，`text`/`image` 来自事件流或 `ContentBlock` 映射。 */
@@ -569,4 +630,20 @@ export interface UiState {
   toolIndex: Record<string, BlockLocation>;
   /** 同 `toolIndex`：只增不减，会话切换靠 `initialState()` 清空（评审 F5）。 */
   permIndex: Record<string, BlockLocation>;
+  /**
+   * G20：当前挂起的模型提问，提问面板（`QuestionCard`）由它渲染。**单槽**：一条轮里
+   * 先后来了两问时新问覆盖旧问 —— 旧问的 id 在后端挂起表里还在，界面却只呈现一道题，
+   * 用户对旧问的应答会走 `question_respond` 返回 `false` 的通路（通知 + 清除）。
+   *
+   * 清除不发生在 reducer 的事件臂里：事件流里**没有**「这道题已被应答」的帧（答案以
+   * 工具结果的形式走 `tool_result` 通路），所以收起面板由 App 在命令返回后调
+   * `clearPendingQuestion` —— 与 `appendUserTurn`/`dropUserTurn` 同一条
+   * 「非事件动作也走 reducer 导出函数」的惯例（R117 的一块一入口）。
+   *
+   * **为什么是可选的**：与 `memorySaved` 同一条理由 —— `MessageList.test.tsx` 那类
+   * 夹具用全量字面量 + `Partial<UiState>` 展开构造 `UiState`，多一个必填键就会让
+   * 那份不在本切片范围内的测试当场 TS2322。消费方把 `undefined` 与 `null` 读成
+   * 同一件事（`App` / `MessageList` 用 `if (!…)`）。
+   */
+  pendingQuestion?: PendingQuestion | null;
 }

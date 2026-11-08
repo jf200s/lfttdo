@@ -43,6 +43,7 @@ export function initialState(): UiState {
     notices: [],
     toolIndex: {},
     permIndex: {},
+    pendingQuestion: null,
   };
 }
 
@@ -154,6 +155,17 @@ export function dropUserTurn(state: UiState, blocks: ContentBlock[]): UiState {
 export function appendUserTurn(state: UiState, blocks: ContentBlock[]): UiState {
   const { state: opened, index } = startTurn(state, "user");
   return mapTurn(opened, index, (t) => ({ ...t, blocks: userBlocks(blocks) }));
+}
+
+/**
+ * 收起提问面板。事件流里没有「这道题已被应答」的帧（答案以工具结果的形式走
+ * `tool_result` 通路），所以由 App 在 `question_respond` 返回后调用 —— 应答成功
+ * 与「无此 id」（已应答、已取消、那一轮已收场）两条路都用它收口。
+ * id 不匹配时原样返回：迟到的清除不许抹掉后来那道新题（单槽被覆盖后旧 id 已无关）。
+ */
+export function clearPendingQuestion(state: UiState, id: string): UiState {
+  if (state.pendingQuestion?.id !== id) return state;
+  return { ...state, pendingQuestion: null };
 }
 
 /**
@@ -275,6 +287,21 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
       }));
     }
 
+    // G20：模型的多选题。既有的通知条行为保留（问题 + 候选原样透传，不回归），
+    // 同时把题挂进 `pendingQuestion` 单槽 —— 提问面板（QuestionCard）由它渲染。
+    // 用户的选择经 App 的应答回调走 ipc 的 `question_respond` 命令回给 Rust，答案
+    // 以工具结果的形式走既有的 `tool_result` 通路进时间线。事件流里没有「已应答」
+    // 这一帧，所以清除不在 reducer 的事件臂里：`clearPendingQuestion` 供 App 在
+    // 命令返回后调用（与 `appendUserTurn`/`dropUserTurn` 同一条惯例）。
+    case "question":
+      return notice(
+        {
+          ...state,
+          pendingQuestion: { id: e.id, question: e.question, options: e.options },
+        },
+        `模型提问：${e.question}（${e.options.join(" / ")}）`,
+      );
+
     case "usage":
       return { ...state, usage: { input: e.input_tokens, output: e.output_tokens } };
 
@@ -295,6 +322,28 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
         memorySaved: { count: e.count, at: (state.memorySaved?.at ?? 0) + 1 },
       };
 
+    // G26：工作流单步进度 —— 最小处理 = 通知条（不开气泡、不动 streaming，
+    // 进度是对话外的观察面，与 context_compacted 同一条降级路径）。
+    // status 三态是 Rust `StepStatus` 的小写线上名（types.ts 的 StepStatus 镜像）。
+    case "workflow_step": {
+      const word = e.status === "running" ? "进行中" : e.status === "done" ? "完成" : "失败";
+      return notice(
+        state,
+        `工作流「${e.workflow}」步骤 ${e.index}/${e.total}：${e.step}（${word}）`,
+      );
+    }
+
+    // G27：实验复跑进度 —— 同上，通知条。metrics 是当次解析的对象，null =
+    // 这一次没解析到 METRIC（不渲染成空摘要，如实说没有）。
+    case "experiment_run": {
+      const summary = e.metrics
+        ? Object.entries(e.metrics)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(", ")
+        : "无 METRIC";
+      return notice(state, `实验复跑 ${e.repeat}/${e.of}：${summary}`);
+    }
+
     case "error":
       return e.fatal
         ? { ...state, fatal: { message: e.message, where: e.where } }
@@ -312,7 +361,7 @@ export function reduce(state: UiState, e: AgentEvent): UiState {
       // 前向兼容：Rust 侧新增事件时前端不许崩（brief:339）——运行期仍然原样返回。
       //
       // 但这一支**不许**兜住任何已经存在于线格式的变体（R111 漏 `user_message` 就是活例子），
-      // 所以把它做成编译期穷尽守卫（评审 F1①）：`AgentEvent` 加了第 12 支而这里没写臂，
+      // 所以把它做成编译期穷尽守卫（评审 F1①）：`AgentEvent` 加了第 13 支而这里没写臂，
       // `e` 在 default 上就不再是 `never`，`tsc` 直接 TS2322 —— 「镜像有臂、reducer 没写」
       // 从「只靠测试」升级成「编译不过」。
       const _exhaustive: never = e;

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { AGENT_CHANNEL } from "../types";
 import {
   appendUserTurn,
+  clearPendingQuestion,
   dropUserTurn,
   initialState,
   reduce,
@@ -157,12 +158,30 @@ const probe: Record<AgentEvent["t"], AgentEvent> = {
   tool_call: toolCall("c2"),
   permission_request: permRequest("p2"),
   permission_resolved: { t: "permission_resolved", id: "p1", decision: { allow: true, scope: "once" } },
+  // G20：放在 Rust 名单里的同一位置（`permission_resolved` 与 `tool_result` 之间）。
+  // 这条键本身就是「镜像有 13 支、reducer 有 13 臂」的机器判据之一（缺键 TS2741）。
+  question: { t: "question", id: "q1", question: "选哪个方案？", options: ["方案一", "方案二"] },
   tool_result: toolResult("c1", "结果"),
   usage: { t: "usage", input_tokens: 1, output_tokens: 2 },
   context_compacted: { t: "context_compacted", dropped: 4, summary_chars: 120 },
   // P1：放在 Rust 名单里的同一位置（`context_compacted` 与 `error` 之间）。
-  // 这条键本身就是「镜像有 12 支、reducer 有 12 臂」的机器判据之一（缺键 TS2741）。
   memory_saved: { t: "memory_saved", count: 2 },
+  // G26/G27：放在 Rust 名单里的同一位置（`memory_saved` 与 `error` 之间）。
+  workflow_step: {
+    t: "workflow_step",
+    workflow: "调研流水",
+    step: "第一步",
+    index: 1,
+    total: 3,
+    status: "running",
+  },
+  experiment_run: {
+    t: "experiment_run",
+    command_tail: "echo METRIC time=5",
+    repeat: 1,
+    of: 3,
+    metrics: { time: 5 },
+  },
   error: { t: "error", where: "loop", message: "循环了", fatal: false },
   done: done(),
 };
@@ -490,21 +509,21 @@ describe("reducer", () => {
     expect(replay([{ t: "user_message", blocks: b }])).toEqual(appendUserTurn(initialState(), b));
   });
 
-  // ==== R118：12 个标签表驱动 ====
+  // ==== R118：15 个标签表驱动 ====
 
-  it("handles every one of the 12 wire t tags without falling through to default", () => {
+  it("handles every one of the 15 wire t tags without falling through to default", () => {
     // 名单来自 `Object.keys(probe)`，probe 的类型是 `Record<AgentEvent["t"], AgentEvent>`：
-    // 镜像有第 13 支而 probe 没补 → tsc 红；probe 补了而 reducer 没写臂 → reducer 的
+    // 镜像有第 16 支而 probe 没补 → tsc 红；probe 补了而 reducer 没写臂 → reducer 的
     // never 守卫红（tsc）+ 这里的 swallowed 断言红。三层都在（评审 F1③）。
     // R202：锚点写 Rust 的测试函数名，不写行号 —— 行号每次上游插删就指偏，名字不会。
-    expect(WIRE_TAGS).toHaveLength(12); // 锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 那条 (12, 12) 断言上
+    expect(WIRE_TAGS).toHaveLength(15); // 锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 那条 (15, 15) 断言上
     const base = replay([start(1), d("在写正文"), toolCall("c1"), permRequest("p1")]);
     const swallowed = WIRE_TAGS.filter((tag) => reduce(base, probe[tag]) === base);
     expect(swallowed).toEqual([]);
   });
 
   it("still mirrors the tag list that events.rs actually serializes", () => {
-    // 评审 F1④：这条才是「Rust 加第 12 支而前端镜像没跟上」的唯一机器判据。
+    // 评审 F1④：这条才是「Rust 加第 14 支而前端镜像没跟上」的唯一机器判据。
     // 之前 WIRE_TAGS 是手抄字面量，全仓库没有任何一条测试把它和 events.rs 连起来 ——
     // Rust 加一支、镜像不动 ⇒ 测试与 tsc 双双全绿，那条事件在 reduce 的 default 里被静默吞掉。
     const src = readSource("../../src-tauri/src/agent/events.rs");
@@ -545,20 +564,20 @@ describe("reducer", () => {
     // 表现得像 Rust 真少了一支，而且名单被截断成 `…(8)`，谁都读不出是哪一支。
     const rust = [...slice.matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]);
     // 三条都要：只比集合的话，切片一旦被收紧成空列表就会「两边都缺同一支」地悄悄通过。
-    // 消息里必须**打印读到的名单**（评审 R176/R177）：12 支的红要能点出多出来那一支的名字，
+    // 消息里必须**打印读到的名单**（评审 R176/R177）：多一支的红要能点出多出来那一支的名字，
     // 只报一个数字的话，改的人还得先去 events.rs 里数一遍。
     // R202（评审 NIT2）：失败消息里**一律不许写行号** —— 本文件的行号每加一条断言就整体下移
     // （本轮自己插了 21 行就重算过一次，而没有任何测试守着它），评审引用的 Rust 行号也已经指偏
     // （`events.rs:358` 只指到函数名那一行，计数断言在它下面十几行）。定位改用**测试函数名**。
     const handoff =
       "这个计数锚在 events.rs 的 `every_agent_event_variant_serializes_its_t_tag` 里那条 " +
-      "`assert_eq!((events.len(), tags.len()), (12, 12))` 断言上；" +
-      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那个测试里的 tags 表和 (12, 12)）、" +
+      "`assert_eq!((events.len(), tags.len()), (15, 15))` 断言上；" +
+      "线格式多一支或少一支，意味着要**同时**改 src-tauri/src/agent/events.rs（那个测试里的 tags 表和 (15, 15)）、" +
       "src/types.ts 的 AgentEvent、本文件的 probe 表，" +
-      "以及本文件那三处计数断言（用例 `handles every one of the 12 wire t tags without falling through to default` " +
+      "以及本文件那三处计数断言（用例 `handles every one of the 15 wire t tags without falling through to default` " +
       "里的 WIRE_TAGS，和**本用例**里的 rust 与 WIRE_TAGS 两条 toHaveLength）";
-    expect(rust, `events.rs 的 tags 表读到 ${rust.length} 支：${JSON.stringify(rust)}。${handoff}`).toHaveLength(12);
-    expect(WIRE_TAGS, `TS 侧镜像只有 ${WIRE_TAGS.length} 支：${JSON.stringify(WIRE_TAGS)}。${handoff}`).toHaveLength(12);
+    expect(rust, `events.rs 的 tags 表读到 ${rust.length} 支：${JSON.stringify(rust)}。${handoff}`).toHaveLength(15);
+    expect(WIRE_TAGS, `TS 侧镜像只有 ${WIRE_TAGS.length} 支：${JSON.stringify(WIRE_TAGS)}。${handoff}`).toHaveLength(15);
     // 集合相等，**不**比顺序：Rust 那边把 tags 数组重新排序不影响线格式，
     // 断言顺序只会造出一个假红。
     // 差集要**点名**（评审 R176）：两边各多出哪几支直接写进消息，别让人去猜 diff。
@@ -673,6 +692,11 @@ describe("reducer", () => {
       toolCall("c2"),
       permRequest("p2"),
       { t: "permission_resolved", id: "p1", decision: { allow: false, reason: "不要" } },
+      // G20：提问臂也写成「换新对象」而不是原地改 —— 单槽挂起同样不许动入参。
+      { t: "question", id: "q9", question: "纯函数探针", options: ["甲"] },
+      // G26/G27：进度臂同样只换新对象（notice 追加数组，不许 push 进参里的那个）。
+      { t: "workflow_step", workflow: "流水", step: "步", index: 1, total: 2, status: "running" },
+      { t: "experiment_run", command_tail: "echo hi", repeat: 1, of: 2, metrics: null },
       toolResult("c1", "结果", true, 4),
       { t: "usage", input_tokens: 7, output_tokens: 8 },
       { t: "context_compacted", dropped: 1, summary_chars: 2 },
@@ -766,6 +790,97 @@ describe("reducer", () => {
     expect(Object.keys(probe.error)).toEqual(["t", "where", "message", "fatal"]);
     expect(Object.keys(contentProbe.image)).toEqual(["type", "data", "mime"]);
     expect(CONTENT_TAGS).toHaveLength(4); // 对齐 types.rs:4-24 的四支
+  });
+});
+
+// ==== G20：question 挂起与清除（提问面板的状态面）====
+
+describe("question", () => {
+  const ask = (id: string, question: string, options: string[]): AgentEvent => ({
+    t: "question",
+    id,
+    question,
+    options,
+  });
+
+  it("records a pending question and keeps the legacy notice behaviour", () => {
+    const s = reduce(initialState(), ask("q1", "选哪个方案？", ["方案一", "方案二"]));
+    // 面板的数据面：id/question/options 三键原样落地，不加工（线格式镜像的同一口径）。
+    expect(s.pendingQuestion).toEqual({
+      id: "q1",
+      question: "选哪个方案？",
+      options: ["方案一", "方案二"],
+    });
+    // 旧通知行为不回归：通知条仍透传问题与候选（notices 是重放可审计的那条通道）。
+    expect(s.notices.join()).toContain("模型提问");
+    expect(s.notices.join()).toContain("选哪个方案？");
+    expect(s.notices.join()).toContain("方案一 / 方案二");
+  });
+
+  it("keeps a single slot: a newer question overwrites the older one", () => {
+    const first = reduce(initialState(), ask("q1", "第一问", ["甲"]));
+    const second = reduce(first, ask("q2", "第二问", []));
+    expect(second.pendingQuestion).toEqual({ id: "q2", question: "第二问", options: [] });
+  });
+
+  it("clears a pending question by id and ignores a stale clear", () => {
+    const s = reduce(initialState(), ask("q1", "第一问", ["甲"]));
+    // 单槽已被新问覆盖时，旧 id 的迟到清除是 no-op（原样返回，不造新对象）。
+    const overwritten = reduce(s, ask("q2", "第二问", []));
+    expect(clearPendingQuestion(overwritten, "q1")).toBe(overwritten);
+    const cleared = clearPendingQuestion(overwritten, "q2");
+    expect(cleared.pendingQuestion).toBeNull();
+    // 空状态与「本来就没有题」同样是 no-op。
+    const empty = initialState();
+    expect(clearPendingQuestion(empty, "q1")).toBe(empty);
+    expect(clearPendingQuestion(cleared, "q2")).toBe(cleared);
+  });
+});
+
+// ==== G26/G27：进度可见性事件（通知条降级）====
+
+describe("progress events (G26/G27)", () => {
+  const step = (
+    index: number,
+    status: "running" | "done" | "failed",
+  ): AgentEvent => ({
+    t: "workflow_step",
+    workflow: "调研流水",
+    step: "第一步",
+    index,
+    total: 3,
+    status,
+  });
+
+  it("renders a workflow step as a notice naming workflow, index and status", () => {
+    const running = reduce(initialState(), step(1, "running"));
+    expect(running.notices.join()).toContain("工作流「调研流水」步骤 1/3：第一步（进行中）");
+    expect(reduce(initialState(), step(1, "done")).notices.join()).toContain("（完成）");
+    expect(reduce(initialState(), step(1, "failed")).notices.join()).toContain("（失败）");
+    // 通知条降级：不开气泡、不动 streaming（进度是对话外的观察面）。
+    expect(running.turns).toEqual([]);
+    expect(running.streaming).toBe(false);
+    expect(running.toolIndex).toEqual({});
+  });
+
+  it("renders an experiment run as a notice with the per-run metrics summary", () => {
+    const s = reduce(initialState(), {
+      t: "experiment_run",
+      command_tail: "echo METRIC time=5",
+      repeat: 2,
+      of: 3,
+      metrics: { time: 5 },
+    });
+    expect(s.notices.join()).toContain("实验复跑 2/3：time=5");
+    // metrics 是 null = 这一次没解析到 METRIC：如实说「无」，不渲染成空摘要。
+    const empty = reduce(initialState(), {
+      t: "experiment_run",
+      command_tail: "echo hi",
+      repeat: 1,
+      of: 1,
+      metrics: null,
+    });
+    expect(empty.notices.join()).toContain("实验复跑 1/1：无 METRIC");
   });
 });
 

@@ -2501,6 +2501,7 @@ dependencies = [
  "libc",
  "rand 0.10.3",
  "readability",
+ "regex",
  "reqwest",
  "rfd",
  "rmcp",

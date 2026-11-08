@@ -3,6 +3,7 @@
 // 风险的唯一真相源是 `risk_of`（= 注册表里那份 `ToolMeta.risk`）。`ToolDef` 里没有 risk
 // 字段，模型看不到也改不了自己的权限级别；未知工具按 `Risk::Exec`（最严的一档）处理，
 // 未知即 Read 会让「没注册的工具」静默自动放行。
+use crate::agent::events::EventSink;
 use crate::agent::types::{Risk, ToolOutput};
 use crate::model::provider::ToolDef;
 use async_trait::async_trait;
@@ -41,6 +42,15 @@ pub struct ToolCtx {
     pub skills_dir: Option<PathBuf>,
     /// 被用户停用的技能文件夹。工具侧也要挡：隐藏声明不等于拒绝调用。
     pub skills_disabled: Vec<String>,
+    /// G16：子代理运行器（`task` 工具用）。`None` = 当前会话没有装配（工具明确报错，
+    /// fail-closed）。接缝定义在本层（`tools/task.rs::SubagentRunner`），实现住 agent 层
+    /// （`agent/task.rs::LoopRunner`）—— tools 不反向依赖 agent 的具体类型。
+    pub subagents: Option<Arc<dyn crate::tools::task::SubagentRunner>>,
+    /// G20：会话的事件出口。`question` 工具用它把多选题**直接**发给用户——
+    /// 不经权限门（提问不是执行，工具本身 Read 档），应答经 ipc 的
+    /// `question_respond` 命令回到挂起的 execute。`None` = 当前会话没有装配
+    /// 事件出口（question 明确报错，fail-closed，与 subagents 同一取向）。
+    pub events: Option<Arc<dyn EventSink>>,
 }
 
 impl ToolCtx {
@@ -283,6 +293,8 @@ mod tests {
             roots,
             skills_dir: None,
             skills_disabled: Vec::new(),
+            subagents: None,
+            events: None,
         }
     }
 

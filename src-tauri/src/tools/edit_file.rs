@@ -145,6 +145,8 @@ impl Tool for EditFileTool {
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+        // G11：变更前快照（撤销链在这里生成；失败的编辑不留痕）。
+        crate::tools::undo::snapshot_before(ctx, &guarded)?;
         crate::tools::fs_write::atomic_write(&guarded, &output)?;
         Ok(ToolOutput::text(format!(
             "已编辑 {}（替换 1 处，共 {} 字节）",
@@ -170,6 +172,8 @@ mod tests {
             roots,
             skills_dir: None,
             skills_disabled: Vec::new(),
+            subagents: None,
+            events: None,
         }
     }
 
