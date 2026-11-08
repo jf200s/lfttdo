@@ -38,6 +38,7 @@ use crate::tools::task::TaskTool;
 use crate::tools::todo::TodoTool;
 use crate::tools::undo::UndoTool;
 use crate::tools::use_skill::UseSkillTool;
+use crate::tools::websearch::WebSearchTool;
 use crate::tools::write_file::WriteFileTool;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
 use serde::Serialize;
@@ -2911,6 +2912,9 @@ pub fn build_production_registry(
     registry.register(Arc::new(TaskTool));
     registry.register(Arc::new(TodoTool));
     registry.register(Arc::new(UndoTool));
+    // G21：websearch。Risk::Read —— 唯一出站目标是写死的 DuckDuckGo 端点（fetch 同款
+    // 只读取向）；provider 可注入，网络行为不进 CI（见 tools/websearch.rs 文件头）。
+    registry.register(Arc::new(WebSearchTool::new()));
     registry
 }
 
@@ -4120,11 +4124,12 @@ mod tests {
                 "todo_write",
                 "undo",
                 "use_skill",
+                "websearch",
                 "write_file",
             ],
             "模型看到的工具集必须是这份名单；echo/guarded 这类测试工具绝不能进生产（它们只活在 #[cfg(test)]）"
         );
-        for name in ["fetch_url", "read_file", "use_skill"] {
+        for name in ["fetch_url", "read_file", "use_skill", "websearch"] {
             assert_eq!(
                 r.risk_of(name),
                 Risk::Read,

@@ -17,4 +17,5 @@ pub mod task;
 pub mod todo;
 pub mod undo;
 pub mod use_skill;
+pub mod websearch;
 pub mod write_file;
