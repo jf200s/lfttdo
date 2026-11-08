@@ -31,6 +31,12 @@ const INTERRUPTED_NOTE: &str = "本轮被打断，工具未执行";
 const MODEL_FAILURE_NOTE: &str = "本轮在模型流中断处失败，工具未执行";
 /// 上下文溢出重试（G05）时，给已流出的半截回复补的那条说明。
 const OVERFLOW_RETRY_NOTE: &str = "上一段响应因上下文超限中断，将收缩上下文后重新回答";
+/// 触顶总结轮（G06）追加在 system 尾的指令：只进那一次请求，不落库。
+const MAX_STEPS_DIRECTIVE: &str = "## 收尾\n\
+ 本轮工作步数已到上限，不能再调用任何工具。请基于**已经完成**的工作写一段简短总结：\
+ 做了什么、结果在哪（文件/路径）、还剩什么没做。不要尝试调用工具。";
+/// 触顶后模型仍凭空喊出的工具调用，统一回这条错误结果（不执行）。
+const MAX_TURNS_NOTE: &str = "已到本轮步数上限，这个调用没有执行";
 /// 工具**已经开始执行**之后被取消：不能断言它没执行完（副作用可能已经发生），
 /// 只能说这份结果没有被采用。
 const TOOL_CANCELLED_NOTE: &str = "本轮已中断，工具结果未采用";
@@ -314,61 +320,10 @@ impl AgentSession {
             }
             self.deps.sink.emit(AgentEvent::TurnStart { turn });
 
-            let mut acc = AssistantAcc::default();
-            // `request()` 要 `&mut self`（记下校准分母），而 `stream` 的接收者是
-            // `&self.deps.model`：分两步取，请求先落地，流再借模型。
+            // `request()` 要 `&mut self`（记下校准分母）：请求先落地，流的消费在
+            // `consume()` 里完成（借 model 的借用随返回值一起结束）。
             let req = self.request();
-            let mut deltas = self.deps.model.stream(req);
-            let mut stream_done = false;
-            let mut interrupted = false;
-            let mut model_error: Option<String> = None;
-
-            // R55：这里用的是 `tokio::select!`。futures 那个 `select!` 的分支要求
-            // `&mut` 位置表达式（`deltas.next()` 不是），而且没有 `biased;`。
-            // 同一个形状（`biased` + `cancel.cancelled()` 臂）在 `PermissionGate::check`
-            // 里已经由 `cancel_stops_a_pending_request_instead_of_hanging` 跑通了。
-            //
-            // 两个分支都只置标志、`break` 之后再动 `self`：分支体里不能调 `&mut self`
-            // 的方法（`self.cancel.cancelled()` 还借用着 `self.cancel`，E0502）。
-            //
-            // `biased` 的代价是一条已知且良性的竞态：**流干净收尾的那一次 poll 里**
-            // 若取消也同时就绪（用户正好在回复结束的同一刻按停止），取消臂先赢，本轮按
-            // `Interrupted` 收尾而不是 `EndTurn`。内容不丢——`commit_partial` 把累加器
-            // 里的整条回复照原样提交，只是 `stop_reason` 记成用户做的那件事。
-            while !stream_done && !interrupted && model_error.is_none() {
-                tokio::select! {
-                    biased;
-                    _ = self.cancel.cancelled() => interrupted = true,
-                    item = deltas.next() => match item {
-                        None => stream_done = true,
-                        Some(Ok(ModelDelta::Usage { input_tokens, output_tokens })) => {
-                            // R60：`AssistantAcc::apply` 会**静默丢掉** Usage 里的 token
-                            // （assistant_acc.rs:37-39），必须在交给它之前自己取走。
-                            // 切片 5：这里同时是 `set_calibration` 的第一个调用方（前置事实 1）。
-                            // 分母用**发出这次请求时**的 est，不是现在的：一轮里可能有多次
-                            // request（工具循环），每次的 usage 只能和它自己那次 build 对齐。
-                            // 两道零闸留在 session 侧：`set_calibration` 只挡非有限值，
-                            // 而 0.0 是**有限**的、会被 clamp 成 0.2 —— 一次「端点报了 0 token」
-                            // 不该把估算压到地板（`a_zero_or_absurd_usage_...` 钉这条）。
-                            if input_tokens > 0 && self.last_est_input > 0 {
-                                self.deps.context.set_calibration(
-                                    input_tokens as f64 / self.last_est_input as f64,
-                                );
-                            }
-                            self.deps.sink.emit(AgentEvent::Usage { input_tokens, output_tokens });
-                        }
-                        Some(Ok(d)) => {
-                            if let Some(text) = acc.apply(d) {
-                                self.deps.sink.emit(AgentEvent::TextDelta { text });
-                            }
-                        }
-                        Some(Err(e)) => model_error = Some(e.to_string()),
-                    }
-                }
-            }
-            // `deltas` 借用着 `self.deps.model`，而下面要 `&mut self`；放掉它，
-            // 顺带把一个没读完的响应体关在这里，而不是拖到整轮结束。
-            drop(deltas);
+            let (acc, interrupted, model_error) = self.consume(req).await;
 
             let assistant = acc.finish();
             if let Some(message) = model_error {
@@ -526,7 +481,114 @@ impl AgentSession {
                 self.history.push(followup);
             }
         }
+
+        // ---- G06：步数触顶的强制收尾 ----
+        // 直接终止会让工作停在半截（用户只看到一个 MaxTurns）。OpenCode 的做法是
+        // **收回工具声明**再要一次总结：`summary_request()` 的 tools 为空表，模型在
+        // 物理上开不了新调用。若它仍凭空喊出工具名，逐个回错误结果（不执行）并按
+        // MaxTurns 收尾 —— 调用与结果保持 R57 的配对，下一轮 history 不会破。
+        self.deps.sink.emit(AgentEvent::TurnStart {
+            turn: self.cfg.max_turns + 1,
+        });
+        let req = self.summary_request();
+        let (acc, interrupted, model_error) = self.consume(req).await;
+        let assistant = acc.finish();
+        if interrupted {
+            self.commit_partial(assistant, INTERRUPTED_NOTE);
+            return self.finish(StopReason::Interrupted);
+        }
+        if let Some(message) = model_error {
+            self.deps.sink.emit(AgentEvent::Error {
+                at: ErrorWhere::Model,
+                message,
+                fatal: true,
+            });
+            self.commit_partial(assistant, MODEL_FAILURE_NOTE);
+            return self.finish(StopReason::Error);
+        }
+        if assistant.blocks.is_empty() {
+            // 与主循环同一形状（R58）：空响应不进 history，报非致命 loop 错误收尾。
+            self.deps.sink.emit(AgentEvent::Error {
+                at: ErrorWhere::Loop,
+                message: "模型返回空响应".into(),
+                fatal: false,
+            });
+            return self.finish(StopReason::MaxTurns);
+        }
+        let calls = assistant.tool_calls();
+        self.history.push(assistant);
+        if calls.is_empty() {
+            // 模型交出文本总结：按正常收尾处理（工作没白做，界面上是一段可读的交付）。
+            return self.finish(StopReason::EndTurn);
+        }
+        for (id, _, _) in calls {
+            self.deps.sink.emit(AgentEvent::ToolResult {
+                call_id: id.clone(),
+                is_error: true,
+                ms: 0,
+                preview: MAX_TURNS_NOTE.to_string(),
+                images: vec![],
+            });
+            self.history
+                .push(Message::tool(&id, ToolOutput::text(MAX_TURNS_NOTE), true));
+        }
         self.finish(StopReason::MaxTurns)
+    }
+
+    /// 消费一次模型流（spec 4.6 的「模型说话」半步）：流尽 / 取消 / 出错三出口。
+    /// `req` 由调用方先建好（`request()`/`summary_request()` 都要 `&mut self`），
+    /// 这里只负责把 delta 灌进累加器。三出口返回后借 `self.deps.model` 的借用即告结束。
+    ///
+    /// R55：`tokio::select!` + `biased`（取消臂先轮询）；R60：Usage 里的 token 在进
+    /// `AssistantAcc` 之前取走做校准，分母是**发出这次请求时**的 est。
+    /// `biased` 的代价是一条已知且良性的竞态：流干净收尾的那次 poll 里若取消同时就绪，
+    /// 取消臂先赢 —— 内容不丢（`commit_partial` 照原样提交），只是 `stop_reason`
+    /// 记成用户做的那件事。
+    async fn consume(&mut self, req: ChatRequest) -> (AssistantAcc, bool, Option<String>) {
+        let mut acc = AssistantAcc::default();
+        let mut deltas = self.deps.model.stream(req);
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return (acc, true, None),
+                item = deltas.next() => match item {
+                    None => return (acc, false, None),
+                    Some(Ok(ModelDelta::Usage { input_tokens, output_tokens })) => {
+                        // 两道零闸留在 session 侧：`set_calibration` 只挡非有限值，
+                        // 而 0.0 是**有限**的、会被 clamp 成 0.2 —— 一次「端点报了 0 token」
+                        // 不该把估算压到地板（`a_zero_or_absurd_usage_...` 钉这条）。
+                        if input_tokens > 0 && self.last_est_input > 0 {
+                            self.deps.context.set_calibration(
+                                input_tokens as f64 / self.last_est_input as f64,
+                            );
+                        }
+                        self.deps.sink.emit(AgentEvent::Usage { input_tokens, output_tokens });
+                    }
+                    Some(Ok(d)) => {
+                        if let Some(text) = acc.apply(d) {
+                            self.deps.sink.emit(AgentEvent::TextDelta { text });
+                        }
+                    }
+                    Some(Err(e)) => return (acc, false, Some(e.to_string())),
+                }
+            }
+        }
+    }
+
+    /// 触顶总结请求：与 [`Self::request`] 同一条组装路径（预算、校准分母、历史窗口
+    /// 全部照算），只有两处不同 —— 工具声明清空、system 尾换成 [`MAX_STEPS_DIRECTIVE`]。
+    /// 技能索引与自动加载**不带**：没有工具可用，技能正文也是噪声。
+    fn summary_request(&mut self) -> ChatRequest {
+        let built = self
+            .deps
+            .context
+            .build_with_extra(&self.history, MAX_STEPS_DIRECTIVE);
+        self.last_est_input = built.est_input_tokens;
+        ChatRequest {
+            messages: built.messages,
+            tools: Vec::new(),
+            temperature: self.deps.temperature,
+        }
     }
 
     /// 每个出口都只经这里：`Done` 恰好一条，且带的就是返回值本身。
@@ -2006,10 +2068,16 @@ mod tests {
             Some(StopReason::MaxTurns),
             "触顶必须显式告知，不可静默"
         );
+        // G06：触顶后要多请求一次做总结（工具声明收回）。夹具的第 26 轮仍是一个
+        // tool_call，它会被回错误结果而不执行，随后按 MaxTurns 收尾。
         assert_eq!(
             rig.reqs().len(),
-            cap as usize,
-            "每轮恰好问模型一次，触顶即停"
+            cap as usize + 1,
+            "触顶轮 + 一次强制总结请求"
+        );
+        assert!(
+            rig.reqs().last().unwrap().tools.is_empty(),
+            "总结请求必须收回全部工具声明"
         );
         assert_eq!(rig.sink.kinds().first().unwrap(), "turn_start");
         assert_eq!(rig.sink.kinds().last().unwrap(), "done");
@@ -2019,10 +2087,12 @@ mod tests {
                 .iter()
                 .filter(|k| *k == "turn_start")
                 .count(),
-            cap as usize
+            cap as usize + 1,
+            "总结轮也发 turn_start"
         );
 
-        // 触顶时 history 也必须停在成对状态：最后一轮的调用已经有结果。
+        // 触顶时 history 也必须停在成对状态：最后一轮的调用已经有结果，
+        // 总结轮里模型凭空喊出的调用也有回执（错误结果），R57 配对不破。
         assert_every_request_paired(&rig);
         let hist = rig.session.history();
         assert_eq!(
@@ -2032,9 +2102,23 @@ mod tests {
         );
         assert_eq!(
             tool_results_of(hist).len(),
-            cap as usize,
-            "每轮一个调用一个结果"
+            cap as usize + 1,
+            "cap 个正常结果 + 总结轮 1 个错误回执"
         );
+    }
+
+    /// G06 的正向半边：总结轮交出的是文本 ⇒ 按正常收尾（EndTurn），工作不白做。
+    #[tokio::test]
+    async fn the_step_cap_summary_turn_ends_normally_when_the_model_text_back() {
+        let mut rounds: Vec<Vec<ModelDelta>> = (0..25usize)
+            .map(|n| tool_round(n, &[("echo", r#"{"text":"loop"}"#)]))
+            .collect();
+        rounds.push(vec![ModelDelta::Text("总结收尾".into())]);
+        let mut rig = Rig::new(rounds);
+        assert_eq!(rig.run("跑满").await, StopReason::EndTurn);
+        assert_eq!(rig.reqs().len(), 26);
+        assert!(rig.reqs().last().unwrap().tools.is_empty());
+        assert!(rig.sink.texts().contains("总结收尾"));
     }
 
     // ---- 取消 ----
