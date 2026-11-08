@@ -25,6 +25,7 @@ use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::store::memory::{MemoryRow, MemoryWrite, RecallCfg};
 use crate::tools::edit_file::EditFileTool;
 use crate::tools::fetch::FetchTool;
+use crate::tools::grep::GrepTool;
 use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
 use crate::tools::registry::ToolRegistry;
@@ -2822,6 +2823,7 @@ pub fn build_production_registry(
 ) -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     registry.register(Arc::new(FetchTool::new()));
+    registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(UseSkillTool));
     registry.register(Arc::new(MemorySearchTool::new(db)));
@@ -4001,7 +4003,7 @@ mod tests {
     /// `echo` / `guarded` 这类替身只该活在 `#[cfg(test)]` 里 —— 它们的名字一旦进生产，
     /// 请求体里就多出一条用户看不懂、实现也不是给用户的工具。
     #[test]
-    fn production_registry_ships_the_seven_builtin_tools() {
+    fn production_registry_ships_the_builtin_tools() {
         let (_dir, db) = (
             tempfile::tempdir().unwrap(),
             Arc::new(Db::open(&tempfile::tempdir().unwrap().path().join("r.db")).unwrap()),
@@ -4016,6 +4018,7 @@ mod tests {
             vec![
                 "edit_file",
                 "fetch_url",
+                "grep",
                 "memory_search",
                 "read_file",
                 "run_command",
