@@ -2295,6 +2295,7 @@ mod tests {
             roots: Settings::default().roots,
             skills_dir: None,
             skills_disabled: Vec::new(),
+            subagents: None,
         };
         let e = ctx
             .resolve_within_roots(&file.to_string_lossy())

@@ -1583,6 +1583,7 @@ mod tests {
             roots: vec![],
             skills_dir: None,
             skills_disabled: Vec::new(),
+            subagents: None,
         }
     }
 

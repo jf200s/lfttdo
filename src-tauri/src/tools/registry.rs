@@ -41,6 +41,10 @@ pub struct ToolCtx {
     pub skills_dir: Option<PathBuf>,
     /// 被用户停用的技能文件夹。工具侧也要挡：隐藏声明不等于拒绝调用。
     pub skills_disabled: Vec<String>,
+    /// G16：子代理运行器（`task` 工具用）。`None` = 当前会话没有装配（工具明确报错，
+    /// fail-closed）。接缝定义在本层（`tools/task.rs::SubagentRunner`），实现住 agent 层
+    /// （`agent/task.rs::LoopRunner`）—— tools 不反向依赖 agent 的具体类型。
+    pub subagents: Option<Arc<dyn crate::tools::task::SubagentRunner>>,
 }
 
 impl ToolCtx {
@@ -283,6 +287,7 @@ mod tests {
             roots,
             skills_dir: None,
             skills_disabled: Vec::new(),
+            subagents: None,
         }
     }
 

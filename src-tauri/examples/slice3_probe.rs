@@ -275,6 +275,7 @@ async fn direct_mode(
         roots: effective_roots(&roots),
         skills_dir: None,
         skills_disabled: Vec::new(),
+        subagents: None,
     };
     let outcome = tool.execute(input.clone(), &ctx).await;
     println!(

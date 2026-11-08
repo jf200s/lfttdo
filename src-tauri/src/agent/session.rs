@@ -362,6 +362,15 @@ impl AgentSession {
             roots: self.roots.clone(),
             skills_dir: self.skills_dir.clone(),
             skills_disabled: self.skills_disabled.clone(),
+            // G16：子代理运行器 —— 用同一套 model/registry/gate/温度/预算起独立子会话
+            // （agent/task.rs::LoopRunner）。文件作用域随 TaskTool 调用时的 ctx 传下去。
+            subagents: Some(Arc::new(crate::agent::task::LoopRunner {
+                model: self.deps.model.clone(),
+                registry: self.deps.registry.clone(),
+                gate: self.deps.gate.clone(),
+                temperature: self.deps.temperature,
+                context_cfg: self.deps.context.config(),
+            })),
         };
 
         // G05：一次 run() 只自动恢复一次溢出。第二次仍超限 = 预算收缩到下限也装不下，
@@ -2493,6 +2502,58 @@ mod tests {
             "改文件后下一轮要反映新内容：{system}"
         );
         assert!(!system.contains("第一版规矩"), "旧内容不许残留：{system}");
+    }
+
+    // ───────────────────────── G16：task 子代理 ─────────────────────────
+
+    /// LoopRunner 起独立子会话：父第 1 轮 task 调用（Write 弹窗放行这一次）→ 子请求
+    /// 返回「子结果」→ 父第 2 轮文本收尾。断言：父的 ToolResult 带回子结果；
+    /// 子会话历史隔离（子请求带 prompt、不带父的 user 原话）；全程恰好 3 次模型请求
+    /// （父子共用同一只脚本模型，请求序 = 父1、子、父2）。
+    #[tokio::test]
+    async fn the_task_tool_runs_a_child_session_and_brings_back_its_text() {
+        let model = ScriptedModel::new(vec![
+            tool_round(1, &[("task", r#"{"prompt":"去查 X 的资料"}"#)]),
+            deltas(&["子结果"]),
+            deltas(&["收尾"]),
+        ]);
+        let recorder = model.recorder.clone();
+        let mut rig = Rig::assembled(
+            model,
+            ContextConfig::default(),
+            recorder,
+            vec![Arc::new(crate::tools::task::TaskTool)],
+        );
+        // task 是 Write 档：后台应答放行这 1 次弹窗（子会话只跑一轮文本，没有别的弹窗）。
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("帮我派个子代理查资料").await, StopReason::EndTurn);
+
+        // 恰好 3 次模型请求：父(工具轮) + 子(子代理那轮) + 父(收尾轮)。
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 3, "父子共用同一只脚本模型：{}", reqs.len());
+
+        // 父的 ToolResult 把子代理的文本带了回来。
+        let results = rig.sink.tool_results();
+        assert!(
+            results
+                .iter()
+                .any(|(_, err, text)| !err && text.contains("子结果")),
+            "ToolResult 要带回子结果：{results:?}"
+        );
+
+        // 历史隔离：子请求（第 2 次）带着 prompt，但没有任何一条消息含父的 user 原话。
+        let child_joined: String = reqs[1].messages.iter().map(|m| m.text_of()).collect();
+        assert!(
+            child_joined.contains("去查 X 的资料"),
+            "子请求要带上 prompt：{child_joined}"
+        );
+        assert!(
+            !child_joined.contains("帮我派个子代理查资料"),
+            "子会话是独立 history，不许泄漏父会话的消息：{child_joined}"
+        );
+
+        // R57 配对（子会话自己的请求也在同一只 recorder 里，一起钉）。
+        assert_every_request_paired(&rig);
     }
 
     /// 溢出识别只认端点文案里的这几个词；普通 4xx/网络错误不许误判成溢出。
