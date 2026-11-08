@@ -224,6 +224,8 @@ async fn turn_mode(args: &[String], prompt: &str) -> Result<(), Box<dyn std::err
             skills_dir: None,
             skills_disabled: Vec::new(),
             cancel: Arc::new(Mutex::new(None)),
+            active_agent_name: None,
+            allowed_tools: None,
             diagnostics_command: None,
             plan_mode: false,
         },

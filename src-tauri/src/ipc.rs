@@ -405,6 +405,12 @@ pub struct TurnDeps {
     /// 【自动诊断】合成 user 轮反馈给模型）。与 plan_mode 同一条线：`send_message`
     /// 从本轮 `Settings` 现取，改设置下一条消息生效；`None`/空串 = 关闭。
     pub diagnostics_command: Option<String>,
+    /// G19：agent 工具白名单（激活档案的 `tools`）。与 plan_mode 同一条线现取；
+    /// `None` = 不限制。会话里双层生效：声明表过滤（`tool_defs_for_turn` 的估算与
+    /// `request()` 同参）+ 循环拦截。
+    pub allowed_tools: Option<Vec<String>>,
+    /// G19：激活档案的名字（拒绝理由点名用）。与 allowed_tools 同源同设。
+    pub active_agent_name: Option<String>,
     /// T5：记忆的四项开关（spec §7），由 `send_message` 从本轮那份 `Settings` 现取
     /// （context/temperature 同一条线：会话不自己读 `Settings`）。`enabled=false` 的
     /// 语义有两级：压缩段零抽取（记忆侧模型调用一个不发起）+ 请求头零备注（连召回
@@ -1304,6 +1310,8 @@ pub async fn run_turn(
         temperature,
         plan_mode,
         diagnostics_command,
+        allowed_tools,
+        active_agent_name,
         memory,
         embed,
         mut roots,
@@ -1331,11 +1339,14 @@ pub async fn run_turn(
     // roots 为空时、use_skill 在无启用技能时会被 request() 隐藏），与 request()
     // 共用同一个过滤函数。否则估算虚高 → 校准系数偏低 → 预算越放越宽。
     let roots_for_estimate = effective_roots(&roots);
+    // G19：白名单同参传入 —— 预算估算与 `request()` 的声明表共用同一份过滤
+    // （算的是全量、发的是过滤后会让估算虚高、校准系数偏低，R286 同理）。
     let tool_defs = crate::agent::session::tool_defs_for_turn(
         &registry,
         &roots_for_estimate,
         skills_dir.as_deref(),
         &skills_disabled,
+        allowed_tools.as_deref(),
     );
     builder.set_tool_tokens(crate::agent::context::tool_defs_tokens(&tool_defs));
 
@@ -1478,6 +1489,8 @@ pub async fn run_turn(
     .with_config(SessionConfig {
         plan_mode,
         diagnostics_command,
+        allowed_tools,
+        active_agent_name,
         ..Default::default()
     });
     session.defer_done();
@@ -1700,6 +1713,16 @@ pub async fn send_message(
     // 会话作用域在**真正开跑**之前对齐：配置/凭据失败的那次发送没有开跑，
     // 不该顺手清掉上一轮用户答过的授权。
     enter_session_scope(&state.last_session, &state.gate, &session_id);
+    // G19：激活的 agent 档案。prompt 是**整段替换**（与用户人设同一语义）且
+    // **优先于人设**——档案是「这个会话此刻是谁」的完整定义，人设只是它的缺省。
+    // tools 白名单交给会话双层执行（声明表过滤 + 循环拦截，见 session.rs）。
+    // 生效提示词的解析是纯函数（`Settings::effective_agent_prompt`，settings.rs
+    // 单测钉住），这里只做一行装配 —— `#[tauri::command]` 在单测里调不动。
+    let profile = settings.active_agent_profile();
+    let mut context_settings = settings.clone();
+    if let Some(prompt) = settings.effective_agent_prompt() {
+        context_settings.system_prompt = prompt;
+    }
     let out = run_turn(
         TurnDeps {
             output_dir: Some(output_dir),
@@ -1709,7 +1732,9 @@ pub async fn send_message(
             model,
             sink: emitter.clone(),
             // R100：钳位与预算只有一处定义，手搭 `ContextConfig{..}` 等于绕过 `normalize()`。
-            context: settings.to_context_config(),
+            // G19：context_settings = settings.clone() + 激活档案的 prompt 覆盖
+            //（未激活时与 settings 相同，行为不变）。
+            context: context_settings.to_context_config(),
             // T39：同上，温度的唯一来源是上面那个 `ModelConfig`（同一个 `normalize()` 出来的）。
             temperature,
             // G15：plan 模式与上面各项同一条线 —— 同一份 `store.load()` 现取，改完设置
@@ -1717,6 +1742,9 @@ pub async fn send_message(
             plan_mode: settings.plan_mode,
             // G18：诊断命令同线现取（每轮一次、写在成功落盘之后，见 session.rs）。
             diagnostics_command: settings.diagnostics_command.clone(),
+            // G19：agent 白名单与档案名同线现取（未激活 = 两个 None，会话行为不变）。
+            allowed_tools: profile.as_ref().and_then(|p| p.tools.clone()),
+            active_agent_name: profile.as_ref().map(|p| p.name.clone()),
             extract_locks: state.extracting.clone(),
             // T26（R276）：roots 和上面两项同源 —— 同一个 `store.load()` 的每一轮现取，
             // 因此**用户改完设置发下一条消息就生效**，这里没有任何缓存可以过期。
@@ -3572,6 +3600,8 @@ mod tests {
                     temperature: None,
                     plan_mode: false,
                     diagnostics_command: None,
+                    allowed_tools: None,
+                    active_agent_name: None,
                     // 夹具默认不带 roots：除了那条专门量 roots 的测试（它自己搭 `TurnDeps`），
                     // T27（R286）之后这里还要多说一句：`build_production_registry()` 的表里
                     // **有** `read_file`，但空 roots 那一轮交给模型的声明表里没有它，
@@ -3952,6 +3982,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: roots.clone(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -4029,6 +4061,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -4753,6 +4787,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -4821,6 +4857,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5203,6 +5241,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -5803,6 +5843,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5982,6 +6024,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6047,6 +6091,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6194,6 +6240,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6365,6 +6413,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6507,6 +6557,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg {
                     enabled: false,
@@ -6565,6 +6617,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory,
                 embed,
@@ -6901,6 +6955,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 extract_locks: ExtractLocks::default(),
@@ -7392,6 +7448,8 @@ mod tests {
                 temperature: None,
                 plan_mode: false,
                 diagnostics_command: None,
+                allowed_tools: None,
+                active_agent_name: None,
                 roots: Vec::new(),
                 memory,
                 embed: None,
@@ -8363,6 +8421,8 @@ mod tests {
                     temperature: None,
                     plan_mode: false,
                     diagnostics_command: None,
+                    allowed_tools: None,
+                    active_agent_name: None,
                     roots: Vec::new(),
                     skills_dir: None,
                     skills_disabled: Vec::new(),

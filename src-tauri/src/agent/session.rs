@@ -88,6 +88,13 @@ pub struct SessionConfig {
     /// （`ipc.rs::run_turn` 每轮现取：改设置下一条消息生效）；`None`/空串 = 关闭
     /// （历史组装与没有本功能时逐字节一致）。
     pub diagnostics_command: Option<String>,
+    /// G19：agent 工具白名单（激活 agent 档案后生效）。`Some` 时双层生效：
+    /// 声明表只留名单内的工具（`filtered_tool_defs` 再滤一层），白名单外的调用在
+    /// 循环里被拒（不执行、不走权限门）。`None` = 不限制，一切照旧。
+    pub allowed_tools: Option<Vec<String>>,
+    /// G19：激活档案的名字（拒绝理由里点名「Agent「X」」用）。与 allowed_tools
+    /// 同源同设（装配点一起给）；None 时拒绝理由退化为「当前 Agent」。
+    pub active_agent_name: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -96,6 +103,8 @@ impl Default for SessionConfig {
             max_turns: 25,
             plan_mode: false,
             diagnostics_command: None,
+            allowed_tools: None,
+            active_agent_name: None,
         }
     }
 }
@@ -206,6 +215,7 @@ fn filtered_tool_defs(
     registry: &ToolRegistry,
     roots: &[PathBuf],
     has_skills: bool,
+    allowed_tools: Option<&[String]>,
 ) -> Vec<ToolDef> {
     let mut tools = registry.defs();
     if !glob::usable_with_roots(roots) {
@@ -232,6 +242,12 @@ fn filtered_tool_defs(
     if !has_skills {
         tools.retain(|d| d.name != use_skill::NAME);
     }
+    // G19：agent 工具白名单再滤一层 —— 只留名单内的名字。与上面的既有过滤**叠加**
+    // （roots 空表隐藏 read_file 等照旧）：两层都是「这一轮到底给不给模型看」的
+    // 判据，隐藏不是授权，白名单外的调用另有循环拦截兜底。
+    if let Some(allowed) = allowed_tools {
+        tools.retain(|d| allowed.iter().any(|a| a == &d.name));
+    }
     tools
 }
 
@@ -242,13 +258,14 @@ pub fn tool_defs_for_turn(
     roots: &[PathBuf],
     skills_dir: Option<&Path>,
     skills_disabled: &[String],
+    allowed_tools: Option<&[String]>,
 ) -> Vec<ToolDef> {
     let has_skills = skills_dir
         .map(crate::skills::discover)
         .unwrap_or_default()
         .iter()
         .any(|e| !skills_disabled.iter().any(|f| f == &e.folder));
-    filtered_tool_defs(registry, roots, has_skills)
+    filtered_tool_defs(registry, roots, has_skills, allowed_tools)
 }
 
 impl AgentSession {
@@ -513,6 +530,37 @@ impl AgentSession {
                     });
                     self.history
                         .push(Message::tool(&id, ToolOutput::text(PLAN_MODE_NOTE), true));
+                    continue;
+                }
+
+                // G19：agent 工具白名单的第二层（第一层是声明表过滤）。插在 plan 拦截
+                // 之后、gate 之前 —— 与 plan 同一归属（会话级护栏已经裁定不执行，轮不到
+                // 权限门），doom 守卫必须仍在其前：白名单内允许的调用照样要被计数，
+                // 白名单外被拒的调用不该污染 doom 计数。调用卡照发（UI 可见这次尝试），
+                // R57 配对不破。
+                if let Some(allowed) = &self.cfg.allowed_tools
+                    && !allowed.iter().any(|a| a == &name)
+                {
+                    let agent = self
+                        .cfg
+                        .active_agent_name
+                        .as_deref()
+                        .unwrap_or("当前 Agent");
+                    let note = format!(
+                        "Agent「{agent}」不允许使用工具 {name}（白名单: {}）",
+                        allowed.join(", ")
+                    );
+                    let started = Instant::now();
+                    let (preview, _) = ToolOutput::text(&note).event_view();
+                    self.deps.sink.emit(AgentEvent::ToolResult {
+                        call_id: id.clone(),
+                        is_error: true,
+                        ms: started.elapsed().as_millis() as u64,
+                        preview,
+                        images: vec![],
+                    });
+                    self.history
+                        .push(Message::tool(&id, ToolOutput::text(note), true));
                     continue;
                 }
 
@@ -928,7 +976,12 @@ impl AgentSession {
         // R286：声明表按「这一轮到底能不能用」过滤，且与预算估算共用同一个函数
         // —— 算的是全量、发的是过滤后，会让估算虚高、校准系数偏低。
         // 隐藏不是授权：模型凭空喊这两个名字照样会走工具自己的拒绝路径。
-        let tools = filtered_tool_defs(&self.deps.registry, &self.roots, !skills.is_empty());
+        let tools = filtered_tool_defs(
+            &self.deps.registry,
+            &self.roots,
+            !skills.is_empty(),
+            self.cfg.allowed_tools.as_deref(),
+        );
         ChatRequest {
             messages: built.messages,
             // R66：`defs()` 已经是 `Vec<model::provider::ToolDef>`（registry.rs:143），
@@ -2804,6 +2857,92 @@ mod tests {
         );
     }
 
+    // ───────────────────────── G19：agent 注册表（工具白名单） ─────────────────────────
+
+    /// allowed_tools 限 [echo] ⇒ 白名单外的 counted（Write）调用被拒：不执行、
+    /// 不走权限门（无 PermissionRequest —— 故意不 spawn 应答任务，拦截失效就挂死变红）；
+    /// 错误结果点名 Agent 与白名单；声明表只留 echo（第一层过滤）；
+    /// 白名单内的 echo 照常执行。R57 配对不破。
+    #[tokio::test]
+    async fn an_agent_allowlist_rejects_tools_outside_the_whitelist() {
+        let (rig, counter) = Rig::with_counted_config(
+            SessionConfig {
+                allowed_tools: Some(vec!["echo".into()]),
+                active_agent_name: Some("研究员".into()),
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("counted", r#"{"k":1}"#)]),
+                tool_round(2, &[("echo", r#"{"text":"白名单内"}"#)]),
+                deltas(&["收到"]),
+            ],
+        );
+        let mut rig = rig;
+        assert_eq!(rig.run("做点事").await, StopReason::EndTurn);
+
+        assert!(
+            counter.calls().is_empty(),
+            "白名单外的 Write 工具绝不能执行：{:?}",
+            counter.calls()
+        );
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1, "counted 以错误结果回给模型：{:?}", results[0]);
+        assert!(
+            results[0].2.contains("不允许使用工具")
+                && results[0].2.contains("研究员")
+                && results[0].2.contains("白名单: echo"),
+            "拒绝理由要点名 Agent 与白名单：{:?}",
+            results[0]
+        );
+        assert!(!results[1].1, "白名单内的 echo 照常执行：{:?}", results[1]);
+        assert!(
+            rig.sink.permission_ids().is_empty(),
+            "白名单拦截不走权限门，echo 零弹窗：{:?}",
+            rig.sink.permission_ids()
+        );
+        // 声明表（第一层）只剩 echo。
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 3);
+        for req in &reqs {
+            let names: Vec<&str> = req.tools.iter().map(|d| d.name.as_str()).collect();
+            assert_eq!(names, vec!["echo"], "声明表只留白名单内的工具：{names:?}");
+        }
+        assert_every_request_paired(&rig);
+    }
+
+    /// allowed_tools = None ⇒ 与现状逐字节一致：两个同配置 rig 跑同一脚本，
+    /// counted 照常弹窗放行并执行，历史完全相等、没有任何白名单拒绝文案。
+    #[tokio::test]
+    async fn without_an_allowlist_the_history_is_byte_identical() {
+        let rounds = vec![
+            tool_round(1, &[("counted", r#"{"k":1}"#)]),
+            deltas(&["收到"]),
+        ];
+        let (mut rig_a, counter_a) =
+            Rig::with_counted_config(SessionConfig::default(), rounds.clone());
+        let (mut rig_b, counter_b) = Rig::with_counted_config(SessionConfig::default(), rounds);
+        let _answers_a = answer_all(&rig_a.gate, &rig_a.sink, 1);
+        let _answers_b = answer_all(&rig_b.gate, &rig_b.sink, 1);
+        assert_eq!(rig_a.run("写一下").await, StopReason::EndTurn);
+        assert_eq!(rig_b.run("写一下").await, StopReason::EndTurn);
+        assert_eq!(
+            rig_a.session.history(),
+            rig_b.session.history(),
+            "无白名单时历史必须与现状逐字节一致"
+        );
+        assert_eq!(counter_a.calls().len(), 1, "counted 照常执行");
+        assert_eq!(counter_b.calls().len(), 1);
+        assert!(
+            rig_a
+                .session
+                .history()
+                .iter()
+                .all(|m| !m.text_of().contains("不允许使用工具")),
+            "无白名单不许出现拒绝文案"
+        );
+    }
+
     /// 溢出识别只认端点文案里的这几个词；普通 4xx/网络错误不许误判成溢出。
     #[test]
     fn overflow_classification_matches_the_common_endpoint_wording() {
@@ -3516,10 +3655,11 @@ mod tests {
         for t in production_tools() {
             registry.register(t);
         }
-        let expected: Vec<String> = tool_defs_for_turn(&registry, &roots, Some(skills.path()), &[])
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
+        let expected: Vec<String> =
+            tool_defs_for_turn(&registry, &roots, Some(skills.path()), &[], None)
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
         assert_eq!(
             declared, expected,
             "预算里算的工具声明必须就是请求里发出去的那一批"
@@ -3533,6 +3673,7 @@ mod tests {
             &roots,
             Some(skills.path()),
             &["translate".to_string()],
+            None,
         );
         assert!(
             !disabled.iter().any(|d| d.name == "use_skill"),
