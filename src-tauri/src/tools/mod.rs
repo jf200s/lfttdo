@@ -4,6 +4,7 @@ pub mod edit_file;
 pub mod fetch;
 pub mod fetch_guard;
 pub(crate) mod fs_write;
+pub mod glob;
 pub mod grep;
 pub mod memory_search;
 pub mod read_file;

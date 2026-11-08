@@ -25,6 +25,7 @@ use crate::store::db::{Db, SessionRow, events_from_messages};
 use crate::store::memory::{MemoryRow, MemoryWrite, RecallCfg};
 use crate::tools::edit_file::EditFileTool;
 use crate::tools::fetch::FetchTool;
+use crate::tools::glob::GlobTool;
 use crate::tools::grep::GrepTool;
 use crate::tools::memory_search::MemorySearchTool;
 use crate::tools::read_file::ReadFileTool;
@@ -2823,6 +2824,7 @@ pub fn build_production_registry(
 ) -> Arc<ToolRegistry> {
     let registry = Arc::new(ToolRegistry::new());
     registry.register(Arc::new(FetchTool::new()));
+    registry.register(Arc::new(GlobTool));
     registry.register(Arc::new(GrepTool));
     registry.register(Arc::new(ReadFileTool));
     registry.register(Arc::new(UseSkillTool));
@@ -4018,6 +4020,7 @@ mod tests {
             vec![
                 "edit_file",
                 "fetch_url",
+                "glob",
                 "grep",
                 "memory_search",
                 "read_file",
