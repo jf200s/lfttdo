@@ -50,6 +50,14 @@ const TOOL_CANCELLED_NOTE: &str = "本轮已中断，工具结果未采用";
 /// 为什么被拒、出路是什么（完成调研给方案 / 退出 plan 模式再改）。
 const PLAN_MODE_NOTE: &str = "Plan 模式：当前为只读研究，不能执行写入/命令类操作。请先完成调研并给出方案；退出 plan 模式后再执行修改。";
 
+/// G17：AGENTS.md 注入段落的标题（拼接格式见 `AgentSession::agents_md_section`）。
+const AGENTS_MD_HEADING: &str = "## 项目规则（AGENTS.md）";
+/// G17：单个 AGENTS.md 的字节上限 —— 防一个巨型文件顶爆预算（截断在 UTF-8 字符
+/// 边界上，见 `floor_char_boundary`）。
+const AGENTS_MD_MAX_BYTES: usize = 8 * 1024;
+/// G17：截断标记 —— 模型与测试都靠它知道「内容不完整」。
+const AGENTS_MD_TRUNCATED_NOTE: &str = "\n\n（AGENTS.md 超过 8 KiB，已截断）";
+
 /// 这条模型错误是不是「上下文超长」。判据只看错误文本：错误**分类**住 provider 层
 /// （`ModelError` 四个变体按「用户该去查什么」划分，不按内容），而溢出是端点自己的
 /// 4xx 文案 —— OpenAI 系 "maximum context length"、Ollama 系 "context window"，
@@ -169,6 +177,20 @@ fn image_followup(images: &[ContentBlock]) -> Option<Message> {
     }];
     blocks.extend(unique.into_iter().cloned());
     Some(Message::user(blocks))
+}
+
+/// G17：UTF-8 安全的截断点。`String::truncate` 在非字符边界会 panic，而 AGENTS.md 是
+/// 用户可手改的文件 —— 8 KiB 这刀不许让它炸。从 `max` 往回退到最近的字符边界
+/// （`is_char_boundary(0)` 恒真，循环必然终止）。
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut cut = max;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
 }
 
 /// `request()` 与预算估算共用这一份，避免「算的是全量注册表、发的是过滤后的表」。
@@ -710,6 +732,52 @@ impl AgentSession {
         }
     }
 
+    /// G17：扫 roots 下**根目录一级**的 `AGENTS.md`，拼出「项目规则」段。
+    /// `request()` 每轮调用 —— 每轮现读，用户改文件下一轮即生效，不落库
+    /// （与技能索引同一条 tail 组装路径，经 `build_with_extra` 天然参与预算）。
+    ///
+    /// · **只读根目录一级**，不做嵌套目录递归 —— MVP 取舍：OpenCode 的嵌套发现要沿
+    ///   目录树走且每个子目录一个作用域，lfttdo 的 roots 本来就是平铺的授权目录；
+    ///   子目录级规则等真有消费者（monorepo 场景）再加，扩展点就在这个循环里。
+    /// · 失败静默跳过：AGENTS.md 缺失不是错误（可选约定），读不动（权限/解码失败）
+    ///   同路。roots 已闸门化 —— 这里读的是用户授权的目录，不需要第二道 containment。
+    /// · 每份内容截到 [`AGENTS_MD_MAX_BYTES`] 并附截断标记（防巨型文件顶爆预算）。
+    /// · 多根时每段带 `### <根目录名>` 小标题分隔（归属可辨）；单根不带。
+    /// · 一个都没有（或全是空文件）⇒ `None`，tail 不加这段 —— 系统提示与功能
+    ///   不存在时逐字节一致（有测试钉）。
+    fn agents_md_section(&self) -> Option<String> {
+        let multi = self.roots.len() > 1;
+        let mut parts: Vec<String> = Vec::new();
+        for root in &self.roots {
+            let Ok(content) = std::fs::read_to_string(root.join("AGENTS.md")) else {
+                continue;
+            };
+            if content.trim().is_empty() {
+                // 空文件 / 纯空白不产生空段落（全部为空时整段消失）。
+                continue;
+            }
+            let mut content = content;
+            if content.len() > AGENTS_MD_MAX_BYTES {
+                let cut = floor_char_boundary(&content, AGENTS_MD_MAX_BYTES);
+                content.truncate(cut);
+                content.push_str(AGENTS_MD_TRUNCATED_NOTE);
+            }
+            if multi {
+                let name = root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| root.to_string_lossy().into_owned());
+                parts.push(format!("### {name}\n\n{content}"));
+            } else {
+                parts.push(content);
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!("{AGENTS_MD_HEADING}\n\n{}", parts.join("\n\n")))
+    }
+
     /// 交给模型的请求：滑窗组装出来的消息 + 注册表的工具声明。
     /// `&mut self` 只为记下这次请求的粗估（校准的分母）；`run()` 是它唯一的调用方。
     fn request(&mut self) -> ChatRequest {
@@ -760,6 +828,13 @@ impl AgentSession {
             tail.push_str("\n\n## 工作目录\n本次会话的输出目录是：");
             tail.push_str(&crate::tools::fs_write::display_path(dir));
             tail.push_str("。生成的图片、视频和文档都写到这里；不要写到别的目录。");
+        }
+        // G17：AGENTS.md 每轮现读（格式与取舍见 `agents_md_section`）—— 用户改文件
+        // 下一轮即生效，不落库；与技能索引同一条 tail 组装路径，走 build_with_extra
+        // 的 tail 参数参与预算（先 build 再往外贴会让请求凭空超线，同下）。
+        if let Some(section) = self.agents_md_section() {
+            tail.push_str("\n\n");
+            tail.push_str(&section);
         }
         // 追加段交给 ContextBuilder 一起算预算：先 build 再往外贴会让请求凭空超线。
         let built = self.deps.context.build_with_extra(&self.history, &tail);
@@ -2261,6 +2336,163 @@ mod tests {
             rig.sink.permission_ids()
         );
         assert_every_request_paired(&rig);
+    }
+
+    // ───────────────────────── G17：AGENTS.md 注入 ─────────────────────────
+
+    /// 根下有 AGENTS.md ⇒ 系统提示含「项目规则」标题与文件内容。
+    #[tokio::test]
+    async fn agents_md_in_the_root_reaches_the_system_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "永远用中文回复").unwrap();
+        let mut rig = Rig::with_roots(
+            vec![deltas(&["好的"])],
+            vec![root.path().to_path_buf()],
+            vec![],
+        );
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        let system = rig.reqs()[0].messages[0].text_of();
+        assert!(system.contains(AGENTS_MD_HEADING), "要有段落标题：{system}");
+        assert!(
+            system.contains("永远用中文回复"),
+            "文件内容要进系统提示：{system}"
+        );
+    }
+
+    /// 两个根各有 AGENTS.md ⇒ 两个都进且带 `### <根目录名>` 小标题，顺序随 roots。
+    #[tokio::test]
+    async fn two_roots_each_get_a_named_subsection_in_root_order() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("AGENTS.md"), "A 的规矩").unwrap();
+        std::fs::write(b.path().join("AGENTS.md"), "B 的规矩").unwrap();
+        let mut rig = Rig::with_roots(
+            vec![deltas(&["好的"])],
+            vec![a.path().to_path_buf(), b.path().to_path_buf()],
+            vec![],
+        );
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        let system = rig.reqs()[0].messages[0].text_of();
+        let a_name = a.path().file_name().unwrap().to_string_lossy();
+        let b_name = b.path().file_name().unwrap().to_string_lossy();
+        assert!(
+            system.contains(&format!("### {a_name}")) && system.contains(&format!("### {b_name}")),
+            "多根要用根目录名做小标题分隔：{system}"
+        );
+        assert!(
+            system.contains("A 的规矩") && system.contains("B 的规矩"),
+            "两份内容都要进：{system}"
+        );
+        let a_pos = system.find("A 的规矩").unwrap();
+        let b_pos = system.find("B 的规矩").unwrap();
+        assert!(
+            a_pos < b_pos,
+            "roots 的顺序就是拼接顺序（可预期的归属）：{system}"
+        );
+    }
+
+    /// 没有 AGENTS.md ⇒ 系统提示与功能不存在时**逐字节一致**（两个 rig 对比）。
+    /// roots 本身不许把任何别的东西带进 tail —— 带进来这里就红了。
+    #[tokio::test]
+    async fn an_empty_root_keeps_the_system_prompt_byte_identical() {
+        let root = tempfile::tempdir().unwrap(); // 空目录：roots 非空但没有 AGENTS.md
+        let mut with_root = Rig::with_roots(
+            vec![deltas(&["好的"])],
+            vec![root.path().to_path_buf()],
+            vec![],
+        );
+        let mut without = Rig::with_roots(vec![deltas(&["好的"])], vec![], vec![]);
+        assert_eq!(with_root.run("hi").await, StopReason::EndTurn);
+        assert_eq!(without.run("hi").await, StopReason::EndTurn);
+        assert_eq!(
+            with_root.reqs()[0].messages[0].text_of(),
+            without.reqs()[0].messages[0].text_of(),
+            "缺 AGENTS.md 时系统提示必须与功能不存在时逐字节一致"
+        );
+    }
+
+    /// 内容 > 8 KiB ⇒ 截断标记出现、8 KiB 之后的字节不进提示、截断前的内容保留。
+    #[tokio::test]
+    async fn an_oversized_agents_md_is_truncated_with_a_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let mut big = "x".repeat(AGENTS_MD_MAX_BYTES + 100);
+        big.push_str("结尾的独有标记");
+        std::fs::write(root.path().join("AGENTS.md"), &big).unwrap();
+        let mut rig = Rig::with_roots(
+            vec![deltas(&["好的"])],
+            vec![root.path().to_path_buf()],
+            vec![],
+        );
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        let system = rig.reqs()[0].messages[0].text_of();
+        assert!(
+            system.contains(AGENTS_MD_TRUNCATED_NOTE),
+            "截断标记要出现：{system}"
+        );
+        assert!(
+            !system.contains("结尾的独有标记"),
+            "8 KiB 之后的字节不许进提示：{system}"
+        );
+        assert!(
+            system.contains(&"x".repeat(64)),
+            "截断前的内容要保留：{system}"
+        );
+    }
+
+    /// 截断点落在多字节字符中间时按字符边界退让：不许 panic、不许出现半个字符。
+    #[test]
+    fn truncation_respects_utf8_char_boundaries() {
+        // 8191 处是边界，8192 落在第一个「中」（3 字节）的中间。
+        let mut s = "x".repeat(AGENTS_MD_MAX_BYTES - 1);
+        s.push_str("中中中");
+        let cut = floor_char_boundary(&s, AGENTS_MD_MAX_BYTES);
+        assert_eq!(cut, AGENTS_MD_MAX_BYTES - 1, "退让到最近的字符边界");
+        let mut t = s.clone();
+        t.truncate(cut); // 非边界会 panic，这一行本身就是断言的一半
+        t.push_str(AGENTS_MD_TRUNCATED_NOTE);
+        assert!(t.ends_with(AGENTS_MD_TRUNCATED_NOTE), "{t:?}");
+    }
+
+    /// 每轮现读：第二轮请求同样带上；**改文件后下一轮请求反映新内容**（不落库 ——
+    /// 系统提示只活在请求上，历史里没有它）。
+    #[tokio::test]
+    async fn agents_md_is_reread_each_round_and_reflects_edits() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "第一版规矩").unwrap();
+        let mut rig = Rig::with_roots(
+            vec![
+                tool_round(1, &[("echo", r#"{"text":"记下了"}"#)]),
+                deltas(&["好"]),
+                deltas(&["继续办"]), // 第二次 run 的那一轮
+            ],
+            vec![root.path().to_path_buf()],
+            vec![],
+        );
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 2, "工具轮 + 收尾轮");
+        assert!(
+            reqs[0].messages[0].text_of().contains("第一版规矩"),
+            "第一轮要带上：{}",
+            reqs[0].messages[0].text_of()
+        );
+        assert!(
+            reqs[1].messages[0].text_of().contains("第一版规矩"),
+            "第二轮同样现读带上（不是装配时读一次缓存住）：{}",
+            reqs[1].messages[0].text_of()
+        );
+
+        // 改文件 → 同一会话再 run 一次：新文本出现、旧文本消失。
+        std::fs::write(root.path().join("AGENTS.md"), "第二版规矩").unwrap();
+        assert_eq!(rig.run("继续").await, StopReason::EndTurn);
+        let reqs = rig.reqs();
+        assert!(reqs.len() >= 3, "第二次 run 至少多一条请求：{}", reqs.len());
+        let system = reqs[2].messages[0].text_of();
+        assert!(
+            system.contains("第二版规矩"),
+            "改文件后下一轮要反映新内容：{system}"
+        );
+        assert!(!system.contains("第一版规矩"), "旧内容不许残留：{system}");
     }
 
     /// 溢出识别只认端点文案里的这几个词；普通 4xx/网络错误不许误判成溢出。
