@@ -14,10 +14,38 @@ use crate::model::provider::{ChatRequest, ModelDelta, ModelProvider};
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
+/// G23：结构化摘要的**六节标题**（逐字固定 —— 测试与「模板随请求发出」的断言都认它们，
+/// 改一个字就是改摘要的线上形状）。语出 OpenCode 的压缩摘要（目标/决定/已完成/阻塞/
+/// 下一步/涉及文件）：「后续模型接手时先读什么」决定分节方式，而不是「原文聊了什么」。
+pub const SUMMARY_SECTIONS: [&str; 6] = [
+    "## 客观",
+    "## 已完成",
+    "## 决定",
+    "## 阻塞",
+    "## 下一步",
+    "## 涉及文件",
+];
+
 /// 摘要调用用的提示词。**独立于 SYSTEM_PROMPT**（`context.rs:11`）：那条教模型「别编造、
 /// 可用工具」，而这里要的是相反的行为——只压缩已给内容，不补充、不调工具。
-pub const SUMMARY_INSTRUCTION: &str = "把下面的对话历史压缩成不超过 400 字的要点备忘。只保留事实（人名、数字、结论、未完成的请求），\
-不要评价、不要补充对话里没有的内容。用中文。";
+///
+/// G23：从「400 字要点备忘」改为 OpenCode 风格的**结构化模板** —— 六节标题逐字固定
+/// （[`SUMMARY_SECTIONS`]），模型按节交卷，后续模型（以及再次压缩时的检查点更新）才能
+/// 按节对齐着读。模板随 [`summary_request`] 原样进请求；模型回什么、[`summary_note`]
+/// 就原样落什么 —— 这条线的两端各有测试钉住（本模块 + `tests/gapcheck2.rs` 的 g23）。
+pub const SUMMARY_INSTRUCTION: &str = "请把以上对话压缩成一份给后续模型看的交接摘要，**只输出以下六节**\
+（每节一行标题 + 内容；某节无内容就写「无」）：\n\
+## 客观\n\
+（用户要做什么，一句话）\n\
+## 已完成\n\
+## 决定\n\
+（已确定的技术选择/约定）\n\
+## 阻塞\n\
+## 下一步\n\
+## 涉及文件\n\
+（路径清单）\n\
+摘要不超过 600 字；只保留事实（人名、数字、结论、未完成的请求），不要评价、不要补充对话里没有的内容；\
+不要寒暄、不要复述原文语气的对话内容。用中文。";
 
 /// 摘要备注的前缀（spec 5.3 的 `早期对话摘要：…`）。
 /// **只加一次**：备注落库时由 [`summary_note`] 拼，`ContextBuilder::build()` 把 System 行
@@ -495,5 +523,72 @@ mod tests {
         // 降级路径也必须带前缀：「有一条被压过的痕迹」是 spec :365 的意图，
         // 而且带前缀才能让第二次压缩把它一起并进新摘要。
         assert!(summary_note(SUMMARY_OMITTED).starts_with(SUMMARY_PREFIX));
+    }
+
+    // ───────────────────────── G23：结构化摘要模板 ─────────────────────────
+
+    /// 指令模板本身带着全部六节标题（逐字固定，见 [`SUMMARY_SECTIONS`]）且按声明顺序出现，
+    /// 另带 600 字上限。改模板不改这里（或反之）当场红 —— 标题是线上形状，
+    /// 「后续模型按节读」建立在它稳定之上。
+    #[test]
+    fn the_summary_instruction_carries_the_six_fixed_sections_in_order() {
+        // 逐字锚点：数组就是「六节标题」的唯一真相，先钉它不许漂。
+        assert_eq!(
+            SUMMARY_SECTIONS,
+            [
+                "## 客观",
+                "## 已完成",
+                "## 决定",
+                "## 阻塞",
+                "## 下一步",
+                "## 涉及文件"
+            ],
+            "六节标题逐字固定；改这里等于改摘要的线上形状"
+        );
+        let mut tail = SUMMARY_INSTRUCTION;
+        for heading in SUMMARY_SECTIONS {
+            let at = tail.find(heading).unwrap_or_else(|| {
+                panic!("指令模板缺节「{heading}」，或顺序与声明不符：{SUMMARY_INSTRUCTION}")
+            });
+            // 顺序钉法：每次从上一节之后找下一节（找到后裁掉头部）。
+            tail = &tail[at + heading.len()..];
+        }
+        assert!(
+            SUMMARY_INSTRUCTION.contains("600 字"),
+            "长度上限要写进模板（600 字），模型才有可执行的约束：{SUMMARY_INSTRUCTION}"
+        );
+        assert!(
+            !SUMMARY_INSTRUCTION.contains("400 字"),
+            "旧模板的 400 字已经退役，留着就是两个真相：{SUMMARY_INSTRUCTION}"
+        );
+    }
+
+    /// 模板**随请求发出**：stub 收到的第一条 system 消息含全部六节标题；
+    /// 返回文本**原样返回**（落库是调用方的事，这里只保证中间这一段零加工）。
+    #[tokio::test]
+    async fn the_structured_template_reaches_the_request_and_the_result_comes_back_verbatim() {
+        // stub 按模板交卷（六节都在的文本）；它必须被逐字带回来。
+        let stub_text = "## 客观\n把 G23 的摘要模板换成结构化\n\
+## 已完成\n模板与测试\n## 决定\n标题逐字固定\n## 阻塞\n无\n## 下一步\n验收\n## 涉及文件\nsrc-tauri/src/agent/summarize.rs";
+        let model = TextModel::new(&[stub_text]);
+        let got = collect_summary(
+            &*model,
+            summary_request(&src_messages()),
+            &never_cancelled(),
+        )
+        .await
+        .expect("stub 交了卷，必须成功");
+        assert_eq!(got, stub_text, "返回文本零加工 —— 原样返回是落库形状的前提");
+
+        // 模型那一侧取证（R57）：发出的请求头一条（system 指令）带着全部六节标题。
+        let req = &model.recorder.calls()[0];
+        assert_eq!(req.messages[0].role, Role::System);
+        let sent = req.messages[0].text_of();
+        for heading in SUMMARY_SECTIONS {
+            assert!(
+                sent.contains(heading),
+                "六节标题必须随请求发给模型，缺「{heading}」：{sent}"
+            );
+        }
     }
 }
