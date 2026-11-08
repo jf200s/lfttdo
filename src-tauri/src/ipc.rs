@@ -40,6 +40,7 @@ use crate::tools::todo::TodoTool;
 use crate::tools::undo::UndoTool;
 use crate::tools::use_skill::UseSkillTool;
 use crate::tools::websearch::WebSearchTool;
+use crate::tools::workflow::WorkflowTool;
 use crate::tools::write_file::WriteFileTool;
 use crate::window_state::{self, Ev, WindowGeom, should_persist};
 use serde::Serialize;
@@ -2953,6 +2954,10 @@ pub fn build_production_registry(
     // G16：task 子代理。runner 由会话循环装配进 ToolCtx（`session::run`）——
     // 注册表只注册工具壳，没有 runner 的执行上下文里它会明确报错（fail-closed）。
     registry.register(Arc::new(TaskTool));
+    // G24：workflow 编排。Risk::Write —— 按定义连续派子代理执行任意组合动作
+    // （task 的 N 连发），这一下必须弹窗；定义文件在 workspace 的
+    // workflows/<name>.json（解析即验 + `{{步骤名}}` 结果传递，见 tools/workflow.rs）。
+    registry.register(Arc::new(WorkflowTool));
     registry.register(Arc::new(TodoTool));
     registry.register(Arc::new(UndoTool));
     // G21：websearch。Risk::Read —— 唯一出站目标是写死的 DuckDuckGo 端点（fetch 同款
@@ -4178,6 +4183,7 @@ mod tests {
                 "undo",
                 "use_skill",
                 "websearch",
+                "workflow",
                 "write_file",
             ],
             "模型看到的工具集必须是这份名单；echo/guarded 这类测试工具绝不能进生产（它们只活在 #[cfg(test)]）"
@@ -4213,6 +4219,13 @@ mod tests {
             r.risk_of("task"),
             Risk::Write,
             "task 必须走 Write 档：派子代理前让用户看得见、拦得住"
+        );
+        // G24：workflow 是 Write 档 —— 按定义连续派子代理（task 的 N 连发），
+        // 降 Read 等于把一串该弹窗的调用折叠成一次静默放行。
+        assert_eq!(
+            r.risk_of("workflow"),
+            Risk::Write,
+            "workflow 必须走 Write 档：编排多个子代理前让用户看得见、拦得住"
         );
         // Agent Shell（spec §2/§8）：`run_command` 是第一把内置 Exec 工具，风险唯一真相源
         // 是 `ShellTool::meta()`（经 `risk_of` 出）。它降档就等于绕开权限门的每次弹窗。

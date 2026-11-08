@@ -19,4 +19,5 @@ pub mod todo;
 pub mod undo;
 pub mod use_skill;
 pub mod websearch;
+pub mod workflow;
 pub mod write_file;

@@ -19,6 +19,7 @@ use crate::tools::registry::{ToolCtx, ToolRegistry};
 use crate::tools::todo;
 use crate::tools::undo;
 use crate::tools::use_skill;
+use crate::tools::workflow;
 use crate::tools::write_file;
 use futures::StreamExt;
 use std::path::{Path, PathBuf};
@@ -258,6 +259,11 @@ fn filtered_tool_defs(
     }
     if !undo::usable_with_roots(roots) {
         tools.retain(|d| d.name != undo::NAME);
+    }
+    // G24：workflow 的定义面在 workspace 的 workflows/ 下（write_root/roots[0]），
+    // 没有工作目录时声明了也只会收到一句报错 —— 与 todo/undo 同一条隐藏判据。
+    if !workflow::usable_with_roots(roots) {
+        tools.retain(|d| d.name != workflow::NAME);
     }
     if !has_skills {
         tools.retain(|d| d.name != use_skill::NAME);
