@@ -29,9 +29,24 @@ use tokio_util::sync::CancellationToken;
 /// 「被打断」当成「工具坏了」再试一遍。
 const INTERRUPTED_NOTE: &str = "本轮被打断，工具未执行";
 const MODEL_FAILURE_NOTE: &str = "本轮在模型流中断处失败，工具未执行";
+/// 上下文溢出重试（G05）时，给已流出的半截回复补的那条说明。
+const OVERFLOW_RETRY_NOTE: &str = "上一段响应因上下文超限中断，将收缩上下文后重新回答";
 /// 工具**已经开始执行**之后被取消：不能断言它没执行完（副作用可能已经发生），
 /// 只能说这份结果没有被采用。
 const TOOL_CANCELLED_NOTE: &str = "本轮已中断，工具结果未采用";
+
+/// 这条模型错误是不是「上下文超长」。判据只看错误文本：错误**分类**住 provider 层
+/// （`ModelError` 四个变体按「用户该去查什么」划分，不按内容），而溢出是端点自己的
+/// 4xx 文案 —— OpenAI 系 "maximum context length"、Ollama 系 "context window"，
+/// 同一件事各家措辞不同，大小写不敏感地认这几个词；中文关键词兜底本地端点的报错。
+fn is_context_overflow(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("context length")
+        || m.contains("context window")
+        || m.contains("context overflow")
+        || message.contains("上下文长度")
+        || message.contains("上下文超")
+}
 
 /// 循环的护栏。`max_turns` 是防模型自我循环的保险丝（spec 4.6）：日常对话 1 轮收尾，
 /// 带工具的多为 2–5 轮，25 是上限而不是目标；触顶时发 `Done{MaxTurns}` 让 UI 明确提示，
@@ -289,6 +304,9 @@ impl AgentSession {
             skills_disabled: self.skills_disabled.clone(),
         };
 
+        // G05：一次 run() 只自动恢复一次溢出。第二次仍超限 = 预算收缩到下限也装不下，
+        // 走既有失败出口把控制权交回用户（改设置/换端点），而不是无限收缩。
+        let mut overflow_retried = false;
         for turn in 1..=self.cfg.max_turns {
             // 上一轮的工具跑完之后又被点了停止：成对状态已经落好，直接收尾。
             if self.cancel.is_cancelled() {
@@ -354,6 +372,19 @@ impl AgentSession {
 
             let assistant = acc.finish();
             if let Some(message) = model_error {
+                // G05：上下文超限先收缩重试一次，而不是整轮失败。半截回复已经流给 UI，
+                // 按 R56 的同一逻辑提交进 history（带归因说明），重试的回答接在它后面。
+                if is_context_overflow(&message) && !overflow_retried {
+                    overflow_retried = true;
+                    self.deps.context.halve_budget();
+                    self.deps.sink.emit(AgentEvent::Error {
+                        at: ErrorWhere::Loop,
+                        message: format!("模型报上下文超限，已收缩上下文并重试：{message}"),
+                        fatal: false,
+                    });
+                    self.commit_partial(assistant, OVERFLOW_RETRY_NOTE);
+                    continue;
+                }
                 // R61：Plan A 里模型错误就结束本轮，所以 fatal 是 true。
                 self.deps.sink.emit(AgentEvent::Error {
                     at: ErrorWhere::Model,
@@ -1816,6 +1847,100 @@ mod tests {
             "错误在第一个 delta 之前就到了：没有任何内容已经流给 UI，所以不提交空轮"
         );
         assert_eq!(rig.reqs().len(), 1);
+    }
+
+    /// G05 夹具：**第一次请求**报 `error_message`，之后按序吐 `then` 各轮；
+    /// `then` 耗尽后继续报同一个错（测「重试仍溢出」）。FailingModel 的文案
+    /// 固定是 429，认不出「溢出」，测不了重试分支。
+    struct OverflowModel {
+        error_message: String,
+        then: Mutex<Vec<Vec<ModelDelta>>>,
+        errored: AtomicBool,
+        recorder: Recorder,
+    }
+
+    #[async_trait]
+    impl ModelProvider for OverflowModel {
+        fn stream<'a>(
+            &'a self,
+            req: ChatRequest,
+        ) -> std::pin::Pin<Box<dyn Stream<Item = Result<ModelDelta, ModelError>> + Send + 'a>>
+        {
+            self.recorder.push(req);
+            let already_errored = self.errored.swap(true, Ordering::SeqCst);
+            let mut q = self.then.lock().unwrap();
+            if already_errored && !q.is_empty() {
+                let next = q.remove(0);
+                return Box::pin(futures::stream::iter(next.into_iter().map(Ok)));
+            }
+            Box::pin(futures::stream::iter(std::iter::once(Err(
+                ModelError::Api(self.error_message.clone()),
+            ))))
+        }
+    }
+
+    /// G05 的正向半边：第一次溢出 → 非致命的 Loop 说明 + 收缩上下文 + 重试一次，
+    /// 重试的回答正常收尾。
+    #[tokio::test]
+    async fn an_overflow_error_recovers_by_shrinking_and_retrying_once() {
+        let model = Arc::new(OverflowModel {
+            error_message: "400 This model's maximum context length is exceeded".into(),
+            then: Mutex::new(vec![vec![ModelDelta::Text("修好了".into())]]),
+            errored: AtomicBool::new(false),
+            recorder: Recorder::default(),
+        });
+        let recorder = model.recorder.clone();
+        let mut rig = Rig::assembled(model, ContextConfig::default(), recorder, vec![]);
+        assert_eq!(rig.run("hi").await, StopReason::EndTurn);
+        assert!(rig.sink.texts().contains("修好了"), "重试的回答要送达");
+        assert_eq!(
+            rig.sink.errors(),
+            vec![(
+                ErrorWhere::Loop,
+                "模型报上下文超限，已收缩上下文并重试：模型返回错误: 400 This model's maximum context length is exceeded".into(),
+                false
+            )],
+            "只有一条非致命的收缩说明，没有 fatal"
+        );
+        assert_eq!(rig.reqs().len(), 2, "溢出后恰好重试一次");
+    }
+
+    /// G05 的另一半：重试仍然溢出 = 走既有失败出口，不能无限收缩。
+    #[tokio::test]
+    async fn a_second_overflow_still_ends_with_a_fatal_error() {
+        let model = Arc::new(OverflowModel {
+            error_message: "400 maximum context length exceeded".into(),
+            then: Mutex::new(vec![]),
+            errored: AtomicBool::new(false),
+            recorder: Recorder::default(),
+        });
+        let recorder = model.recorder.clone();
+        let mut rig = Rig::assembled(model, ContextConfig::default(), recorder, vec![]);
+        assert_eq!(rig.run("hi").await, StopReason::Error);
+        let errors = rig.sink.errors();
+        assert_eq!(errors.len(), 2, "一次收缩说明 + 一次 fatal：{errors:?}");
+        assert!(!errors[0].2, "第一次是非致命说明");
+        assert!(errors[1].2, "第二次是 fatal");
+        assert_eq!(rig.sink.done(), Some(StopReason::Error));
+        assert_eq!(rig.reqs().len(), 2, "重试恰好一次，之后收尾");
+    }
+
+    /// 溢出识别只认端点文案里的这几个词；普通 4xx/网络错误不许误判成溢出。
+    #[test]
+    fn overflow_classification_matches_the_common_endpoint_wording() {
+        assert!(is_context_overflow(
+            "400 This model's maximum context length is exceeded"
+        ));
+        assert!(is_context_overflow(
+            "model requires a larger context window"
+        ));
+        assert!(is_context_overflow("请求失败：上下文长度超限"));
+        assert!(!is_context_overflow(
+            "模型返回错误: 401 Unauthorized invalid_api_key"
+        ));
+        assert!(!is_context_overflow(
+            "无法连接模型端点 https://x.test: dns error"
+        ));
     }
 
     /// R56 的另外半张脸：取消出口被 `interrupting_mid_stream_...` 钉住了，报错出口用的是

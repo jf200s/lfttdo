@@ -131,6 +131,16 @@ impl ContextBuilder {
         self.calibration = factor.clamp(0.2, 3.0);
     }
 
+    /// 上下文溢出恢复（G05）用的收缩：把输入预算与滑窗各减半（有下限）。
+    /// 会话层在模型报「上下文超长」时调用一次；下一次 `build()` 的滑窗会更
+    /// 激进地丢老消息。**历史本体不动** —— 丢的只是这次请求里带多少，
+    /// 落库与重放的真相源不受影响。连续溢出走两次 = 预算到下限仍装不下，
+    /// 那时该交给既有失败出口报给用户，而不是无限收缩。
+    pub fn halve_budget(&mut self) {
+        self.cfg.budget_tokens = (self.cfg.budget_tokens / 2).max(2048);
+        self.cfg.window_messages = (self.cfg.window_messages / 2).max(4);
+    }
+
     /// 组装本次请求的消息。预算 = 配置上限 - 输出预留，先受滑窗上限约束，
     /// 再从最近往前缩到预算内；缩到只剩 1 条仍超预算时**照样返回**（spec :365 保证不报错）。
     /// 切口永不会落在 assistant 的 `ToolCall` 与它的 tool 结果之间（见循环里的 advance）。
@@ -537,6 +547,24 @@ fn turn_start_indices(conv: &[&Message]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G05：溢出收缩 = 预算与滑窗各减半，且有下限（不无限收缩）。
+    #[test]
+    fn halve_budget_halves_and_respects_floors() {
+        let mut b = ContextBuilder::new(ContextConfig {
+            budget_tokens: 32_000,
+            window_messages: 40,
+            ..ContextConfig::default()
+        });
+        b.halve_budget();
+        assert_eq!(b.cfg.budget_tokens, 16_000);
+        assert_eq!(b.cfg.window_messages, 20);
+        for _ in 0..8 {
+            b.halve_budget();
+        }
+        assert_eq!(b.cfg.budget_tokens, 2048, "预算下限 2048");
+        assert_eq!(b.cfg.window_messages, 4, "滑窗下限 4 条");
+    }
     use crate::agent::types::{ContentBlock, ImageMime, Message, Role, ToolOutput};
     use serde_json::json;
 
