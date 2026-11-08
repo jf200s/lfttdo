@@ -2923,6 +2923,17 @@ mod tests {
         path
     }
 
+    /// Windows 镜像夹具（与 unix 版同形状；Windows CI 上验证）：run_diagnostics 是
+    /// **直接 spawn**（按 whitespace 切 program+args，不经 shell），Windows 上最贴近
+    /// 的可执行形状是 .cmd 文件（std 的 Command 对 .bat/.cmd 走 cmd.exe 转发）——
+    /// 诊断反馈的逻辑跨平台，脚本形状平台各异（shebang+x 位 ↔ .cmd）。
+    #[cfg(windows)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
     /// 诊断脚本输出一行 ⇒ write_file 成功落盘后历史里出现【自动诊断】合成 user 轮
     /// （位置：tool 结果之后、模型下一轮之前），且下一次请求的 messages 带上该文本。
     #[cfg(unix)]
@@ -3042,6 +3053,111 @@ mod tests {
     async fn a_failing_silent_command_appends_nothing() {
         let out = tempfile::tempdir().unwrap();
         let script = write_script(out.path(), "diag.sh", "exit 3");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("write_file", args.as_str())]),
+                deltas(&["收到"]),
+            ],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+        let hist = rig.session.history();
+        assert_eq!(hist.len(), 4, "失败且无输出 = 没有诊断轮：{hist:?}");
+        assert!(
+            hist.iter().all(|m| !m.text_of().contains("【自动诊断】")),
+            "不许把退出码编造成诊断文本"
+        );
+    }
+
+    // ───────────────── G18 的 Windows 镜像（逻辑跨平台；Windows CI 上验证） ─────────────────
+    // 脚本形状换成 .cmd（见 write_script 的 Windows 版）；断言与 unix 版逐条对应。
+
+    /// Windows 镜像：诊断脚本输出一行 ⇒【自动诊断】合成 user 轮照常落历史与请求。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_diagnostics_command_appends_a_synthetic_user_turn() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.cmd", "@echo error: missing semicolon");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("write_file", args.as_str())]),
+                deltas(&["收到"]),
+            ],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+
+        let hist = rig.session.history();
+        assert_eq!(hist.len(), 5, "合成 user 轮恰好多出一条：{hist:?}");
+        assert_eq!(hist[3].role, Role::User);
+        let diag_text = hist[3].text_of();
+        assert!(
+            diag_text.contains("【自动诊断】") && diag_text.contains("missing semicolon"),
+            "诊断轮要带标记与脚本输出：{diag_text}"
+        );
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 2);
+        let joined: String = reqs[1].messages.iter().map(|m| m.text_of()).collect();
+        assert!(
+            joined.contains("【自动诊断】") && joined.contains("missing semicolon"),
+            "第二次请求要带上诊断反馈：{joined}"
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    /// Windows 镜像：诊断命令成功但输出为空 ⇒ 不追加任何消息。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_empty_diagnostics_output_appends_nothing() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.cmd", "@exit /b 0");
+        let file = out.path().join("note.txt");
+        let args = json!({ "path": file, "content": "hello" }).to_string();
+        let mut rig = diagnostics_rig(
+            SessionConfig {
+                diagnostics_command: Some(script.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("write_file", args.as_str())]),
+                deltas(&["收到"]),
+            ],
+            out.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("写一下").await, StopReason::EndTurn);
+        let hist = rig.session.history();
+        assert_eq!(
+            hist.len(),
+            4,
+            "user → assistant(调用) → tool(结果) → assistant，没有诊断轮：{hist:?}"
+        );
+        assert!(
+            hist.iter().all(|m| !m.text_of().contains("【自动诊断】")),
+            "空输出不许出现诊断轮"
+        );
+    }
+
+    /// Windows 镜像：命令失败（非零退出）且无输出 ⇒ 不追加。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_failing_silent_command_appends_nothing() {
+        let out = tempfile::tempdir().unwrap();
+        let script = write_script(out.path(), "diag.cmd", "@exit /b 3");
         let file = out.path().join("note.txt");
         let args = json!({ "path": file, "content": "hello" }).to_string();
         let mut rig = diagnostics_rig(

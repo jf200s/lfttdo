@@ -4395,6 +4395,28 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Windows 镜像（与 unix 版同形状；Windows CI 上验证）：裸名按 PATHEXT 展开候选
+    /// （shell.rs 的 `candidate_names`），可执行判定看扩展名而不是 x 位 —— 夹具
+    /// 相应地放一个 `mysh.cmd`，裸名 `mysh` 必须经 `.CMD` 候选命中。
+    #[cfg(windows)]
+    #[test]
+    fn shell_profile_validate_hits_a_bare_name_in_the_injected_search_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let hit = dir.path().join("mysh.cmd");
+        std::fs::write(&hit, b"@echo off\r\n").unwrap();
+        validate_shell_profile_with_dirs(
+            ShellProfile {
+                id: " mine ".into(),
+                label: " 显示名 ".into(),
+                program: "mysh".into(),
+                args: vec![" -c ".into()],
+            },
+            &[dir.path().to_path_buf()],
+        )
+        .expect("裸名在注入目录里命中必须 Ok");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// Windows 支：当前测试可执行文件是**真的**存在且带 .exe 的普通文件
     /// （桩的启发式判据），绝对路径直判必须过（plan：Windows 分支用 current_exe 兜底真值）。
     #[cfg(windows)]

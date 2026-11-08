@@ -639,7 +639,9 @@ mod tests {
     }
 
     /// 测试里同步跑 git（setup 与取证都用它）：失败即 panic（夹具前提坏了要炸响）。
-    #[cfg(unix)]
+    /// git 是跨平台的；`GIT_CONFIG_{GLOBAL,SYSTEM}=/dev/null` 在 Git for Windows
+    /// 上同样生效（它把 /dev/null 映射到 NUL）—— Windows CI 上验证。
+    #[cfg(any(unix, windows))]
     fn git_sync(dir: &Path, args: &[&str]) -> String {
         let out = StdCommand::new("git")
             .args(args)
@@ -659,7 +661,7 @@ mod tests {
 
     /// 临时 git 仓库：init + 本仓库身份（不碰全局配置）+ 空 init commit。
     /// keep 的 commit 身份来自仓库级 config，CI 环境没有全局身份也能跑。
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn temp_git_repo() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("建临时目录失败");
         let repo = dir.path().join("repo");
@@ -851,7 +853,10 @@ mod tests {
         }
     }
 
-    // ---- 进程用例（需要 git 与 sh：CI 的 ubuntu/windows 都有 git，sh 只保证 unix）----
+    // ---- 进程用例（G28 起 Windows CI 覆盖）：git 跨平台，命令语法分平台 ——
+    // unix 用 sh（单引号 / $n），windows 用 cmd（echo 不带引号）/ powershell（计数器）。
+    // 命令语法 unix 专属（sh 特性）的用例保持 #[cfg(unix)] 并注明；逻辑跨平台的
+    // 按 any(unix, windows) 或同形状 #[cfg(windows)] 镜像（Windows CI 上验证）。
 
     /// run：临时 git 仓库里 echo METRIC —— 指标解析正确、账本落 1 行。
     #[cfg(unix)]
@@ -882,6 +887,44 @@ mod tests {
         assert_eq!(ledger[0]["primary"], "time");
     }
 
+    /// Windows 镜像（与 unix 版同形状；Windows CI 上验证）：cmd 的 echo 不需要也
+    /// 不该带单引号（引号会原样进输出），其余断言逐条对应。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_parses_metrics_and_records_the_ledger() {
+        let (_dir, repo) = temp_git_repo();
+        let ctx = ctx_with(vec![repo.clone()], None);
+        let tool = ExperimentTool::new();
+        let out = tool
+            .execute(
+                json!({"action": "experiment_run", "command": "echo METRIC time=5"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = text_of(out);
+        assert!(text.contains("time = 5"), "{text}");
+        assert!(text.contains("METRIC time=5"), "输出尾要带命令原文：{text}");
+        let ledger = read_ledger(&repo);
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0]["action"], "run");
+        assert_eq!(ledger[0]["command"], "echo METRIC time=5");
+        assert_eq!(
+            ledger[0]["metrics"],
+            json!({"time": 5.0}),
+            "账本里 metrics 是真对象"
+        );
+        assert_eq!(ledger[0]["primary"], "time");
+    }
+
+    /// Windows 计数器命令（PowerShell 一行，经 cmd /C 原样透传）：每次执行自增并
+    /// 打印 —— cmd 没有 sh 的 `$()` 算术，纯 cmd 写法要靠 `call echo %%n%%` 的
+    /// 展开陷阱，晦涩易碎；windows-latest 必有 powershell.exe。Windows CI 上验证。
+    #[cfg(windows)]
+    const COUNTER_CMD: &str = "powershell -NoProfile -Command \"$n=0; \
+         if(Test-Path c.txt){$n=[int](Get-Content c.txt | Select-Object -First 1)}; \
+         $n=$n+1; Set-Content c.txt $n; Write-Output ('METRIC time='+$n)\"";
+
     /// 复跑取中位数：三次分别产出 1/2/3，中位数 2；每次复跑各记一行账本。
     #[cfg(unix)]
     #[tokio::test]
@@ -894,6 +937,36 @@ mod tests {
         let out = tool
             .execute(
                 json!({"action": "experiment_run", "command": cmd, "repeat": 3}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = text_of(out);
+        assert!(text.contains("3 次取中位数"), "{text}");
+        assert!(text.contains("time = 2"), "中位数(1,2,3) = 2：{text}");
+        assert!(
+            text.contains("原始值: 1, 2, 3"),
+            "中位数说明要带各次原始值：{text}"
+        );
+        let ledger = read_ledger(&repo);
+        assert_eq!(ledger.len(), 3, "复跑结果全记录进账本：{}", ledger.len());
+        for line in &ledger {
+            assert_eq!(line["action"], "run");
+            assert_eq!(line["repeat"], 3);
+        }
+    }
+
+    /// Windows 镜像（与 unix 版同形状；Windows CI 上验证）：计数器换成 PowerShell
+    /// 一行，中位数/账本断言逐条对应。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn repeat_runs_record_each_iteration_and_report_the_median() {
+        let (_dir, repo) = temp_git_repo();
+        let ctx = ctx_with(vec![repo.clone()], None);
+        let tool = ExperimentTool::new();
+        let out = tool
+            .execute(
+                json!({"action": "experiment_run", "command": COUNTER_CMD, "repeat": 3}),
                 &ctx,
             )
             .await
@@ -955,9 +1028,50 @@ mod tests {
         }
     }
 
+    /// Windows 镜像（与 unix 版同形状；Windows CI 上验证）：计数器换成 PowerShell
+    /// 一行；command_tail 断言改为与命令常量的末 60 字符逐字相等（按字符截取的
+    /// 判据在两个平台必须是同一条 —— tail_chars 的实现只有一份）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn repeat_runs_emit_one_experiment_run_event_per_iteration_in_order() {
+        let (_dir, repo) = temp_git_repo();
+        let sink = Arc::new(EventLog::default());
+        let mut ctx = ctx_with(vec![repo.clone()], None);
+        ctx.events = Some(sink.clone());
+        let tool = ExperimentTool::new();
+        tool.execute(
+            json!({"action": "experiment_run", "command": COUNTER_CMD, "repeat": 3}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let runs = sink.runs();
+        assert_eq!(
+            runs,
+            vec![
+                (runs[0].0.clone(), 1, 3, json!({"time": 1.0})),
+                (runs[1].0.clone(), 2, 3, json!({"time": 2.0})),
+                (runs[2].0.clone(), 3, 3, json!({"time": 3.0})),
+            ],
+            "每次复跑一条事件，序号 1 起始、按序推进，metrics 是当次值：{runs:?}"
+        );
+        for (tail, _, _, _) in &runs {
+            assert_eq!(
+                tail.chars().count(),
+                60,
+                "command_tail 恒为 60 字符：{tail}"
+            );
+            assert_eq!(
+                tail.as_str(),
+                tail_chars(COUNTER_CMD, 60),
+                "截尾保的是命令末 60 字符：{tail}"
+            );
+        }
+    }
+
     /// G27 的两个边界：没解析到 METRIC 的复跑 metrics 是 `null`（不是 `{}` 也不是
     /// 缺键）；命令不足 60 字符时 command_tail 原样透传（不垫空格）。
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn a_run_without_metrics_emits_null_and_a_short_command_stays_whole() {
         let (_dir, repo) = temp_git_repo();
@@ -980,7 +1094,7 @@ mod tests {
     }
 
     /// 非 git 目录：run 照常（不需要 git），keep/discard 明确报「不是 git 仓库」。
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn keep_and_discard_fail_loudly_outside_a_git_repo() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1015,7 +1129,7 @@ mod tests {
     }
 
     /// keep 的顺序纪律：本实例没跑过 run ⇒ 明确报错，不碰 git。
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn keep_without_a_run_asks_for_one() {
         let (_dir, repo) = temp_git_repo();
@@ -1036,7 +1150,7 @@ mod tests {
 
     /// keep 无变更：干净仓库里（账本自身被 porcelain 过滤）⇒「没有可保留的变更」。
     /// 这条同时钉住「.lfttdo 不算变更」—— 账本刚写过一行，porcelain 非空但被排除。
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn keep_without_changes_is_rejected_and_lfttdo_does_not_count() {
         let (_dir, repo) = temp_git_repo();
@@ -1069,7 +1183,7 @@ mod tests {
 
     /// 完整循环：写文件 → run → keep（commit 出现、账本 2 行）→ 改坏 + 新增未跟踪
     /// 文件 → run → discard → 文件字节级恢复、未跟踪产物被清、账本保全。
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn the_full_loop_keeps_commits_and_discard_restores_bytes() {
         let (_dir, repo) = temp_git_repo();
@@ -1163,7 +1277,7 @@ mod tests {
 
     /// 账本写失败不阻断：.lfttdo 被一个同名**文件**占住时，追加必然失败，
     /// 但 run 的命令结果照常返回（观察面让位于主交付）。
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[tokio::test]
     async fn a_ledger_write_failure_does_not_block_the_run() {
         let (_dir, repo) = temp_git_repo();
