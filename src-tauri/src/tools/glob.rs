@@ -184,12 +184,14 @@ impl Tool for GlobTool {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        // 汇总与提示放最前（与 grep 同一布局：预览截断时提示必须还在）。
+        let mut head = format!("共 {} 个文件", hits.len());
         if truncated_by_cap {
-            text.push_str(&format!(
-                "\n[已达 {MAX_RESULTS} 条上限，结果被截断；请收窄 pattern]"
-            ));
+            head.push_str("；[已达上限，结果被截断，请收窄 pattern]");
         }
-        text.push_str(&format!("\n共 {} 个文件", hits.len()));
+        text = format!("{head}\n{text}");
+        // G09：超长输出截断 + 完整内容落盘（.lfttdo/outputs/）。
+        let text = crate::tools::output_bound::bound_tool_output(text, ctx);
         Ok(ToolOutput::Text { text })
     }
 }

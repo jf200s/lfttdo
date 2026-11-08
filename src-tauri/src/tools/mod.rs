@@ -7,6 +7,7 @@ pub(crate) mod fs_write;
 pub mod glob;
 pub mod grep;
 pub mod memory_search;
+pub(crate) mod output_bound;
 pub mod read_file;
 pub mod registry;
 // run_command（agent 的 shell 执行工具）：2026-11-01 先交付接口契约桩，

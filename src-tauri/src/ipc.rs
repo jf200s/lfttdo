@@ -3444,7 +3444,7 @@ mod tests {
     use crate::permission::gate::PermissionGate;
     use crate::store::db::{Db, events_from_messages};
     use crate::tools::registry::ToolRegistry;
-    
+
     use async_trait::async_trait;
     use futures::Stream;
     use tempfile::TempDir;

@@ -25,8 +25,6 @@ pub fn usable_with_roots(roots: &[PathBuf]) -> bool {
 
 /// 命中条数上限。到顶就停（不再继续读后续文件），末尾说明收窄手段。
 const MAX_MATCHES: usize = 200;
-/// 单行展示上限（字符）：超长行（压缩 JS、minified）截断，避免一条命中占满输出。
-const LINE_DISPLAY_CAP: usize = 500;
 /// 遍历深度与文件数上限：防符号链接环之外的失控树（幽灵目录、挂载点）。
 const MAX_DEPTH: usize = 32;
 const MAX_FILES: usize = 20_000;
@@ -68,15 +66,11 @@ fn wildcard_match(name: &str, pattern: &str) -> bool {
     pi == p.len()
 }
 
-/// 一处命中的展示行。行内容按字符截到 [`LINE_DISPLAY_CAP`]（字节切会碎在 UTF-8 中间）。
+/// 一处命中的展示行。**不做单行截断**：超长输出（一条 minified 巨行、几百条命中）
+/// 统一由 `output_bound` 在出口限幅 —— 两套截断会互相抢活（单行截断把输出压到
+/// 限幅阈值之下，总限幅就永远不触发），而「截断」只该有一处实现、一个口径。
 fn match_line(path: &Path, line_no: usize, line: &str) -> String {
-    let display: String = if line.chars().count() > LINE_DISPLAY_CAP {
-        let truncated: String = line.chars().take(LINE_DISPLAY_CAP).collect();
-        format!("{truncated}…")
-    } else {
-        line.to_string()
-    };
-    format!("{}:{}: {}", path.display(), line_no, display.trim_end())
+    format!("{}:{}: {}", path.display(), line_no, line.trim_end())
 }
 
 /// 递归收集待搜文件。返回 (文件表, 被跳过的非文本文件数)。
@@ -284,26 +278,32 @@ impl Tool for GrepTool {
                 }
             )));
         }
-        let mut text = out.join("\n");
+        // 汇总与提示放**最前**：出口的 output_bound 只保留开头一段预览 ——
+        // 提示若缀在明细后面，恰好在超长的场景里会被截掉（模型最需要提示的时刻
+        // 恰恰是它看不见提示的时刻）。命中明细随后，全文照常落盘。
+        let mut text = String::new();
         if out.len() >= MAX_MATCHES {
             text.push_str(&format!(
-                "\n[已达 {MAX_MATCHES} 处命中上限，结果被截断；请收窄 pattern 或加 glob 过滤]"
+                "[已达 {MAX_MATCHES} 处命中上限，结果被截断；请收窄 pattern 或加 glob 过滤]\n"
             ));
         }
         if truncated > files.len() {
             text.push_str(&format!(
-                "\n[文件数达到扫描上限，仅扫描前 {} 个文件]",
+                "[文件数达到扫描上限，仅扫描前 {} 个文件]\n",
                 files.len()
             ));
         }
         if skipped > 0 {
-            text.push_str(&format!("\n[跳过 {skipped} 个二进制/非 UTF-8 文件]"));
+            text.push_str(&format!("[跳过 {skipped} 个二进制/非 UTF-8 文件]\n"));
         }
         text.push_str(&format!(
-            "\n共 {} 处命中（{} 个文件）",
+            "共 {} 处命中（{} 个文件）\n",
             out.len(),
             matched_files.len()
         ));
+        text.push_str(&out.join("\n"));
+        // G09：超长输出截断 + 完整内容落盘（.lfttdo/outputs/）。
+        let text = crate::tools::output_bound::bound_tool_output(text, ctx);
         Ok(ToolOutput::Text { text })
     }
 }
@@ -454,11 +454,15 @@ mod tests {
         );
     }
 
-    /// 超长行按字符截断：不 panic（字节切 UTF-8 会碎），不交出 500 字以上的行。
+    /// 超长行不再行内截断：出口的 output_bound 统一处理（截断标记 + 完整落盘）。
     #[tokio::test]
-    async fn an_overlong_line_is_truncated_by_chars() {
+    async fn an_overlong_line_is_bounded_at_the_output_layer() {
         let tmp = tempfile::tempdir().unwrap();
-        let line = format!("{find}{long}\n", find = "find_me", long = "字".repeat(2000));
+        let line = format!(
+            "{find}{long}\n",
+            find = "find_me",
+            long = "字".repeat(600_000)
+        );
         std::fs::write(tmp.path().join("long.txt"), line).unwrap();
         let out = run(
             json!({ "pattern": "find_me", "path": tmp.path() }),
@@ -470,12 +474,15 @@ mod tests {
             ToolOutput::Text { text } => text,
             other => panic!("{other:?}"),
         };
-        let line_out = text.lines().next().unwrap();
-        // 展示格式是「{path}:{行号}: {内容}」：按「冒号+空格」切，第 2 段起是内容
-        // （第 1 段吃掉了「路径:行号」整体 —— 路径里的 `C:` 这类盘符不带空格，不会被误切）。
-        let content = line_out.split(": ").nth(1).unwrap();
-        assert!(content.ends_with('…'), "截断要挂省略号：{content}");
-        assert!(content.chars().count() <= LINE_DISPLAY_CAP + 1, "{content}");
+        assert!(text.starts_with("[输出超长"), "截断标记在最前：{text}");
+        assert!(text.chars().count() < 4000, "{}", text.chars().count());
+        // 完整输出落盘可读，内容包含原始命中。
+        let base = tmp.path().to_str().unwrap();
+        let start = text.find(base).unwrap();
+        let end = text[start..].find(' ').unwrap();
+        let full = std::fs::read_to_string(&text[start..start + end]).unwrap();
+        assert!(full.contains("find_me"));
+        assert!(full.contains("字"), "落盘的是未截断的完整行");
     }
 
     /// 注册名与声明过滤判据共用同一份常量（与 read_file 的 NAME 纪律一致）。
