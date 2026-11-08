@@ -95,6 +95,12 @@ pub struct SessionConfig {
     /// G19：激活档案的名字（拒绝理由里点名「Agent「X」」用）。与 allowed_tools
     /// 同源同设（装配点一起给）；None 时拒绝理由退化为「当前 Agent」。
     pub active_agent_name: Option<String>,
+    /// G22：task 工具可点名的 agent 档案表（`task(agent:"explore")` 时在表里查找）。
+    /// 子代理的身份由 task 调用**显式点名**，父会话自己的 allowed_tools / 人设**不**
+    /// 自动传给子会话 —— 「审计员主会话」≠「审计员子代理」：主会话的白名单管的是
+    /// 主会话这一轮，子代理是谁、能干什么，是派活那一刻才定的事。Default 空表 =
+    /// 无档案可点名，task 的行为与从前逐字节一致。
+    pub agents: Vec<AgentProfile>,
 }
 
 impl Default for SessionConfig {
@@ -105,8 +111,22 @@ impl Default for SessionConfig {
             diagnostics_command: None,
             allowed_tools: None,
             active_agent_name: None,
+            agents: Vec::new(),
         }
     }
+}
+
+/// G22：task 工具可点名的子代理档案（OpenCode 的 explore/general 模式）。住 agent 层的
+/// **中性结构**，不放 settings.rs —— agent 层不许依赖 settings（Plan A 依赖方向），
+/// `AgentProfileJson → AgentProfile` 的映射归 ipc 装配层（`ipc.rs::agent_profiles`）。
+/// `prompt` 非空 ⇒ 子会话系统提示词整段替换（「只读调研员」这类人设）；
+/// `tools` 有表 ⇒ 子会话的工具白名单；两个 `None` 各自表示「不替换 / 不限制」。
+/// description（`AgentProfileJson` 里有）是给人看的档案说明，模型用不上，故不在此结构中。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentProfile {
+    pub name: String,
+    pub prompt: Option<String>,
+    pub tools: Option<Vec<String>>,
 }
 
 /// 会话的全部外部依赖，由装配点（Task 13）注入。每一项都是 `Arc`（`context` 除外），
@@ -387,12 +407,15 @@ impl AgentSession {
             skills_disabled: self.skills_disabled.clone(),
             // G16：子代理运行器 —— 用同一套 model/registry/gate/温度/预算起独立子会话
             // （agent/task.rs::LoopRunner）。文件作用域随 TaskTool 调用时的 ctx 传下去。
+            // G22：档案表从本会话的配置带下去 —— task 调用点名哪个档案（`task(agent:"explore")`），
+            // 子会话就换成哪个身份；表本身不自动传给子会话（孙代理不支持，取舍见 LoopRunner）。
             subagents: Some(Arc::new(crate::agent::task::LoopRunner {
                 model: self.deps.model.clone(),
                 registry: self.deps.registry.clone(),
                 gate: self.deps.gate.clone(),
                 temperature: self.deps.temperature,
                 context_cfg: self.deps.context.config(),
+                agents: self.cfg.agents.clone(),
             })),
             // G20：事件出口原样交给工具（question 发多选题用）。与上面同一份 sink，
             // 事件线只有一条；question 不经权限门，门与出口在这里就已分流。
@@ -2678,6 +2701,176 @@ mod tests {
         );
 
         // R57 配对（子会话自己的请求也在同一只 recorder 里，一起钉）。
+        assert_every_request_paired(&rig);
+    }
+
+    // ───────────────────────── G22：受限子代理（task 的 agent 档案） ─────────────────────────
+
+    /// G22 夹具：注册表恰好含 task、两把「白名单外」的工具（write_file / run_command）
+    /// 以及三把「白名单内」的（read_file / grep / glob），roots 指向真目录。
+    /// 「含/不含」的断言必须有真工具在场才有意义 —— 工具没注册的话「不含」是空真。
+    fn restricted_agent_rig(cfg: SessionConfig, rounds: Vec<Vec<ModelDelta>>, root: &Path) -> Rig {
+        let model = ScriptedModel::new(rounds);
+        let recorder = model.recorder.clone();
+        let sink = Arc::new(VecSink::default());
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(crate::tools::task::TaskTool));
+        registry.register(Arc::new(crate::tools::read_file::ReadFileTool));
+        registry.register(Arc::new(crate::tools::write_file::WriteFileTool));
+        registry.register(Arc::new(crate::tools::grep::GrepTool));
+        registry.register(Arc::new(crate::tools::glob::GlobTool));
+        registry.register(Arc::new(crate::tools::shell::ShellTool::new(Arc::new(
+            std::sync::RwLock::new(crate::tools::shell::ShellCatalog::from_parts(vec![], "")),
+        ))));
+        let gate = Arc::new(PermissionGate::new().with_sink(sink.clone()));
+        let session = AgentSession::new(SessionDeps {
+            model,
+            registry,
+            gate: gate.clone(),
+            sink: sink.clone(),
+            context: ContextBuilder::new(ContextConfig::default()),
+            temperature: None,
+        })
+        .with_roots(vec![root.to_path_buf()])
+        .with_config(cfg);
+        Rig {
+            session,
+            sink,
+            gate,
+            recorder,
+        }
+    }
+
+    /// 点名 `agent:"explore"` ⇒ 子会话换档案身份：system 含档案人设「只读调研员」，
+    /// 声明表含白名单内的 read_file、不含白名单外的 write_file / run_command；
+    /// 父子历史隔离与从前一致。三次请求 = 父1（task 调用）+ 子1 + 父2（收尾）。
+    #[tokio::test]
+    async fn a_task_agent_profile_swaps_the_child_session_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rig = restricted_agent_rig(
+            SessionConfig {
+                agents: vec![AgentProfile {
+                    name: "explore".into(),
+                    prompt: Some("你是只读调研员".into()),
+                    tools: Some(vec!["read_file".into(), "grep".into(), "glob".into()]),
+                }],
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("task", r#"{"prompt":"去查 X","agent":"explore"}"#)]),
+                deltas(&["子结果"]),
+                deltas(&["收尾"]),
+            ],
+            root.path(),
+        );
+        // task 是 Write 档：后台应答放行这 1 次弹窗（子会话只跑一轮文本，没有别的调用）。
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("派 explore 去查").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 3, "父1 + 子1 + 父2：{}", reqs.len());
+
+        // 子会话（第 2 次请求）的人设来自档案 prompt —— 整段替换生效。
+        let child = &reqs[1];
+        assert_eq!(child.messages[0].role, Role::System);
+        assert!(
+            child.messages[0].text_of().contains("你是只读调研员"),
+            "子会话 system 要含档案人设：{}",
+            child.messages[0].text_of()
+        );
+        // 工具白名单：名单内的在、名单外的不在（注册表里确实有那两把，见夹具注释）。
+        let names: Vec<&str> = child.tools.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            names.contains(&"read_file"),
+            "白名单内的 read_file 要在子会话声明表里：{names:?}"
+        );
+        for banned in ["write_file", "run_command"] {
+            assert!(
+                !names.contains(&banned),
+                "{banned} 不许进受限子会话的声明表：{names:?}"
+            );
+        }
+
+        // 历史隔离不变：子请求带 prompt、不带父的 user 原话。
+        let child_joined: String = child.messages.iter().map(|m| m.text_of()).collect();
+        assert!(
+            child_joined.contains("去查 X"),
+            "子请求要带上 prompt：{child_joined}"
+        );
+        assert!(
+            !child_joined.contains("派 explore 去查"),
+            "档案不改 task 的独立 history 语义：{child_joined}"
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    /// 点名一个不存在的档案 ⇒ 父的 ToolResult 是错误（含「没有这个 agent 档案」），
+    /// 子会话压根没被创建：总请求数 2，全是父的（fail-closed，绝不静默回落成全工具子代理）。
+    #[tokio::test]
+    async fn an_unknown_agent_name_fails_without_creating_a_child_session() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rig = restricted_agent_rig(
+            SessionConfig {
+                agents: vec![AgentProfile {
+                    name: "explore".into(),
+                    prompt: Some("你是只读调研员".into()),
+                    tools: Some(vec!["read_file".into()]),
+                }],
+                ..Default::default()
+            },
+            vec![
+                tool_round(1, &[("task", r#"{"prompt":"查一下","agent":"不存在"}"#)]),
+                deltas(&["收尾"]),
+            ],
+            root.path(),
+        );
+        // task 本身仍要过 Write 弹窗（拦截发生在档案查找**之后**的工具执行里）。
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("派一个不存在的档案").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 2, "父两次、无子请求：{}", reqs.len());
+        let results = rig.sink.tool_results();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].1 && results[0].2.contains("没有这个 agent 档案"),
+            "ToolResult 要是错误且点名档案缺失：{:?}",
+            results[0]
+        );
+        assert_every_request_paired(&rig);
+    }
+
+    /// 回归：不点名 agent ⇒ 与现状一致 —— 子会话不吃任何白名单，
+    /// 声明表是注册表经 roots 过滤后的全量（write_file / run_command 都在）。
+    #[tokio::test]
+    async fn a_task_call_without_an_agent_keeps_the_full_toolset_child() {
+        let root = tempfile::tempdir().unwrap();
+        let mut rig = restricted_agent_rig(
+            SessionConfig::default(),
+            vec![
+                tool_round(1, &[("task", r#"{"prompt":"去查 X"}"#)]),
+                deltas(&["子结果"]),
+                deltas(&["收尾"]),
+            ],
+            root.path(),
+        );
+        let _answers = answer_all(&rig.gate, &rig.sink, 1);
+        assert_eq!(rig.run("派子代理去查").await, StopReason::EndTurn);
+
+        let reqs = rig.reqs();
+        assert_eq!(reqs.len(), 3, "父1 + 子1 + 父2：{}", reqs.len());
+        let names: Vec<&str> = reqs[1].tools.iter().map(|d| d.name.as_str()).collect();
+        for expected in ["read_file", "write_file", "run_command"] {
+            assert!(
+                names.contains(&expected),
+                "无 agent 名 = 现状全量，{expected} 该在子会话声明表里：{names:?}"
+            );
+        }
+        assert!(
+            !reqs[1].messages[0].text_of().contains("你是只读调研员"),
+            "无档案时子会话沿用默认人设：{}",
+            reqs[1].messages[0].text_of()
+        );
         assert_every_request_paired(&rig);
     }
 

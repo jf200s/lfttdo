@@ -10,7 +10,7 @@ use crate::agent::memory::{
     MemoryCandidate, MemoryDecision, PROFILE_CHAR_CAP, consolidate_memory, extract_memories,
     merge_profile,
 };
-use crate::agent::session::{AgentSession, SessionConfig, SessionDeps};
+use crate::agent::session::{AgentProfile, AgentSession, SessionConfig, SessionDeps};
 use crate::agent::summarize::{SUMMARY_OMITTED, collect_summary, summary_note, summary_request};
 use crate::agent::types::{ContentBlock, Message, Role};
 use crate::mcp::bridge::{McpBridge, McpTool, ServerStatus};
@@ -413,6 +413,10 @@ pub struct TurnDeps {
     pub allowed_tools: Option<Vec<String>>,
     /// G19：激活档案的名字（拒绝理由点名用）。与 allowed_tools 同源同设。
     pub active_agent_name: Option<String>,
+    /// G22：task 工具可点名的 agent 档案表。与 allowed_tools 同一条线现取
+    /// （`send_message` 经 [`agent_profiles`] 从 `Settings.agents` 映射，改设置下一条
+    /// 消息生效），`run_turn` 装进 `SessionConfig.agents`。
+    pub agents: Vec<AgentProfile>,
     /// T5：记忆的四项开关（spec §7），由 `send_message` 从本轮那份 `Settings` 现取
     /// （context/temperature 同一条线：会话不自己读 `Settings`）。`enabled=false` 的
     /// 语义有两级：压缩段零抽取（记忆侧模型调用一个不发起）+ 请求头零备注（连召回
@@ -1058,6 +1062,23 @@ pub(crate) fn memory_turn_cfg(settings: &Settings) -> MemoryTurnCfg {
     }
 }
 
+/// G22:`Settings.agents → Vec<AgentProfile>` 的**唯一**转换点(与 `memory_turn_cfg`
+/// 同一条纪律:`#[tauri::command]` 在单测里调不动,映射抽成纯函数才能单测钉住;
+/// 放 ipc 不做成 `Settings` 的派生方法,理由同 `memory_turn_cfg` —— settings.rs 是
+/// 不依赖上层的底层文件)。只映射 name/prompt/tools:`description` 是给人看的档案
+/// 说明,模型与子会话都用不上 —— 丢在这里是有意的,不是漏搬。
+pub(crate) fn agent_profiles(settings: &Settings) -> Vec<AgentProfile> {
+    settings
+        .agents
+        .iter()
+        .map(|p| AgentProfile {
+            name: p.name.clone(),
+            prompt: p.prompt.clone(),
+            tools: p.tools.clone(),
+        })
+        .collect()
+}
+
 /// T10(机制一:编码特异性):召回 query 拼上**上一轮**用户消息的文本。
 ///
 /// 人回忆时并不只用当前这句话当线索:追问(「那它呢」「还有别的吗」)本身没有实体,
@@ -1314,6 +1335,7 @@ pub async fn run_turn(
         diagnostics_command,
         allowed_tools,
         active_agent_name,
+        agents,
         memory,
         embed,
         mut roots,
@@ -1488,11 +1510,13 @@ pub async fn run_turn(
     // G15：plan 模式每轮现取（改设置下一条消息生效）—— 会话里 Write/Exec 级调用被拒、
     // Read 照常，语义归 session.rs（`SessionConfig.plan_mode` / `PLAN_MODE_NOTE`）。
     // `max_turns` 保持默认 25：它是防自我循环的保险丝而不是旋钮（spec 4.6），不进 Settings。
+    // G22：agents 档案表同线装配 —— 会话再经 LoopRunner 喂给 task 工具（session.rs）。
     .with_config(SessionConfig {
         plan_mode,
         diagnostics_command,
         allowed_tools,
         active_agent_name,
+        agents,
         ..Default::default()
     });
     session.defer_done();
@@ -1747,6 +1771,10 @@ pub async fn send_message(
             // G19：agent 白名单与档案名同线现取（未激活 = 两个 None，会话行为不变）。
             allowed_tools: profile.as_ref().and_then(|p| p.tools.clone()),
             active_agent_name: profile.as_ref().map(|p| p.name.clone()),
+            // G22：task 可点名的档案表 —— 同一份 `store.load()` 现取，经 `agent_profiles`
+            // 映射（只搬 name/prompt/tools，见该函数注释）。空表 = 没有档案可点名，
+            // task 的行为与从前一致。
+            agents: agent_profiles(&settings),
             extract_locks: state.extracting.clone(),
             // T26（R276）：roots 和上面两项同源 —— 同一个 `store.load()` 的每一轮现取，
             // 因此**用户改完设置发下一条消息就生效**，这里没有任何缓存可以过期。
@@ -3626,6 +3654,7 @@ mod tests {
                     diagnostics_command: None,
                     allowed_tools: None,
                     active_agent_name: None,
+                    agents: Vec::new(),
                     // 夹具默认不带 roots：除了那条专门量 roots 的测试（它自己搭 `TurnDeps`），
                     // T27（R286）之后这里还要多说一句：`build_production_registry()` 的表里
                     // **有** `read_file`，但空 roots 那一轮交给模型的声明表里没有它，
@@ -4009,6 +4038,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: roots.clone(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -4088,6 +4118,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -4822,6 +4853,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -4892,6 +4924,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -5276,6 +5309,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 skills_dir: None,
                 skills_disabled: Vec::new(),
@@ -5878,6 +5912,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6059,6 +6094,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6126,6 +6162,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6276,6 +6313,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6449,6 +6487,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 embed: None,
@@ -6593,6 +6632,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg {
                     enabled: false,
@@ -6653,6 +6693,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory,
                 embed,
@@ -6783,6 +6824,39 @@ mod tests {
         assert_eq!(c.embedding_model, s.memory_embedding_model);
         // source 归一后只有两种取值,布尔与字符串的换算因此是精确的(没有第三态可漏)。
         assert_eq!(s.memory_embedding_source, "endpoint");
+    }
+
+    /// G22:`agent_profiles` 是 `Settings.agents → Vec<AgentProfile>` 的唯一转换点。
+    /// name/prompt/tools 逐字映射;`description` 是给人看的,映射时**丢弃** ——
+    /// 「少搬一个字段」只能这样钉住:给 description 塞哨兵值,断言目标结构里没有它。
+    #[test]
+    fn agent_profiles_maps_name_prompt_tools_and_drops_the_description() {
+        use crate::settings::AgentProfileJson;
+        let s = Settings {
+            agents: vec![AgentProfileJson {
+                name: "explore".into(),
+                description: "只读调研员的说明(给人看)".into(),
+                prompt: Some("你是只读调研员".into()),
+                tools: Some(vec!["read_file".into(), "grep".into(), "glob".into()]),
+            }],
+            ..Default::default()
+        };
+        let got = agent_profiles(&s);
+        assert_eq!(got.len(), 1, "档案逐条映射:{got:?}");
+        // 与「不含 description 的字面值」精确相等:name/prompt/tools 逐字透传。
+        // `AgentProfile` 本身就没有 description 字段(编译期事实),将来谁往结构里加
+        // 字段、往映射里塞多余的值,这条等式当场红。
+        assert_eq!(
+            got[0],
+            AgentProfile {
+                name: "explore".into(),
+                prompt: Some("你是只读调研员".into()),
+                tools: Some(vec!["read_file".into(), "grep".into(), "glob".into()]),
+            },
+            "name/prompt/tools 逐字透传,description 不在目标结构里"
+        );
+        // 空档案表 = 空表:未配置时 task 的行为与从前一致。
+        assert!(agent_profiles(&Settings::default()).is_empty());
     }
 
     /// T12:装配函数是 `Settings → MemoryTurnCfg` 的唯一一处转换,所以两个新设置项
@@ -6991,6 +7065,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory: MemoryTurnCfg::default(),
                 extract_locks: ExtractLocks::default(),
@@ -7484,6 +7559,7 @@ mod tests {
                 diagnostics_command: None,
                 allowed_tools: None,
                 active_agent_name: None,
+                agents: Vec::new(),
                 roots: Vec::new(),
                 memory,
                 embed: None,
@@ -8457,6 +8533,7 @@ mod tests {
                     diagnostics_command: None,
                     allowed_tools: None,
                     active_agent_name: None,
+                    agents: Vec::new(),
                     roots: Vec::new(),
                     skills_dir: None,
                     skills_disabled: Vec::new(),
