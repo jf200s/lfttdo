@@ -77,6 +77,19 @@ pub struct ToolRule {
     pub action: RuleAction,
 }
 
+/// G14：分段规则判定的折叠结果（`RuleTable::folded_decision` 产出，`check` 消费）。
+/// 模块私有：对外的可见形态仍是 `Decision`，折叠只是 check 内部的中间语义。
+enum RuleOutcome {
+    /// 任一段命中 deny —— 带最先命中的段与规则（拒绝理由要点名两者）。
+    Deny { segment: String, rule: ToolRule },
+    /// 任一段命中 ask（且没有 deny）—— 整体 ask，落到弹窗路径。
+    Ask,
+    /// 每一段都命中 allow —— 整体放行。
+    Allow,
+    /// 有段落没被任何规则覆盖（或没有任何段）—— 未覆盖段按无规则处理，走默认路径。
+    Pass,
+}
+
 /// 会话级放行攒下来的作用域令牌集。键是 `PermissionGate::rule_key` 的产物 ——
 /// **不是裸工具名**，裸工具名会把「本会话允许写一次」变成「本会话可写任意路径」。
 #[derive(Default)]
@@ -267,9 +280,10 @@ impl RuleTable {
         crate::lock::read(&self.tool_rules).clone()
     }
 
-    /// G13 对外的判定入口（只需要动作的调用方用这个）。`check` 走 `matching_rule`：
-    /// 拒绝理由要引用**命中的那条 pattern**，光有动作拼不出来 —— 两者必须共用同一份
-    /// 匹配实现（R77：不留两份）。
+    /// G13 对外的判定入口（只需要动作的调用方用这个）—— **单 scope** 的底层判定原语：
+    /// G14 起 `check` 对 Exec 走 `folded_decision` 的分段折叠，本方法不再直接被 check
+    /// 用于整条命令。`check` 拒绝理由要引用**命中的那条 pattern**，光有动作拼不出来 ——
+    /// 两者必须共用同一份匹配实现（R77：不留两份）。
     pub fn rule_decision(&self, tool: &str, scope: &str) -> Option<RuleAction> {
         self.matching_rule(tool, scope).map(|r| r.action)
     }
@@ -297,6 +311,49 @@ impl RuleTable {
             }
         }
         hit
+    }
+
+    /// G14：分段折叠判定。对每段各自跑 `matching_rule`（段内仍是 last-match-wins），
+    /// 再按 **deny > ask > 全 allow > 默认路径** 折叠成整体动作：
+    /// · 任一段命中 deny → 整体 deny —— allow 前缀带不过 deny 段
+    ///   （`git status && rm -rf /x` 在 `git *` allow + `rm *` deny 下必拒，G14 的核心语义）；
+    /// · 否则任一段命中 ask → 整体 ask（落到弹窗）；
+    /// · 否则全部段都命中 allow → 整体 allow；
+    /// · 否则（有 allow 段也有未命中段 / 全部未命中 / 没有任何段）→ Pass：未命中段按
+    ///   无规则处理，allow **不带过它没点名的段**，整体落回默认路径 —— allow+miss 折成
+    ///   默认而不是 allow，是刻意收紧：`echo a; npm test` 里 echo 的 allow 不许把
+    ///   没有任何规则覆盖的 npm 段一起放走。
+    /// 多个 deny 命中时取**最先**命中的段做理由（最早出现的违规最有诊断价值）。
+    fn folded_decision(&self, tool: &str, segments: &[String]) -> RuleOutcome {
+        let mut deny = None;
+        let mut ask = false;
+        let mut allow = false;
+        let mut miss = false;
+        for seg in segments {
+            match self.matching_rule(tool, seg) {
+                Some(rule) => match rule.action {
+                    RuleAction::Deny => {
+                        if deny.is_none() {
+                            deny = Some((seg.clone(), rule));
+                        }
+                    }
+                    RuleAction::Ask => ask = true,
+                    RuleAction::Allow => allow = true,
+                },
+                None => miss = true,
+            }
+        }
+        if let Some((segment, rule)) = deny {
+            return RuleOutcome::Deny { segment, rule };
+        }
+        if ask {
+            return RuleOutcome::Ask;
+        }
+        if allow && !miss {
+            // 走到这里的段只有 allow 与 miss 两种命中结果：!miss = 每一段都命中 allow。
+            return RuleOutcome::Allow;
+        }
+        RuleOutcome::Pass
     }
 
     /// 清空工具规则（装配侧 `None` / 形状非法时的复位路径；测试复位同用）。
@@ -328,6 +385,70 @@ pub(crate) fn scope_of(name: &str, input: &serde_json::Value) -> String {
         return host.to_ascii_lowercase();
     }
     "read".to_string()
+}
+
+/// G14：把 Exec 的 `command` 按 shell 的顺序连接符切段 —— `&&`、`||`、`;`、`|`、换行。
+/// 切段规则：
+/// · 双字符分隔符（`&&`/`||`）先于单字符判定 —— `||` 不许被切成两次 `|`；
+/// · 单个 `&` **不是**分隔符（规格只列了 `&&`/`||`/`;`/`|`/换行；后台运行的 `&`
+///   是另一层语义，这里不替工具层做主）；
+/// · 引号（`'`/`"`）内的分隔符**不切** —— `echo "a; b"` 是一段：规则匹配不该把
+///   引号里的文本当成新命令。已知 MVP 简化：只按字面字符做引号配对，不做 `\` 转义
+///   语义（`\"` 会提前闭合引号）—— 误切的后果由折叠兜住（切出的段各自过规则，
+///   落 deny 或默认路径，都不会静默放行）；
+/// · 每段 trim；trim 后为空的段丢弃 —— `git status && ` 的悬挂分隔符不产生幽灵段
+///   （空段会被 `*` 这类模式意外命中，等于给没写的命令造出判定）。
+/// 空输入 / 纯分隔符返回空表（调用方决定空表的语义，见 `check` 的回落分支）。
+pub(crate) fn split_command_segments(command: &str) -> Vec<String> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_single {
+            if c == '\'' {
+                in_single = false;
+            }
+            current.push(c);
+            continue;
+        }
+        if in_double {
+            if c == '"' {
+                in_double = false;
+            }
+            current.push(c);
+            continue;
+        }
+        match c {
+            // 引号开合：引号字符本身原样保留在段里（匹配时看到的就是原文）。
+            '\'' => {
+                in_single = true;
+                current.push(c);
+            }
+            '"' => {
+                in_double = true;
+                current.push(c);
+            }
+            // 双字符分隔符先判，吃掉两个字符。
+            '&' if chars.peek() == Some(&'&') => {
+                chars.next();
+                segments.push(std::mem::take(&mut current));
+            }
+            '|' if chars.peek() == Some(&'|') => {
+                chars.next();
+                segments.push(std::mem::take(&mut current));
+            }
+            ';' | '|' | '\n' => segments.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    segments.push(current);
+    segments
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn is_mcp_tool(name: &str) -> bool {
@@ -450,34 +571,54 @@ impl PermissionGate {
             Some(Verdict::Ask) => {}
             None => {}
         }
-        // G13：工具级权限规则（Settings.permission_rules → RuleTable::tool_rules）。
+        // G13/G14：工具级权限规则（Settings.permission_rules → RuleTable::tool_rules）。
         // 插在会话级放行 lookup **之前**是刻意的，这层语义必须写明：规则 Deny 必须压过
         // 「本会话都允许」—— 用户在设置里写死 `rm *` → deny，就不该被会话里答过的一次
         // 「都允许」静默推翻（与上面 Block 压过会话放行同一取向：显式配置 > 会话内授权）。
         // 规则 Allow 只给 `Scope::Once`，且不 remember_session：规则是常驻策略，每次调用
-        // 都由规则自己判定，不需要也不该变成一次会话级买断。Ask 在这里不收场，
-        // 落回下面的既有路径（会话放行 → Read 自动放行 → 弹窗）。
-        // 匹配串（scope）：Exec 取 `command` 原文（`git *` 这类模式对的是命令行）；
-        // 其余工具给空串 —— 裸字符串规则靠「pattern == 工具名」命中，见 `matching_rule`。
-        let scope_text = match call.risk {
-            Risk::Exec => call
-                .input
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(""),
-            _ => "",
-        };
-        if let Some(rule) = self.rules.matching_rule(&call.name, scope_text) {
-            match rule.action {
-                RuleAction::Deny => {
-                    return Decision::deny(format!(
-                        "权限规则拒绝了这次调用（命中规则: {}）",
-                        rule.pattern
-                    ));
+        // 都由规则自己判定，不需要也不该变成一次会话级买断。
+        // 匹配串（G14 分段）：Exec 的 `command` 按 shell 连接符（&&/||/;/|/换行）切段后
+        // **逐段**判定 —— `git status && rm -rf /x` 里 git 段的 allow 不带过 rm 段；
+        // 其余工具没有「段」，给单元素空串表，判定与 G13 逐字相同（裸字符串规则靠
+        // 「pattern == 工具名」命中，见 `matching_rule`）。
+        let segments: Vec<String> = match call.risk {
+            Risk::Exec => {
+                let segs = call
+                    .input
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .map(split_command_segments)
+                    .unwrap_or_default();
+                // command 字段缺失（或只有分隔符）时切段得到空表：回落成单元素空串段。
+                // 裸字符串整工具规则（pattern == 工具名）与 `*` 模式必须照常看到这次调用，
+                // 不许因为字段缺失而整体失效 —— G13 的 `{"run_command": "deny"}` 对
+                // 畸形调用也是 deny，这个语义分段化之后要保持。
+                if segs.is_empty() {
+                    vec![String::new()]
+                } else {
+                    segs
                 }
-                RuleAction::Allow => return Decision::allow(Scope::Once),
-                RuleAction::Ask => {}
             }
+            _ => vec![String::new()],
+        };
+        match self.rules.folded_decision(&call.name, &segments) {
+            RuleOutcome::Deny { segment, rule } => {
+                // 理由点名命中的规则与违规段；非 Exec 没有「段」（空串），保持 G13 的理由格式。
+                let reason = if segment.is_empty() {
+                    format!("权限规则拒绝了这次调用（命中规则: {}）", rule.pattern)
+                } else {
+                    format!(
+                        "权限规则拒绝了这次调用（命中规则: {}，段落: {}）",
+                        rule.pattern, segment
+                    )
+                };
+                return Decision::deny(reason);
+            }
+            // Allow：每一段都被 allow 规则覆盖 —— 整体放行。
+            RuleOutcome::Allow => return Decision::allow(Scope::Once),
+            // Ask（任一段命中 ask）与 Pass（有段落没被任何规则覆盖 / 没有任何段）都不在
+            // 这里收场：未覆盖的段按无规则处理，继续走既有路径（会话放行 → Read 自动放行 → 弹窗）。
+            RuleOutcome::Ask | RuleOutcome::Pass => {}
         }
         // 优先级 2：会话级放行（用户已经在本会话里答过「都行」）。
         // 「本会话」由 IPC 层在切会话时清空（`clear_session_rules`）。
@@ -1584,5 +1725,205 @@ mod tests {
         let (h, id) = pending_request(&gate, &c, &CancellationToken::new(), &sink, 1).await;
         gate.resolve(&id, Decision::deny("测试收尾"));
         assert!(!h.await.unwrap().allowed());
+    }
+
+    // ───────────────────────── G14：run_command 分段匹配 ─────────────────────────
+
+    /// 分段器覆盖规格点名的全部分隔符：&&、;、|、||（不许切成两次 |）、换行；
+    /// 无分隔符 = 单段；分隔符两侧多空格 trim；悬挂分隔符不产生空段；单个 & 不切。
+    #[test]
+    fn split_command_segments_covers_every_spec_delimiter() {
+        assert_eq!(
+            split_command_segments("git status && rm -rf /x"),
+            vec!["git status", "rm -rf /x"]
+        );
+        assert_eq!(
+            split_command_segments("echo a; npm test"),
+            vec!["echo a", "npm test"]
+        );
+        assert_eq!(
+            split_command_segments("cat a | grep b"),
+            vec!["cat a", "grep b"]
+        );
+        assert_eq!(
+            split_command_segments("a || b"),
+            vec!["a", "b"],
+            "`||` 是一个分隔符：切成两次 `|` 会在中间多出一个空段/重复切分"
+        );
+        assert_eq!(
+            split_command_segments("echo one\necho two"),
+            vec!["echo one", "echo two"],
+            "换行也是连接符"
+        );
+        assert_eq!(
+            split_command_segments("  git status  "),
+            vec!["git status"],
+            "无分隔符 = 单段，两端空白 trim"
+        );
+        assert_eq!(
+            split_command_segments("a   &&    b"),
+            vec!["a", "b"],
+            "分隔符两侧的多空格 trim"
+        );
+        assert_eq!(
+            split_command_segments("git status && "),
+            vec!["git status"],
+            "悬挂分隔符不产生空段（空段会被 `*` 模式意外命中）"
+        );
+        assert_eq!(
+            split_command_segments("sleep 5 & echo done"),
+            vec!["sleep 5 & echo done"],
+            "单个 & 不在分隔符清单里（&& 才是），不切"
+        );
+        assert_eq!(
+            split_command_segments("a && b || c; d | e\necho f"),
+            vec!["a", "b", "c", "d", "e", "echo f"],
+            "多种分隔符混用"
+        );
+        assert_eq!(
+            split_command_segments("   "),
+            Vec::<String>::new(),
+            "全空白输入没有段"
+        );
+        assert_eq!(split_command_segments(""), Vec::<String>::new());
+    }
+
+    /// 引号内的分隔符不切（本实现的语义红线：规则匹配不把引号里的文本当成新命令）。
+    /// 引号字符本身原样保留在段里；未闭合引号读到结尾都不再切 —— 宁可整段落默认路径，
+    /// 也不做猜测性切分（引号配对按字面字符计，不做 `\"` 转义语义，见函数注释）。
+    #[test]
+    fn quoted_delimiters_do_not_split_and_unterminated_quotes_stay_whole() {
+        assert_eq!(
+            split_command_segments("echo \"a; b\" | cat"),
+            vec!["echo \"a; b\"", "cat"],
+            "双引号内的 `;` 不切"
+        );
+        assert_eq!(
+            split_command_segments("echo 'x && y'; ls"),
+            vec!["echo 'x && y'", "ls"],
+            "单引号内的 `&&` 不切，引号外的 `;` 照切"
+        );
+        assert_eq!(
+            split_command_segments("echo \"unterminated; ls"),
+            vec!["echo \"unterminated; ls"],
+            "未闭合引号：整段保留，落到默认路径而不是猜着切"
+        );
+    }
+
+    /// G14 验收语义：组合命令里 allow 前缀**带不过** deny 段 ——
+    /// `git status && rm -rf /x` 在 `git *` allow + `rm *` deny 下必须整体 deny，
+    /// 理由点名命中的段与规则（整条文本匹配的旧语义会让 `git *` 通配放行整条）。
+    #[tokio::test]
+    async fn a_deny_segment_kills_the_whole_combo_command() {
+        let sink = Arc::new(VecSink::default());
+        let gate = PermissionGate::new().with_sink(sink.clone());
+        gate.set_rules_from_json(&json!({
+            "run_command": [
+                {"pattern": "git *", "action": "allow"},
+                {"pattern": "rm *", "action": "deny"}
+            ]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "run_command".into(),
+            risk: Risk::Exec,
+            input: json!({"command": "git status && rm -rf /x"}),
+        };
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert!(
+            matches!(&d, Decision::Deny { reason }
+                if reason.contains("权限规则") && reason.contains("rm *") && reason.contains("rm -rf /x")),
+            "deny 段要拦下整条组合命令，理由点名段与规则：{d:?}"
+        );
+        assert!(sink.events().is_empty(), "规则 deny 不弹窗，直接拒");
+    }
+
+    /// 全部段都命中 allow → 整体放行：`git status && git log` 两条都在 `git *` 的覆盖内。
+    #[tokio::test]
+    async fn all_allow_segments_allow_the_whole_combo() {
+        let sink = Arc::new(VecSink::default());
+        let gate = PermissionGate::new().with_sink(sink.clone());
+        gate.set_rules_from_json(&json!({
+            "run_command": [{"pattern": "git *", "action": "allow"}]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "run_command".into(),
+            risk: Risk::Exec,
+            input: json!({"command": "git status && git log"}),
+        };
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert_eq!(d, Decision::allow(Scope::Once), "{d:?}");
+        assert!(sink.events().is_empty(), "规则 allow 不弹窗");
+    }
+
+    /// allow 段 + 未命中段 → 落默认路径：echo 段的 allow 不带过没有任何规则覆盖的
+    /// npm 段（未命中段按无规则处理）。headless 下默认路径 = deny(没有可应答的界面)
+    /// —— 既不是规则 allow 也不是规则 deny，两条都算本测试失败。
+    #[tokio::test]
+    async fn an_uncovered_segment_sends_allow_back_to_the_default_path() {
+        let gate = PermissionGate::new();
+        gate.set_rules_from_json(&json!({
+            "run_command": [{"pattern": "echo *", "action": "allow"}]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "run_command".into(),
+            risk: Risk::Exec,
+            input: json!({"command": "echo a; npm test"}),
+        };
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert!(
+            matches!(&d, Decision::Deny { reason }
+                if reason.contains("没有可应答的界面") && !reason.contains("权限规则")),
+            "allow 段 + 未命中段必须落默认路径（headless deny），不许被 allow 带过去：{d:?}"
+        );
+    }
+
+    /// 任一段命中 ask（且没有 deny）→ 整体 ask：落到弹窗，allow 段不许把 ask 段压成放行。
+    #[tokio::test]
+    async fn an_ask_segment_wins_over_allow_segments() {
+        let sink = Arc::new(VecSink::default());
+        let gate = PermissionGate::new().with_sink(sink.clone());
+        gate.set_rules_from_json(&json!({
+            "run_command": [
+                {"pattern": "git *", "action": "allow"},
+                {"pattern": "curl *", "action": "ask"}
+            ]
+        }))
+        .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "run_command".into(),
+            risk: Risk::Exec,
+            input: json!({"command": "git status && curl example.com"}),
+        };
+        let (h, id) = pending_request(&gate, &c, &CancellationToken::new(), &sink, 1).await;
+        gate.resolve(&id, Decision::deny("测试收尾"));
+        assert!(!h.await.unwrap().allowed(), "ask 段必须落到弹窗路径");
+    }
+
+    /// G13 语义保持：裸字符串整工具规则（pattern == 工具名）对**畸形调用**（command
+    /// 字段缺失）同样生效 —— 切段得到空表时回落成单元素空串段，规则不许因字段缺失
+    /// 而整体失效（G13 里 `{"run_command": "deny"}` 对这种调用就是 deny）。
+    #[tokio::test]
+    async fn a_bare_whole_tool_deny_fires_even_when_the_command_field_is_missing() {
+        let gate = PermissionGate::new();
+        gate.set_rules_from_json(&json!({"run_command": "deny"}))
+            .unwrap();
+        let c = ToolCallView {
+            id: "c1".into(),
+            name: "run_command".into(),
+            risk: Risk::Exec,
+            input: json!({}),
+        };
+        let d = gate.check(&c, &CancellationToken::new()).await;
+        assert!(
+            matches!(&d, Decision::Deny { reason } if reason.contains("权限规则")),
+            "整工具 deny 不许因 command 字段缺失而漏成弹窗：{d:?}"
+        );
     }
 }
